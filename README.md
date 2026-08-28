@@ -1,5 +1,7 @@
 # omp-telegram
 
+[![CI](https://github.com/LucaCappelletti94/omp-telegram/actions/workflows/ci.yml/badge.svg)](https://github.com/LucaCappelletti94/omp-telegram/actions/workflows/ci.yml)
+
 Telegram notifications and remote control for [Oh My Pi](https://github.com/can1357/oh-my-pi) sessions. Turn ends arrive as a one line agent-written summary with an urgency light and optional tappable choices whose label starts the next turn. `ask` questions appear at the terminal and on Telegram at once, and the first answer wins.
 
 Parallel sessions share one bot: each message carries a session badge, replies route to the session that sent the replied-to message, and titles name the tmux window. With forum topic mode enabled on the bot, each session gets its own thread instead.
