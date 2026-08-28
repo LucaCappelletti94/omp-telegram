@@ -18,6 +18,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - run: npm run lint
       - run: node --check setup.mjs
       - run: npm test
       - run: npm run preview

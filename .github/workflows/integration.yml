@@ -1,0 +1,29 @@
+name: omp integration
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: curl -fsSL https://omp.sh/install | sh
+      - name: Extension loads in a real omp
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.omp/bin:$PATH"
+          omp --version
+          d=$(mktemp -d)
+          printf 'extensions: \n  - %s\n' "$GITHUB_WORKSPACE" > "$d/config.yml"
+          printf '{"token":"000000000000000000000000000000","chatId":1,"offset":1}' > "$d/notify-telegram.json"
+          PI_CODING_AGENT_DIR="$d" timeout 45 omp -p "hi" > out.txt 2>&1 || true
+          if grep -qi "Failed to load extension" out.txt; then
+            echo "extension failed to load" && tail -20 out.txt && exit 1
+          fi
+          test -n "$(ls "$d"/notify-telegram/sessions/ 2>/dev/null)" || { echo "no session record written" && tail -20 out.txt && exit 1; }
+          echo "extension loaded, session record present"

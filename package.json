@@ -9,6 +9,7 @@
 	},
 	"scripts": {
 		"test": "node --disable-warning=ExperimentalWarning test/run.mjs",
+		"lint": "npx -y @biomejs/biome@1.9.4 ci .",
 		"preview": "node --disable-warning=ExperimentalWarning test/preview.mjs",
 		"setup": "node setup.mjs"
 	},
