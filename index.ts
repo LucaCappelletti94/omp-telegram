@@ -22,13 +22,12 @@ const PREVIEW_MAX = 300;
 const RECENT_MESSAGE_CAP = 60;
 const TELEGRAM_TEXT_MAX = 4096;
 
-/** One definition of stance presentation, so a button and the body it belongs to cannot drift. */
+/** Single source for stance marker and colour. */
 const STANCE = {
 	preferable: { marker: "(preferable)", style: "success" as const },
 	discouraged: { marker: "(discouraged)", style: "danger" as const },
 };
 
-/** Visually distinct at notification size, so a glance separates two parallel sessions. */
 const BADGE_PALETTE = [
 	"\u{1F98A}", // fox
 	"\u{1F419}", // octopus
@@ -62,9 +61,9 @@ interface SessionRecord {
 	emoji: string;
 	label: string;
 	lastNotified: number;
-	/** Ids of messages this session recently sent, so a reply to one of them routes back here. */
+	/** Replying to one of these routes back here. */
 	recent: number[];
-	/** The turn-end question currently offered on Telegram, so a press survives a session resume. */
+	/** Standing turn-end question; survives a resume. */
 	standing: { id: string; messageId: number | null; labels: string[] } | null;
 	heartbeat: number;
 }
@@ -102,7 +101,7 @@ interface AskOption {
 	label: string;
 	description?: string;
 	preview?: string;
-	/** Marks an option present only for contrast. `recommended` on the question marks the positive case. */
+	/** Present only for contrast. */
 	discouraged?: boolean;
 }
 
@@ -124,7 +123,6 @@ interface AskResult {
 	customInput?: string;
 }
 
-/** One `ask` call currently offered on Telegram, advanced question by question. */
 interface PendingAsk {
 	askId: string;
 	head: string;
@@ -138,7 +136,6 @@ interface PendingAsk {
 	finish: (results: AskResult[]) => void;
 }
 
-/** What the agent recorded for the turn-end notification. */
 interface TurnStatus {
 	text: string;
 	urgency: "green" | "orange" | "red";
@@ -146,16 +143,12 @@ interface TurnStatus {
 	options?: string[];
 }
 
-/** A routed Telegram event waiting for the session that owns it. */
 interface InboxEntry {
 	kind: "text" | "callback";
 	value: string;
 }
 
-/**
- * Several omp processes share the state directory and `writeFileSync` truncates before writing, so
- * every cross-process file is written via temp plus rename, which POSIX makes atomic.
- */
+/** Temp plus rename: a reader in another omp process must never see a torn file. */
 function writeFileAtomic(path: string, content: string, mode?: number): void {
 	const temp = `${path}.${process.pid}.${Date.now().toString(36)}.tmp`;
 	writeFileSync(temp, content, mode === undefined ? {} : { mode });
@@ -195,7 +188,7 @@ function persistOffset(offset: number): void {
 	writeFileAtomic(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, 0o600);
 }
 
-/** Markdown subset to Telegram HTML. Code spans are stashed first so emphasis cannot touch them. */
+/** Markdown subset to Telegram HTML. Code is stashed first so emphasis cannot touch it. */
 function toTelegramHtml(source: string): string {
 	const blocks: string[] = [];
 	const stash = (html: string): string => {
@@ -233,7 +226,6 @@ interface TelegramFailure {
 	description: string;
 }
 
-/** Every non-ok reply is reported through `onFailure` before the caller sees `null`. */
 async function callTelegramRaw<T>(
 	config: Config,
 	method: string,
@@ -341,7 +333,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	const recentMessages: number[] = [];
 	let lastNotifiedAt = 0;
 
-	/** omp treats a rejected detached promise as fatal, so fire-and-forget work is caught and logged. */
+	/** A rejected detached promise is fatal in omp. */
 	function detach(work: Promise<unknown>, label: string): void {
 		work.catch((error) =>
 			pi.logger.warn(`notify-telegram: ${label} failed`, {
@@ -354,7 +346,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return callTelegramRaw<T>(cfg, method, body, timeoutMs, (failure) => pi.logger.warn("telegram call failed", failure));
 	}
 
-	/** Telegram answers malformed HTML with a 400 and drops the message, so a failed rich send retries as plain text. */
+	/** A rejected HTML send retries as plain text; the size limit is on the rendered form. */
 	async function sendOrEdit(
 		cfg: Config,
 		method: "sendMessage" | "editMessageText",
@@ -362,7 +354,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		plain: string,
 	): Promise<TelegramMessage | null> {
 		const quiet = { link_preview_options: { is_disabled: true } };
-		// Escaping expands text, so the limit is measured on the rendered form.
 		let source = plain;
 		while (toTelegramHtml(source).length > TELEGRAM_TEXT_MAX && source.length > 200) {
 			source = source.slice(0, Math.floor(source.length * 0.8));
@@ -410,11 +401,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (parsed === null || typeof parsed !== "object") return null;
 			return parsed as SessionRecord;
 		} catch {
-			return null; // Torn read of a record another process is rewriting.
+			return null;
 		}
 	}
 
-	/** One directory scan for every consumer: routing, badge and tag claims, and the reaper. */
 	function allRecords(): Array<{ id: string; record: SessionRecord }> {
 		if (!existsSync(SESSIONS_DIR)) return [];
 		const out: Array<{ id: string; record: SessionRecord }> = [];
@@ -426,14 +416,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return out;
 	}
 
-	/** Every live record except this session's own, used for lock takeover and badge collision checks. */
 	function otherLiveRecords(): SessionRecord[] {
 		return allRecords()
 			.filter(({ id, record }) => id !== sessionId && Date.now() - record.heartbeat <= LOCK_STALE_MS)
 			.map(({ record }) => record);
 	}
 
-	/** Keeps a prior badge when it is still free, otherwise takes the first palette entry nobody live is using. */
 	function claimBadge(): string {
 		const taken = new Set(otherLiveRecords().map((record) => record.emoji));
 		const previous = readSessionRecord(sessionId)?.emoji;
@@ -445,7 +433,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return BADGE_PALETTE[hash] ?? BADGE_PALETTE[0] ?? "";
 	}
 
-	/** Session ids are time-ordered, so prefixes collide. Routing needs a random token. */
+	/** Session id prefixes are timestamps and collide; routing needs a random token. */
 	function claimTag(): string {
 		const taken = new Set(otherLiveRecords().map((record) => record.tag));
 		const previous = readSessionRecord(sessionId)?.tag;
@@ -457,7 +445,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return Math.random().toString(36).slice(2, 7).padEnd(5, "0");
 	}
 
-	/** Dead sessions leave records and inboxes behind. Left alone they accumulate for days. */
 	function reapDeadSessions(): void {
 		if (!existsSync(SESSIONS_DIR)) return;
 		for (const entry of readdirSync(SESSIONS_DIR)) {
@@ -472,21 +459,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** The head of every outgoing message: badge, project folder, then a title or the session tag. */
 	function badge(ctx: ExtensionContext): string {
 		const folder = ctx.cwd.split("/").filter((part) => part.length > 0).pop() ?? ctx.cwd;
 		const detail = badgeOverride.length > 0 ? badgeOverride : (ctx.sessionManager.getSessionName() ?? "");
 		return `${badgeEmoji} ${folder} \u00B7 ${detail.length > 0 ? detail.slice(0, 60) : sessionTag}`;
 	}
 
-	/** Sends into this session's topic when one exists, and into the flat chat otherwise. */
 	function threaded(extra: Record<string, unknown>): Record<string, unknown> {
 		if (config === null) return extra;
 		const base = { chat_id: config.chatId, ...extra };
 		return topicId === null ? base : { ...base, message_thread_id: topicId };
 	}
 
-	/** tmux window (tab) number, re-read per message because windows get reordered. */
+	/** Re-read per message; windows get reordered. */
 	function tmuxLocation(): string | null {
 		const pane = process.env.TMUX_PANE;
 		if (process.env.TMUX === undefined || pane === undefined) return null;
@@ -500,7 +485,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** The tail of what the agent last said, which is the actual status of the session. */
 	function lastAssistantTail(ctx: ExtensionContext): string {
 		try {
 			if (typeof ctx.sessionManager.getBranch !== "function") return "";
@@ -519,18 +503,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 			}
 		} catch {
-			// A malformed entry must not break the notification that reports on it.
 		}
 		return "";
 	}
 
-	/** Message head shared by every sender: badge line only outside a topic, then a bold title. */
 	function withHead(ctx: ExtensionContext, title: string, body: string): string {
 		const head = topicId === null ? `${badge(ctx)}\n\n` : "";
 		return `${head}**${title}**\n${body}`;
 	}
 
-	/** A blue service notice. `thread` overrides the session topic for replies into a foreign thread. */
+	/** `thread` overrides the session topic for replies into a foreign thread. */
 	async function serviceNotice(text: string, thread?: number): Promise<void> {
 		if (config === null) return;
 		const body: Record<string, unknown> =
@@ -547,7 +529,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		writeSessionRecord(ctx);
 	}
 
-	/** Creates this session's topic, reusing the one a previous run left behind. Silently no-ops when topic mode is off. */
 	async function ensureTopic(ctx: ExtensionContext): Promise<void> {
 		if (config === null) return;
 		const previous = readSessionRecord(sessionId);
@@ -577,7 +558,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		topicName = name;
 	}
 
-	/** omp titles a session after its first turn, so the topic name is refreshed once that lands. */
+	/** The session title lands after the first turn. */
 	async function renameTopicIfStale(ctx: ExtensionContext): Promise<void> {
 		if (config === null || topicId === null) return;
 		const name = badge(ctx).slice(0, 128);
@@ -596,7 +577,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** Shutdown cannot await an HTTP call, so the id is queued and the next session start clears it. */
+	/** Shutdown cannot await; the next start sweeps the queue. */
 	async function sweepPendingTopics(): Promise<void> {
 		if (config === null) return;
 		const pending = readPendingTopics();
@@ -607,11 +588,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/**
-	 * Exactly one session may poll `getUpdates`, or Telegram answers 409 and updates are lost. The
-	 * lock is one file created with the atomic `wx` flag, owner identity inside. Ownership is
-	 * re-read before every poll rather than cached, so a lost race converges within one tick.
-	 */
+	/** One poller only, or Telegram 409s. Atomic `wx` create; ownership re-read, never cached. */
 	function readLock(): { sessionId: string; pid: number; heartbeat: number } | null {
 		if (!existsSync(LOCK_FILE)) return null;
 		try {
@@ -632,12 +609,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {
 			const held = readLock();
 			if (held !== null && Date.now() - held.heartbeat < LOCK_STALE_MS) return false;
-			// Stale or unreadable. Remove and retry once, then verify, because a second stealer can
-			// unlink the file this one just created.
-			try {
+				try {
 				unlinkSync(LOCK_FILE);
 			} catch {
-				// Someone else removed it first, which is fine.
 			}
 			try {
 				writeFileSync(LOCK_FILE, mine, { flag: "wx" });
@@ -654,7 +628,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	function refreshLock(): void {
 		if (!ownsLock()) return;
-		// Atomic, or a torn read looks stale and invites a steal from a live owner.
 		writeFileAtomic(LOCK_FILE, JSON.stringify({ sessionId, pid: process.pid, heartbeat: Date.now() }));
 	}
 
@@ -663,15 +636,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		try {
 			unlinkSync(LOCK_FILE);
 		} catch {
-			// Already gone.
 		}
 	}
 
-	/**
-	 * Precedence: owning topic, then replied-to message, then recency for bare messages only. A
-	 * reply targets a session, so an unresolvable target is refused, never guessed. Stale records
-	 * are skipped here and removed only by the reaper, which takes record and inbox together.
-	 */
+	/** Topic, then replied-to message, then recency. Unresolvable targets are refused, not guessed. */
 	function routeMessage(thread: number | undefined, replyTo: number | undefined): string | null {
 		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
 		const byReply = replyTo === undefined ? null : (live.find(({ record }) => record.recent?.includes(replyTo) === true)?.id ?? null);
@@ -686,7 +654,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return best === null ? null : best.id;
 	}
 
-	/** A button press carries the ask id, whose token before the dash names the owning session. */
 	function routeByAskId(askId: string): string | null {
 		const tag = askId.split("-")[0] ?? "";
 		if (tag.length === 0) return null;
@@ -738,7 +705,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					pi.logger.warn("telegram: rejected a message from an unexpected chat", { chat: message.chat.id });
 					continue;
 				}
-				// A caption is usable text. Anything with neither is told so rather than dropped.
 				const text = message.text ?? message.caption;
 				if (text === undefined || text.length === 0) {
 					await serviceNotice("Only text reaches the agent. Add a caption, or send the content as text.", message.message_thread_id);
@@ -766,13 +732,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** Sends the current question with everything the terminal dialog would show, or edits it in place. */
 	async function presentQuestion(ask: PendingAsk, edit: boolean): Promise<void> {
 		if (config === null) return;
 		const question = ask.questions[ask.index];
 		if (question === undefined) return;
-		// Buttons already carry every label, so the body repeats a label only when it has something
-		// extra to say. Blocks are separated by blank lines because indentation reads as ragged on a phone.
+		// An option appears in the body only when it adds something beyond its button label.
 		const blocks: string[] = [];
 		if (ask.head.length > 0 && topicId === null) blocks.push(ask.head);
 		const where = tmuxLocation();
@@ -812,7 +776,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		ask.messageId = sentMessage?.message_id ?? null;
 	}
 
-	/** Retires a question message. The empty keyboard is explicit; omission is undocumented. */
+	/** The empty keyboard is deliberate: clearing by omission is undocumented. */
 	async function closeAskMessage(messageId: number | null, text: string): Promise<void> {
 		if (config === null || messageId === null) return;
 		await sendOrEdit(
@@ -823,14 +787,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	/** A turn-end question blocks nothing: a press starts the next turn. Only the latest stands. */
+	/** Blocks nothing: a press starts the next turn. Only the latest stands. */
 	async function sendStandingQuestion(
 		ctx: ExtensionContext,
 		title: string,
 		recorded: { text: string; question?: string; options?: string[] },
 	): Promise<void> {
 		if (config === null || recorded.options === undefined) return;
-		// Retire the old question only after the new one exists.
 		const superseded = standingQuestion;
 		standingSeq += 1;
 		const id = `${sessionTag}-n${standingSeq.toString(36)}`;
@@ -866,7 +829,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}));
 	}
 
-	/** Moves past the answered question, or settles the ask when the last one is done. */
 	async function advance(ask: PendingAsk): Promise<void> {
 		if (config === null) return;
 		const answered = ask.questions[ask.index];
@@ -923,10 +885,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await advance(ask);
 	}
 
-	/**
-	 * Entries are applied sequentially and awaited: two taps arriving in one poll batch must see
-	 * each other's state, or the second lands on a stale question index and is dropped.
-	 */
+	/** Sequential: two taps in one poll batch must see each other's state. */
 	async function drainInbox(): Promise<void> {
 		if (drainInFlight) return;
 		drainInFlight = true;
@@ -938,7 +897,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				.sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10));
 			for (const name of names) {
 				const path = join(dir, name);
-				// Read and remove before parsing, so a corrupt entry cannot jam the loop forever.
 				let raw = "";
 				try {
 					raw = readFileSync(path, "utf8");
@@ -946,7 +904,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					try {
 						unlinkSync(path);
 					} catch {
-						// Already gone.
 					}
 				}
 				let parsed: unknown = null;
@@ -1029,15 +986,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (invoke === undefined) throw new Error("Ask tool requires interactive mode");
 			const questions = params.questions as AskQuestion[];
 			const context = typeof params.context === "string" ? params.context.trim() : "";
-			// `context` must not reach the strict native tool as a field, but the terminal still has to
-			// show it, so it rides along inside the first question instead of being Telegram-only.
+			// The native tool is strict: `context` rides inside the first question instead.
 			const nativeParams = {
 				questions: questions.map((question, index) => ({
 					...question,
 					question: index === 0 && context.length > 0 ? `${context}\n\n${question.question}` : question.question,
 					options: question.options.map((option) => {
-						// `discouraged` is ours, and the native tool is strict, so it cannot travel as a field.
-						const { discouraged, ...rest } = option;
+							const { discouraged, ...rest } = option;
 						if (discouraged !== true) return rest;
 						const description = rest.description?.trim() ?? "";
 						return {
@@ -1085,8 +1040,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 
 				abortLocal.abort();
-				// Answered away from the terminal, so the transcript is the only place the question and
-				// its context will survive. Restate both, or the terminal reader sees a bare label.
+				// Restate question and context: the transcript is their only record now.
 				const lines: string[] = [];
 				if (context.length > 0) lines.push(`Context given: ${context}`);
 				for (const result of winner.results) {
@@ -1099,8 +1053,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					details: winner.results.length === 1 ? winner.results[0] : { results: winner.results },
 				};
 			} catch (error) {
-				// Esc at the terminal aborts the native dialog and rejects the race. Without this the
-				// question stayed on Telegram with live buttons that answered a call already gone.
 				const aborted = error instanceof Error && /cancel|abort/iu.test(error.message);
 				await closeAskMessage(ask.messageId, aborted ? "Cancelled at the terminal." : "This question is no longer active.");
 				throw error;
@@ -1187,7 +1139,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		reapDeadSessions();
 		sessionTag = claimTag();
 		badgeEmoji = claimBadge();
-		// One read of the previous record restores everything a resume must keep.
 		const previous = readSessionRecord(sessionId);
 		badgeOverride = previous?.label ?? "";
 		if (previous?.standing != null && typeof previous.standing.id === "string") {
@@ -1197,7 +1148,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			recentMessages.push(...previous.recent.filter((n): n is number => typeof n === "number"));
 		}
 		lastNotifiedAt = typeof previous?.lastNotified === "number" ? previous.lastNotified : 0;
-		// A leftover directory from the pre-file lock scheme would make every `wx` fail with EISDIR.
 		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
 			rmSync(LOCK_FILE, { recursive: true, force: true });
 		}
@@ -1211,7 +1161,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			});
 		}
 
-		// Timers are registered before any network call, so a failed start can still receive.
+		// Timers before any network call: a failed start must still receive.
 		ctx.setInterval(() => {
 			try {
 				writeSessionRecord(ctx);
@@ -1251,7 +1201,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("input", async (_event, ctx) => {
 		turnSummary = null;
 		statusBlockUsed = false;
-		// A terminal answer supersedes the question standing on Telegram.
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
@@ -1266,7 +1215,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const where = tmuxLocation();
 		const suffix = where === null ? "" : ` (tmux ${where})`;
 
-		// Preferred path: the agent recorded the notification itself, possibly with choices.
 		if (turnSummary !== null) {
 			const heads = {
 				green: "\u{1F7E2} Turn finished",
@@ -1283,7 +1231,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Required, not requested: block once, and degrade to the excerpt fallback after that.
 		if (!statusBlockUsed) {
 			statusBlockUsed = true;
 			return {
@@ -1293,7 +1240,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			};
 		}
 
-		// Fallback: the tail of the last assistant message, urgency guessed from a trailing question.
 		const tail = lastAssistantTail(ctx);
 		const wantsReply = /\?\s*$/m.test(tail);
 		const title = `${wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished"}${suffix}`;
@@ -1320,7 +1266,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		unsubscribeInput?.();
 		unsubscribeInput = null;
 		if (config !== null && topicId !== null) {
-			// The process may exit before this request lands, so the id is queued for the next start to sweep.
 			writeFileAtomic(PENDING_TOPICS, JSON.stringify([...readPendingTopics(), topicId]));
 			detach(
 				callTelegram(config, "deleteForumTopic", { chat_id: config.chatId, message_thread_id: topicId }, 5_000),

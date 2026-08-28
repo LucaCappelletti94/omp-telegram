@@ -1,5 +1,4 @@
-// Prints exactly what a rendered question and a turn-end notice look like, sending nothing.
-// Run: node --disable-warning=ExperimentalWarning test/preview.mjs
+// Prints a rendered question and turn-end notice; sends nothing.
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

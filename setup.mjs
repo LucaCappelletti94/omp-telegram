@@ -1,5 +1,3 @@
-// Interactive setup: validates the bot token, resolves your chat id, writes the config file.
-// Run: node setup.mjs
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -23,9 +21,7 @@ const api = async (token, method, body) => {
   return payload.result;
 };
 
-console.log("Create a bot with @BotFather (/newbot) if you have not, then paste its token.");
-console.log("The token is a credential to your agent. It is written only to:");
-console.log(`  ${configPath} (mode 600)\n`);
+console.log(`Token from @BotFather. Written only to ${configPath} (mode 600).\n`);
 
 const token = (await rl.question("Bot token: ")).trim();
 const me = await api(token, "getMe");
@@ -69,6 +65,5 @@ console.log(`\nDone. Chat id ${chatId} written to ${configPath}.`);
 console.log(`\nLast step, add this checkout to ${join(agentDir, "config.yml")}:\n`);
 console.log("extensions:");
 console.log(`  - ${checkout}`);
-console.log("\nNew omp sessions will pick it up. Optional: disable omp's own bell so tmux");
-console.log('windows stop flagging "!" (completion.notify and ask.notify, both "off").');
+console.log("\nNew omp sessions pick it up.");
 rl.close();

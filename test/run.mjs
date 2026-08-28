@@ -1,6 +1,4 @@
-// Regression suite for ~/.omp/agent/extensions/notify-telegram.ts
-// Run: node --disable-warning=ExperimentalWarning ~/.omp/agent/notify-telegram-tests/run.mjs
-// The Telegram API is stubbed throughout, so this sends nothing and needs no network.
+// Full suite against a stubbed Telegram API; sends nothing.
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,7 +10,6 @@ const STRANGER = 999000111;
 
 const root = mkdtempSync(join(tmpdir(), "notify-suite-"));
 process.env.PI_CODING_AGENT_DIR = root;
-// The suite may itself run inside tmux; the tmux suffix would make titles nondeterministic.
 delete process.env.TMUX;
 delete process.env.TMUX_PANE;
 const writeConfig = (extra = {}) =>
