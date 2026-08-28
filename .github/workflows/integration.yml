@@ -21,6 +21,15 @@ jobs:
           d=$(mktemp -d)
           printf 'extensions: \n  - %s\n' "$GITHUB_WORKSPACE" > "$d/config.yml"
           printf '{"token":"000000000000000000000000000000","chatId":1,"offset":1}' > "$d/notify-telegram.json"
+          printf '%s\n' \
+            "providers:" \
+            "  stub:" \
+            "    baseUrl: http://127.0.0.1:9/v1" \
+            "    auth: none" \
+            "    api: openai-completions" \
+            "    models:" \
+            "      - { id: stub, name: stub, contextWindow: 8192, maxTokens: 1024, input: [text] }" \
+            > "$d/models.yml"
           PI_CODING_AGENT_DIR="$d" timeout 45 omp -p "hi" > out.txt 2>&1 || true
           if grep -qi "Failed to load extension" out.txt; then
             echo "extension failed to load" && tail -20 out.txt && exit 1
