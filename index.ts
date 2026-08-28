@@ -1,5 +1,15 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -195,16 +205,17 @@ function toTelegramHtml(source: string): string {
 		blocks.push(html);
 		return `\u0000${blocks.length - 1}\u0000`;
 	};
-	const escape = (text: string): string => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+	const escapeHtml = (text: string): string =>
+		text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
 	let work = source.replace(/```([A-Za-z0-9_+-]*)\n?([\s\S]*?)```/g, (_match, language: string, code: string) => {
 		const opener = language.length > 0 ? `<pre><code class="language-${language}">` : "<pre>";
 		const closer = language.length > 0 ? "</code></pre>" : "</pre>";
-		return stash(`${opener}${escape(code.replace(/\n$/, ""))}${closer}`);
+		return stash(`${opener}${escapeHtml(code.replace(/\n$/, ""))}${closer}`);
 	});
-	work = work.replace(/`([^`\n]+)`/g, (_match, code: string) => stash(`<code>${escape(code)}</code>`));
+	work = work.replace(/`([^`\n]+)`/g, (_match, code: string) => stash(`<code>${escapeHtml(code)}</code>`));
 
-	work = escape(work);
+	work = escapeHtml(work);
 	// Headings have no Telegram equivalent and otherwise render as literal hash marks.
 	work = work.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
 	work = work.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>');
@@ -217,6 +228,7 @@ function toTelegramHtml(source: string): string {
 	work = work.replace(/(^|[\s(])_([^\n_]+)_(?=[\s).,:!?]|$)/g, "$1<i>$2</i>");
 	work = work.replace(/^&gt;\s?(.*)$/gm, "<blockquote>$1</blockquote>");
 	work = work.replace(/<\/blockquote>\n<blockquote>/g, "\n");
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: NUL is the stash marker
 	return work.replace(/\u0000(\d+)\u0000/g, (_match, index: string) => blocks[Number(index)] ?? "");
 }
 
@@ -294,7 +306,11 @@ function questionKeyboard(ask: PendingAsk, question: AskQuestion): InlineButton[
 	const optionButtons = question.options.map((option, optionIndex) => {
 		const mark = question.multi === true && chosen.has(option.label) ? "[x] " : "";
 		const stance =
-			question.recommended === optionIndex ? STANCE.preferable : option.discouraged === true ? STANCE.discouraged : null;
+			question.recommended === optionIndex
+				? STANCE.preferable
+				: option.discouraged === true
+					? STANCE.discouraged
+					: null;
 		const suffix = stance === null ? "" : ` ${stance.marker}`;
 		const button: InlineButton = {
 			text: `${mark}${option.label}${suffix}`.slice(0, BUTTON_TEXT_MAX),
@@ -342,8 +358,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	function callTelegram<T>(cfg: Config, method: string, body: Record<string, unknown>, timeoutMs: number): Promise<T | null> {
-		return callTelegramRaw<T>(cfg, method, body, timeoutMs, (failure) => pi.logger.warn("telegram call failed", failure));
+	function callTelegram<T>(
+		cfg: Config,
+		method: string,
+		body: Record<string, unknown>,
+		timeoutMs: number,
+	): Promise<T | null> {
+		return callTelegramRaw<T>(cfg, method, body, timeoutMs, (failure) =>
+			pi.logger.warn("telegram call failed", failure),
+		);
 	}
 
 	/** A rejected HTML send retries as plain text; the size limit is on the rendered form. */
@@ -370,7 +393,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		if (method === "sendMessage" && typeof sent?.message_id === "number") {
 			recentMessages.push(sent.message_id);
-			if (recentMessages.length > RECENT_MESSAGE_CAP) recentMessages.splice(0, recentMessages.length - RECENT_MESSAGE_CAP);
+			if (recentMessages.length > RECENT_MESSAGE_CAP)
+				recentMessages.splice(0, recentMessages.length - RECENT_MESSAGE_CAP);
 		}
 		return sent;
 	}
@@ -460,7 +484,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function badge(ctx: ExtensionContext): string {
-		const folder = ctx.cwd.split("/").filter((part) => part.length > 0).pop() ?? ctx.cwd;
+		const folder =
+			ctx.cwd
+				.split("/")
+				.filter((part) => part.length > 0)
+				.pop() ?? ctx.cwd;
 		const detail = badgeOverride.length > 0 ? badgeOverride : (ctx.sessionManager.getSessionName() ?? "");
 		return `${badgeEmoji} ${folder} \u00B7 ${detail.length > 0 ? detail.slice(0, 60) : sessionTag}`;
 	}
@@ -497,13 +525,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				for (let j = content.length - 1; j >= 0; j--) {
 					const block = content[j] as { type?: unknown; text?: unknown };
 					if (block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0) {
-						const tail = block.text.trim().split(/\n{2,}/).at(-1) ?? "";
+						const tail =
+							block.text
+								.trim()
+								.split(/\n{2,}/)
+								.at(-1) ?? "";
 						return tail.length > 600 ? `${tail.slice(0, 600)}...` : tail;
 					}
 				}
 			}
-		} catch {
-		}
+		} catch {}
 		return "";
 	}
 
@@ -609,10 +640,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {
 			const held = readLock();
 			if (held !== null && Date.now() - held.heartbeat < LOCK_STALE_MS) return false;
-				try {
+			try {
 				unlinkSync(LOCK_FILE);
-			} catch {
-			}
+			} catch {}
 			try {
 				writeFileSync(LOCK_FILE, mine, { flag: "wx" });
 			} catch {
@@ -635,14 +665,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!ownsLock()) return;
 		try {
 			unlinkSync(LOCK_FILE);
-		} catch {
-		}
+		} catch {}
 	}
 
 	/** Topic, then replied-to message, then recency. Unresolvable targets are refused, not guessed. */
 	function routeMessage(thread: number | undefined, replyTo: number | undefined): string | null {
 		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
-		const byReply = replyTo === undefined ? null : (live.find(({ record }) => record.recent?.includes(replyTo) === true)?.id ?? null);
+		const byReply =
+			replyTo === undefined ? null : (live.find(({ record }) => record.recent?.includes(replyTo) === true)?.id ?? null);
 		if (thread !== undefined) {
 			return live.find(({ record }) => record.topicId === thread)?.id ?? byReply;
 		}
@@ -707,7 +737,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 				const text = message.text ?? message.caption;
 				if (text === undefined || text.length === 0) {
-					await serviceNotice("Only text reaches the agent. Add a caption, or send the content as text.", message.message_thread_id);
+					await serviceNotice(
+						"Only text reaches the agent. Add a caption, or send the content as text.",
+						message.message_thread_id,
+					);
 					continue;
 				}
 				const thread = message.message_thread_id;
@@ -797,7 +830,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const superseded = standingQuestion;
 		standingSeq += 1;
 		const id = `${sessionTag}-n${standingSeq.toString(36)}`;
-		const body = withHead(ctx, title, `${recorded.text}${recorded.question === undefined ? "" : `\n\n${recorded.question}`}`);
+		const body = withHead(
+			ctx,
+			title,
+			`${recorded.text}${recorded.question === undefined ? "" : `\n\n${recorded.question}`}`,
+		);
 		const keyboard = packRows(
 			recorded.options.map((label, index) => ({
 				text: label.slice(0, BUTTON_TEXT_MAX),
@@ -903,8 +940,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				} finally {
 					try {
 						unlinkSync(path);
-					} catch {
-					}
+					} catch {}
 				}
 				let parsed: unknown = null;
 				try {
@@ -938,7 +974,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					else await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
 					continue;
 				}
-				if (ask !== null && ask.awaitingText) {
+				if (ask?.awaitingText) {
 					ask.awaitingText = false;
 					ask.custom[ask.index] = entry.value;
 					ask.selected[ask.index] = new Set<string>();
@@ -992,12 +1028,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					...question,
 					question: index === 0 && context.length > 0 ? `${context}\n\n${question.question}` : question.question,
 					options: question.options.map((option) => {
-							const { discouraged, ...rest } = option;
+						const { discouraged, ...rest } = option;
 						if (discouraged !== true) return rest;
 						const description = rest.description?.trim() ?? "";
 						return {
 							...rest,
-							description: description.length > 0 ? `${STANCE.discouraged.marker} ${description}` : STANCE.discouraged.marker,
+							description:
+								description.length > 0 ? `${STANCE.discouraged.marker} ${description}` : STANCE.discouraged.marker,
 						};
 					}),
 				})),
@@ -1054,7 +1091,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				};
 			} catch (error) {
 				const aborted = error instanceof Error && /cancel|abort/iu.test(error.message);
-				await closeAskMessage(ask.messageId, aborted ? "Cancelled at the terminal." : "This question is no longer active.");
+				await closeAskMessage(
+					ask.messageId,
+					aborted ? "Cancelled at the terminal." : "This question is no longer active.",
+				);
 				throw error;
 			} finally {
 				pendingAsk = null;
@@ -1091,7 +1131,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			turnSummary = {
 				text: summary.slice(0, 900),
 				urgency,
-				question: typeof params.question === "string" && params.question.trim().length > 0 ? params.question.trim() : undefined,
+				question:
+					typeof params.question === "string" && params.question.trim().length > 0 ? params.question.trim() : undefined,
 				options: labels.length > 0 ? labels : undefined,
 			};
 			return {
@@ -1252,7 +1293,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const tool = typeof named === "string" ? named : "a tool";
 		const where = tmuxLocation();
 		detach(
-			notify(ctx, `\u{1F534} Approval needed${where === null ? "" : ` (tmux ${where})`}`, `${tool} is waiting for approval.`),
+			notify(
+				ctx,
+				`\u{1F534} Approval needed${where === null ? "" : ` (tmux ${where})`}`,
+				`${tool} is waiting for approval.`,
+			),
 			"approval notice",
 		);
 	});

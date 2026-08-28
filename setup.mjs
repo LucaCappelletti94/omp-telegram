@@ -8,17 +8,17 @@ const configPath = join(agentDir, "notify-telegram.json");
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 const api = async (token, method, body) => {
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body ?? {}),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const payload = await response.json().catch(() => null);
-  if (payload === null || payload.ok !== true) {
-    throw new Error(`${method} failed: ${payload?.description ?? response.status}`);
-  }
-  return payload.result;
+	const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(body ?? {}),
+		signal: AbortSignal.timeout(30_000),
+	});
+	const payload = await response.json().catch(() => null);
+	if (payload === null || payload.ok !== true) {
+		throw new Error(`${method} failed: ${payload?.description ?? response.status}`);
+	}
+	return payload.result;
 };
 
 console.log(`Token from @BotFather. Written only to ${configPath} (mode 600).\n`);
@@ -28,11 +28,11 @@ const me = await api(token, "getMe");
 console.log(`\nToken valid: @${me.username}`);
 
 if (existsSync(configPath)) {
-  const keep = (await rl.question("A config already exists. Overwrite it? [y/N] ")).trim().toLowerCase();
-  if (keep !== "y") {
-    console.log("Left untouched.");
-    process.exit(0);
-  }
+	const keep = (await rl.question("A config already exists. Overwrite it? [y/N] ")).trim().toLowerCase();
+	if (keep !== "y") {
+		console.log("Left untouched.");
+		process.exit(0);
+	}
 }
 
 console.log(`\nNow open Telegram, find @${me.username}, press Start, and send it any message.`);
@@ -42,23 +42,30 @@ let chatId = null;
 let offset = 0;
 const deadline = Date.now() + 5 * 60_000;
 while (chatId === null && Date.now() < deadline) {
-  const updates = await api(token, "getUpdates", { offset, timeout: 25, allowed_updates: ["message"] });
-  for (const update of updates) {
-    offset = Math.max(offset, update.update_id + 1);
-    const chat = update.message?.chat;
-    if (chat?.type === "private") chatId = chat.id;
-  }
+	const updates = await api(token, "getUpdates", { offset, timeout: 25, allowed_updates: ["message"] });
+	for (const update of updates) {
+		offset = Math.max(offset, update.update_id + 1);
+		const chat = update.message?.chat;
+		if (chat?.type === "private") chatId = chat.id;
+	}
 }
 if (chatId === null) {
-  console.log("No message arrived within five minutes. Run setup again.");
-  process.exit(1);
+	console.log("No message arrived within five minutes. Run setup again.");
+	process.exit(1);
 }
 
 mkdirSync(agentDir, { recursive: true });
 const temp = `${configPath}.tmp`;
-writeFileSync(temp, `${JSON.stringify({ token, chatId, offset, quietSeconds: 45, notifyOnTurnEnd: true }, null, 2)}\n`, { mode: 0o600 });
+writeFileSync(
+	temp,
+	`${JSON.stringify({ token, chatId, offset, quietSeconds: 45, notifyOnTurnEnd: true }, null, 2)}\n`,
+	{ mode: 0o600 },
+);
 renameSync(temp, configPath);
-await api(token, "sendMessage", { chat_id: chatId, text: "omp-telegram is configured. Notifications will arrive here." });
+await api(token, "sendMessage", {
+	chat_id: chatId,
+	text: "omp-telegram is configured. Notifications will arrive here.",
+});
 
 const checkout = new URL(".", import.meta.url).pathname.replace(/\/$/, "");
 console.log(`\nDone. Chat id ${chatId} written to ${configPath}.`);
