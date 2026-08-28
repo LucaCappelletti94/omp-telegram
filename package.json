@@ -1,0 +1,18 @@
+{
+	"name": "omp-telegram",
+	"version": "0.1.0",
+	"description": "Telegram notifications and remote control for Oh My Pi sessions",
+	"type": "module",
+	"license": "MIT",
+	"omp": {
+		"extensions": ["./index.ts"]
+	},
+	"scripts": {
+		"test": "node --disable-warning=ExperimentalWarning test/run.mjs",
+		"preview": "node --disable-warning=ExperimentalWarning test/preview.mjs",
+		"setup": "node setup.mjs"
+	},
+	"engines": {
+		"node": ">=23"
+	}
+}
