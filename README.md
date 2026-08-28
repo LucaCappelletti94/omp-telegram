@@ -11,6 +11,8 @@ Parallel sessions share one bot: each message carries a session badge, replies r
 Create a bot with [@BotFather](https://t.me/BotFather), then:
 
 ```
+git clone https://github.com/LucaCappelletti94/omp-telegram
+cd omp-telegram
 node setup.mjs
 ```
 
@@ -26,11 +28,3 @@ In the JSON config, `quietSeconds` (default 45) silences turn end notices while 
 ## Answering
 
 Tap a button, reply to a session's message, or send a bare message for the last session that notified you. Unroutable messages are refused with an explanation, and presses on settled questions get a closure notice. Question text renders a Markdown subset: code, fences, bold, italic, strikethrough, spoilers, quotes, links.
-
-## Tests
-
-`npm test` runs the suite against a stubbed API and sends nothing. `npm run preview` prints a rendered question. Node 23+ or Bun.
-
-## Security
-
-Input is accepted only from the configured chat and sender; everything else is dropped and logged. The token is a credential to the agent itself: one bot per person, private chat only.
