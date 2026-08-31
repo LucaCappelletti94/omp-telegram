@@ -424,6 +424,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastNotifiedAt = 0;
 	let turnActive = false;
 	let typingSentAt = 0;
+	let approvalWaiting = false;
 	let pinnedMessageId: number | null = null;
 	let topicIcons: Array<{ emoji?: string; custom_emoji_id?: string }> | null = null;
 
@@ -657,9 +658,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return sent;
 	}
 
-	/** The typing status lasts about five seconds; refresh while a turn runs and nothing waits on the user. */
+	/** The typing status lasts about five seconds; refresh while the agent loop runs and nothing waits on the user. */
 	function maybeType(): void {
-		if (config === null || !turnActive || pendingAsk !== null) return;
+		if (config === null || !turnActive || pendingAsk !== null || approvalWaiting) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
 		if (Date.now() - typingSentAt < TYPING_MS) return;
 		typingSentAt = Date.now();
@@ -669,7 +670,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** A thumbs-up on the delivered message: received, the turn is running. */
 	function ackDelivered(messageId: number | undefined): void {
 		if (config === null || typeof messageId !== "number") return;
-		turnActive = true;
 		detach(
 			callTelegram(
 				config,
@@ -1231,7 +1231,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								`**Chosen:** ${label}`,
 								settledKeyboard(standing.labels, new Set([label])),
 							);
-							turnActive = true;
 							pi.sendUserMessage(label);
 						}
 					} else {
@@ -1554,8 +1553,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("input", async (_event, ctx) => {
 		turnSummary = null;
 		statusBlockUsed = false;
-		turnActive = true;
-		typingSentAt = 0;
 		unpinRed(ctx);
 		const standing = standingQuestion;
 		if (standing !== null) {
@@ -1565,8 +1562,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	});
 
+	// The agent loop is the only truthful "working" signal: `input` also fires for
+	// submissions that never start a turn, which left the typing status stuck on.
+	pi.on("agent_start", async () => {
+		turnActive = true;
+		approvalWaiting = false;
+		typingSentAt = 0;
+	});
+
+	pi.on("agent_end", async () => {
+		turnActive = false;
+		approvalWaiting = false;
+	});
+
 	pi.on("session_stop", async (_event, ctx) => {
 		turnActive = false;
+		approvalWaiting = false;
 		if (config === null || !config.notifyOnTurnEnd) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
 		const where = tmuxLocation();
@@ -1610,6 +1621,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_approval_requested", async (event, ctx) => {
+		approvalWaiting = true;
 		if (config === null) return;
 		const named = event !== null && typeof event === "object" && "toolName" in event ? event.toolName : undefined;
 		const tool = typeof named === "string" ? named : "a tool";
@@ -1622,6 +1634,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			),
 			"approval notice",
 		);
+	});
+
+	pi.on("tool_approval_resolved", async () => {
+		approvalWaiting = false;
 	});
 
 	pi.on("credential_disabled", async (_event, ctx) => {

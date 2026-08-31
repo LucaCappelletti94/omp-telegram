@@ -1577,12 +1577,19 @@ const ux = spawn("01a04800-0000-0000-0000-000000000000", "/home/dev/work/pgvecto
 await ux.fire("session_start");
 check("the command menu is registered", called("setMyCommands").length > 0);
 
-// Typing indicator while a turn runs.
+// Typing indicator follows the agent loop, not raw input events.
 const typingBefore = called("sendChatAction").length;
 await ux.fire("input");
 await ux.pump(150);
-check("a running turn shows a typing status", called("sendChatAction").length > typingBefore);
+check("input alone does not show typing", called("sendChatAction").length === typingBefore);
+await ux.fire("agent_start");
+await ux.pump(150);
+check("a running agent loop shows a typing status", called("sendChatAction").length === typingBefore + 1);
 check("the action is typing", lastCall("sendChatAction").body.action === "typing");
+await ux.fire("agent_start"); // resets the typing throttle, so only agent_end can explain silence below
+await ux.fire("agent_end");
+await ux.pump(150);
+check("the loop's end stops the typing refresh", called("sendChatAction").length === typingBefore + 1);
 
 // A text reply to the question message answers it, no button needed.
 const uxState = {};
