@@ -7,7 +7,7 @@ const root = mkdtempSync(join(tmpdir(), "omp-telegram-preview-"));
 process.env.PI_CODING_AGENT_DIR = root;
 writeFileSync(
 	join(root, "notify-telegram.json"),
-	JSON.stringify({ token: "0".repeat(30), chatId: 1, offset: 1, quietSeconds: 0 }),
+	JSON.stringify({ token: `12345:${"A".repeat(30)}`, chatId: 1, offset: 1, quietSeconds: 0 }),
 );
 
 const sent = [];

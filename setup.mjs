@@ -39,6 +39,7 @@ console.log(`\nNow open Telegram, find @${me.username}, press Start, and send it
 console.log("Waiting...");
 
 let chatId = null;
+let sender = "";
 let offset = 0;
 const deadline = Date.now() + 5 * 60_000;
 while (chatId === null && Date.now() < deadline) {
@@ -46,11 +47,24 @@ while (chatId === null && Date.now() < deadline) {
 	for (const update of updates) {
 		offset = Math.max(offset, update.update_id + 1);
 		const chat = update.message?.chat;
-		if (chat?.type === "private") chatId = chat.id;
+		if (chat?.type === "private") {
+			chatId = chat.id;
+			const from = update.message?.from ?? {};
+			sender = [from.first_name, from.last_name, from.username ? `(@${from.username})` : ""].filter(Boolean).join(" ");
+		}
 	}
 }
 if (chatId === null) {
 	console.log("No message arrived within five minutes. Run setup again.");
+	process.exit(1);
+}
+
+// The first private message wins the pairing, so confirm who was captured before binding.
+const accept = (await rl.question(`\nGot a message from ${sender || "an unnamed account"}. Bind to them? [y/N] `))
+	.trim()
+	.toLowerCase();
+if (accept !== "y") {
+	console.log("Not bound. Run setup again.");
 	process.exit(1);
 }
 

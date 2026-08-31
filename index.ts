@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
@@ -10,8 +11,8 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent");
@@ -35,6 +36,7 @@ const TELEGRAM_TEXT_MAX = 4096;
 const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;
 const TYPING_MS = 5_000;
+const DRAFT_MS = 1_500;
 /** The party-popper send effect, verified against the live API; effects exist in private chats only. */
 const GREEN_EFFECT_ID = "5046509860389126442";
 
@@ -69,6 +71,7 @@ interface Config {
 	offset: number;
 	quietSeconds: number;
 	notifyOnTurnEnd: boolean;
+	streamDrafts: boolean;
 }
 
 interface SessionRecord {
@@ -87,6 +90,8 @@ interface SessionRecord {
 	standing: { id: string; messageId: number | null; labels: string[] } | null;
 	/** Message pinned for a red status; unpinned when the next turn starts. */
 	pinned: number | null;
+	/** Draft-stream identifier; a stop press routes back through it. */
+	draftId: number;
 	heartbeat: number;
 }
 
@@ -115,6 +120,7 @@ interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
 	callback_query?: TelegramCallbackQuery;
+	stopped_message_generation?: { chat: { id: number }; message_thread_id?: number; draft_id: number };
 }
 
 interface InlineButton {
@@ -244,7 +250,7 @@ function loadConfig(): Config | null {
 	}
 	if (parsed === null || typeof parsed !== "object") return null;
 	const raw = parsed as Record<string, unknown>;
-	if (typeof raw.token !== "string" || raw.token.length < 20) return null;
+	if (typeof raw.token !== "string" || !/^\d+:[A-Za-z0-9_-]{25,}$/u.test(raw.token)) return null;
 	if (typeof raw.chatId !== "number") return null;
 	return {
 		token: raw.token,
@@ -252,6 +258,7 @@ function loadConfig(): Config | null {
 		offset: typeof raw.offset === "number" ? raw.offset : 0,
 		quietSeconds: typeof raw.quietSeconds === "number" ? raw.quietSeconds : 45,
 		notifyOnTurnEnd: raw.notifyOnTurnEnd !== false,
+		streamDrafts: raw.streamDrafts !== false,
 	};
 }
 
@@ -427,14 +434,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let approvalWaiting = false;
 	let pinnedMessageId: number | null = null;
 	let topicIcons: Array<{ emoji?: string; custom_emoji_id?: string }> | null = null;
+	/** The live session context, for record writes outside event handlers. */
+	let sessionCtx: ExtensionContext | null = null;
+	let draftId = 0;
+	let draftText = "";
+	let draftDirty = false;
+	let draftSentAt = 0;
+	let currentTool = "";
+	let turnInput = 0;
+	let turnOutput = 0;
+	let turnCost = 0;
+	let turnTools = 0;
+	const noticedKinds = new Set<string>();
 
-	/** A rejected detached promise is fatal in omp. */
+	/** A rejected detached promise is fatal in omp; the token never reaches the log. */
 	function detach(work: Promise<unknown>, label: string): void {
-		work.catch((error) =>
+		work.catch((error) => {
+			const raw = error instanceof Error ? error.message : String(error);
 			pi.logger.warn(`notify-telegram: ${label} failed`, {
-				error: error instanceof Error ? error.message : String(error),
-			}),
-		);
+				error: config === null ? raw : raw.split(config.token).join("<token>"),
+			});
+		});
 	}
 
 	function callTelegram<T>(
@@ -446,6 +466,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return callTelegramRaw<T>(cfg, method, body, timeoutMs, (failure) =>
 			pi.logger.warn("telegram call failed", failure),
 		);
+	}
+
+	function trackSent(sent: TelegramMessage | null): void {
+		if (typeof sent?.message_id !== "number") return;
+		recentMessages.push(sent.message_id);
+		if (recentMessages.length > RECENT_MESSAGE_CAP) {
+			recentMessages.splice(0, recentMessages.length - RECENT_MESSAGE_CAP);
+		}
 	}
 
 	/** A rejected HTML send retries as plain text; the size limit is on the rendered form. */
@@ -471,11 +499,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const { message_effect_id: _effect, ...safe } = body;
 			sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: source }, 15_000);
 		}
-		if (method === "sendMessage" && typeof sent?.message_id === "number") {
-			recentMessages.push(sent.message_id);
-			if (recentMessages.length > RECENT_MESSAGE_CAP)
-				recentMessages.splice(0, recentMessages.length - RECENT_MESSAGE_CAP);
-		}
+		if (method === "sendMessage") trackSent(sent);
 		return sent;
 	}
 
@@ -493,9 +517,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			recent: [...recentMessages],
 			standing: standingQuestion,
 			pinned: pinnedMessageId,
+			draftId,
 			heartbeat: Date.now(),
 		};
-		writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(record));
+		writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(record), 0o600);
 	}
 
 	function readSessionRecord(id: string): SessionRecord | null {
@@ -543,10 +568,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const taken = new Set(otherLiveRecords().map((record) => record.tag));
 		const previous = readSessionRecord(sessionId)?.tag;
 		if (previous !== undefined && /^[a-z0-9]{5}$/u.test(previous) && !taken.has(previous)) return previous;
-		for (let attempt = 0; attempt < 64; attempt++) {
+		for (let attempt = 0; attempt < 128; attempt++) {
 			const candidate = Math.random().toString(36).slice(2, 7).padEnd(5, "0");
 			if (!taken.has(candidate)) return candidate;
 		}
+		// Beyond 128 collisions the roster is effectively full; a clash is astronomically unlikely.
 		return Math.random().toString(36).slice(2, 7).padEnd(5, "0");
 	}
 
@@ -645,6 +671,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await callTelegram(config, "sendMessage", body, 15_000);
 	}
 
+	/** Structured markdown (tables, fences) goes out as a native rich message; anything else keeps the HTML subset path. */
+	async function sendStructured(
+		cfg: Config,
+		body: Record<string, unknown>,
+		plain: string,
+	): Promise<TelegramMessage | null> {
+		if (/```|(^|\n)\|.+\|/.test(plain)) {
+			const sent = await callTelegram<TelegramMessage>(
+				cfg,
+				"sendRichMessage",
+				{ ...body, rich_message: { markdown: plain } },
+				15_000,
+			);
+			if (sent !== null) {
+				trackSent(sent);
+				return sent;
+			}
+		}
+		return await sendOrEdit(cfg, "sendMessage", body, plain);
+	}
+
 	async function notify(
 		ctx: ExtensionContext,
 		title: string,
@@ -652,7 +699,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		extra: Record<string, unknown> = {},
 	): Promise<TelegramMessage | null> {
 		if (config === null) return null;
-		const sent = await sendOrEdit(config, "sendMessage", threaded(extra), withHead(ctx, title, body));
+		const sent = await sendStructured(config, threaded(extra), withHead(ctx, title, body));
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
 		return sent;
@@ -662,9 +709,52 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function maybeType(): void {
 		if (config === null || !turnActive || pendingAsk !== null || approvalWaiting) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
+		if (Date.now() - draftSentAt < 10_000) return;
 		if (Date.now() - typingSentAt < TYPING_MS) return;
 		typingSentAt = Date.now();
 		detach(callTelegram(config, "sendChatAction", threaded({ action: "typing" }), 10_000), "typing action");
+	}
+
+	/** Streams the turn as an ephemeral draft bubble with a native stop control. */
+	function maybeDraft(): void {
+		if (config === null || !config.streamDrafts || config.chatId <= 0) return;
+		if (!turnActive || pendingAsk !== null || approvalWaiting) return;
+		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
+		if (!draftDirty || Date.now() - draftSentAt < DRAFT_MS) return;
+		draftDirty = false;
+		draftSentAt = Date.now();
+		const tool = currentTool.length > 0 ? `\u25B8 ${currentTool}` : "";
+		let tail = draftText.length > 3500 ? draftText.slice(-3500) : draftText;
+		// A raw slice can open on the low half of a surrogate pair, which is invalid JSON.
+		const lead = tail.charCodeAt(0);
+		if (lead >= 0xdc00 && lead <= 0xdfff) tail = tail.slice(1);
+		const text = [tail, tool].filter((part) => part.length > 0).join("\n\n");
+		detach(
+			callTelegram(config, "sendMessageDraft", threaded({ draft_id: draftId, text, can_stop: true }), 10_000),
+			"draft stream",
+		);
+	}
+
+	/** One notice per kind per turn: recovery machinery explains silences without spamming. */
+	function transparencyNotice(kind: string, text: string): void {
+		if (config === null || noticedKinds.has(kind)) return;
+		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
+		noticedKinds.add(kind);
+		detach(serviceNotice(text), "transparency notice");
+	}
+
+	/** Turn cost line for summaries; empty until the turn spent something. */
+	function usageFooter(): string {
+		const parts: string[] = [];
+		if (turnInput + turnOutput > 0) {
+			const [inTokens, outTokens] = [turnInput, turnOutput].map((n) =>
+				n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n),
+			);
+			parts.push(`${inTokens} in / ${outTokens} out`);
+		}
+		if (turnCost > 0) parts.push(`$${turnCost >= 0.095 ? turnCost.toFixed(2) : turnCost.toFixed(3)}`);
+		if (turnTools > 0) parts.push(`${turnTools} ${turnTools === 1 ? "tool" : "tools"}`);
+		return parts.length === 0 ? "" : `\n\n\`${parts.join(" \u00B7 ")}\``;
 	}
 
 	/** A thumbs-up on the delivered message: received, the turn is running. */
@@ -862,8 +952,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	function deliver(target: string, updateId: number, entry: InboxEntry): void {
 		const dir = join(INBOX_DIR, target);
-		mkdirSync(dir, { recursive: true });
-		writeFileAtomic(join(dir, `${updateId}.json`), JSON.stringify(entry));
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		writeFileAtomic(join(dir, `${updateId}.json`), JSON.stringify(entry), 0o600);
 	}
 
 	/** Bot API refuses getFile beyond 20 MB; larger uploads get a notice instead of silence. */
@@ -872,18 +962,136 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const file = await callTelegram<{ file_path?: string }>(cfg, "getFile", { file_id: media.fileId }, 30_000);
 		const remote = file?.file_path;
 		if (typeof remote !== "string" || remote.length === 0) return null;
-		const response = await fetch(`https://api.telegram.org/file/bot${cfg.token}/${remote}`, {
-			signal: AbortSignal.timeout(60_000),
-		});
-		if (!response.ok) return null;
-		const bytes = new Uint8Array(await response.arrayBuffer());
+		// A thrown fetch here must not escape: pollOnce would never advance the update
+		// offset, refetching the batch and re-delivering its earlier updates forever.
+		let bytes: Uint8Array;
+		try {
+			const response = await fetch(`https://api.telegram.org/file/bot${cfg.token}/${remote}`, {
+				signal: AbortSignal.timeout(60_000),
+			});
+			if (!response.ok) return null;
+			bytes = new Uint8Array(await response.arrayBuffer());
+		} catch {
+			return null;
+		}
 		if (bytes.byteLength > MEDIA_MAX_BYTES) return null;
 		const base = (media.name ?? remote).split("/").at(-1) ?? "file";
 		const safe = base.replaceAll(/[^\w.-]/gu, "_").slice(-80);
-		mkdirSync(MEDIA_DIR, { recursive: true });
+		mkdirSync(MEDIA_DIR, { recursive: true, mode: 0o700 });
 		const path = join(MEDIA_DIR, `${updateId}-${safe}`);
-		writeFileSync(path, bytes);
+		writeFileSync(path, bytes, { mode: 0o600 });
 		return path;
+	}
+
+	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<void> {
+		const stopped = update.stopped_message_generation;
+		if (stopped !== undefined) {
+			if (stopped.chat.id === cfg.chatId) {
+				const owner = allRecords().find(
+					({ record }) => record.draftId === stopped.draft_id && Date.now() - record.heartbeat <= LOCK_STALE_MS,
+				)?.id;
+				if (owner !== undefined) deliver(owner, update.update_id, { kind: "command", value: "stopturn" });
+			}
+			return;
+		}
+		const callback = update.callback_query;
+		if (callback !== undefined && callback.data !== undefined) {
+			if (callback.message?.chat.id !== cfg.chatId || callback.from?.id !== cfg.chatId) {
+				pi.logger.warn("telegram: rejected a button press from an unexpected origin", {
+					chat: callback.message?.chat.id,
+					from: callback.from?.id,
+				});
+				return;
+			}
+			const owner = routeByAskId(callback.data.split(":")[1] ?? "");
+			await callTelegram(
+				cfg,
+				"answerCallbackQuery",
+				{
+					callback_query_id: callback.id,
+					text:
+						owner === null
+							? "That question's session is gone."
+							: callback.data.startsWith("c:")
+								? "Starting the next turn."
+								: "Answer recorded.",
+				},
+				10_000,
+			);
+			if (owner !== null) deliver(owner, update.update_id, { kind: "callback", value: callback.data });
+			return;
+		}
+
+		const message = update.message;
+		if (message === undefined) return;
+		if (message.chat.id !== cfg.chatId) {
+			pi.logger.warn("telegram: rejected a message from an unexpected chat", { chat: message.chat.id });
+			return;
+		}
+		const thread = message.message_thread_id;
+		const replyTo = message.reply_to_message?.message_id;
+		const text = message.text ?? message.caption;
+
+		const command = typeof text === "string" ? /^\/(hidequestions|status)\b/u.exec(text.trim())?.[1] : undefined;
+		if (command !== undefined) {
+			const scoped = thread === undefined ? null : routeMessage(thread, replyTo);
+			const targets =
+				scoped !== null
+					? [scoped]
+					: allRecords()
+							.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
+							.map(({ id }) => id);
+			for (const target of targets) {
+				deliver(target, update.update_id, { kind: "command", value: command });
+			}
+			return;
+		}
+
+		const media = pickMedia(message);
+		if (media !== null) {
+			const target = routeMessage(thread, replyTo);
+			if (target === null) {
+				await serviceNotice("No live omp session owns that message, so it was dropped.", thread);
+				return;
+			}
+			const saved = await downloadMedia(cfg, media, update.update_id);
+			if (saved === null) {
+				await serviceNotice("That file could not be fetched (20 MB is the ceiling), so it was dropped.", thread);
+				return;
+			}
+			deliver(target, update.update_id, {
+				kind: "file",
+				value: saved,
+				mime: media.mime,
+				caption: message.caption,
+				messageId: message.message_id,
+				replyTo,
+			});
+			return;
+		}
+
+		if (text === undefined || text.length === 0) {
+			await serviceNotice(
+				"That message type does not reach the agent. Send text, a photo, a voice note, an audio file, or a document.",
+				thread,
+			);
+			return;
+		}
+
+		const target = routeMessage(thread, replyTo);
+		if (target === null) {
+			await serviceNotice(
+				"No live omp session owns that message, so it was dropped. Reply to a message from the session you mean.",
+				thread,
+			);
+			return;
+		}
+		deliver(target, update.update_id, {
+			kind: "text",
+			value: text,
+			messageId: message.message_id,
+			replyTo,
+		});
 	}
 
 	async function pollOnce(): Promise<void> {
@@ -893,111 +1101,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const updates = await callTelegram<TelegramUpdate[]>(
 				config,
 				"getUpdates",
-				{ offset: config.offset, timeout: LONG_POLL_S, allowed_updates: ["message", "callback_query"] },
+				{
+					offset: config.offset,
+					timeout: LONG_POLL_S,
+					allowed_updates: ["message", "callback_query", "stopped_message_generation"],
+				},
 				(LONG_POLL_S + 10) * 1000,
 			);
 			if (updates === null || updates.length === 0) return;
 			let highest = config.offset - 1;
 			for (const update of updates) {
 				highest = Math.max(highest, update.update_id);
-
-				const callback = update.callback_query;
-				if (callback !== undefined && callback.data !== undefined) {
-					if (callback.message?.chat.id !== config.chatId || callback.from?.id !== config.chatId) {
-						pi.logger.warn("telegram: rejected a button press from an unexpected origin", {
-							chat: callback.message?.chat.id,
-							from: callback.from?.id,
-						});
-						continue;
-					}
-					const owner = routeByAskId(callback.data.split(":")[1] ?? "");
-					await callTelegram(
-						config,
-						"answerCallbackQuery",
-						{
-							callback_query_id: callback.id,
-							text:
-								owner === null
-									? "That question's session is gone."
-									: callback.data.startsWith("c:")
-										? "Starting the next turn."
-										: "Answer recorded.",
-						},
-						10_000,
-					);
-					if (owner !== null) deliver(owner, update.update_id, { kind: "callback", value: callback.data });
-					continue;
-				}
-
-				const message = update.message;
-				if (message === undefined) continue;
-				if (message.chat.id !== config.chatId) {
-					pi.logger.warn("telegram: rejected a message from an unexpected chat", { chat: message.chat.id });
-					continue;
-				}
-				const thread = message.message_thread_id;
-				const replyTo = message.reply_to_message?.message_id;
-				const text = message.text ?? message.caption;
-
-				if (typeof text === "string" && /^\/hidequestions\b/u.test(text.trim())) {
-					const scoped = thread === undefined ? null : routeMessage(thread, replyTo);
-					const targets =
-						scoped !== null
-							? [scoped]
-							: allRecords()
-									.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
-									.map(({ id }) => id);
-					for (const target of targets) {
-						deliver(target, update.update_id, { kind: "command", value: "hidequestions" });
-					}
-					continue;
-				}
-
-				const media = pickMedia(message);
-				if (media !== null) {
-					const target = routeMessage(thread, replyTo);
-					if (target === null) {
-						await serviceNotice("No live omp session owns that message, so it was dropped.", thread);
-						continue;
-					}
-					const saved = await downloadMedia(config, media, update.update_id);
-					if (saved === null) {
-						await serviceNotice("That file could not be fetched (20 MB is the ceiling), so it was dropped.", thread);
-						continue;
-					}
-					deliver(target, update.update_id, {
-						kind: "file",
-						value: saved,
-						mime: media.mime,
-						caption: message.caption,
-						messageId: message.message_id,
-						replyTo,
+				try {
+					await handleUpdate(config, update);
+				} catch (error) {
+					// One malformed or failing update must not wedge the batch: the offset still advances.
+					pi.logger.warn("notify-telegram: skipped a malformed update", {
+						update: update.update_id,
+						error: error instanceof Error ? error.message : String(error),
 					});
-					continue;
 				}
-
-				if (text === undefined || text.length === 0) {
-					await serviceNotice(
-						"That message type does not reach the agent. Send text, a photo, a voice note, an audio file, or a document.",
-						thread,
-					);
-					continue;
-				}
-
-				const target = routeMessage(thread, replyTo);
-				if (target === null) {
-					await serviceNotice(
-						"No live omp session owns that message, so it was dropped. Reply to a message from the session you mean.",
-						thread,
-					);
-					continue;
-				}
-				deliver(target, update.update_id, {
-					kind: "text",
-					value: text,
-					messageId: message.message_id,
-					replyTo,
-				});
 			}
 			config.offset = highest + 1;
 			persistOffset(config.offset);
@@ -1083,9 +1206,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				callback_data: `c:${id}:${index}`,
 			})),
 		);
-		const sent = await sendOrEdit(
+		const sent = await sendStructured(
 			config,
-			"sendMessage",
 			threaded({
 				reply_markup: { inline_keyboard: keyboard, force_reply: true },
 				...urgencyExtras(recorded.urgency),
@@ -1214,8 +1336,32 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						const standing = standingQuestion;
 						if (standing !== null) {
 							standingQuestion = null;
+							if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 							await closeAskMessage(standing.messageId, "Question hidden.");
 						}
+					}
+					if (entry.value === "stopturn" && sessionCtx !== null && turnActive) {
+						sessionCtx.abort();
+						detach(serviceNotice("Stopping at your request."), "stop notice");
+					}
+					if (entry.value === "status" && sessionCtx !== null) {
+						const state =
+							pendingAsk !== null
+								? "waiting on a question"
+								: approvalWaiting
+									? "waiting on a tool approval"
+									: turnActive
+										? currentTool.length > 0
+											? `working (${currentTool})`
+											: "working"
+										: "idle";
+						const lines = [
+							badge(sessionCtx),
+							`State: ${state}.`,
+							standingQuestion !== null ? "A choice question stands open." : "",
+							pinnedMessageId !== null ? "A red status is pinned." : "",
+						].filter((line) => line.length > 0);
+						await serviceNotice(lines.join("\n"));
 					}
 					continue;
 				}
@@ -1225,14 +1371,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					if (standing !== null && standing.id === choiceId) {
 						const label = standing.labels[Number.parseInt(rawIndex ?? "", 10)];
 						standingQuestion = null;
-						if (label !== undefined) {
-							await closeAskMessage(
-								standing.messageId,
-								`**Chosen:** ${label}`,
-								settledKeyboard(standing.labels, new Set([label])),
-							);
-							pi.sendUserMessage(label);
-						}
+						if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+						// Close even when the index is unreadable: state is already cleared,
+						// and a live-looking keyboard on a dead question misleads.
+						await closeAskMessage(
+							standing.messageId,
+							label === undefined ? "This question is closed." : `**Chosen:** ${label}`,
+							label === undefined ? undefined : settledKeyboard(standing.labels, new Set([label])),
+						);
+						if (label !== undefined) pi.sendUserMessage(label);
 					} else {
 						await serviceNotice("That question is closed. It was superseded or already answered.");
 					}
@@ -1461,6 +1608,167 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
+	/** Multipart upload for outbound files; JSON callTelegram cannot carry bytes. */
+	async function uploadTelegram<T>(
+		cfg: Config,
+		method: string,
+		fields: Record<string, string | number>,
+		files: Array<{ field: string; name: string; data: Uint8Array }>,
+		attempt = 0,
+	): Promise<T | null> {
+		const form = new FormData();
+		for (const [key, value] of Object.entries(fields)) form.append(key, String(value));
+		for (const file of files) form.append(file.field, new Blob([file.data]), file.name);
+		try {
+			const response = await fetch(`https://api.telegram.org/bot${cfg.token}/${method}`, {
+				method: "POST",
+				body: form,
+				signal: AbortSignal.timeout(120_000),
+			});
+			const payload: unknown = await response.json().catch(() => null);
+			const envelope =
+				payload !== null && typeof payload === "object"
+					? (payload as { ok?: unknown; result?: unknown; parameters?: { retry_after?: unknown } })
+					: null;
+			const retryAfter = envelope?.parameters?.retry_after;
+			if (response.status === 429 && typeof retryAfter === "number" && retryAfter <= 30 && attempt === 0) {
+				await new Promise((wake) => setTimeout(wake, (retryAfter + 0.5) * 1000));
+				return await uploadTelegram<T>(cfg, method, fields, files, 1);
+			}
+			if (envelope === null || envelope.ok !== true) {
+				pi.logger.warn("telegram upload failed", { method, status: response.status });
+				return null;
+			}
+			return envelope.result as T;
+		} catch (error) {
+			const raw = error instanceof Error ? error.message : String(error);
+			pi.logger.warn("telegram upload failed", { method, error: raw.split(cfg.token).join("<token>") });
+			return null;
+		}
+	}
+
+	pi.registerTool({
+		name: "notify_file",
+		label: "Notify File",
+		description:
+			"Send files from disk to the user's Telegram chat, for artifacts the user should see on their phone: a screenshot, a rendered diff, a report, a build output. `paths`: 1 to 10 file paths under the session workspace or the system tmp directory (copy anything else into the workspace first). Images arrive as photos and several images become one album, everything else arrives as a document (50 MB per file, 100 MB per call). `caption`: optional short plain text shown with the first file.",
+		approval: "read",
+		strict: true,
+		parameters: z.object({
+			paths: z.array(z.string()).min(1).max(10),
+			caption: z.string().optional(),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (config === null) {
+				return { content: [{ type: "text", text: "Error: Telegram is not configured" }], isError: true };
+			}
+			const caption = typeof params.caption === "string" ? params.caption.trim().slice(0, 1024) : "";
+			const allowedRoots = [ctx.cwd, tmpdir(), MEDIA_DIR];
+			const loaded: Array<{ path: string; name: string; data: Uint8Array; photo: boolean }> = [];
+			let totalBytes = 0;
+			for (const requested of params.paths as string[]) {
+				const path = resolve(ctx.cwd, requested);
+				if (!allowedRoots.some((root) => path === root || path.startsWith(`${root}/`))) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Error: ${path} is outside the workspace and tmp directories. Copy the file into the workspace first.`,
+							},
+						],
+						isError: true,
+					};
+				}
+				let size = 0;
+				try {
+					const info = statSync(path);
+					if (!info.isFile()) {
+						return { content: [{ type: "text", text: `Error: ${path} is not a regular file` }], isError: true };
+					}
+					size = info.size;
+				} catch {
+					return { content: [{ type: "text", text: `Error: cannot read ${path}` }], isError: true };
+				}
+				if (size > 50 * 1024 * 1024) {
+					return { content: [{ type: "text", text: `Error: ${path} exceeds the 50 MB upload limit` }], isError: true };
+				}
+				totalBytes += size;
+				if (totalBytes > 100 * 1024 * 1024) {
+					return {
+						content: [{ type: "text", text: "Error: the batch exceeds the 100 MB total limit" }],
+						isError: true,
+					};
+				}
+				let data: Uint8Array;
+				try {
+					data = readFileSync(path);
+				} catch {
+					return { content: [{ type: "text", text: `Error: cannot read ${path}` }], isError: true };
+				}
+				const name = (path.split("/").at(-1) ?? "file").replaceAll(/[^\w.-]/gu, "_").slice(-80);
+				const photo = /\.(png|jpe?g|gif|webp|bmp)$/iu.test(name) && data.byteLength <= 10 * 1024 * 1024;
+				loaded.push({ path, name, data, photo });
+			}
+
+			const base: Record<string, string | number> = { chat_id: config.chatId };
+			if (topicId !== null) base.message_thread_id = topicId;
+			const sentIds: number[] = [];
+			if (loaded.length > 1 && loaded.every((file) => file.photo)) {
+				const media = loaded.map((file, index) => ({
+					type: "photo",
+					media: `attach://f${index}`,
+					...(index === 0 && caption.length > 0 ? { caption } : {}),
+				}));
+				const sent = await uploadTelegram<TelegramMessage[]>(
+					config,
+					"sendMediaGroup",
+					{ ...base, media: JSON.stringify(media) },
+					loaded.map((file, index) => ({ field: `f${index}`, name: file.name, data: file.data })),
+				);
+				if (sent === null) {
+					return { content: [{ type: "text", text: "Error: Telegram rejected the album upload" }], isError: true };
+				}
+				for (const message of sent) {
+					trackSent(message);
+					sentIds.push(message.message_id);
+				}
+			} else {
+				for (const [index, file] of loaded.entries()) {
+					const fields: Record<string, string | number> = { ...base };
+					if (index === 0 && caption.length > 0) fields.caption = caption;
+					const kind = file.photo ? "photo" : "document";
+					fields[kind] = "attach://f0";
+					let sent = await uploadTelegram<TelegramMessage>(config, file.photo ? "sendPhoto" : "sendDocument", fields, [
+						{ field: "f0", name: file.name, data: file.data },
+					]);
+					// Telegram rejects photos over its dimension limits; the same bytes go through as a document.
+					if (sent === null && file.photo) {
+						const retry: Record<string, string | number> = { ...base };
+						if (index === 0 && caption.length > 0) retry.caption = caption;
+						retry.document = "attach://f0";
+						sent = await uploadTelegram<TelegramMessage>(config, "sendDocument", retry, [
+							{ field: "f0", name: file.name, data: file.data },
+						]);
+					}
+					if (sent === null) {
+						return {
+							content: [{ type: "text", text: `Error: Telegram rejected the upload of ${file.path}` }],
+							isError: true,
+						};
+					}
+					trackSent(sent);
+					sentIds.push(sent.message_id);
+				}
+			}
+			lastNotifiedAt = Date.now();
+			writeSessionRecord(ctx);
+			return {
+				content: [{ type: "text", text: `Sent ${loaded.length} file${loaded.length === 1 ? "" : "s"} to Telegram.` }],
+				details: { messageIds: sentIds },
+			};
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig();
 		if (config === null && existsSync(CONFIG_PATH)) {
@@ -1472,12 +1780,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pi.logger.debug("notify-telegram disabled: no usable config at ~/.omp/agent/notify-telegram.json");
 			return;
 		}
+		sessionCtx = ctx;
 		sessionId = ctx.sessionManager.getSessionId();
-		mkdirSync(SESSIONS_DIR, { recursive: true });
-		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true });
+		mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+		try {
+			// mkdir applies the mode only at creation; a dir inherited from an older version stays loose otherwise.
+			chmodSync(STATE_DIR, 0o700);
+		} catch {}
+		mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
+		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true, mode: 0o700 });
 		reapDeadSessions();
 		reapOldMedia();
 		sessionTag = claimTag();
+		// Base-36 tag as a number: stable across resumes, unique across live sessions.
+		draftId = Number.parseInt(sessionTag, 36) + 1;
 		badgeEmoji = claimBadge();
 		const previous = readSessionRecord(sessionId);
 		badgeOverride = previous?.label ?? "";
@@ -1489,6 +1805,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		lastNotifiedAt = typeof previous?.lastNotified === "number" ? previous.lastNotified : 0;
 		pinnedMessageId = typeof previous?.pinned === "number" ? previous.pinned : null;
+		// Topic state must come back before the first record write below, or a
+		// crash-recovered session clobbers it and creates a duplicate forum topic.
+		if (typeof previous?.topicId === "number") {
+			topicId = previous.topicId;
+			topicName = typeof previous.topicName === "string" ? previous.topicName : "";
+		}
 		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
 			rmSync(LOCK_FILE, { recursive: true, force: true });
 		}
@@ -1500,11 +1822,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			callTelegram(
 				config,
 				"setMyCommands",
-				{ commands: [{ command: "hidequestions", description: "Hide open question buttons" }] },
+				{
+					commands: [
+						{ command: "status", description: "Show what each session is doing" },
+						{ command: "hidequestions", description: "Hide open question buttons" },
+					],
+				},
 				15_000,
 			),
 			"command menu",
 		);
+		detach(callTelegram(config, "setChatMenuButton", { menu_button: { type: "commands" } }, 15_000), "menu button");
 
 		if (ctx.hasUI) {
 			unsubscribeInput = ctx.ui.onTerminalInput(() => {
@@ -1530,6 +1858,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			try {
 				detach(drainInbox(), "inbox drain");
 				maybeType();
+				maybeDraft();
 				// Re-read rather than trusting a boolean: two pollers caused 918 Telegram conflicts.
 				if (ownsLock()) detach(pollOnce(), "telegram poll");
 			} catch (error) {
@@ -1568,11 +1897,89 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnActive = true;
 		approvalWaiting = false;
 		typingSentAt = 0;
+		draftText = "";
+		draftDirty = false;
+		currentTool = "";
+		turnInput = 0;
+		turnOutput = 0;
+		turnCost = 0;
+		turnTools = 0;
+		noticedKinds.clear();
 	});
 
 	pi.on("agent_end", async () => {
 		turnActive = false;
 		approvalWaiting = false;
+		draftText = "";
+		draftDirty = false;
+		currentTool = "";
+	});
+
+	pi.on("message_update", async (event) => {
+		// The host types these payloads, but the runtime guards stay: harnesses and
+		// older hosts may fire sparse events.
+		const message: unknown = event.message;
+		if (message === null || typeof message !== "object") return;
+		if (!("role" in message) || message.role !== "assistant") return;
+		if (!("content" in message) || !Array.isArray(message.content)) return;
+		let text = "";
+		for (const block of message.content) {
+			if (block === null || typeof block !== "object" || !("type" in block)) continue;
+			if (block.type !== "text" || !("text" in block) || typeof block.text !== "string") continue;
+			text = text.length === 0 ? block.text : `${text}\n\n${block.text}`;
+		}
+		draftText = text;
+		draftDirty = true;
+	});
+
+	pi.on("message_end", async (event) => {
+		const message: unknown = event.message;
+		if (message === null || typeof message !== "object") return;
+		if (!("role" in message) || message.role !== "assistant") return;
+		if (!("usage" in message)) return;
+		const usage: unknown = message.usage;
+		if (usage === null || typeof usage !== "object") return;
+		if ("input" in usage && typeof usage.input === "number") turnInput += usage.input;
+		if ("output" in usage && typeof usage.output === "number") turnOutput += usage.output;
+		if ("cost" in usage && usage.cost !== null && typeof usage.cost === "object" && "total" in usage.cost) {
+			if (typeof usage.cost.total === "number") turnCost += usage.cost.total;
+		}
+	});
+
+	pi.on("tool_execution_start", async (event) => {
+		turnTools += 1;
+		const intent = typeof event.intent === "string" && event.intent.length > 0 ? `: ${event.intent}` : "";
+		currentTool = `${typeof event.toolName === "string" ? event.toolName : "tool"}${intent}`.slice(0, 80);
+		draftDirty = true;
+	});
+
+	pi.on("tool_execution_end", async () => {
+		currentTool = "";
+		draftDirty = true;
+	});
+
+	pi.on("auto_retry_start", async (event) => {
+		if (typeof event.attempt !== "number" || event.attempt < 2) return;
+		transparencyNotice("retry", `Provider trouble, retrying (${event.attempt}/${event.maxAttempts}).`);
+	});
+
+	pi.on("retry_fallback_applied", async (event) => {
+		transparencyNotice("fallback", `Model fell back from ${event.from} to ${event.to}.`);
+	});
+
+	pi.on("retry_fallback_succeeded", async (event) => {
+		transparencyNotice("fallback-ok", `Recovered on ${event.model}.`);
+	});
+
+	pi.on("auto_compaction_start", async (event) => {
+		transparencyNotice("compaction", `Context is being compacted (${event.reason}), the turn may pause briefly.`);
+	});
+
+	pi.on("auto_compaction_end", async (event) => {
+		if (event.skipped === true || event.willRetry === true) return;
+		if (event.aborted === true || typeof event.errorMessage === "string") {
+			transparencyNotice("compaction-fail", "Context compaction failed. The context window may overflow.");
+		}
 	});
 
 	pi.on("session_stop", async (_event, ctx) => {
@@ -1595,13 +2002,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const work = notify(
 					ctx,
 					`${heads[recorded.urgency]}${suffix}`,
-					recorded.text,
+					recorded.text + usageFooter(),
 					urgencyExtras(recorded.urgency),
 				).then((sent) => (recorded.urgency === "red" ? pinRed(ctx, sent) : undefined));
 				detach(work, "turn-end notice");
 				return;
 			}
-			detach(sendStandingQuestion(ctx, heads[recorded.urgency] + suffix, recorded), "turn-end question");
+			detach(
+				sendStandingQuestion(ctx, heads[recorded.urgency] + suffix, {
+					...recorded,
+					text: recorded.text + usageFooter(),
+				}),
+				"turn-end question",
+			);
 			return;
 		}
 
@@ -1617,7 +2030,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const tail = lastAssistantTail(ctx);
 		const wantsReply = /\?\s*$/m.test(tail);
 		const title = `${wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished"}${suffix}`;
-		detach(notify(ctx, title, tail.length > 0 ? tail : "Awaiting your next instruction."), "turn-end notice");
+		detach(
+			notify(ctx, title, (tail.length > 0 ? tail : "Awaiting your next instruction.") + usageFooter()),
+			"turn-end notice",
+		);
 	});
 
 	pi.on("tool_approval_requested", async (event, ctx) => {

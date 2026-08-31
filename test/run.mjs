@@ -25,7 +25,7 @@ delete process.env.TMUX_PANE;
 const writeConfig = (extra = {}) =>
 	writeFileSync(
 		join(root, "notify-telegram.json"),
-		JSON.stringify({ token: "0".repeat(30), chatId: CHAT, offset: 100, quietSeconds: 0, ...extra }, null, 2),
+		JSON.stringify({ token: `12345:${"A".repeat(30)}`, chatId: CHAT, offset: 100, quietSeconds: 0, ...extra }, null, 2),
 		{ mode: 0o600 },
 	);
 writeConfig();
@@ -45,8 +45,21 @@ globalThis.fetch = async (url, init) => {
 		return { ok: true, arrayBuffer: async () => new TextEncoder().encode("fake-image-bytes").buffer };
 	}
 	const method = String(url).split("/").pop();
+	if (init?.body instanceof FormData) {
+		const body = {};
+		for (const [key, value] of init.body.entries()) {
+			body[key] = typeof value === "string" ? value : `<file ${value.size}b>`;
+		}
+		api.calls.push({ method, body });
+		const result =
+			method === "sendMediaGroup" ? [{ message_id: api.nextMessage++ }] : { message_id: api.nextMessage++ };
+		return { ok: true, json: async () => ({ ok: true, result }) };
+	}
 	const body = JSON.parse(init.body);
 	api.calls.push({ method, body });
+	if ((api.failMethods ?? []).includes(method)) {
+		return { ok: false, status: 400, json: async () => ({ ok: false, description: "failed by test" }) };
+	}
 	if (method === "createForumTopic" && !api.topicsEnabled) {
 		return { ok: false, status: 400, json: async () => ({ ok: false, description: "TOPICS_DISABLED" }) };
 	}
@@ -104,6 +117,7 @@ const spawn = (id, cwd, title = "") => {
 		registerTool: (def) => tools.set(def.name, def),
 		sendUserMessage: (text, options) => steers.push({ text, options }),
 	};
+	let aborts = 0;
 	const ctx = {
 		hasUI: false,
 		cwd,
@@ -112,6 +126,9 @@ const spawn = (id, cwd, title = "") => {
 		setInterval: (fn) => timers.push(fn) - 1,
 		setTimeout: (fn) => timers.push(fn) - 1,
 		clearTimer: () => {},
+		abort: () => {
+			aborts += 1;
+		},
 	};
 	mod.default(pi);
 	return {
@@ -121,14 +138,17 @@ const spawn = (id, cwd, title = "") => {
 		timers,
 		warns,
 		steers,
+		get aborts() {
+			return aborts;
+		},
 		setTitle: (value) => {
 			name = value;
 		},
-		fire: async (event) => {
+		fire: async (event, payload = {}) => {
 			const results = [];
-			for (const fn of handlers.get(event) ?? []) results.push(await fn({}, ctx));
+			for (const fn of handlers.get(event) ?? []) results.push(await fn(payload, ctx));
 			if (event === "session_stop" && results.some((r) => r?.decision === "block")) {
-				for (const fn of handlers.get(event) ?? []) await fn({}, ctx);
+				for (const fn of handlers.get(event) ?? []) await fn(payload, ctx);
 			}
 			return results;
 		},
@@ -361,8 +381,8 @@ check(
 	one.warns.some((w) => w.m.includes("unexpected origin")),
 );
 check(
-	"allowed_updates asks for both kinds",
-	lastCall("getUpdates").body.allowed_updates.join(",") === "message,callback_query",
+	"allowed_updates asks for all three kinds",
+	lastCall("getUpdates").body.allowed_updates.join(",") === "message,callback_query,stopped_message_generation",
 );
 check(
 	"offset advances past rejected updates",
@@ -1721,6 +1741,314 @@ check(
 );
 api.topicsEnabled = false;
 api.icons = null;
+
+// A crash-recovered session must keep its forum topic instead of leaking a new one.
+api.topicsEnabled = true;
+const crashed = spawn("01a04a00-0000-0000-0000-000000000000", "/home/dev/work/lance");
+await crashed.fire("session_start");
+const crashedTopic = record(crashed.id).topicId;
+check("the crashed session had a topic", typeof crashedTopic === "number");
+const topicsBefore = called("createForumTopic").length;
+const revived = spawn(crashed.id, "/home/dev/work/lance");
+await revived.fire("session_start");
+check("a crash resume keeps the same topic", record(crashed.id).topicId === crashedTopic);
+check("no duplicate topic is created", called("createForumTopic").length === topicsBefore);
+api.topicsEnabled = false;
+heading("streaming, cost, and transparency");
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const fx = spawn("01a04b00-0000-0000-0000-000000000000", "/home/dev/work/quackml");
+await fx.fire("session_start");
+check(
+	"the status command is registered",
+	lastCall("setMyCommands").body.commands.some((c) => c.command === "status"),
+);
+check("the menu button exposes commands", lastCall("setChatMenuButton").body.menu_button.type === "commands");
+
+// Drafts stream the partial answer with a native stop control.
+await fx.fire("agent_start");
+await fx.fire("message_update", {
+	message: { role: "assistant", content: [{ type: "text", text: "Partial answer" }] },
+});
+await fx.pump(150);
+const draft = lastCall("sendMessageDraft");
+check("a partial answer streams as a draft", draft?.body.text.includes("Partial answer") === true);
+check("the draft carries a stop control", draft.body.can_stop === true);
+check("the draft id matches the session record", draft.body.draft_id === record(fx.id).draftId);
+
+await fx.fire("tool_execution_start", { toolName: "bash", intent: "Running tests" });
+await settle(1600);
+await fx.pump(150);
+check("tool activity rides in the draft", lastCall("sendMessageDraft").body.text.includes("bash: Running tests"));
+
+// A stop press on the draft aborts the running turn.
+api.queued = [{ update_id: 700, stopped_message_generation: { chat: { id: CHAT }, draft_id: record(fx.id).draftId } }];
+await fx.pump(250);
+await fx.pump(250);
+check("a stop press aborts the running turn", fx.aborts === 1);
+
+// Usage lands as a footer on the turn-end summary.
+await fx.fire("message_end", {
+	message: { role: "assistant", usage: { input: 12400, output: 900, cost: { total: 0.0512 } } },
+});
+await fx.fire("agent_end");
+await fx.tools.get("notify_status").execute("f1", { summary: "Done.", urgency: "green" }, undefined, undefined, fx.ctx);
+await fx.fire("session_stop");
+await settle(150);
+const footerMsg = lastCall("sendMessage").body.text;
+check("the summary carries token counts", footerMsg.includes("12.4k in / 900 out"));
+check("the summary carries the cost", footerMsg.includes("$0.051"));
+check("the summary counts tools", footerMsg.includes("1 tool"));
+
+// Transparency notices, once per kind per turn.
+await fx.fire("agent_start");
+await fx.fire("auto_retry_start", { attempt: 2, maxAttempts: 8 });
+await settle(120);
+check("a retry shows a notice", lastCall("sendMessage").body.text.includes("retrying (2/8)"));
+const noticesBefore = called("sendMessage").length;
+await fx.fire("auto_retry_start", { attempt: 3, maxAttempts: 8 });
+await settle(120);
+check("the notice does not repeat within a turn", called("sendMessage").length === noticesBefore);
+await fx.fire("retry_fallback_applied", { from: "a/x", to: "b/y" });
+await settle(120);
+check("a model fallback shows a notice", lastCall("sendMessage").body.text.includes("fell back from a/x to b/y"));
+await fx.fire("auto_compaction_start", { reason: "overflow" });
+await settle(120);
+check("compaction shows a notice", lastCall("sendMessage").body.text.includes("compacted (overflow)"));
+await fx.fire("agent_end");
+
+// /status answers from the extension without touching the agent.
+writeFileSync(join(inboxOf(fx.id), "701.json"), JSON.stringify({ kind: "command", value: "status" }));
+await fx.pump(250);
+check("status reports the session state", lastCall("sendMessage").body.text.includes("State: idle."));
+check(
+	"status does not reach the agent",
+	!fx.steers.some((s) => typeof s.text === "string" && s.text.includes("status")),
+);
+
+// Structured summaries go out as native rich messages, with a plain fallback.
+await fx.fire("input");
+await fx.tools
+	.get("notify_status")
+	.execute(
+		"f2",
+		{ summary: "Results:\n\n| step | state |\n| --- | --- |\n| build | ok |", urgency: "green" },
+		undefined,
+		undefined,
+		fx.ctx,
+	);
+await fx.fire("session_stop");
+await settle(150);
+const richSummary = lastCall("sendRichMessage");
+check(
+	"a table summary goes out as a rich message",
+	richSummary?.body.rich_message.markdown.includes("| build | ok |") === true,
+);
+api.failMethods = ["sendRichMessage"];
+await fx.fire("input");
+await fx.tools
+	.get("notify_status")
+	.execute("f3", { summary: "Again:\n\n| a | b |\n| - | - |", urgency: "green" }, undefined, undefined, fx.ctx);
+await fx.fire("session_stop");
+await settle(150);
+check("rich rejection falls back to the plain renderer", lastCall("sendMessage").body.text.includes("| a | b |"));
+api.failMethods = [];
+
+// The agent pushes files to the phone.
+const artefact = join(root, "artefact.png");
+writeFileSync(artefact, "png-bytes");
+const photoSend = await fx.tools
+	.get("notify_file")
+	.execute("f4", { paths: [artefact], caption: "the screenshot" }, undefined, undefined, fx.ctx);
+check("a png goes out as a photo", lastCall("sendPhoto").body.photo === "attach://f0");
+check("the caption rides along", lastCall("sendPhoto").body.caption === "the screenshot");
+check("the tool reports success", photoSend.isError !== true);
+const artefact2 = join(root, "artefact2.jpg");
+writeFileSync(artefact2, "jpg-bytes");
+await fx.tools.get("notify_file").execute("f5", { paths: [artefact, artefact2] }, undefined, undefined, fx.ctx);
+check("two images go out as one album", JSON.parse(lastCall("sendMediaGroup").body.media).length === 2);
+const logFile = join(root, "build.log");
+writeFileSync(logFile, "log-bytes");
+await fx.tools.get("notify_file").execute("f6", { paths: [logFile] }, undefined, undefined, fx.ctx);
+check("a log goes out as a document", lastCall("sendDocument").body.document === "attach://f0");
+const missing = await fx.tools
+	.get("notify_file")
+	.execute("f7", { paths: ["/nope/x.png"] }, undefined, undefined, fx.ctx);
+check("a missing file is a clean error", missing.isError === true);
+
+heading("review-two regressions");
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const rv = spawn("01a04c00-0000-0000-0000-000000000000", "/home/dev/work/htmlq");
+await rv.fire("session_start");
+
+// Usage counters and notice dedupe must reset on the second turn, not just work on the first.
+await rv.fire("agent_start");
+await rv.fire("message_end", {
+	message: { role: "assistant", usage: { input: 200, output: 50, cost: { total: 0.01 } } },
+});
+await rv.fire("auto_retry_start", { attempt: 2, maxAttempts: 5 });
+await settle(120);
+check("retry notice fires in the first turn", lastCall("sendMessage").body.text.includes("retrying (2/5)"));
+await rv.fire("agent_end");
+await rv.tools.get("notify_status").execute("r1", { summary: "One.", urgency: "green" }, undefined, undefined, rv.ctx);
+await rv.fire("session_stop");
+await settle(150);
+check("first turn footer counts its own usage", lastCall("sendMessage").body.text.includes("200 in / 50 out"));
+await rv.fire("input");
+await rv.fire("agent_start");
+await rv.fire("message_end", {
+	message: { role: "assistant", usage: { input: 100, output: 30, cost: { total: 0.005 } } },
+});
+const secondRetryBefore = called("sendMessage").length;
+await rv.fire("auto_retry_start", { attempt: 2, maxAttempts: 5 });
+await settle(120);
+check("the notice dedupe resets with the new turn", called("sendMessage").length === secondRetryBefore + 1);
+await rv.fire("agent_end");
+await rv.tools.get("notify_status").execute("r2", { summary: "Two.", urgency: "green" }, undefined, undefined, rv.ctx);
+await rv.fire("session_stop");
+await settle(150);
+const secondFooter = lastCall("sendMessage").body.text;
+check(
+	"second turn footer starts from zero",
+	secondFooter.includes("100 in / 30 out") && !secondFooter.includes("300 in"),
+);
+
+// Plain prose must never touch the rich endpoint.
+await rv.fire("input");
+const richBefore = called("sendRichMessage").length;
+await rv.tools
+	.get("notify_status")
+	.execute("r3", { summary: "Plain sentence, nothing structured.", urgency: "green" }, undefined, undefined, rv.ctx);
+await rv.fire("session_stop");
+await settle(150);
+check("plain prose never touches the rich endpoint", called("sendRichMessage").length === richBefore);
+check("plain prose lands as a normal message", lastCall("sendMessage").body.text.includes("Plain sentence"));
+
+// Drafts stay silent while a question is pending.
+await rv.fire("input");
+await rv.fire("agent_start");
+const rvState = {};
+const rvAsk = rv.tools
+	.get("ask")
+	.execute(
+		"r4",
+		{ questions: [{ id: "q", question: "Q?", options: [{ label: "a" }, { label: "b" }] }] },
+		undefined,
+		undefined,
+		stubbornCtx(rv.ctx, rvState),
+	);
+await settle(150);
+const draftsBefore = called("sendMessageDraft").length;
+await rv.fire("message_update", {
+	message: { role: "assistant", content: [{ type: "text", text: "should not stream" }] },
+});
+await settle(1600);
+await rv.pump(120);
+check("drafts stay silent while a question is pending", called("sendMessageDraft").length === draftsBefore);
+const rvAskId = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
+writeFileSync(join(inboxOf(rv.id), "800.json"), JSON.stringify({ kind: "callback", value: `o:${rvAskId}:0:0` }));
+await rv.pump(250);
+await rvAsk;
+
+// The draft throttle limits the send rate to one per window.
+await rv.fire("message_update", { message: { role: "assistant", content: [{ type: "text", text: "tick one" }] } });
+await rv.pump(80);
+const draftCount = called("sendMessageDraft").length;
+check("the first dirty tick sends a draft", draftCount === draftsBefore + 1);
+await rv.fire("message_update", { message: { role: "assistant", content: [{ type: "text", text: "tick two" }] } });
+await rv.pump(80);
+check("a second update inside the window is throttled", called("sendMessageDraft").length === draftCount);
+await settle(1500);
+await rv.pump(80);
+check("the throttle releases after its window", called("sendMessageDraft").length === draftCount + 1);
+
+// A stop command while idle is a no-op.
+await rv.fire("agent_end");
+writeFileSync(join(inboxOf(rv.id), "801.json"), JSON.stringify({ kind: "command", value: "stopturn" }));
+await rv.pump(200);
+check("a stop command while idle does not abort", rv.aborts === 0);
+
+// /status names the running tool.
+await rv.fire("input");
+await rv.fire("agent_start");
+await rv.fire("tool_execution_start", { toolName: "bash", intent: "compiling" });
+writeFileSync(join(inboxOf(rv.id), "802.json"), JSON.stringify({ kind: "command", value: "status" }));
+await rv.pump(200);
+check("status reports the running tool", lastCall("sendMessage").body.text.includes("working (bash: compiling)"));
+await rv.fire("agent_end");
+
+// Album captions sit only on the first item; the sandbox refuses foreign paths.
+const chartA = join(root, "chart-a.png");
+const chartB = join(root, "chart-b.png");
+writeFileSync(chartA, "a");
+writeFileSync(chartB, "b");
+await rv.tools
+	.get("notify_file")
+	.execute("r5", { paths: [chartA, chartB], caption: "the chart" }, undefined, undefined, rv.ctx);
+const albumMedia = JSON.parse(lastCall("sendMediaGroup").body.media);
+check(
+	"the album caption sits only on the first item",
+	albumMedia[0].caption === "the chart" && !("caption" in albumMedia[1]),
+);
+const outside = await rv.tools
+	.get("notify_file")
+	.execute("r6", { paths: ["/etc/hostname"] }, undefined, undefined, rv.ctx);
+check("paths outside the sandbox are refused", outside.isError === true && outside.content[0].text.includes("outside"));
+const dirSend = await rv.tools.get("notify_file").execute("r7", { paths: [root] }, undefined, undefined, rv.ctx);
+check("a directory is refused cleanly", dirSend.isError === true);
+
+// An unfetchable file must not wedge the update offset.
+api.queued = [
+	{
+		update_id: 720,
+		message: { message_id: 90, date: 1, chat: { id: CHAT }, voice: { file_id: "huge", file_size: 21 * 1024 * 1024 } },
+	},
+];
+await rv.pump(250);
+await rv.pump(250);
+check("an oversized file is refused with a notice", lastCall("sendMessage").body.text.includes("could not be fetched"));
+check(
+	"the failed media does not wedge the offset",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset > 720,
+);
+
+// Downloaded media is private on disk.
+const downloaded = readdirSync(mediaDir).find((f) => f.startsWith("500-"));
+check(
+	"downloaded media is private",
+	downloaded !== undefined && (statSync(join(mediaDir, downloaded)).mode & 0o777) === 0o600,
+);
+
+// A stop press routes to the drafting session, not to the poller.
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const rvA = spawn("01a04d00-0000-0000-0000-000000000000", "/home/dev/work/polars");
+await rvA.fire("session_start");
+const rvB = spawn("01a04d01-0000-0000-0000-000000000000", "/home/dev/work/arrow");
+await rvB.fire("session_start");
+await rvB.fire("agent_start");
+api.queued = [{ update_id: 730, stopped_message_generation: { chat: { id: CHAT }, draft_id: record(rvB.id).draftId } }];
+await rvA.pump(250);
+check("the stop routes to the drafting session's inbox", inboxCount(rvB.id) === 1);
+const stopEntry = readdirSync(inboxOf(rvB.id))[0];
+check("inbox entries are private", (statSync(join(inboxOf(rvB.id), stopEntry)).mode & 0o777) === 0o600);
+await rvB.pump(250);
+check("the drafting session aborts", rvB.aborts === 1);
+check("the poller session does not", rvA.aborts === 0);
+
+// streamDrafts: false silences the stream entirely.
+writeConfig({ streamDrafts: false });
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const quietDrafts = spawn("01a04e00-0000-0000-0000-000000000000", "/home/dev/work/sled");
+await quietDrafts.fire("session_start");
+await quietDrafts.fire("agent_start");
+const draftsQuiet = called("sendMessageDraft").length;
+await quietDrafts.fire("message_update", {
+	message: { role: "assistant", content: [{ type: "text", text: "hidden" }] },
+});
+await settle(1600);
+await quietDrafts.pump(120);
+check("streamDrafts false silences the draft stream", called("sendMessageDraft").length === draftsQuiet);
+await quietDrafts.fire("agent_end");
+writeConfig();
 
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
