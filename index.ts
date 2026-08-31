@@ -32,9 +32,13 @@ const PREVIEW_MAX = 300;
 const RECENT_MESSAGE_CAP = 60;
 const TELEGRAM_TEXT_MAX = 4096;
 
-/** Single source for stance marker and colour. */
+/**
+ * Single source for stance marker and colour. Telegram button styles offer only
+ * red, green and blue, so the middle stance carries its colour in the marker.
+ */
 const STANCE = {
 	preferable: { marker: "(preferable)", style: "success" as const },
+	lukewarm: { marker: "\u{1F7E0} (lukewarm)", style: undefined },
 	discouraged: { marker: "(discouraged)", style: "danger" as const },
 };
 
@@ -111,6 +115,8 @@ interface AskOption {
 	label: string;
 	description?: string;
 	preview?: string;
+	/** Workable, but not the pick. */
+	lukewarm?: boolean;
 	/** Present only for contrast. */
 	discouraged?: boolean;
 }
@@ -122,6 +128,14 @@ interface AskQuestion {
 	header?: string;
 	multi?: boolean;
 	recommended?: number;
+}
+
+/** Preferable wins over discouraged, which wins over lukewarm, when a caller marks contradictions. */
+function stanceOf(question: AskQuestion, option: AskOption, index: number) {
+	if (question.recommended === index) return STANCE.preferable;
+	if (option.discouraged === true) return STANCE.discouraged;
+	if (option.lukewarm === true) return STANCE.lukewarm;
+	return null;
 }
 
 interface AskResult {
@@ -305,18 +319,13 @@ function questionKeyboard(ask: PendingAsk, question: AskQuestion): InlineButton[
 	const chosen = ask.selected[ask.index] ?? new Set<string>();
 	const optionButtons = question.options.map((option, optionIndex) => {
 		const mark = question.multi === true && chosen.has(option.label) ? "[x] " : "";
-		const stance =
-			question.recommended === optionIndex
-				? STANCE.preferable
-				: option.discouraged === true
-					? STANCE.discouraged
-					: null;
+		const stance = stanceOf(question, option, optionIndex);
 		const suffix = stance === null ? "" : ` ${stance.marker}`;
 		const button: InlineButton = {
 			text: `${mark}${option.label}${suffix}`.slice(0, BUTTON_TEXT_MAX),
 			callback_data: `o:${ask.askId}:${ask.index}:${optionIndex}`,
 		};
-		if (stance !== null) button.style = stance.style;
+		if (stance?.style !== undefined) button.style = stance.style;
 		return button;
 	});
 	const tail: InlineButton[] = [{ text: "Type an answer", callback_data: `t:${ask.askId}:${ask.index}` }];
@@ -781,8 +790,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		for (const [index, option] of question.options.entries()) {
 			const description = option.description?.trim() ?? "";
 			const preview = option.preview?.trim() ?? "";
-			const stance =
-				question.recommended === index ? STANCE.preferable : option.discouraged === true ? STANCE.discouraged : null;
+			const stance = stanceOf(question, option, index);
 			if (description.length === 0 && preview.length === 0 && stance === null) continue;
 			const lines = [stance === null ? `**${option.label}**` : `**${option.label}** ${stance.marker}`];
 			if (description.length > 0) lines.push(description);
@@ -992,7 +1000,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "ask",
 		label: "Ask",
 		description:
-			"Ask the interactive user one or more questions. Answerable at the terminal or from Telegram, whichever answers first. Set `context` when the question cannot be judged from the option list alone, for example the finding that prompted it or what each alternative costs. Context is shown in both places. Question, option and context text render as Markdown on Telegram. Supported: `inline code` for identifiers, paths and values, triple-backtick fences with a language for multi-line code, **bold**, *italic* or _italic_, ~~strikethrough~~, ||spoiler||, a leading angle bracket for a quoted line, a leading hash for a heading, and [label](https://url) links. Tables, bullet nesting and anything else render as plain text, so prefer a fenced block for tabular output. Mark desirability so a choice reads at a glance: set `recommended` to the index of the one option you would take, and set `discouraged` on any option offered only for contrast. Preferable renders green and discouraged renders red, both labelled, on Telegram and in the terminal. Leave both unset for options that are genuinely equivalent.",
+			"Ask the interactive user one or more questions. Answerable at the terminal or from Telegram, whichever answers first. Set `context` when the question cannot be judged from the option list alone, for example the finding that prompted it or what each alternative costs. Context is shown in both places. Question, option and context text render as Markdown on Telegram. Supported: `inline code` for identifiers, paths and values, triple-backtick fences with a language for multi-line code, **bold**, *italic* or _italic_, ~~strikethrough~~, ||spoiler||, a leading angle bracket for a quoted line, a leading hash for a heading, and [label](https://url) links. Tables, bullet nesting and anything else render as plain text, so prefer a fenced block for tabular output. Mark desirability so a choice reads at a glance, as a three colour semaphore: set `recommended` to the index of the one option you would take, set `lukewarm` on an option that would work but that you would not pick, and set `discouraged` on an option offered only for contrast. Preferable renders green, lukewarm carries an orange marker, and discouraged renders red, all labelled, on Telegram and in the terminal. Leave every mark unset for options that are genuinely equivalent.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -1007,6 +1015,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								description: z.string().optional(),
 								preview: z.string().optional(),
 								discouraged: z.boolean().optional(),
+								lukewarm: z.boolean().optional(),
 							}),
 						),
 						header: z.string().optional(),
@@ -1027,14 +1036,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				questions: questions.map((question, index) => ({
 					...question,
 					question: index === 0 && context.length > 0 ? `${context}\n\n${question.question}` : question.question,
-					options: question.options.map((option) => {
-						const { discouraged, ...rest } = option;
-						if (discouraged !== true) return rest;
+					options: question.options.map((option, optionIndex) => {
+						const { discouraged, lukewarm, ...rest } = option;
+						if (discouraged !== true && lukewarm !== true) return rest;
+						const stance = stanceOf(question, option, optionIndex);
+						if (stance === null || stance === STANCE.preferable) return rest;
 						const description = rest.description?.trim() ?? "";
 						return {
 							...rest,
-							description:
-								description.length > 0 ? `${STANCE.discouraged.marker} ${description}` : STANCE.discouraged.marker,
+							description: description.length > 0 ? `${stance.marker} ${description}` : stance.marker,
 						};
 					}),
 				})),
@@ -1106,7 +1116,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "notify_status",
 		label: "Notify Status",
 		description:
-			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two sentences in plain words stating what was done and what stands open, Markdown subset allowed. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 short `options` (for example Continue, Review the diff, Stop here): they become tappable buttons and the tapped label starts the next turn. Omit them only when there is genuinely nothing to ask.",
+			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two sentences in plain words stating what was done and what stands open, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 short `options` drawn from those real next steps (for example Continue, Review the diff, Stop here): they become tappable buttons, the tapped label starts the next turn, and the most likely choice goes first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -1146,7 +1156,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "session_badge",
 		label: "Session Badge",
 		description:
-			"Change how this session identifies itself in Telegram notifications. A badge is assigned automatically at startup, so call this only when the automatic emoji collides with another running session or the folder name does not describe the work.",
+			"Change how this session identifies itself in Telegram notifications. `emoji` replaces the badge emoji (a single emoji) and `label` replaces the descriptive text (up to 60 characters). A badge is assigned automatically at startup, so call this only when the automatic emoji collides with another running session or the folder name does not describe the work.",
 		approval: "read",
 		parameters: z.object({
 			emoji: z.string().optional(),
@@ -1277,7 +1287,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return {
 				decision: "block" as const,
 				reason:
-					"Before finishing, call notify_status with a one-or-two-sentence summary of where things stand and an urgency (green done, orange reply wanted, red blocked). If any user action is wanted, such as continue, review, or a decision, also set question and 2 to 6 short options, which become tappable buttons whose label starts the next turn. Omit them only when there is genuinely nothing to ask. The user is away from the terminal and sees only this.",
+					"Before finishing, call notify_status with a one-or-two-sentence summary of where things stand and an urgency (green done, orange reply wanted, red blocked). Be proactive about next steps: name the concrete ones when they exist, and say plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. If any user action is wanted, such as continue, review, or a decision, also set question and 2 to 6 short options drawn from those real next steps, which become tappable buttons whose label starts the next turn. Omit them when there is genuinely nothing to ask. The user is away from the terminal and sees only this.",
 			};
 		}
 

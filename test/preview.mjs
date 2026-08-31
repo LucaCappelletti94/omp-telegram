@@ -60,6 +60,7 @@ tools.get("ask").execute(
 						preview: "ALTER TABLE idx_new RENAME TO idx;",
 					},
 					{ label: "Leave it", description: "Nightly job retries anyway.", discouraged: true },
+					{ label: "Rebuild synchronously", description: "Blocks writers for minutes.", lukewarm: true },
 				],
 				recommended: 1,
 			},

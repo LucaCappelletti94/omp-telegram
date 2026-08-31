@@ -1021,6 +1021,7 @@ const stanceAsk = {
 				{ label: "the good one", description: "cheapest to maintain" },
 				{ label: "the bad one", description: "here for contrast", discouraged: true },
 				{ label: "bare option" },
+				{ label: "the meh one", description: "works, but slow", lukewarm: true },
 			],
 		},
 	],
@@ -1037,10 +1038,17 @@ check("the discouraged button is labelled", stRows[2][0].text.includes("(discour
 check("neutral buttons carry no marker", !stRows[0][0].text.includes("(") && !stRows[3][0].text.includes("("));
 check("body marks the preferable option the same way", stBody.text.includes("<b>the good one</b> (preferable)"));
 check("body marks the discouraged option the same way", stBody.text.includes("<b>the bad one</b> (discouraged)"));
+check("the lukewarm option carries no colour of its own", stRows[4][0].style === undefined);
+check("the lukewarm button carries the orange marker", stRows[4][0].text.includes("\u{1F7E0} (lukewarm)"));
+check("body marks the lukewarm option the same way", stBody.text.includes("<b>the meh one</b> \u{1F7E0} (lukewarm)"));
 check("a neutral option with nothing to add is omitted from the body", !stBody.text.includes("bare option"));
 check(
 	"the terminal sees the discouraged marker too",
 	stanceParams.params.questions[0].options[2].description.startsWith("(discouraged)"),
+);
+check(
+	"the terminal sees the lukewarm marker too",
+	stanceParams.params.questions[0].options[4].description.startsWith("\u{1F7E0} (lukewarm)"),
 );
 check(
 	"the marker is not lost when there was no description",
@@ -1049,6 +1057,10 @@ check(
 check(
 	"discouraged never reaches the strict native tool",
 	stanceParams.params.questions[0].options.every((o) => !("discouraged" in o)),
+);
+check(
+	"lukewarm never reaches the strict native tool",
+	stanceParams.params.questions[0].options.every((o) => !("lukewarm" in o)),
 );
 check(
 	"neutral descriptions are untouched",
@@ -1067,6 +1079,7 @@ writeFileSync(join(inboxOf(st.id), "970.json"), JSON.stringify({ kind: "callback
 await st.pump(250);
 check("a coloured option still answers normally", (await stRun).details.selectedOptions[0] === "the good one");
 check("tool description explains how to mark desirability", st.tools.get("ask").description.includes("`discouraged`"));
+check("tool description explains the middle stance", st.tools.get("ask").description.includes("`lukewarm`"));
 
 // A marked option with no description must still be listed, since the mark is the information.
 const bareState = {};
@@ -1204,6 +1217,16 @@ check(
 check(
 	"the block explains what to call",
 	firstStop.find((r) => r?.decision === "block").reason.includes("notify_status"),
+);
+check(
+	"the block asks for real next steps and forbids invented ones",
+	firstStop.find((r) => r?.decision === "block").reason.includes("next steps") &&
+		firstStop.find((r) => r?.decision === "block").reason.includes("Never invent"),
+);
+check(
+	"notify_status description asks for real next steps and forbids invented ones",
+	rs.tools.get("notify_status").description.includes("next steps") &&
+		rs.tools.get("notify_status").description.includes("Never invent"),
 );
 check(
 	"after the block the fallback message still goes out",
