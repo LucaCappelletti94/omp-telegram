@@ -27,4 +27,4 @@ In the JSON config, `quietSeconds` (default 45) silences turn end notices while 
 
 ## Answering
 
-Tap a button, reply to a session's message, or send a bare message for the last session that notified you. Unroutable messages are refused with an explanation, and presses on settled questions get a closure notice. Question text renders a Markdown subset: code, fences, bold, italic, strikethrough, spoilers, quotes, links.
+Tap a button, reply to a session's message, or send a bare message for the last session that notified you. Replying to a question message answers it directly in your own words, photos reach the agent as images, and voice notes, audio files, and documents are saved to disk and handed to the agent as file paths. While a turn runs the chat shows a typing status, delivered messages get a thumbs-up reaction, red statuses stay pinned until the next turn, and `/hidequestions` clears open question buttons. Unroutable messages are refused with an explanation, and presses on settled questions get a closure notice. Question text renders a Markdown subset: code, fences, bold, italic, strikethrough, spoilers, quotes, links.

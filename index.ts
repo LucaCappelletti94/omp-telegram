@@ -22,6 +22,7 @@ const LEGACY_LOCK_DIR = join(STATE_DIR, "poller.lock.d");
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
 const PENDING_TOPICS = join(STATE_DIR, "pending-topics.json");
 const INBOX_DIR = join(STATE_DIR, "inbox");
+const MEDIA_DIR = join(STATE_DIR, "media");
 
 const HEARTBEAT_MS = 15_000;
 const LOCK_STALE_MS = 45_000;
@@ -31,6 +32,11 @@ const BUTTON_TEXT_MAX = 60;
 const PREVIEW_MAX = 300;
 const RECENT_MESSAGE_CAP = 60;
 const TELEGRAM_TEXT_MAX = 4096;
+const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
+const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;
+const TYPING_MS = 5_000;
+/** The party-popper send effect, verified against the live API; effects exist in private chats only. */
+const GREEN_EFFECT_ID = "5046509860389126442";
 
 /**
  * Single source for stance marker and colour. Telegram button styles offer only
@@ -79,6 +85,8 @@ interface SessionRecord {
 	recent: number[];
 	/** Standing turn-end question; survives a resume. */
 	standing: { id: string; messageId: number | null; labels: string[] } | null;
+	/** Message pinned for a red status; unpinned when the next turn starts. */
+	pinned: number | null;
 	heartbeat: number;
 }
 
@@ -90,6 +98,10 @@ interface TelegramMessage {
 	reply_to_message?: { message_id: number };
 	text?: string;
 	caption?: string;
+	photo?: Array<{ file_id: string; file_size?: number }>;
+	voice?: { file_id: string; file_size?: number; mime_type?: string };
+	audio?: { file_id: string; file_size?: number; mime_type?: string; file_name?: string };
+	document?: { file_id: string; file_size?: number; mime_type?: string; file_name?: string };
 }
 
 interface TelegramCallbackQuery {
@@ -109,6 +121,7 @@ interface InlineButton {
 	text: string;
 	callback_data: string;
 	style?: "danger" | "success" | "primary";
+	disabled?: Record<string, never>;
 }
 
 interface AskOption {
@@ -168,8 +181,50 @@ interface TurnStatus {
 }
 
 interface InboxEntry {
-	kind: "text" | "callback";
+	kind: "text" | "callback" | "file" | "command";
+	/** Text, callback payload, downloaded file path, or command name. */
 	value: string;
+	/** Incoming Telegram message id, for delivery receipts. */
+	messageId?: number;
+	/** Message id the sender replied to. */
+	replyTo?: number;
+	caption?: string;
+	mime?: string;
+}
+
+interface IncomingFile {
+	fileId: string;
+	mime: string;
+	size?: number;
+	name?: string;
+}
+
+/** Largest photo size wins; Telegram photos are always JPEG. */
+function pickMedia(message: TelegramMessage): IncomingFile | null {
+	const photo = message.photo?.at(-1);
+	if (photo !== undefined) return { fileId: photo.file_id, mime: "image/jpeg", size: photo.file_size };
+	const voice = message.voice;
+	if (voice !== undefined)
+		return { fileId: voice.file_id, mime: voice.mime_type ?? "audio/ogg", size: voice.file_size };
+	const audio = message.audio;
+	if (audio !== undefined) {
+		return {
+			fileId: audio.file_id,
+			mime: audio.mime_type ?? "audio/mpeg",
+			size: audio.file_size,
+			name: audio.file_name,
+		};
+	}
+	const document = message.document;
+	if (document !== undefined) {
+		return {
+			fileId: document.file_id,
+			mime: document.mime_type ?? "application/octet-stream",
+			size: document.file_size,
+			name: document.file_name,
+		};
+	}
+	return null;
 }
 
 /** Temp plus rename: a reader in another omp process must never see a torn file. */
@@ -335,6 +390,16 @@ function questionKeyboard(ask: PendingAsk, question: AskQuestion): InlineButton[
 	return [...packRows(optionButtons), ...packRows(tail)];
 }
 
+/** The options stay visible but dead, with the chosen answers ticked. */
+function settledKeyboard(labels: string[], chosen: Set<string>): InlineButton[][] {
+	return packRows(
+		labels.map((label) => ({
+			text: `${chosen.has(label) ? "\u2713 " : ""}${label}`.slice(0, BUTTON_TEXT_MAX),
+			callback_data: "x",
+		})),
+	);
+}
+
 export default function notifyTelegram(pi: ExtensionAPI): void {
 	const z = pi.zod;
 
@@ -357,6 +422,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let topicName = "";
 	const recentMessages: number[] = [];
 	let lastNotifiedAt = 0;
+	let turnActive = false;
+	let typingSentAt = 0;
+	let pinnedMessageId: number | null = null;
+	let topicIcons: Array<{ emoji?: string; custom_emoji_id?: string }> | null = null;
 
 	/** A rejected detached promise is fatal in omp. */
 	function detach(work: Promise<unknown>, label: string): void {
@@ -398,7 +467,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 		if (sent === null) {
 			pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method });
-			sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...body, text: source }, 15_000);
+			const { message_effect_id: _effect, ...safe } = body;
+			sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: source }, 15_000);
 		}
 		if (method === "sendMessage" && typeof sent?.message_id === "number") {
 			recentMessages.push(sent.message_id);
@@ -421,6 +491,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			lastNotified: lastNotifiedAt,
 			recent: [...recentMessages],
 			standing: standingQuestion,
+			pinned: pinnedMessageId,
 			heartbeat: Date.now(),
 		};
 		writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(record));
@@ -489,6 +560,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (record !== null && Date.now() - record.heartbeat <= LOCK_STALE_MS) continue;
 			unlinkSync(join(SESSIONS_DIR, entry));
 			rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
+		}
+	}
+
+	/** Downloaded Telegram files are working input, not an archive. */
+	function reapOldMedia(): void {
+		if (!existsSync(MEDIA_DIR)) return;
+		for (const entry of readdirSync(MEDIA_DIR)) {
+			const path = join(MEDIA_DIR, entry);
+			try {
+				if (Date.now() - statSync(path).mtimeMs > MEDIA_KEEP_MS) unlinkSync(path);
+			} catch {}
 		}
 	}
 
@@ -562,11 +644,72 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await callTelegram(config, "sendMessage", body, 15_000);
 	}
 
-	async function notify(ctx: ExtensionContext, title: string, body: string): Promise<void> {
-		if (config === null) return;
-		await sendOrEdit(config, "sendMessage", threaded({}), withHead(ctx, title, body));
+	async function notify(
+		ctx: ExtensionContext,
+		title: string,
+		body: string,
+		extra: Record<string, unknown> = {},
+	): Promise<TelegramMessage | null> {
+		if (config === null) return null;
+		const sent = await sendOrEdit(config, "sendMessage", threaded(extra), withHead(ctx, title, body));
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
+		return sent;
+	}
+
+	/** The typing status lasts about five seconds; refresh while a turn runs and nothing waits on the user. */
+	function maybeType(): void {
+		if (config === null || !turnActive || pendingAsk !== null) return;
+		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
+		if (Date.now() - typingSentAt < TYPING_MS) return;
+		typingSentAt = Date.now();
+		detach(callTelegram(config, "sendChatAction", threaded({ action: "typing" }), 10_000), "typing action");
+	}
+
+	/** A thumbs-up on the delivered message: received, the turn is running. */
+	function ackDelivered(messageId: number | undefined): void {
+		if (config === null || typeof messageId !== "number") return;
+		turnActive = true;
+		detach(
+			callTelegram(
+				config,
+				"setMessageReaction",
+				{ chat_id: config.chatId, message_id: messageId, reaction: [{ type: "emoji", emoji: "\u{1F44D}" }] },
+				10_000,
+			),
+			"delivery receipt",
+		);
+	}
+
+	/** Green gets the celebration effect; red gets pinned by the caller. */
+	function urgencyExtras(urgency: TurnStatus["urgency"]): Record<string, unknown> {
+		if (urgency !== "green" || config === null || config.chatId <= 0) return {};
+		return { message_effect_id: GREEN_EFFECT_ID };
+	}
+
+	/** A red status stays pinned until the next turn touches the session. */
+	async function pinRed(ctx: ExtensionContext, sent: TelegramMessage | null): Promise<void> {
+		if (config === null || typeof sent?.message_id !== "number") return;
+		unpinRed(ctx);
+		await callTelegram(
+			config,
+			"pinChatMessage",
+			{ chat_id: config.chatId, message_id: sent.message_id, disable_notification: true },
+			10_000,
+		);
+		pinnedMessageId = sent.message_id;
+		writeSessionRecord(ctx);
+	}
+
+	function unpinRed(ctx: ExtensionContext): void {
+		if (config === null || pinnedMessageId === null) return;
+		const messageId = pinnedMessageId;
+		pinnedMessageId = null;
+		writeSessionRecord(ctx);
+		detach(
+			callTelegram(config, "unpinChatMessage", { chat_id: config.chatId, message_id: messageId }, 10_000),
+			"unpin",
+		);
 	}
 
 	async function ensureTopic(ctx: ExtensionContext): Promise<void> {
@@ -580,10 +723,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const colours = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047];
 		const index = Math.max(0, BADGE_PALETTE.indexOf(badgeEmoji)) % colours.length;
 		const name = badge(ctx).slice(0, 128);
+		if (topicIcons === null) {
+			const stickers = await callTelegram<Array<{ emoji?: string; custom_emoji_id?: string }>>(
+				config,
+				"getForumTopicIconStickers",
+				{},
+				15_000,
+			);
+			topicIcons = Array.isArray(stickers) ? stickers : [];
+		}
+		const icon = topicIcons.find((sticker) => sticker.emoji === badgeEmoji)?.custom_emoji_id;
 		const created = await callTelegram<unknown>(
 			config,
 			"createForumTopic",
-			{ chat_id: config.chatId, name, icon_color: colours[index] },
+			{
+				chat_id: config.chatId,
+				name,
+				icon_color: colours[index],
+				...(typeof icon === "string" ? { icon_custom_emoji_id: icon } : {}),
+			},
 			15_000,
 		);
 		const thread =
@@ -708,6 +866,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		writeFileAtomic(join(dir, `${updateId}.json`), JSON.stringify(entry));
 	}
 
+	/** Bot API refuses getFile beyond 20 MB; larger uploads get a notice instead of silence. */
+	async function downloadMedia(cfg: Config, media: IncomingFile, updateId: number): Promise<string | null> {
+		if (media.size !== undefined && media.size > MEDIA_MAX_BYTES) return null;
+		const file = await callTelegram<{ file_path?: string }>(cfg, "getFile", { file_id: media.fileId }, 30_000);
+		const remote = file?.file_path;
+		if (typeof remote !== "string" || remote.length === 0) return null;
+		const response = await fetch(`https://api.telegram.org/file/bot${cfg.token}/${remote}`, {
+			signal: AbortSignal.timeout(60_000),
+		});
+		if (!response.ok) return null;
+		const bytes = new Uint8Array(await response.arrayBuffer());
+		if (bytes.byteLength > MEDIA_MAX_BYTES) return null;
+		const base = (media.name ?? remote).split("/").at(-1) ?? "file";
+		const safe = base.replaceAll(/[^\w.-]/gu, "_").slice(-80);
+		mkdirSync(MEDIA_DIR, { recursive: true });
+		const path = join(MEDIA_DIR, `${updateId}-${safe}`);
+		writeFileSync(path, bytes);
+		return path;
+	}
+
 	async function pollOnce(): Promise<void> {
 		if (config === null || pollInFlight) return;
 		pollInFlight = true;
@@ -732,8 +910,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						});
 						continue;
 					}
-					await callTelegram(config, "answerCallbackQuery", { callback_query_id: callback.id }, 10_000);
 					const owner = routeByAskId(callback.data.split(":")[1] ?? "");
+					await callTelegram(
+						config,
+						"answerCallbackQuery",
+						{
+							callback_query_id: callback.id,
+							text:
+								owner === null
+									? "That question's session is gone."
+									: callback.data.startsWith("c:")
+										? "Starting the next turn."
+										: "Answer recorded.",
+						},
+						10_000,
+					);
 					if (owner !== null) deliver(owner, update.update_id, { kind: "callback", value: callback.data });
 					continue;
 				}
@@ -744,16 +935,54 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					pi.logger.warn("telegram: rejected a message from an unexpected chat", { chat: message.chat.id });
 					continue;
 				}
+				const thread = message.message_thread_id;
+				const replyTo = message.reply_to_message?.message_id;
 				const text = message.text ?? message.caption;
+
+				if (typeof text === "string" && /^\/hidequestions\b/u.test(text.trim())) {
+					const scoped = thread === undefined ? null : routeMessage(thread, replyTo);
+					const targets =
+						scoped !== null
+							? [scoped]
+							: allRecords()
+									.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
+									.map(({ id }) => id);
+					for (const target of targets) {
+						deliver(target, update.update_id, { kind: "command", value: "hidequestions" });
+					}
+					continue;
+				}
+
+				const media = pickMedia(message);
+				if (media !== null) {
+					const target = routeMessage(thread, replyTo);
+					if (target === null) {
+						await serviceNotice("No live omp session owns that message, so it was dropped.", thread);
+						continue;
+					}
+					const saved = await downloadMedia(config, media, update.update_id);
+					if (saved === null) {
+						await serviceNotice("That file could not be fetched (20 MB is the ceiling), so it was dropped.", thread);
+						continue;
+					}
+					deliver(target, update.update_id, {
+						kind: "file",
+						value: saved,
+						mime: media.mime,
+						caption: message.caption,
+						messageId: message.message_id,
+						replyTo,
+					});
+					continue;
+				}
+
 				if (text === undefined || text.length === 0) {
 					await serviceNotice(
-						"Only text reaches the agent. Add a caption, or send the content as text.",
-						message.message_thread_id,
+						"That message type does not reach the agent. Send text, a photo, a voice note, an audio file, or a document.",
+						thread,
 					);
 					continue;
 				}
-				const thread = message.message_thread_id;
-				const replyTo = message.reply_to_message?.message_id;
 
 				const target = routeMessage(thread, replyTo);
 				if (target === null) {
@@ -763,7 +992,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					);
 					continue;
 				}
-				deliver(target, update.update_id, { kind: "text", value: text });
+				deliver(target, update.update_id, {
+					kind: "text",
+					value: text,
+					messageId: message.message_id,
+					replyTo,
+				});
 			}
 			config.offset = highest + 1;
 			persistOffset(config.offset);
@@ -802,7 +1036,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			blocks.push(lines.join("\n"));
 		}
 		const body = blocks.join("\n\n");
-		const markup = { inline_keyboard: questionKeyboard(ask, question) };
+		const markup = { inline_keyboard: questionKeyboard(ask, question), force_reply: true };
 
 		if (edit && ask.messageId !== null) {
 			await sendOrEdit(
@@ -817,23 +1051,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		ask.messageId = sentMessage?.message_id ?? null;
 	}
 
-	/** The empty keyboard is deliberate: clearing by omission is undocumented. */
-	async function closeAskMessage(messageId: number | null, text: string): Promise<void> {
+	/** Settled options survive as dead grey buttons; the empty keyboard elsewhere is deliberate, since clearing by omission is undocumented. */
+	async function closeAskMessage(messageId: number | null, text: string, keep?: InlineButton[][]): Promise<void> {
 		if (config === null || messageId === null) return;
+		const inline_keyboard =
+			keep === undefined
+				? []
+				: keep.map((row) => row.map((button) => ({ ...button, callback_data: "x", disabled: {} })));
 		await sendOrEdit(
 			config,
 			"editMessageText",
-			{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } },
+			{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard } },
 			text,
 		);
 	}
 
 	/** Blocks nothing: a press starts the next turn. Only the latest stands. */
-	async function sendStandingQuestion(
-		ctx: ExtensionContext,
-		title: string,
-		recorded: { text: string; question?: string; options?: string[] },
-	): Promise<void> {
+	async function sendStandingQuestion(ctx: ExtensionContext, title: string, recorded: TurnStatus): Promise<void> {
 		if (config === null || recorded.options === undefined) return;
 		const superseded = standingQuestion;
 		standingSeq += 1;
@@ -852,12 +1086,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const sent = await sendOrEdit(
 			config,
 			"sendMessage",
-			threaded({ reply_markup: { inline_keyboard: keyboard } }),
+			threaded({
+				reply_markup: { inline_keyboard: keyboard, force_reply: true },
+				...urgencyExtras(recorded.urgency),
+			}),
 			body,
 		);
 		standingQuestion = { id, messageId: sent?.message_id ?? null, labels: recorded.options };
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
+		if (recorded.urgency === "red") await pinRed(ctx, sent);
 		if (superseded !== null) {
 			await closeAskMessage(superseded.messageId, "Superseded by a newer question.");
 		}
@@ -880,7 +1118,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const chosen = [...(ask.selected[ask.index] ?? new Set<string>())];
 		const shown = ask.custom[ask.index] ?? (chosen.length === 0 ? "no selection" : chosen.join(", "));
 		if (answered !== undefined) {
-			await closeAskMessage(ask.messageId, `${answered.question}\n\n**Answered:** ${shown}`);
+			const labels = answered.options.map((option) => option.label);
+			await closeAskMessage(
+				ask.messageId,
+				`${answered.question}\n\n**Answered:** ${shown}`,
+				settledKeyboard(labels, new Set(chosen)),
+			);
 		}
 		ask.messageId = null;
 		ask.index += 1;
@@ -962,6 +1205,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (typeof entry.value !== "string" || entry.value.length === 0) continue;
 
 				const ask = pendingAsk;
+				if (entry.kind === "command") {
+					if (entry.value === "hidequestions") {
+						if (ask !== null && ask.messageId !== null) {
+							await closeAskMessage(ask.messageId, "Question hidden. It stays open at the terminal.");
+							ask.messageId = null;
+						}
+						const standing = standingQuestion;
+						if (standing !== null) {
+							standingQuestion = null;
+							await closeAskMessage(standing.messageId, "Question hidden.");
+						}
+					}
+					continue;
+				}
 				if (entry.kind === "callback" && entry.value.startsWith("c:")) {
 					const [, choiceId, rawIndex] = entry.value.split(":");
 					const standing = standingQuestion;
@@ -969,7 +1226,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						const label = standing.labels[Number.parseInt(rawIndex ?? "", 10)];
 						standingQuestion = null;
 						if (label !== undefined) {
-							await closeAskMessage(standing.messageId, `**Chosen:** ${label}`);
+							await closeAskMessage(
+								standing.messageId,
+								`**Chosen:** ${label}`,
+								settledKeyboard(standing.labels, new Set([label])),
+							);
+							turnActive = true;
 							pi.sendUserMessage(label);
 						}
 					} else {
@@ -982,7 +1244,33 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					else await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
 					continue;
 				}
-				if (ask?.awaitingText) {
+				if (entry.kind === "file") {
+					const caption = typeof entry.caption === "string" ? entry.caption.trim() : "";
+					if (entry.mime?.startsWith("image/") === true) {
+						let data = "";
+						try {
+							data = readFileSync(entry.value).toString("base64");
+						} catch {}
+						if (data.length === 0) continue;
+						pi.sendUserMessage(
+							[
+								{ type: "image", data, mimeType: entry.mime },
+								{ type: "text", text: caption.length > 0 ? caption : "(image sent from Telegram)" },
+							],
+							{ deliverAs: "steer" },
+						);
+					} else {
+						const tail = caption.length > 0 ? ` Caption: ${caption}` : "";
+						pi.sendUserMessage(
+							`The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`,
+							{ deliverAs: "steer" },
+						);
+					}
+					ackDelivered(entry.messageId);
+					continue;
+				}
+				const isReplyToQuestion = ask !== null && typeof entry.replyTo === "number" && entry.replyTo === ask.messageId;
+				if (ask !== null && (ask.awaitingText || isReplyToQuestion)) {
 					ask.awaitingText = false;
 					ask.custom[ask.index] = entry.value;
 					ask.selected[ask.index] = new Set<string>();
@@ -990,6 +1278,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					continue;
 				}
 				pi.sendUserMessage(entry.value, { deliverAs: "steer" });
+				ackDelivered(entry.messageId);
 			}
 		} finally {
 			drainInFlight = false;
@@ -1188,6 +1477,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		mkdirSync(SESSIONS_DIR, { recursive: true });
 		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true });
 		reapDeadSessions();
+		reapOldMedia();
 		sessionTag = claimTag();
 		badgeEmoji = claimBadge();
 		const previous = readSessionRecord(sessionId);
@@ -1199,12 +1489,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			recentMessages.push(...previous.recent.filter((n): n is number => typeof n === "number"));
 		}
 		lastNotifiedAt = typeof previous?.lastNotified === "number" ? previous.lastNotified : 0;
+		pinnedMessageId = typeof previous?.pinned === "number" ? previous.pinned : null;
 		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
 			rmSync(LOCK_FILE, { recursive: true, force: true });
 		}
 		rmSync(LEGACY_LOCK_DIR, { recursive: true, force: true });
 		writeSessionRecord(ctx);
 		acquireLock();
+
+		detach(
+			callTelegram(
+				config,
+				"setMyCommands",
+				{ commands: [{ command: "hidequestions", description: "Hide open question buttons" }] },
+				15_000,
+			),
+			"command menu",
+		);
 
 		if (ctx.hasUI) {
 			unsubscribeInput = ctx.ui.onTerminalInput(() => {
@@ -1229,6 +1530,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		ctx.setInterval(() => {
 			try {
 				detach(drainInbox(), "inbox drain");
+				maybeType();
 				// Re-read rather than trusting a boolean: two pollers caused 918 Telegram conflicts.
 				if (ownsLock()) detach(pollOnce(), "telegram poll");
 			} catch (error) {
@@ -1252,6 +1554,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("input", async (_event, ctx) => {
 		turnSummary = null;
 		statusBlockUsed = false;
+		turnActive = true;
+		typingSentAt = 0;
+		unpinRed(ctx);
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
@@ -1261,6 +1566,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_stop", async (_event, ctx) => {
+		turnActive = false;
 		if (config === null || !config.notifyOnTurnEnd) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
 		const where = tmuxLocation();
@@ -1275,7 +1581,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const recorded = turnSummary;
 			turnSummary = null;
 			if (recorded.options === undefined) {
-				detach(notify(ctx, `${heads[recorded.urgency]}${suffix}`, recorded.text), "turn-end notice");
+				const work = notify(
+					ctx,
+					`${heads[recorded.urgency]}${suffix}`,
+					recorded.text,
+					urgencyExtras(recorded.urgency),
+				).then((sent) => (recorded.urgency === "red" ? pinRed(ctx, sent) : undefined));
+				detach(work, "turn-end notice");
 				return;
 			}
 			detach(sendStandingQuestion(ctx, heads[recorded.urgency] + suffix, recorded), "turn-end question");

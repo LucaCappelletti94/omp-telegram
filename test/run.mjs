@@ -37,8 +37,13 @@ const api = {
 	topicsEnabled: true,
 	nextTopic: 900,
 	nextMessage: 7,
+	icons: null,
 };
 globalThis.fetch = async (url, init) => {
+	if (String(url).includes("/file/bot")) {
+		api.calls.push({ method: "fileDownload", body: { url: String(url) } });
+		return { ok: true, arrayBuffer: async () => new TextEncoder().encode("fake-image-bytes").buffer };
+	}
 	const method = String(url).split("/").pop();
 	const body = JSON.parse(init.body);
 	api.calls.push({ method, body });
@@ -55,7 +60,11 @@ globalThis.fetch = async (url, init) => {
 				? { message_id: api.nextMessage++ }
 				: method === "createForumTopic"
 					? { message_thread_id: api.nextTopic++ }
-					: true;
+					: method === "getFile"
+						? { file_path: "documents/file_9.oga" }
+						: method === "getForumTopicIconStickers"
+							? (api.icons ?? [])
+							: true;
 	return { ok: true, json: async () => ({ ok: true, result }) };
 };
 
@@ -896,27 +905,64 @@ const hugeRun = mdSession.tools
 await settle(200);
 check("an oversized message is shrunk below the telegram ceiling", lastCall("sendMessage").body.text.length <= 4096);
 
-// A non-text message is answered rather than dropped.
+// Media reaches the agent: photos as images, voice and documents as saved file paths.
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 const voiceSession = spawn("01a03e02-0000-0000-0000-000000000000", "/home/dev/work/ds4");
 await voiceSession.fire("session_start");
-api.queued = [{ update_id: 500, message: { message_id: 70, date: 1, chat: { id: CHAT }, voice: { file_id: "x" } } }];
-const beforeVoice = called("sendMessage").length;
-await voiceSession.pump(250);
-check("a voice note gets an explanation instead of silence", called("sendMessage").length === beforeVoice + 1);
-check("the explanation says text is required", lastCall("sendMessage").body.text.includes("Only text"));
 api.queued = [
 	{
-		update_id: 501,
-		message: { message_id: 71, date: 1, chat: { id: CHAT }, photo: [{ file_id: "y" }], caption: "look at this" },
+		update_id: 500,
+		message: { message_id: 70, date: 1, chat: { id: CHAT }, voice: { file_id: "x", mime_type: "audio/ogg" } },
 	},
 ];
-const beforeCaption = called("sendMessage").length;
-const inboxTotal = () => readdirSync(join(root, "notify-telegram/inbox")).reduce((n, d) => n + inboxCount(d), 0);
-const captionBefore = inboxTotal();
 await voiceSession.pump(250);
-check("a photo caption is accepted as text", inboxTotal() === captionBefore + 1);
-check("a caption is not refused as unsupported", called("sendMessage").length === beforeCaption);
+await voiceSession.pump(250);
+check(
+	"a voice note is fetched from telegram",
+	called("getFile").some((c) => c.body.file_id === "x"),
+);
+const mediaDir = join(root, "notify-telegram/media");
+check("the audio lands on disk", existsSync(mediaDir) && readdirSync(mediaDir).length > 0);
+
+// Drain side, delivered directly: an image becomes an image block, other files travel as paths.
+mkdirSync(mediaDir, { recursive: true });
+const photoPath = join(mediaDir, "photo-test.png");
+writeFileSync(photoPath, "not-really-png");
+writeFileSync(
+	join(inboxOf(voiceSession.id), "502.json"),
+	JSON.stringify({ kind: "file", value: photoPath, mime: "image/png", caption: "look at this", messageId: 71 }),
+);
+await voiceSession.pump(250);
+const photoSteer = voiceSession.steers.at(-1);
+check(
+	"a photo reaches the agent as an image block",
+	Array.isArray(photoSteer?.text) && photoSteer.text[0].type === "image",
+);
+check(
+	"the image data is the file, base64",
+	photoSteer.text[0].data === Buffer.from("not-really-png").toString("base64"),
+);
+check("the caption rides along", photoSteer.text[1].text === "look at this");
+check("the image is steered into the running turn", photoSteer.options.deliverAs === "steer");
+check("delivery is acknowledged with a reaction", lastCall("setMessageReaction").body.message_id === 71);
+
+const filePath = join(mediaDir, "notes.oga");
+writeFileSync(filePath, "opus");
+writeFileSync(
+	join(inboxOf(voiceSession.id), "503.json"),
+	JSON.stringify({ kind: "file", value: filePath, mime: "audio/ogg", messageId: 72 }),
+);
+await voiceSession.pump(250);
+const fileSteer = voiceSession.steers.at(-1);
+check("audio travels as its saved path", typeof fileSteer?.text === "string" && fileSteer.text.includes(filePath));
+check("the mime type is named", fileSteer.text.includes("audio/ogg"));
+
+// A message type nothing handles is answered rather than dropped.
+api.queued = [{ update_id: 504, message: { message_id: 73, date: 1, chat: { id: CHAT }, sticker: { file_id: "s" } } }];
+const beforeSticker = called("sendMessage").length;
+await voiceSession.pump(250);
+check("an unsupported type gets an explanation", called("sendMessage").length === beforeSticker + 1);
+check("the explanation lists what works", lastCall("sendMessage").body.text.includes("photo"));
 
 // ------------------------------------------------------ terminal cancellation and closure
 heading("cancellation and message closure");
@@ -996,8 +1042,12 @@ writeFileSync(join(inboxOf(esc.id), "960.json"), JSON.stringify({ kind: "callbac
 await esc.pump(250);
 const firstClosed = lastCall("editMessageText");
 check(
-	"the first question's keyboard is cleared when it is answered",
-	firstClosed.body.reply_markup.inline_keyboard.length === 0,
+	"the answered question keeps its options as dead buttons",
+	firstClosed.body.reply_markup.inline_keyboard.flat().every((b) => b.disabled !== undefined),
+);
+check(
+	"the chosen option is ticked",
+	firstClosed.body.reply_markup.inline_keyboard.flat().some((b) => b.text === "\u2713 y"),
 );
 check("the first question shows its answer", firstClosed.body.text.includes("Answered:"));
 writeFileSync(join(inboxOf(esc.id), "961.json"), JSON.stringify({ kind: "callback", value: `o:${walkAsk}:1:0` }));
@@ -1323,7 +1373,11 @@ check(
 	"the question message is retired with the choice",
 	retired.body.text.includes("Chosen:") && retired.body.text.includes("Review the diff"),
 );
-check("its keyboard is cleared", retired.body.reply_markup.inline_keyboard.length === 0);
+check(
+	"its options stay visible but dead, the choice ticked",
+	retired.body.reply_markup.inline_keyboard.flat().every((b) => b.disabled !== undefined) &&
+		retired.body.reply_markup.inline_keyboard.flat().some((b) => b.text === "\u2713 Review the diff"),
+);
 
 // A second press on the same, now cleared, question is told it is closed.
 writeFileSync(join(inboxOf(tq.id), "991.json"), JSON.stringify({ kind: "callback", value: tqButton.callback_data }));
@@ -1516,6 +1570,150 @@ await rrBack.pump(250);
 check("a stale record does not win recency routing", inboxCount(staleId) === 0);
 check("routing does not delete the stale record", existsSync(join(sessionsDir, `${staleId}.json`)));
 unlinkSync(join(sessionsDir, `${staleId}.json`));
+
+heading("remote interaction upgrades");
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const ux = spawn("01a04800-0000-0000-0000-000000000000", "/home/dev/work/pgvector");
+await ux.fire("session_start");
+check("the command menu is registered", called("setMyCommands").length > 0);
+
+// Typing indicator while a turn runs.
+const typingBefore = called("sendChatAction").length;
+await ux.fire("input");
+await ux.pump(150);
+check("a running turn shows a typing status", called("sendChatAction").length > typingBefore);
+check("the action is typing", lastCall("sendChatAction").body.action === "typing");
+
+// A text reply to the question message answers it, no button needed.
+const uxState = {};
+const uxRun = ux.tools
+	.get("ask")
+	.execute(
+		"ux1",
+		{ questions: [{ id: "q", question: "Deploy how?", options: [{ label: "Canary" }, { label: "Full" }] }] },
+		undefined,
+		undefined,
+		stubbornCtx(ux.ctx, uxState),
+	);
+await settle(150);
+const uxMsg = lastCall("sendMessage").body;
+const uxMsgId = api.nextMessage - 1;
+check("the question opens the reply interface", uxMsg.reply_markup.force_reply === true);
+writeFileSync(
+	join(inboxOf(ux.id), "600.json"),
+	JSON.stringify({ kind: "text", value: "canary, but watch the p99", replyTo: uxMsgId, messageId: 80 }),
+);
+await ux.pump(250);
+const uxResult = await uxRun;
+check("a reply to the question answers it", uxResult.details.customInput === "canary, but watch the p99");
+check("the reply is not steered into the turn", !ux.steers.some((s) => s.text === "canary, but watch the p99"));
+
+// A steer is acknowledged with a reaction.
+writeFileSync(
+	join(inboxOf(ux.id), "601.json"),
+	JSON.stringify({ kind: "text", value: "also bump the deps", messageId: 81 }),
+);
+await ux.pump(250);
+check(
+	"a steer reaches the agent",
+	ux.steers.some((s) => s.text === "also bump the deps"),
+);
+check("and is acknowledged with a thumbs up", lastCall("setMessageReaction").body.message_id === 81);
+
+// Button presses through the poller answer with a toast.
+await ux.fire("input");
+await ux.tools
+	.get("notify_status")
+	.execute("ux2", { summary: "Pick one.", urgency: "orange", options: ["Go", "Stop"] }, undefined, undefined, ux.ctx);
+await ux.fire("session_stop");
+await settle(150);
+const uxStanding = lastCall("sendMessage").body;
+check("the standing question opens the reply interface too", uxStanding.reply_markup.force_reply === true);
+const uxGo = uxStanding.reply_markup.inline_keyboard.flat()[0];
+api.queued = [
+	{
+		update_id: 610,
+		callback_query: {
+			id: "cbux",
+			data: uxGo.callback_data,
+			from: { id: CHAT },
+			message: { message_id: 7, chat: { id: CHAT } },
+		},
+	},
+];
+await ux.pump(250);
+await ux.pump(250);
+const uxToast = called("answerCallbackQuery").find((c) => c.body.callback_query_id === "cbux");
+check(
+	"a standing press answers with a toast",
+	uxToast !== undefined && uxToast.body.text === "Starting the next turn.",
+);
+
+// hidequestions closes the open buttons.
+await ux.fire("input");
+await ux.tools
+	.get("notify_status")
+	.execute("ux3", { summary: "Choose.", urgency: "orange", options: ["A", "B"] }, undefined, undefined, ux.ctx);
+await ux.fire("session_stop");
+await settle(150);
+api.queued = [{ update_id: 611, message: { message_id: 82, date: 1, chat: { id: CHAT }, text: "/hidequestions" } }];
+await ux.pump(250);
+await ux.pump(250);
+check(
+	"hidequestions retires the standing question",
+	called("editMessageText").some((c) => c.body.text.includes("Question hidden")),
+);
+
+// Red statuses pin until the next turn.
+await ux.fire("input");
+await ux.tools
+	.get("notify_status")
+	.execute("ux4", { summary: "Blocked on credentials.", urgency: "red" }, undefined, undefined, ux.ctx);
+await ux.fire("session_stop");
+await settle(200);
+const pinnedCall = lastCall("pinChatMessage");
+check("a red status is pinned", pinnedCall !== undefined && typeof pinnedCall.body.message_id === "number");
+check("the pin is recorded for the next session", record(ux.id).pinned === pinnedCall.body.message_id);
+await ux.fire("input");
+await settle(150);
+check("the next turn unpins it", lastCall("unpinChatMessage").body.message_id === pinnedCall.body.message_id);
+check("the record clears", record(ux.id).pinned === null);
+
+// Green statuses celebrate.
+await ux.tools
+	.get("notify_status")
+	.execute("ux5", { summary: "All 14 tests pass, nothing remains.", urgency: "green" }, undefined, undefined, ux.ctx);
+await ux.fire("session_stop");
+await settle(150);
+const green = called("sendMessage").findLast(
+	(c) => typeof c.body.text === "string" && c.body.text.includes("nothing remains"),
+);
+check("a green status carries the celebration effect", green?.body.message_effect_id === "5046509860389126442");
+
+// Topic icons match the badge when the free icon set has it.
+api.topicsEnabled = true;
+api.icons = [
+	"\u{1F98A}",
+	"\u{1F419}",
+	"\u{1F335}",
+	"\u{1F3B8}",
+	"\u{1F680}",
+	"\u{1F41D}",
+	"\u{1F344}",
+	"\u{1F9ED}",
+	"\u{1F42C}",
+	"\u{1F3A9}",
+	"\u{1F9F2}",
+	"\u{1F94C}",
+].map((emoji) => ({ emoji, custom_emoji_id: `icon-${emoji}` }));
+const iconic = spawn("01a04900-0000-0000-0000-000000000000", "/home/dev/work/duckpond");
+await iconic.fire("session_start");
+check(
+	"the topic icon matches the badge emoji",
+	lastCall("createForumTopic").body.icon_custom_emoji_id === `icon-${record(iconic.id).emoji}`,
+);
+api.topicsEnabled = false;
+api.icons = null;
 
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
