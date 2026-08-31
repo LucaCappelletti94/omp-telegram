@@ -20,7 +20,7 @@ jobs:
           omp --version
           d=$(mktemp -d)
           printf 'extensions: \n  - %s\n' "$GITHUB_WORKSPACE" > "$d/config.yml"
-          printf '{"token":"000000000000000000000000000000","chatId":1,"offset":1}' > "$d/notify-telegram.json"
+          printf '{"token":"12345:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","chatId":1,"offset":1}' > "$d/notify-telegram.json"
           printf '%s\n' \
             "providers:" \
             "  stub:" \
