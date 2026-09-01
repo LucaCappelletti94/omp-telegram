@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
 	chmodSync,
 	existsSync,
@@ -317,6 +317,42 @@ function toTelegramHtml(source: string): string {
 	return work.replace(/\u0000(\d+)\u0000/g, (_match, index: string) => blocks[Number(index)] ?? "");
 }
 
+/** Best-effort question texts from a half-streamed ask tool-call JSON, tolerant of a cut mid-string. */
+function extractQuestionPreviews(partialJson: string): string[] {
+	const previews: string[] = [];
+	const opener = /(?<!\\)"question"\s*:\s*"/g;
+	let match = opener.exec(partialJson);
+	while (match !== null) {
+		let i = opener.lastIndex;
+		let out = "";
+		let closed = false;
+		while (i < partialJson.length && !closed) {
+			const ch = partialJson[i] ?? "";
+			if (ch === '"') {
+				closed = true;
+			} else if (ch === "\\") {
+				const esc = partialJson[i + 1];
+				if (esc === undefined) break;
+				if (esc === "u") {
+					const hex = partialJson.slice(i + 2, i + 6);
+					if (!/^[0-9a-fA-F]{4}$/u.test(hex)) break;
+					out += String.fromCharCode(Number.parseInt(hex, 16));
+					i += 6;
+				} else {
+					out += esc === "n" ? "\n" : esc === "t" ? "\t" : esc;
+					i += 2;
+				}
+			} else {
+				out += ch;
+				i += 1;
+			}
+		}
+		if (out.trim().length > 0) previews.push(out);
+		match = opener.exec(partialJson);
+	}
+	return previews;
+}
+
 interface TelegramFailure {
 	method: string;
 	status: number;
@@ -450,6 +486,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let draftDirty = false;
 	let draftSentAt = 0;
 	let currentTool = "";
+	let askStream: { index: number; buffer: string } | null = null;
+	let askPreview = "";
 	let turnInput = 0;
 	let turnOutput = 0;
 	let turnCost = 0;
@@ -647,6 +685,58 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** Puts this session's window in front for the user's return, but never while they are typing elsewhere. */
+	function focusTmuxWindow(): void {
+		if (config === null || Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
+		const pane = process.env.TMUX_PANE;
+		if (process.env.TMUX === undefined || pane === undefined) return;
+		try {
+			execFileSync("tmux", ["select-window", "-t", pane], { timeout: 2000 });
+		} catch {}
+	}
+
+	/** Offered on green summaries: everything is done, so the session may be shut down from the phone. */
+	function closeSessionButton(): InlineButton {
+		const label = process.env.TMUX === undefined ? "Close this session" : "Close this session and its tmux tab";
+		return { text: label, callback_data: `k:${sessionTag}`, style: "danger" };
+	}
+
+	/** A detached shell outlives omp, so the window dies only after the process has exited. */
+	function scheduleTmuxWindowKill(): void {
+		const pane = process.env.TMUX_PANE;
+		if (process.env.TMUX === undefined || pane === undefined) return;
+		let windowId = "";
+		try {
+			windowId = execFileSync("tmux", ["display-message", "-p", "-t", pane, "#{window_id}"], { timeout: 2000 })
+				.toString()
+				.trim();
+		} catch {
+			return;
+		}
+		if (!/^@\d+$/u.test(windowId)) return;
+		try {
+			spawn("sh", ["-c", `sleep 2; exec tmux kill-window -t '${windowId}'`], {
+				detached: true,
+				stdio: "ignore",
+			}).unref();
+		} catch {}
+	}
+
+	/** The green-summary close button: strip the button, then let the ordinary shutdown path run. */
+	async function closeSessionFromTelegram(messageId: number | undefined): Promise<void> {
+		if (config !== null && typeof messageId === "number" && standingQuestion?.messageId !== messageId) {
+			// A standing question is rewritten by session_shutdown; a plain summary only loses its button.
+			await callTelegram(
+				config,
+				"editMessageReplyMarkup",
+				{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } },
+				10_000,
+			);
+		}
+		scheduleTmuxWindowKill();
+		sessionCtx?.shutdown();
+	}
+
 	/** One line per omp window, read from the same pane titles that drive the tmux tabs. */
 	function fleetReport(): string | null {
 		if (process.env.TMUX === undefined) return null;
@@ -785,12 +875,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!draftDirty || Date.now() - draftSentAt < DRAFT_MS) return;
 		draftDirty = false;
 		draftSentAt = Date.now();
-		const tool = currentTool.length > 0 ? `\u25B8 ${currentTool}` : "";
-		let tail = draftText.length > 3500 ? draftText.slice(-3500) : draftText;
-		// A raw slice can open on the low half of a surrogate pair, which is invalid JSON.
-		const lead = tail.charCodeAt(0);
-		if (lead >= 0xdc00 && lead <= 0xdfff) tail = tail.slice(1);
-		const text = [tail, tool].filter((part) => part.length > 0).join("\n\n");
+		let text: string;
+		if (askPreview.length > 0) {
+			// The header leads, so the preview truncates from the tail, unlike the prose stream.
+			text = askPreview.length > 3500 ? askPreview.slice(0, 3500) : askPreview;
+			const last = text.charCodeAt(text.length - 1);
+			if (last >= 0xd800 && last <= 0xdbff) text = text.slice(0, -1);
+		} else {
+			const tool = currentTool.length > 0 ? `\u25B8 ${currentTool}` : "";
+			let tail = draftText.length > 3500 ? draftText.slice(-3500) : draftText;
+			// A raw slice can open on the low half of a surrogate pair, which is invalid JSON.
+			const lead = tail.charCodeAt(0);
+			if (lead >= 0xdc00 && lead <= 0xdfff) tail = tail.slice(1);
+			text = [tail, tool].filter((part) => part.length > 0).join("\n\n");
+		}
 		const cfg = config;
 		const body = threaded({ draft_id: draftId, can_stop: true });
 		detach(
@@ -1097,13 +1195,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					text:
 						owner === null
 							? "That question's session is gone."
-							: callback.data.startsWith("c:")
-								? "Starting the next turn."
-								: "Answer recorded.",
+							: callback.data.startsWith("k:")
+								? "Closing the session."
+								: callback.data.startsWith("c:")
+									? "Starting the next turn."
+									: "Answer recorded.",
 				},
 				10_000,
 			);
-			if (owner !== null) deliver(owner, update.update_id, { kind: "callback", value: callback.data });
+			if (owner !== null)
+				deliver(owner, update.update_id, {
+					kind: "callback",
+					value: callback.data,
+					messageId: callback.message?.message_id,
+				});
 			return;
 		}
 
@@ -1307,6 +1412,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				callback_data: `c:${id}:${index}`,
 			})),
 		);
+		if (recorded.urgency === "green") keyboard.push([closeSessionButton()]);
 		const sent = await sendStructured(
 			config,
 			threaded({
@@ -1437,6 +1543,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (parsed === null || typeof parsed !== "object") continue;
 				const entry = parsed as Partial<InboxEntry>;
 				if (typeof entry.value !== "string" || entry.value.length === 0) continue;
+				// A reply or an answer means attention is on this session: put its window in front for the return.
+				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
+					focusTmuxWindow();
+				}
 
 				const ask = pendingAsk;
 				if (entry.kind === "command") {
@@ -1475,6 +1585,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						].filter((line) => line.length > 0);
 						await serviceNotice(lines.join("\n"));
 					}
+					continue;
+				}
+				if (entry.kind === "callback" && entry.value.startsWith("k:")) {
+					await closeSessionFromTelegram(entry.messageId);
 					continue;
 				}
 				if (entry.kind === "callback" && entry.value.startsWith("c:")) {
@@ -2024,6 +2138,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		draftText = "";
 		draftDirty = false;
 		currentTool = "";
+		askStream = null;
+		askPreview = "";
 		turnInput = 0;
 		turnOutput = 0;
 		turnCost = 0;
@@ -2037,6 +2153,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		draftText = "";
 		draftDirty = false;
 		currentTool = "";
+		askStream = null;
+		askPreview = "";
 	});
 
 	pi.on("message_update", async (event) => {
@@ -2054,7 +2172,45 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		draftText = text;
 		draftDirty = true;
+		trackAskStream((event as { assistantMessageEvent?: unknown }).assistantMessageEvent, message.content);
 	});
+
+	/** Follows a streaming ask tool call so the draft can preview the questions, header first. */
+	function trackAskStream(streamEvent: unknown, content: unknown[]): void {
+		if (streamEvent === null || typeof streamEvent !== "object") return;
+		const ev = streamEvent as { type?: unknown; contentIndex?: unknown; delta?: unknown };
+		if (typeof ev.contentIndex !== "number") return;
+		if (ev.type === "toolcall_start") {
+			// The tool name often lands with the first delta, so the check waits until then.
+			askStream = { index: ev.contentIndex, buffer: "" };
+			return;
+		}
+		if (askStream === null || askStream.index !== ev.contentIndex) return;
+		if (ev.type === "toolcall_end") {
+			askStream = null;
+			askPreview = "";
+			return;
+		}
+		if (ev.type !== "toolcall_delta" || typeof ev.delta !== "string") return;
+		askStream.buffer += ev.delta;
+		const block: unknown = content[askStream.index];
+		const name =
+			block !== null && typeof block === "object" && "name" in block ? (block as { name?: unknown }).name : undefined;
+		if (name !== "ask") {
+			// Some other tool's call: stop following it once the name is known.
+			if (typeof name === "string") askStream = null;
+			return;
+		}
+		const questions = extractQuestionPreviews(askStream.buffer);
+		const blocks: string[] = [];
+		const head = sessionCtx === null ? "" : badge(sessionCtx);
+		if (head.length > 0 && topicId === null) blocks.push(head);
+		blocks.push("\u{1F534} Input needed (the question is still being written)");
+		if (questions.length === 1) blocks.push(questions[0] ?? "");
+		else if (questions.length > 1) blocks.push(questions.map((q, i) => `${i + 1}. ${q}`).join("\n\n"));
+		askPreview = blocks.join("\n\n");
+		draftDirty = true;
+	}
 
 	pi.on("message_end", async (event) => {
 		const message: unknown = event.message;
@@ -2123,12 +2279,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const recorded = turnSummary;
 			turnSummary = null;
 			if (recorded.options === undefined) {
-				const work = notify(
-					ctx,
-					`${heads[recorded.urgency]}${suffix}`,
-					recorded.text + usageFooter(),
-					urgencyExtras(recorded.urgency),
-				).then((sent) => (recorded.urgency === "red" ? pinRed(ctx, sent) : undefined));
+				const extra: Record<string, unknown> = { ...urgencyExtras(recorded.urgency) };
+				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
+				const work = notify(ctx, `${heads[recorded.urgency]}${suffix}`, recorded.text + usageFooter(), extra).then(
+					(sent) => (recorded.urgency === "red" ? pinRed(ctx, sent) : undefined),
+				);
 				detach(work, "turn-end notice");
 				return;
 			}

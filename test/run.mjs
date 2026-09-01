@@ -2394,6 +2394,185 @@ await orphanSess.fire("session_start");
 	await md.fire("agent_end");
 }
 
+// A streaming ask tool call previews its questions in the draft, header first.
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const qp = spawn("01a06003-0000-0000-0000-000000000000", "/home/dev/work/qdraft");
+	await qp.fire("session_start");
+	await qp.fire("agent_start");
+	const askContent = [{ type: "toolCall", id: "t1", name: "ask", arguments: {} }];
+	const askMsg = { role: "assistant", content: askContent };
+	await qp.fire("message_update", {
+		message: askMsg,
+		assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: askMsg },
+	});
+	await qp.fire("message_update", {
+		message: askMsg,
+		assistantMessageEvent: {
+			type: "toolcall_delta",
+			contentIndex: 0,
+			delta: '{"questions":[{"question":"Ship the \\"big\\" relea',
+			partial: askMsg,
+		},
+	});
+	await settle(1600);
+	await qp.pump(150);
+	const partial = lastCall("sendMessageDraft");
+	check(
+		"a streaming ask previews the partial question under an input-needed line",
+		partial?.body.text.includes("Input needed") === true && partial.body.text.includes('Ship the "big" relea'),
+	);
+	check("the ask preview leads with the session badge", partial.body.text.indexOf("qdraft") >= 0);
+	await qp.fire("message_update", {
+		message: askMsg,
+		assistantMessageEvent: {
+			type: "toolcall_delta",
+			contentIndex: 0,
+			delta: 'se now?","options":[]},{"question":"Also update the docs?"',
+			partial: askMsg,
+		},
+	});
+	await settle(1600);
+	await qp.pump(150);
+	const both = lastCall("sendMessageDraft");
+	check(
+		"a second streamed question numbers the preview",
+		both?.body.text.includes('1. Ship the "big" release now?') === true &&
+			both.body.text.includes("2. Also update the docs?"),
+	);
+	await qp.fire("message_update", {
+		message: askMsg,
+		assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall: askContent[0], partial: askMsg },
+	});
+	await qp.fire("message_update", {
+		message: { role: "assistant", content: [{ type: "text", text: "back to prose" }] },
+	});
+	await settle(1600);
+	await qp.pump(150);
+	check(
+		"the preview clears once the ask call completes",
+		lastCall("sendMessageDraft").body.text.includes("back to prose"),
+	);
+	await qp.fire("agent_end");
+}
+
+// A green summary offers a close-session button that shuts the session down from the phone.
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const cs = spawn("01a06004-0000-0000-0000-000000000000", "/home/dev/work/closer");
+	let shutdowns = 0;
+	cs.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await cs.fire("session_start");
+	await cs.fire("input");
+	await cs.tools
+		.get("notify_status")
+		.execute("g1", { summary: "All done.", urgency: "green" }, undefined, undefined, cs.ctx);
+	await cs.fire("session_stop");
+	await settle(150);
+	const doneMsg = lastCall("sendMessage");
+	const closeBtn = (doneMsg.body.reply_markup?.inline_keyboard ?? [])
+		.flat()
+		.find((b) => b.callback_data?.startsWith("k:"));
+	check("a green summary carries a close-session button", closeBtn !== undefined && closeBtn.style === "danger");
+	await cs.fire("input");
+	await cs.tools
+		.get("notify_status")
+		.execute("g2", { summary: "Reply wanted.", urgency: "orange" }, undefined, undefined, cs.ctx);
+	await cs.fire("session_stop");
+	await settle(150);
+	check(
+		"an orange summary has no close button",
+		(lastCall("sendMessage").body.reply_markup?.inline_keyboard ?? [])
+			.flat()
+			.every((b) => b.callback_data?.startsWith("k:") !== true),
+	);
+	await cs.fire("input");
+	await cs.tools
+		.get("notify_status")
+		.execute(
+			"g3",
+			{ summary: "Done, pick.", urgency: "green", options: ["Merge", "Wait"] },
+			undefined,
+			undefined,
+			cs.ctx,
+		);
+	await cs.fire("session_stop");
+	await settle(150);
+	check(
+		"a green standing question appends the close row",
+		lastCall("sendMessage")
+			.body.reply_markup.inline_keyboard.flat()
+			.some((b) => b.callback_data?.startsWith("k:")),
+	);
+	const tag = JSON.parse(readFileSync(join(sessionsDir, `${cs.id}.json`), "utf8")).tag;
+	writeFileSync(
+		join(inboxOf(cs.id), "3001.json"),
+		JSON.stringify({ kind: "callback", value: `k:${tag}`, messageId: 5555 }),
+	);
+	await cs.pump(250);
+	check("a close press shuts the session down", shutdowns === 1);
+	const strip = called("editMessageReplyMarkup").find((c) => c.body.message_id === 5555);
+	check(
+		"a close press strips the button from a plain summary",
+		strip !== undefined && strip.body.reply_markup.inline_keyboard.length === 0,
+	);
+}
+
+// A Telegram reply focuses the session's tmux window, but never while the terminal is busy.
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const binDir = join(root, "fakebin");
+	mkdirSync(binDir, { recursive: true });
+	const tmuxLog = join(root, "tmux-calls.log");
+	writeFileSync(join(binDir, "tmux"), `#!/bin/sh\necho "$@" >> ${tmuxLog}\n`, { mode: 0o755 });
+	const oldPath = process.env.PATH;
+	process.env.PATH = `${binDir}:${oldPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	process.env.TMUX_PANE = "%77";
+	writeConfig({ quietSeconds: 1 });
+	const fw = spawn("01a06005-0000-0000-0000-000000000000", "/home/dev/work/focus");
+	let typed = null;
+	fw.ctx.hasUI = true;
+	fw.ctx.ui = {
+		onTerminalInput: (fn) => {
+			typed = fn;
+			return () => {};
+		},
+	};
+	await settle(1100);
+	await fw.fire("session_start");
+	rmSync(tmuxLog, { force: true });
+	writeFileSync(
+		join(inboxOf(fw.id), "3101.json"),
+		JSON.stringify({ kind: "text", value: "go ahead", messageId: 6001 }),
+	);
+	await fw.pump(250);
+	check(
+		"a telegram reply focuses the session's tmux window",
+		existsSync(tmuxLog) && readFileSync(tmuxLog, "utf8").includes("select-window -t %77"),
+	);
+	rmSync(tmuxLog, { force: true });
+	typed();
+	writeFileSync(
+		join(inboxOf(fw.id), "3102.json"),
+		JSON.stringify({ kind: "text", value: "and this too", messageId: 6002 }),
+	);
+	await fw.pump(250);
+	check(
+		"no focus jump while the terminal is busy",
+		!existsSync(tmuxLog) || !readFileSync(tmuxLog, "utf8").includes("select-window"),
+	);
+	writeConfig();
+	process.env.PATH = oldPath;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+}
+
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);
