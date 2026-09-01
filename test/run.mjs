@@ -51,6 +51,9 @@ globalThis.fetch = async (url, init) => {
 			body[key] = typeof value === "string" ? value : `<file ${value.size}b>`;
 		}
 		api.calls.push({ method, body });
+		if ((api.failMethods ?? []).includes(method)) {
+			return { ok: false, status: 400, json: async () => ({ ok: false, description: "failed by test" }) };
+		}
 		const result =
 			method === "sendMediaGroup" ? [{ message_id: api.nextMessage++ }] : { message_id: api.nextMessage++ };
 		return { ok: true, json: async () => ({ ok: true, result }) };
@@ -120,6 +123,7 @@ const spawn = (id, cwd, title = "") => {
 		hasUI: false,
 		cwd,
 		sessionManager: { getSessionId: () => id, getSessionName: () => name },
+		model: { provider: "openai", id: "gpt-5.6-sol" },
 		ui: { onTerminalInput: () => () => {} },
 		setInterval: (fn) => timers.push(fn) - 1,
 		setTimeout: (fn) => timers.push(fn) - 1,
@@ -981,6 +985,28 @@ await voiceSession.pump(250);
 check("an unsupported type gets an explanation", called("sendMessage").length === beforeSticker + 1);
 check("the explanation lists what works", lastCall("sendMessage").body.text.includes("photo"));
 
+api.queued = [
+	{
+		update_id: 505,
+		message: {
+			message_id: 74,
+			date: 1,
+			chat: { id: CHAT },
+			text: "orphaned reply",
+			reply_to_message: { message_id: 999_999 },
+		},
+	},
+];
+await voiceSession.pump(250);
+const ownerlessNotice = lastCall("sendMessage").body.text;
+check(
+	"an ownerless routing error stays plain",
+	ownerlessNotice.startsWith("\u{1F535} No live omp session") &&
+		!ownerlessNotice.includes("Task: ") &&
+		!ownerlessNotice.includes("Model: ") &&
+		!ownerlessNotice.includes("Tmux: "),
+);
+
 // ------------------------------------------------------ terminal cancellation and closure
 heading("cancellation and message closure");
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
@@ -1016,6 +1042,14 @@ check(
 );
 check("it says it was cancelled at the terminal", closing.body.text.includes("Cancelled at the terminal"));
 check(
+	"cancelled native question retains context and question",
+	closing.body.text.startsWith(
+		`Task: subql [${record(esc.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) &&
+		closing.body.text.includes("Proceed?") &&
+		closing.body.text.includes("Cancelled at the terminal"),
+);
+check(
 	"the keyboard is explicitly cleared",
 	Array.isArray(closing.body.reply_markup?.inline_keyboard) && closing.body.reply_markup.inline_keyboard.length === 0,
 );
@@ -1026,6 +1060,12 @@ writeFileSync(join(inboxOf(esc.id), "950.json"), JSON.stringify({ kind: "callbac
 await esc.pump(200);
 check("a press on a closed question gets a reply", called("sendMessage").length === beforeStale + 1);
 check("the reply explains the question is closed", lastCall("sendMessage").body.text.includes("closed"));
+check(
+	"a stale question notice begins with session context",
+	lastCall("sendMessage").body.text.startsWith(
+		`\u{1F535} Task: subql [${record(esc.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	),
+);
 
 // Answering at the terminal must also clear the keyboard.
 const okRun = esc.tools.get("ask").execute("e2", escAsk, undefined, undefined, {
@@ -1083,7 +1123,7 @@ const stanceAsk = {
 			question: "Which approach?",
 			recommended: 1,
 			options: [
-				{ label: "neutral one", description: "no strong view" },
+				{ label: "neutral one", description: "no strong view", preview: "preview should disappear" },
 				{ label: "the good one", description: "cheapest to maintain" },
 				{ label: "the bad one", description: "here for contrast", discouraged: true },
 				{ label: "bare option" },
@@ -1143,6 +1183,23 @@ check(
 const stAskId = stRows[0][0].callback_data.split(":")[1];
 writeFileSync(join(inboxOf(st.id), "970.json"), JSON.stringify({ kind: "callback", value: `o:${stAskId}:0:1` }));
 await st.pump(250);
+const settledStance = lastCall("editMessageText");
+check(
+	"selected native answer retains context, question, result, and buttons",
+	settledStance.body.text.startsWith(
+		`Task: diesel [${record(st.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) &&
+		settledStance.body.text.includes("Which approach?") &&
+		settledStance.body.text.includes("Answered:") &&
+		settledStance.body.text.includes("the good one") &&
+		settledStance.body.reply_markup.inline_keyboard.flat().every((button) => button.disabled !== undefined) &&
+		settledStance.body.reply_markup.inline_keyboard.flat().some((button) => button.text === "\u2713 the good one"),
+);
+check(
+	"settled native body omits option descriptions and previews",
+	!settledStance.body.text.includes("cheapest to maintain") &&
+		!settledStance.body.text.includes("preview should disappear"),
+);
 check("a coloured option still answers normally", (await stRun).details.selectedOptions[0] === "the good one");
 check("tool description explains how to mark desirability", st.tools.get("ask").description.includes("`discouraged`"));
 check("tool description explains the middle stance", st.tools.get("ask").description.includes("`lukewarm`"));
@@ -1345,6 +1402,18 @@ check(
 		rs.tools.get("notify_status").description.includes("maintainer"),
 );
 check(
+	"the block requires self-contained phone choices",
+	firstStop.find((r) => r?.decision === "block").reason.includes("answerable from a phone") &&
+		firstStop.find((r) => r?.decision === "block").reason.includes("what each option does or costs") &&
+		firstStop.find((r) => r?.decision === "block").reason.includes("Never use only a phase number or letter"),
+);
+check(
+	"notify_status requires self-contained phone choices",
+	rs.tools.get("notify_status").description.includes("answerable from a phone") &&
+		rs.tools.get("notify_status").description.includes("what each option does or costs") &&
+		rs.tools.get("notify_status").description.includes("Never use only a phase number or letter"),
+);
+check(
 	"after the block the fallback message still goes out",
 	lastCall("sendMessage").body.text.includes("Turn finished"),
 );
@@ -1451,6 +1520,12 @@ check(
 	retired.body.reply_markup.inline_keyboard.flat().every((b) => b.disabled !== undefined) &&
 		retired.body.reply_markup.inline_keyboard.flat().some((b) => b.text === "\u2713 Review the diff"),
 );
+check(
+	"selected standing answer retains context and question",
+	retired.body.text.startsWith(
+		`Task: sqlitegis [${record(tq.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) && retired.body.text.includes("How should we proceed?"),
+);
 
 // A second press on the same, now cleared, question is told it is closed.
 writeFileSync(join(inboxOf(tq.id), "991.json"), JSON.stringify({ kind: "callback", value: tqButton.callback_data }));
@@ -1465,19 +1540,35 @@ check(
 await tq.fire("input");
 await tq.tools
 	.get("notify_status")
-	.execute("q2", { summary: "First.", urgency: "orange", options: ["A", "B"] }, undefined, undefined, tq.ctx);
+	.execute(
+		"q2",
+		{ summary: "First.", urgency: "orange", question: "Use the first choice?", options: ["A", "B"] },
+		undefined,
+		undefined,
+		tq.ctx,
+	);
 await tq.fire("session_stop");
 await settle(150);
 const firstQ = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data;
-await tq.fire("input");
 await tq.tools
 	.get("notify_status")
-	.execute("q3", { summary: "Second.", urgency: "orange", options: ["C", "D"] }, undefined, undefined, tq.ctx);
+	.execute(
+		"q3",
+		{ summary: "Second.", urgency: "orange", question: "Use the second choice?", options: ["C", "D"] },
+		undefined,
+		undefined,
+		tq.ctx,
+	);
 await tq.fire("session_stop");
 await settle(200);
+const supersededStanding = lastCall("editMessageText");
 check(
-	"terminal input retires the older standing question",
-	called("editMessageText").some((c) => c.body.text.includes("Answered at the terminal")),
+	"superseded standing question retains context, question, and reason",
+	supersededStanding.body.text.startsWith(
+		`Task: sqlitegis [${record(tq.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) &&
+		supersededStanding.body.text.includes("Use the first choice?") &&
+		supersededStanding.body.text.includes("Superseded by a newer question"),
 );
 writeFileSync(join(inboxOf(tq.id), "992.json"), JSON.stringify({ kind: "callback", value: firstQ }));
 await tq.pump(250);
@@ -1485,7 +1576,13 @@ check("a press on the superseded question is refused", lastCall("sendMessage").b
 
 // A standing question survives a session resume.
 const tqRecord = JSON.parse(readFileSync(join(sessionsDir, `${tq.id}.json`), "utf8"));
-check("the standing question is persisted", tqRecord.standing !== null && Array.isArray(tqRecord.standing.labels));
+check(
+	"the standing question persists its compact settlement head",
+	tqRecord.standing !== null &&
+		Array.isArray(tqRecord.standing.labels) &&
+		typeof tqRecord.standing.head === "string" &&
+		tqRecord.standing.head.includes("Use the second choice?"),
+);
 const resumed = spawn(tq.id, "/home/dev/work/sqlitegis");
 await resumed.fire("session_start");
 const standingId = tqRecord.standing.id;
@@ -1494,6 +1591,16 @@ await resumed.pump(250);
 check(
 	"a press after a resume still starts the next turn",
 	resumed.steers.some((x) => x.text === "D"),
+);
+const resumedRetired = lastCall("editMessageText");
+check(
+	"resumed standing answer retains its stored context and question",
+	resumedRetired.body.text.startsWith(
+		`Task: sqlitegis [${record(tq.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) &&
+		resumedRetired.body.text.includes("Use the second choice?") &&
+		resumedRetired.body.text.includes("Chosen:") &&
+		resumedRetired.body.text.includes("D"),
 );
 
 // A terminal reply while a choice question stands on Telegram must close it.
@@ -1760,15 +1867,40 @@ check(
 await ux.fire("input");
 await ux.tools
 	.get("notify_status")
-	.execute("ux3", { summary: "Choose.", urgency: "orange", options: ["A", "B"] }, undefined, undefined, ux.ctx);
+	.execute(
+		"ux3",
+		{ summary: "Choose.", urgency: "orange", question: "Which hidden choice?", options: ["A", "B"] },
+		undefined,
+		undefined,
+		ux.ctx,
+	);
 await ux.fire("session_stop");
 await settle(150);
+writeFileSync(join(inboxOf(ux.id), "6101.json"), JSON.stringify({ kind: "command", value: "status" }));
+await ux.pump(250);
+const openQuestionStatus = lastCall("sendMessage").body.text;
+check(
+	"status begins with context while a choice is open",
+	openQuestionStatus.startsWith(
+		`\u{1F535} Task: pgvector [${record(ux.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	),
+);
+check("status retains the open-question alert", openQuestionStatus.includes("A choice question stands open."));
 api.queued = [{ update_id: 611, message: { message_id: 82, date: 1, chat: { id: CHAT }, text: "/hidequestions" } }];
 await ux.pump(250);
 await ux.pump(250);
 check(
 	"hidequestions retires the standing question",
 	called("editMessageText").some((c) => c.body.text.includes("Question hidden")),
+);
+const hiddenStanding = lastCall("editMessageText");
+check(
+	"hidden standing question retains context, question, and reason",
+	hiddenStanding.body.text.startsWith(
+		`Task: pgvector [${record(ux.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) &&
+		hiddenStanding.body.text.includes("Which hidden choice?") &&
+		hiddenStanding.body.text.includes("Question hidden"),
 );
 
 await ux.tools
@@ -1845,6 +1977,10 @@ await settle(200);
 const pinnedCall = lastCall("pinChatMessage");
 check("a red status is pinned", pinnedCall !== undefined && typeof pinnedCall.body.message_id === "number");
 check("the pin is recorded for the next session", record(ux.id).pinned === pinnedCall.body.message_id);
+writeFileSync(join(inboxOf(ux.id), "6111.json"), JSON.stringify({ kind: "command", value: "status" }));
+await ux.pump(250);
+const pinnedStatus = lastCall("sendMessage").body.text;
+check("status retains the pinned-status alert", pinnedStatus.includes("A red status is pinned."));
 await ux.fire("agent_start");
 await settle(150);
 check("a Telegram-started turn unpins it", lastCall("unpinChatMessage").body.message_id === pinnedCall.body.message_id);
@@ -1918,21 +2054,48 @@ const draft = lastCall("sendMessageDraft");
 check("a partial answer streams as a draft", draft?.body.text.includes("Partial answer") === true);
 check("the draft carries a stop control", draft.body.can_stop === true);
 check("the draft id matches the session record", draft.body.draft_id === record(fx.id).draftId);
+const draftContext = `Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
+check("every draft starts with session context", draft.body.text.startsWith(draftContext));
 
 await fx.fire("tool_execution_start", { toolName: "bash", intent: "Running tests" });
 await settle(1600);
 await fx.pump(150);
 check("tool activity rides in the draft", lastCall("sendMessageDraft").body.text.includes("bash: Running tests"));
+check("tool draft still starts with session context", lastCall("sendMessageDraft").body.text.startsWith(draftContext));
+fx.ctx.model = { provider: "anthropic", id: "claude-sonnet-4-6" };
+await fx.fire("message_update", {
+	message: { role: "assistant", content: [{ type: "text", text: "Partial answer after fallback" }] },
+});
+await settle(1600);
+await fx.pump(150);
+const switchedDraft = lastCall("sendMessageDraft").body;
+check(
+	"a later draft reflects the live model and retains its content",
+	switchedDraft.text.startsWith(
+		`Task: quackml [${record(fx.id).tag}] | Model: anthropic/claude-sonnet-4-6 | Tmux: not attached`,
+	) &&
+		switchedDraft.text.includes("Partial answer after fallback") &&
+		switchedDraft.text.includes("bash: Running tests") &&
+		switchedDraft.can_stop === true,
+);
+fx.ctx.model = { provider: "openai", id: "gpt-5.6-sol" };
 
 // A stop press on the draft aborts the running turn.
 api.queued = [{ update_id: 700, stopped_message_generation: { chat: { id: CHAT }, draft_id: record(fx.id).draftId } }];
 await fx.pump(250);
 await fx.pump(250);
 check("a stop press aborts the running turn", fx.aborts === 1);
+const fxSessionContext = `\u{1F535} Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
+check("a stop notice begins with session context", lastCall("sendMessage").body.text.startsWith(fxSessionContext));
 
 // Usage lands as a footer on the turn-end summary.
 await fx.fire("message_end", {
-	message: { role: "assistant", usage: { input: 12400, output: 900, cost: { total: 0.0512 } } },
+	message: {
+		role: "assistant",
+		provider: "openai",
+		model: "gpt-5.6-sol",
+		usage: { input: 12400, output: 900, cost: { total: 0.0512 } },
+	},
 });
 await fx.fire("agent_end");
 await fx.tools.get("notify_status").execute("f1", { summary: "Done.", urgency: "green" }, undefined, undefined, fx.ctx);
@@ -1942,12 +2105,89 @@ const footerMsg = lastCall("sendMessage").body.text;
 check("the summary carries token counts", footerMsg.includes("12.4k in / 900 out"));
 check("the summary carries the cost", footerMsg.includes("$0.051"));
 check("the summary counts tools", footerMsg.includes("1 tool"));
+check("the summary names the model", footerMsg.includes("openai/gpt-5.6-sol"));
+
+// Fallback turns keep usage attributed to the model that incurred it.
+await fx.fire("input");
+await fx.fire("agent_start");
+await fx.fire("tool_execution_start", { toolName: "read" });
+await fx.fire("tool_execution_start", { toolName: "bash" });
+await fx.fire("message_end", {
+	message: { role: "assistant", usage: { input: 200, output: 50, cost: { total: 0.01 } } },
+});
+await fx.fire("message_end", {
+	message: {
+		role: "assistant",
+		provider: "anthropic",
+		model: "claude-sonnet-4-6",
+		usage: { input: 300, output: 70, cost: { total: 0.02 } },
+	},
+});
+await fx.fire("message_end", {
+	message: {
+		role: "assistant",
+		provider: "openai",
+		model: "gpt-5.6-sol",
+		usage: { input: 25, output: 5, cost: { total: 0.001 } },
+	},
+});
+await fx.fire("agent_end");
+await fx.tools
+	.get("notify_status")
+	.execute("usage-fallback", { summary: "Fallback done.", urgency: "green" }, undefined, undefined, fx.ctx);
+await fx.fire("session_stop");
+await settle(150);
+const fallbackFooter = lastCall("sendMessage").body.text;
+const fallbackUsageLines = fallbackFooter.split("\n").filter((line) => line.includes(" in / "));
+const openaiUsageLine = fallbackUsageLines.find((line) => line.includes("openai/gpt-5.6-sol")) ?? "";
+const anthropicUsageLine = fallbackUsageLines.find((line) => line.includes("anthropic/claude-sonnet-4-6")) ?? "";
+check(
+	"sparse usage uses the model captured at agent start",
+	openaiUsageLine.includes("225 in / 55 out") && openaiUsageLine.includes("$0.011"),
+);
+check(
+	"two models produce two lines in first-use order",
+	fallbackUsageLines.length === 2 &&
+		fallbackUsageLines[0].includes("openai/gpt-5.6-sol") &&
+		fallbackUsageLines[1].includes("anthropic/claude-sonnet-4-6"),
+);
+check(
+	"each model line contains only its own usage",
+	!openaiUsageLine.includes("300 in / 70 out") &&
+		anthropicUsageLine.includes("300 in / 70 out") &&
+		anthropicUsageLine.includes("$0.020") &&
+		!anthropicUsageLine.includes("225 in / 55 out"),
+);
+check("the turn-wide tool count appears once", (fallbackFooter.match(/2 tools/g) ?? []).length === 1);
+
+await fx.fire("input");
+await fx.fire("agent_start");
+await fx.fire("message_end", {
+	message: { role: "assistant", usage: { input: 10, output: 4, cost: { total: 0.002 } } },
+});
+await fx.fire("agent_end");
+await fx.tools
+	.get("notify_status")
+	.execute("usage-reset", { summary: "Next turn.", urgency: "green" }, undefined, undefined, fx.ctx);
+await fx.fire("session_stop");
+await settle(150);
+const resetFooter = lastCall("sendMessage").body.text;
+check(
+	"the next agent start resets all usage state",
+	resetFooter.includes("openai/gpt-5.6-sol") &&
+		resetFooter.includes("10 in / 4 out") &&
+		resetFooter.includes("$0.002") &&
+		!resetFooter.includes("anthropic/claude-sonnet-4-6") &&
+		!resetFooter.includes("225 in / 55 out") &&
+		!resetFooter.includes("2 tools"),
+);
 
 // Transparency notices, once per kind per turn.
 await fx.fire("agent_start");
 await fx.fire("auto_retry_start", { attempt: 2, maxAttempts: 8 });
 await settle(120);
 check("a retry shows a notice", lastCall("sendMessage").body.text.includes("retrying (2/8)"));
+check("a retry notice begins with session context", lastCall("sendMessage").body.text.startsWith(fxSessionContext));
 const noticesBefore = called("sendMessage").length;
 await fx.fire("auto_retry_start", { attempt: 3, maxAttempts: 8 });
 await settle(120);
@@ -1955,9 +2195,175 @@ check("the notice does not repeat within a turn", called("sendMessage").length =
 await fx.fire("retry_fallback_applied", { from: "a/x", to: "b/y" });
 await settle(120);
 check("a model fallback shows a notice", lastCall("sendMessage").body.text.includes("fell back from a/x to b/y"));
-await fx.fire("auto_compaction_start", { reason: "overflow" });
+check("a fallback notice begins with session context", lastCall("sendMessage").body.text.startsWith(fxSessionContext));
+const tmuxBin = join(root, "bin");
+mkdirSync(tmuxBin);
+writeFileSync(
+	join(tmuxBin, "tmux"),
+	`#!/bin/sh
+case "$*" in
+	*'#{session_name}:#{window_index}.#{pane_index}'*) printf 'work:3.1\\n'
+esac
+`,
+	{ mode: 0o755 },
+);
+const pathBeforeTmuxTest = process.env.PATH;
+process.env.PATH = `${tmuxBin}:${pathBeforeTmuxTest}`;
+process.env.TMUX = "test";
+process.env.TMUX_PANE = "%7";
+fx.setTitle("Tune the quack model");
+await fx.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
 await settle(120);
-check("compaction shows a notice", lastCall("sendMessage").body.text.includes("compacted (overflow)"));
+const compactionMsg = lastCall("sendMessage").body.text;
+const titleContext = compactionMsg.split("\n")[0];
+check("compaction shows a notice", compactionMsg.includes("compacted (overflow)"));
+check(
+	"session title supplies the context task",
+	titleContext === "\u{1F535} Task: Tune the quack model | Model: openai/gpt-5.6-sol | Tmux: work:3.1",
+);
+check(
+	"context is one stable labeled line",
+	compactionMsg.split("\n").filter((line) => line.includes("Task: ")).length === 1,
+);
+
+await fx.fire("auto_compaction_end", {
+	action: "remote",
+	aborted: false,
+	willRetry: false,
+	errorMessage: "provider rejected compaction",
+});
+await settle(120);
+const compactionFailure = lastCall("sendMessage").body.text;
+check("compaction failure keeps the start context", compactionFailure.startsWith(titleContext));
+check(
+	"final compaction failure carries trigger, end action, and error",
+	compactionFailure.includes("Trigger: overflow") &&
+		compactionFailure.includes("Action: remote") &&
+		compactionFailure.includes("provider rejected compaction"),
+);
+
+await fx.fire("agent_start");
+await fx.fire("auto_compaction_start", { reason: "threshold", action: "handoff" });
+await settle(120);
+await fx.fire("auto_compaction_end", {
+	action: "shake",
+	aborted: true,
+	willRetry: false,
+	errorMessage: "ignored abort detail",
+});
+await settle(120);
+const abortedCompaction = lastCall("sendMessage").body.text;
+check(
+	"aborted compaction reports aborted",
+	abortedCompaction.includes("Trigger: threshold") &&
+		abortedCompaction.includes("Action: shake") &&
+		abortedCompaction.includes("aborted") &&
+		!abortedCompaction.includes("ignored abort detail"),
+);
+
+await fx.fire("agent_start");
+await fx.fire("auto_compaction_start", { reason: "idle", action: "remote" });
+await settle(120);
+const longCompactionError = `${"x".repeat(300)}clipped-tail`;
+await fx.fire("auto_compaction_end", {
+	action: "remote",
+	aborted: false,
+	willRetry: false,
+	errorMessage: longCompactionError,
+});
+await settle(120);
+const clippedCompaction = lastCall("sendMessage").body.text;
+check(
+	"long compaction errors are clipped at 300 characters",
+	clippedCompaction.includes("x".repeat(300)) && !clippedCompaction.includes("clipped-tail"),
+);
+
+await fx.fire("agent_start");
+await fx.fire("auto_compaction_start", { reason: "incomplete", action: "snapcompact" });
+await settle(120);
+const beforeSkippedCompaction = called("sendMessage").length;
+await fx.fire("auto_compaction_end", {
+	action: "snapcompact",
+	aborted: false,
+	willRetry: false,
+	skipped: true,
+});
+await settle(120);
+check("skipped compaction stays silent", called("sendMessage").length === beforeSkippedCompaction);
+
+await fx.fire("agent_start");
+await fx.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
+await settle(120);
+const beforeRetryingCompaction = called("sendMessage").length;
+await fx.fire("auto_compaction_end", {
+	action: "context-full",
+	aborted: false,
+	willRetry: true,
+	errorMessage: "retryable failure",
+});
+await settle(120);
+check("retrying compaction stays silent", called("sendMessage").length === beforeRetryingCompaction);
+
+const terminalCompactions = [
+	["success", { action: "remote", aborted: false, willRetry: false }],
+	["failure", { action: "remote", aborted: false, willRetry: false, errorMessage: "failed" }],
+	["abort", { action: "remote", aborted: true, willRetry: false }],
+	["skip", { action: "remote", aborted: false, willRetry: false, skipped: true }],
+	["retry", { action: "remote", aborted: false, willRetry: true, errorMessage: "retry" }],
+];
+for (const [label, terminal] of terminalCompactions) {
+	await fx.fire("agent_start");
+	await fx.fire("auto_compaction_start", { reason: "idle", action: "remote" });
+	await settle(120);
+	await fx.fire("auto_compaction_end", terminal);
+	await settle(120);
+	await fx.fire("agent_start");
+	const beforeOrphanedEnd = called("sendMessage").length;
+	await fx.fire("auto_compaction_end", {
+		action: "shake",
+		aborted: false,
+		willRetry: false,
+		errorMessage: "orphaned end",
+	});
+	await settle(120);
+	check(`compaction state clears after ${label}`, called("sendMessage").length === beforeOrphanedEnd);
+}
+
+await fx.tools.get("session_badge").execute("identity-badge", { label: "Pinned task" }, undefined, undefined, fx.ctx);
+fx.setTitle("Ignored session title");
+await fx.fire("agent_start");
+await fx.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
+await settle(120);
+check(
+	"explicit badge label overrides the session title",
+	lastCall("sendMessage").body.text.split("\n")[0] ===
+		"\u{1F535} Task: Pinned task | Model: openai/gpt-5.6-sol | Tmux: work:3.1",
+);
+
+await fx.tools.get("session_badge").execute("identity-clear", { label: "" }, undefined, undefined, fx.ctx);
+fx.setTitle("");
+await fx.fire("agent_start");
+await fx.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
+await settle(120);
+check(
+	"folder and session tag supply the unnamed task",
+	lastCall("sendMessage").body.text.split("\n")[0] ===
+		`\u{1F535} Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: work:3.1`,
+);
+
+delete process.env.TMUX;
+delete process.env.TMUX_PANE;
+fx.ctx.model = undefined;
+await fx.fire("agent_start");
+await fx.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
+await settle(120);
+check(
+	"absent model and tmux have explicit context values",
+	lastCall("sendMessage").body.text.split("\n")[0] ===
+		`\u{1F535} Task: quackml [${record(fx.id).tag}] | Model: unavailable | Tmux: not attached`,
+);
+fx.ctx.model = { provider: "openai", id: "gpt-5.6-sol" };
+process.env.PATH = pathBeforeTmuxTest;
 await fx.fire("agent_end");
 
 // /status answers from the extension without touching the agent.
@@ -1967,6 +2373,15 @@ check("status reports the session state", lastCall("sendMessage").body.text.incl
 check(
 	"status does not reach the agent",
 	!fx.steers.some((s) => typeof s.text === "string" && s.text.includes("status")),
+);
+check("status begins with session context", lastCall("sendMessage").body.text.startsWith(fxSessionContext));
+await fx.fire("credential_disabled", { provider: "anthropic", disabledCause: "do not expose this cause" });
+await settle(120);
+const credentialNotice = lastCall("sendMessage").body.text;
+check("a credential notice begins with session context", credentialNotice.startsWith(fxSessionContext));
+check(
+	"a credential notice names only the provider",
+	credentialNotice.includes("anthropic") && !credentialNotice.includes("do not expose this cause"),
 );
 
 // Structured summaries go out as native rich messages, with a plain fallback.
@@ -2004,16 +2419,49 @@ const photoSend = await fx.tools
 	.get("notify_file")
 	.execute("f4", { paths: [artefact], caption: "the screenshot" }, undefined, undefined, fx.ctx);
 check("a png goes out as a photo", lastCall("sendPhoto").body.photo === "attach://f0");
-check("the caption rides along", lastCall("sendPhoto").body.caption === "the screenshot");
+const fileContext = `Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
+check(
+	"a single file caption carries context first",
+	lastCall("sendPhoto").body.caption === `${fileContext}\n\nthe screenshot`,
+);
 check("the tool reports success", photoSend.isError !== true);
 const artefact2 = join(root, "artefact2.jpg");
 writeFileSync(artefact2, "jpg-bytes");
 await fx.tools.get("notify_file").execute("f5", { paths: [artefact, artefact2] }, undefined, undefined, fx.ctx);
 check("two images go out as one album", JSON.parse(lastCall("sendMediaGroup").body.media).length === 2);
+const contextualAlbumMedia = JSON.parse(lastCall("sendMediaGroup").body.media);
+check(
+	"an album carries context only on its first item",
+	contextualAlbumMedia[0].caption === fileContext && !("caption" in contextualAlbumMedia[1]),
+);
 const logFile = join(root, "build.log");
 writeFileSync(logFile, "log-bytes");
 await fx.tools.get("notify_file").execute("f6", { paths: [logFile] }, undefined, undefined, fx.ctx);
 check("a log goes out as a document", lastCall("sendDocument").body.document === "attach://f0");
+check("a captionless document still carries context", lastCall("sendDocument").body.caption === fileContext);
+
+api.failMethods = ["sendPhoto"];
+const fallbackSend = await fx.tools
+	.get("notify_file")
+	.execute("f6-fallback", { paths: [artefact], caption: "fallback artifact" }, undefined, undefined, fx.ctx);
+api.failMethods = [];
+check("a rejected photo falls back to a document", fallbackSend.isError !== true);
+check(
+	"photo fallback reuses the contextual caption",
+	lastCall("sendDocument").body.caption === `${fileContext}\n\nfallback artifact`,
+);
+
+const longCallerCaption = "z".repeat(2_000);
+await fx.tools
+	.get("notify_file")
+	.execute("f6-long", { paths: [logFile], caption: longCallerCaption }, undefined, undefined, fx.ctx);
+const boundedCaption = lastCall("sendDocument").body.caption;
+check(
+	"a long caller caption is truncated after the complete context",
+	boundedCaption.startsWith(`${fileContext}\n\n`) &&
+		boundedCaption.length === 1024 &&
+		boundedCaption.slice(fileContext.length + 2).length === 1022 - fileContext.length,
+);
 const missing = await fx.tools
 	.get("notify_file")
 	.execute("f7", { paths: ["/nope/x.png"] }, undefined, undefined, fx.ctx);
@@ -2115,9 +2563,25 @@ check("a stop command while idle does not abort", rv.aborts === 0);
 await rv.fire("input");
 await rv.fire("agent_start");
 await rv.fire("tool_execution_start", { toolName: "bash", intent: "compiling" });
+await rv.fire("message_end", {
+	message: { role: "assistant", usage: { input: 77, output: 9, cost: { total: 0.004 } } },
+});
 writeFileSync(join(inboxOf(rv.id), "802.json"), JSON.stringify({ kind: "command", value: "status" }));
 await rv.pump(200);
 check("status reports the running tool", lastCall("sendMessage").body.text.includes("working (bash: compiling)"));
+const activeStatus = lastCall("sendMessage").body.text;
+check(
+	"active status begins with session context",
+	activeStatus.startsWith(
+		`\u{1F535} Task: htmlq [${record(rv.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	),
+);
+check(
+	"status retains state and active tool without partial usage",
+	activeStatus.includes("State: working (bash: compiling).") &&
+		!activeStatus.includes("77 in / 9 out") &&
+		!activeStatus.includes("$0.004"),
+);
 await rv.fire("agent_end");
 
 // Album captions sit only on the first item; the sandbox refuses foreign paths.
@@ -2131,7 +2595,9 @@ await rv.tools
 const albumMedia = JSON.parse(lastCall("sendMediaGroup").body.media);
 check(
 	"the album caption sits only on the first item",
-	albumMedia[0].caption === "the chart" && !("caption" in albumMedia[1]),
+	albumMedia[0].caption ===
+		`Task: htmlq [${record(rv.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached\n\nthe chart` &&
+		!("caption" in albumMedia[1]),
 );
 const outside = await rv.tools
 	.get("notify_file")

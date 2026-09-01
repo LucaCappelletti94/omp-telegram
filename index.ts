@@ -33,6 +33,7 @@ const BUTTON_TEXT_MAX = 60;
 const PREVIEW_MAX = 300;
 const RECENT_MESSAGE_CAP = 60;
 const TELEGRAM_TEXT_MAX = 4096;
+const TELEGRAM_CAPTION_MAX = 1024;
 const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;
 const TYPING_MS = 5_000;
@@ -86,8 +87,8 @@ interface SessionRecord {
 	lastNotified: number;
 	/** Replying to one of these routes back here. */
 	recent: number[];
-	/** Standing turn-end question; survives a resume. `closing` is the body to show once it dies unanswered. */
-	standing: { id: string; messageId: number | null; labels: string[]; closing: string } | null;
+	/** Standing turn-end question; survives a resume. */
+	standing: StandingQuestion | null;
 	/** Message carrying a live close-session button on a plain green summary. */
 	closeOffer: number | null;
 	/** Message pinned for a red status; unpinned when the next turn starts. */
@@ -173,6 +174,7 @@ interface PendingAsk {
 	head: string;
 	context: string;
 	questions: AskQuestion[];
+	settlementHeads: string[];
 	index: number;
 	messageId: number | null;
 	selected: Set<string>[];
@@ -193,6 +195,19 @@ interface TurnStatus {
 	urgency: "green" | "orange" | "red";
 	question?: string;
 	options?: string[];
+}
+
+interface StandingQuestion {
+	id: string;
+	messageId: number | null;
+	labels: string[];
+	head: string;
+}
+
+interface ModelUsage {
+	input: number;
+	output: number;
+	cost: number;
 }
 
 interface InboxEntry {
@@ -475,7 +490,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let unsubscribeInput: (() => void) | null = null;
 	let turnSummary: TurnStatus | null = null;
 	let standingSeq = 0;
-	let standingQuestion: { id: string; messageId: number | null; labels: string[]; closing: string } | null = null;
+	let standingQuestion: StandingQuestion | null = null;
 	let closeOfferMessageId: number | null = null;
 	let statusBlockUsed = false;
 	let badgeEmoji = "";
@@ -499,11 +514,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let currentTool = "";
 	let askStream: { index: number; buffer: string } | null = null;
 	let askPreview = "";
-	let turnInput = 0;
-	let turnOutput = 0;
-	let turnCost = 0;
+	let turnStartingModel = "unavailable";
 	let turnTools = 0;
+	const turnUsageByModel = new Map<string, ModelUsage>();
 	const noticedKinds = new Set<string>();
+	let activeCompaction: { trigger: string; action: string } | null = null;
 
 	/** A rejected detached promise is fatal in omp; the token never reaches the log. */
 	function detach(work: Promise<unknown>, label: string): void {
@@ -676,6 +691,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const detail = badgeOverride.length > 0 ? badgeOverride : (ctx.sessionManager.getSessionName() ?? "");
 		return `${badgeEmoji} ${folder} \u00B7 ${detail.length > 0 ? detail.slice(0, 60) : sessionTag}`;
 	}
+	function taskName(ctx: ExtensionContext): string {
+		const named = badgeOverride.length > 0 ? badgeOverride : (ctx.sessionManager.getSessionName() ?? "");
+		if (named.length > 0) return named.slice(0, 60);
+		const folder =
+			ctx.cwd
+				.split("/")
+				.filter((part) => part.length > 0)
+				.pop() ?? ctx.cwd;
+		return `${folder} [${sessionTag}]`;
+	}
 
 	function threaded(extra: Record<string, unknown>): Record<string, unknown> {
 		if (config === null) return extra;
@@ -683,12 +708,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return topicId === null ? base : { ...base, message_thread_id: topicId };
 	}
 
-	/** Re-read per message; windows get reordered. */
+	/** Re-read per message because tmux windows can move. */
 	function tmuxLocation(): string | null {
 		const pane = process.env.TMUX_PANE;
 		if (process.env.TMUX === undefined || pane === undefined) return null;
 		try {
-			const out = execFileSync("tmux", ["display-message", "-p", "-t", pane, "#{window_index}"], { timeout: 2000 })
+			const out = execFileSync(
+				"tmux",
+				["display-message", "-p", "-t", pane, "#{session_name}:#{window_index}.#{pane_index}"],
+				{ timeout: 2000 },
+			)
 				.toString()
 				.trim();
 			return out.length > 0 ? out : null;
@@ -814,6 +843,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return `\u{1F39B} ${summary}\n${lines.join("\n")}`;
 	}
 
+	function sessionContextLine(ctx: ExtensionContext): string {
+		const model = ctx.model === undefined ? "unavailable" : `${ctx.model.provider}/${ctx.model.id}`;
+		return `Task: ${taskName(ctx)} | Model: ${model} | Tmux: ${tmuxLocation() ?? "not attached"}`;
+	}
+
 	function lastAssistantTail(ctx: ExtensionContext): string {
 		try {
 			if (typeof ctx.sessionManager.getBranch !== "function") return "";
@@ -852,6 +886,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				? threaded({ text: `\u{1F535} ${text}` })
 				: { chat_id: config.chatId, message_thread_id: thread, text: `\u{1F535} ${text}` };
 		await callTelegram(config, "sendMessage", body, 15_000);
+	}
+
+	async function sessionNotice(ctx: ExtensionContext, text: string): Promise<void> {
+		await serviceNotice(`${sessionContextLine(ctx)}\n\n${text}`);
 	}
 
 	/** Structured markdown (tables, fences) goes out as a native rich message; anything else keeps the HTML subset path. */
@@ -917,26 +955,33 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** Streams the turn as an ephemeral draft bubble with a native stop control. */
 	function maybeDraft(): void {
-		if (config === null || !config.streamDrafts || config.chatId <= 0) return;
+		if (config === null || !config.streamDrafts || config.chatId <= 0 || sessionCtx === null) return;
 		if (!turnActive || pendingAsk !== null || approvalWaiting) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
 		if (!draftDirty || Date.now() - draftSentAt < DRAFT_MS) return;
 		draftDirty = false;
 		draftSentAt = Date.now();
-		let text: string;
-		if (askPreview.length > 0) {
-			// The header leads, so the preview truncates from the tail, unlike the prose stream.
-			text = askPreview.length > 3500 ? askPreview.slice(0, 3500) : askPreview;
-			const last = text.charCodeAt(text.length - 1);
-			if (last >= 0xd800 && last <= 0xdbff) text = text.slice(0, -1);
+		const context = sessionContextLine(sessionCtx);
+		const tool = currentTool.length > 0 ? `\u25B8 ${currentTool}` : "";
+		const prefix = `${context}\n\n`;
+		const suffix = tool.length > 0 ? `\n\n${tool}` : "";
+		const tailLimit = Math.max(0, TELEGRAM_TEXT_MAX - prefix.length - suffix.length);
+		const previewing = askPreview.length > 0;
+		const source = previewing ? askPreview : draftText;
+		let tail =
+			tailLimit === 0 || source.length <= tailLimit
+				? source.slice(0, tailLimit)
+				: previewing
+					? source.slice(0, tailLimit)
+					: source.slice(-tailLimit);
+		if (previewing) {
+			const last = tail.charCodeAt(tail.length - 1);
+			if (last >= 0xd800 && last <= 0xdbff) tail = tail.slice(0, -1);
 		} else {
-			const tool = currentTool.length > 0 ? `\u25B8 ${currentTool}` : "";
-			let tail = draftText.length > 3500 ? draftText.slice(-3500) : draftText;
-			// A raw slice can open on the low half of a surrogate pair, which is invalid JSON.
 			const lead = tail.charCodeAt(0);
 			if (lead >= 0xdc00 && lead <= 0xdfff) tail = tail.slice(1);
-			text = [tail, tool].filter((part) => part.length > 0).join("\n\n");
 		}
+		const text = tail.length > 0 ? `${prefix}${tail}${suffix}` : `${context}${suffix}`;
 		const cfg = config;
 		const body = threaded({ draft_id: draftId, can_stop: true });
 		detach(
@@ -955,26 +1000,30 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	/** One notice per kind per turn: recovery machinery explains silences without spamming. */
-	function transparencyNotice(kind: string, text: string): void {
+	/** One notice per kind per turn keeps recovery details concise. */
+	function transparencyNotice(kind: string, text: string, ctx?: ExtensionContext): void {
 		if (config === null || noticedKinds.has(kind)) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
 		noticedKinds.add(kind);
-		detach(serviceNotice(text), "transparency notice");
+		detach(ctx === undefined ? serviceNotice(text) : sessionNotice(ctx, text), "transparency notice");
 	}
 
-	/** Turn cost line for summaries; empty until the turn spent something. */
+	/** Usage lines stay grouped by model. */
 	function usageFooter(): string {
-		const parts: string[] = [];
-		if (turnInput + turnOutput > 0) {
-			const [inTokens, outTokens] = [turnInput, turnOutput].map((n) =>
-				n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n),
-			);
-			parts.push(`${inTokens} in / ${outTokens} out`);
+		const lines: string[] = [];
+		for (const [model, usage] of turnUsageByModel) {
+			const parts = [model];
+			if (usage.input + usage.output > 0) {
+				const [inTokens, outTokens] = [usage.input, usage.output].map((value) =>
+					value >= 1000 ? `${(value / 1000).toFixed(1)}k` : String(value),
+				);
+				parts.push(`${inTokens} in / ${outTokens} out`);
+			}
+			if (usage.cost > 0) parts.push(`$${usage.cost >= 0.095 ? usage.cost.toFixed(2) : usage.cost.toFixed(3)}`);
+			lines.push(`\`${parts.join(" \u00B7 ")}\``);
 		}
-		if (turnCost > 0) parts.push(`$${turnCost >= 0.095 ? turnCost.toFixed(2) : turnCost.toFixed(3)}`);
-		if (turnTools > 0) parts.push(`${turnTools} ${turnTools === 1 ? "tool" : "tools"}`);
-		return parts.length === 0 ? "" : `\n\n\`${parts.join(" \u00B7 ")}\``;
+		if (turnTools > 0) lines.push(`\`${turnTools} ${turnTools === 1 ? "tool" : "tools"}\``);
+		return lines.length === 0 ? "" : `\n\n${lines.join("\n")}`;
 	}
 
 	/** A thumbs-up on the delivered message: received, the turn is running. */
@@ -1428,8 +1477,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		ask.messageId = sentMessage?.message_id ?? null;
 	}
 
-	/** Settled options survive as dead grey buttons; the empty keyboard elsewhere is deliberate, since clearing by omission is undocumented. */
-	async function closeAskMessage(messageId: number | null, text: string, keep?: InlineButton[][]): Promise<void> {
+	/** Settled options survive as dead grey buttons. */
+	async function settleQuestionMessage(
+		messageId: number | null,
+		head: string,
+		result: string,
+		keep?: InlineButton[][],
+	): Promise<void> {
 		if (config === null || messageId === null) return;
 		const inline_keyboard =
 			keep === undefined
@@ -1439,7 +1493,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			config,
 			"editMessageText",
 			{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard } },
-			text,
+			`${head}\n\n${result}`,
 		);
 	}
 
@@ -1449,6 +1503,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const superseded = standingQuestion;
 		standingSeq += 1;
 		const id = `${sessionTag}-n${standingSeq.toString(36)}`;
+		const prompt = recorded.question?.trim() || recorded.text;
+		const settlementHead = `${sessionContextLine(ctx)}\n\n${prompt}`;
 		const body = withHead(
 			ctx,
 			title,
@@ -1473,13 +1529,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			id,
 			messageId: sent?.message_id ?? null,
 			labels: recorded.options,
-			closing: withHead(ctx, title, recorded.text),
+			head: settlementHead,
 		};
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
 		if (recorded.urgency === "red") await pinRed(ctx, sent);
 		if (superseded !== null) {
-			await closeAskMessage(superseded.messageId, "Superseded by a newer question.");
+			await settleQuestionMessage(superseded.messageId, superseded.head, "Superseded by a newer question.");
 		}
 	}
 
@@ -1500,12 +1556,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const chosen = [...(ask.selected[ask.index] ?? new Set<string>())];
 		const shown = ask.custom[ask.index] ?? (chosen.length === 0 ? "no selection" : chosen.join(", "));
 		if (answered !== undefined) {
-			const labels = answered.options.map((option) => option.label);
-			await closeAskMessage(
-				ask.messageId,
-				`${answered.question}\n\n**Answered:** ${shown}`,
-				settledKeyboard(labels, new Set(chosen)),
-			);
+			const head = ask.settlementHeads[ask.index];
+			if (head !== undefined) {
+				const labels = answered.options.map((option) => option.label);
+				await settleQuestionMessage(
+					ask.messageId,
+					head,
+					`**Answered:** ${shown}`,
+					settledKeyboard(labels, new Set(chosen)),
+				);
+			}
 		}
 		if (pendingAsk !== ask) return; // Settled at the terminal while the closing edit was in flight.
 		ask.messageId = null;
@@ -1517,7 +1577,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await presentQuestion(ask, false);
 		if (pendingAsk !== ask) {
 			// The terminal settled this ask while the next question was in flight; close the orphan keyboard.
-			await closeAskMessage(ask.messageId, "This question is no longer active.");
+			const head = ask.settlementHeads[ask.index];
+			if (head !== undefined) {
+				await settleQuestionMessage(ask.messageId, head, "This question is no longer active.");
+			}
 			ask.messageId = null;
 		}
 	}
@@ -1600,20 +1663,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (entry.kind === "command") {
 					if (entry.value === "hidequestions") {
 						if (ask !== null && ask.messageId !== null) {
-							await closeAskMessage(ask.messageId, "Question hidden. It stays open at the terminal.");
+							const head = ask.settlementHeads[ask.index];
+							if (head !== undefined) {
+								await settleQuestionMessage(ask.messageId, head, "Question hidden. It stays open at the terminal.");
+							}
 							ask.messageId = null;
 						}
 						const standing = standingQuestion;
 						if (standing !== null) {
 							standingQuestion = null;
 							if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-							await closeAskMessage(standing.messageId, "Question hidden.");
+							await settleQuestionMessage(standing.messageId, standing.head, "Question hidden.");
 						}
 						retireCloseOffer(true);
 					}
 					if (entry.value === "stopturn" && sessionCtx !== null && turnActive) {
 						sessionCtx.abort();
-						detach(serviceNotice("Stopping at your request."), "stop notice");
+						detach(sessionNotice(sessionCtx, "Stopping at your request."), "stop notice");
 					}
 					if (entry.value === "status" && sessionCtx !== null) {
 						const state =
@@ -1627,12 +1693,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 											: "working"
 										: "idle";
 						const lines = [
-							badge(sessionCtx),
 							`State: ${state}.`,
 							standingQuestion !== null ? "A choice question stands open." : "",
 							pinnedMessageId !== null ? "A red status is pinned." : "",
 						].filter((line) => line.length > 0);
-						await serviceNotice(lines.join("\n"));
+						await sessionNotice(sessionCtx, lines.join("\n"));
 					}
 					continue;
 				}
@@ -1649,12 +1714,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 						// Close even when the index is unreadable: state is already cleared,
 						// and a live-looking keyboard on a dead question misleads.
-						await closeAskMessage(
+						await settleQuestionMessage(
 							standing.messageId,
+							standing.head,
 							label === undefined ? "This question is closed." : `**Chosen:** ${label}`,
 							label === undefined ? undefined : settledKeyboard(standing.labels, new Set([label])),
 						);
 						if (label !== undefined) pi.sendUserMessage(label);
+					} else if (sessionCtx !== null) {
+						await sessionNotice(sessionCtx, "That question is closed. It was superseded or already answered.");
 					} else {
 						await serviceNotice("That question is closed. It was superseded or already answered.");
 					}
@@ -1662,7 +1730,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 				if (entry.kind === "callback") {
 					if (ask !== null) await applyCallback(ask, entry.value);
-					else await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
+					else if (sessionCtx !== null) {
+						await sessionNotice(sessionCtx, "That question is closed. It was answered or cancelled at the terminal.");
+					} else {
+						await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
+					}
 					continue;
 				}
 				if (entry.kind === "file") {
@@ -1766,12 +1838,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (config === null) return await invoke(nativeParams, { signal, onUpdate });
 
 			askSequence += 1;
+			const settlementContext = sessionContextLine(ctx);
 			const remote = Promise.withResolvers<AskResult[]>();
 			const ask: PendingAsk = {
 				askId: `${sessionTag}-${askSequence.toString(36)}`,
 				head: badge(ctx),
 				context,
 				questions,
+				settlementHeads: questions.map((question) => `${settlementContext}\n\n${question.question}`),
 				index: 0,
 				messageId: null,
 				selected: questions.map(() => new Set<string>()),
@@ -1796,7 +1870,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			try {
 				const winner = await Promise.race([local, answered]);
 				if (winner.kind === "local") {
-					detach(closeAskMessage(ask.messageId, "Answered at the terminal."), "terminal-answer edit");
+					const head = ask.settlementHeads[ask.index];
+					if (head !== undefined) {
+						detach(settleQuestionMessage(ask.messageId, head, "Answered at the terminal."), "terminal-answer edit");
+					}
 					return winner.value;
 				}
 
@@ -1815,10 +1892,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				};
 			} catch (error) {
 				const aborted = error instanceof Error && /cancel|abort/iu.test(error.message);
-				await closeAskMessage(
-					ask.messageId,
-					aborted ? "Cancelled at the terminal." : "This question is no longer active.",
-				);
+				const head = ask.settlementHeads[ask.index];
+				if (head !== undefined) {
+					await settleQuestionMessage(
+						ask.messageId,
+						head,
+						aborted ? "Cancelled at the terminal." : "This question is no longer active.",
+					);
+				}
 				throw error;
 			} finally {
 				pendingAsk = null;
@@ -1830,7 +1911,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "notify_status",
 		label: "Notify Status",
 		description:
-			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two sentences in plain words stating what was done and what stands open, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 short `options` drawn from those real next steps (for example Continue, Review the diff, Stop here): they become tappable buttons, the tapped label starts the next turn, and the most likely choice goes first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices.",
+			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two plain sentences when no choice is attached, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 short `options` drawn from those real next steps. The notification must be answerable from a phone without terminal context. Options are bare labels, so the `summary` must name the decision, explain why it is needed now, and state what each option does or costs. Each option must name the action. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -1943,7 +2024,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (config === null) {
 				return { content: [{ type: "text", text: "Error: Telegram is not configured" }], isError: true };
 			}
-			const caption = typeof p.caption === "string" ? p.caption.trim().slice(0, 1024) : "";
+			const requestedCaption = typeof p.caption === "string" ? p.caption.trim() : "";
+			const context = sessionContextLine(ctx);
+			const separator = requestedCaption.length > 0 ? "\n\n" : "";
+			const callerLimit = Math.max(0, TELEGRAM_CAPTION_MAX - context.length - separator.length);
+			let callerCaption = requestedCaption.slice(0, callerLimit);
+			const trailing = callerCaption.charCodeAt(callerCaption.length - 1);
+			if (trailing >= 0xd800 && trailing <= 0xdbff) callerCaption = callerCaption.slice(0, -1);
+			const caption = callerCaption.length > 0 ? `${context}${separator}${callerCaption}` : context;
 			const allowedRoots = [ctx.cwd, tmpdir(), MEDIA_DIR];
 			const loaded: Array<{ path: string; name: string; data: Uint8Array; photo: boolean }> = [];
 			let totalBytes = 0;
@@ -2081,7 +2169,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (previous?.standing != null && typeof previous.standing.id === "string") {
 			standingQuestion = {
 				...previous.standing,
-				closing: typeof previous.standing.closing === "string" ? previous.standing.closing : "",
+				head: typeof previous.standing.head === "string" ? previous.standing.head : "",
 			};
 		}
 		if (Array.isArray(previous?.recent)) {
@@ -2175,7 +2263,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (standing !== null) {
 			standingQuestion = null;
 			writeSessionRecord(ctx);
-			detach(closeAskMessage(standing.messageId, "Answered at the terminal."), "standing-question close");
+			detach(
+				settleQuestionMessage(standing.messageId, standing.head, "Answered at the terminal."),
+				"standing-question close",
+			);
 		}
 	});
 
@@ -2190,7 +2281,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (standing !== null) {
 			standingQuestion = null;
 			writeSessionRecord(ctx);
-			detach(closeAskMessage(standing.messageId, "Superseded by new work."), "standing-question close");
+			detach(
+				settleQuestionMessage(standing.messageId, standing.head, "Superseded by new work."),
+				"standing-question close",
+			);
 		}
 		approvalWaiting = false;
 		typingSentAt = 0;
@@ -2199,10 +2293,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		currentTool = "";
 		askStream = null;
 		askPreview = "";
-		turnInput = 0;
-		turnOutput = 0;
-		turnCost = 0;
+		turnStartingModel = ctx.model === undefined ? "unavailable" : `${ctx.model.provider}/${ctx.model.id}`;
 		turnTools = 0;
+		turnUsageByModel.clear();
 		noticedKinds.clear();
 	});
 
@@ -2278,11 +2371,32 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!("usage" in message)) return;
 		const usage: unknown = message.usage;
 		if (usage === null || typeof usage !== "object") return;
-		if ("input" in usage && typeof usage.input === "number") turnInput += usage.input;
-		if ("output" in usage && typeof usage.output === "number") turnOutput += usage.output;
-		if ("cost" in usage && usage.cost !== null && typeof usage.cost === "object" && "total" in usage.cost) {
-			if (typeof usage.cost.total === "number") turnCost += usage.cost.total;
+		const input = "input" in usage && typeof usage.input === "number" ? usage.input : 0;
+		const output = "output" in usage && typeof usage.output === "number" ? usage.output : 0;
+		const cost =
+			"cost" in usage &&
+			usage.cost !== null &&
+			typeof usage.cost === "object" &&
+			"total" in usage.cost &&
+			typeof usage.cost.total === "number"
+				? usage.cost.total
+				: 0;
+		if (input === 0 && output === 0 && cost === 0) return;
+		const model =
+			"provider" in message &&
+			typeof message.provider === "string" &&
+			"model" in message &&
+			typeof message.model === "string"
+				? `${message.provider}/${message.model}`
+				: turnStartingModel;
+		const recorded = turnUsageByModel.get(model);
+		if (recorded === undefined) {
+			turnUsageByModel.set(model, { input, output, cost });
+			return;
 		}
+		recorded.input += input;
+		recorded.output += output;
+		recorded.cost += cost;
 	});
 
 	pi.on("tool_execution_start", async (event) => {
@@ -2297,28 +2411,43 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		draftDirty = true;
 	});
 
-	pi.on("auto_retry_start", async (event) => {
+	pi.on("auto_retry_start", async (event, ctx) => {
 		if (typeof event.attempt !== "number" || event.attempt < 2) return;
-		transparencyNotice("retry", `Provider trouble, retrying (${event.attempt}/${event.maxAttempts}).`);
+		transparencyNotice("retry", `Provider trouble, retrying (${event.attempt}/${event.maxAttempts}).`, ctx);
 	});
 
-	pi.on("retry_fallback_applied", async (event) => {
-		transparencyNotice("fallback", `Model fell back from ${event.from} to ${event.to}.`);
+	pi.on("retry_fallback_applied", async (event, ctx) => {
+		transparencyNotice("fallback", `Model fell back from ${event.from} to ${event.to}.`, ctx);
 	});
 
-	pi.on("retry_fallback_succeeded", async (event) => {
-		transparencyNotice("fallback-ok", `Recovered on ${event.model}.`);
+	pi.on("retry_fallback_succeeded", async (event, ctx) => {
+		transparencyNotice("fallback-ok", `Recovered on ${event.model}.`, ctx);
 	});
 
-	pi.on("auto_compaction_start", async (event) => {
-		transparencyNotice("compaction", `Context is being compacted (${event.reason}), the turn may pause briefly.`);
+	pi.on("auto_compaction_start", async (event, ctx) => {
+		activeCompaction = { trigger: event.reason, action: event.action };
+		transparencyNotice(
+			"compaction",
+			`Context is being compacted (${event.reason}), the turn may pause briefly. Action: ${event.action}.`,
+			ctx,
+		);
 	});
 
-	pi.on("auto_compaction_end", async (event) => {
-		if (event.skipped === true || event.willRetry === true) return;
-		if (event.aborted === true || typeof event.errorMessage === "string") {
-			transparencyNotice("compaction-fail", "Context compaction failed. The context window may overflow.");
+	pi.on("auto_compaction_end", async (event, ctx) => {
+		const compaction = activeCompaction;
+		activeCompaction = null;
+		if (compaction === null || event.skipped === true || event.willRetry === true) return;
+		let failure = "aborted";
+		if (event.aborted !== true) {
+			if (typeof event.errorMessage !== "string") return;
+			failure = event.errorMessage.slice(0, PREVIEW_MAX);
 		}
+		const action = typeof event.action === "string" ? event.action : compaction.action;
+		transparencyNotice(
+			"compaction-fail",
+			`Context compaction failed.\nTrigger: ${compaction.trigger}\nAction: ${action}\nFailure: ${failure}`,
+			ctx,
+		);
 	});
 
 	pi.on("session_stop", async (_event, ctx) => {
@@ -2368,7 +2497,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return {
 				decision: "block" as const,
 				reason:
-					"Before finishing, call notify_status with a one-or-two-sentence summary of where things stand and an urgency (green done, orange reply wanted, red blocked). Be proactive about next steps: name the concrete ones when they exist, and say plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. If any user action is wanted, such as continue, review, or a decision, also set question and 2 to 6 short options drawn from those real next steps, which become tappable buttons whose label starts the next turn. Omit them when there is genuinely nothing to ask. The user is away from the terminal and sees only this.",
+					"Before finishing, call notify_status with a one-or-two-sentence summary when no choice is attached and an urgency (green done, orange reply wanted, red blocked). Be proactive about next steps: name the concrete ones when they exist, and say plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. If any user action is wanted, also set question and 2 to 6 short options drawn from those real next steps. The notification must be answerable from a phone without terminal context. Options are bare labels, so the summary must name the decision, explain why it is needed now, and state what each option does or costs. Each option must name the action. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit them when there is genuinely nothing to ask.",
 			};
 		}
 
@@ -2416,9 +2545,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		finishApprovalNotice(ctx, notice);
 	});
 
-	pi.on("credential_disabled", async (_event, ctx) => {
+	pi.on("credential_disabled", async (event, ctx) => {
 		if (config === null) return;
-		detach(notify(ctx, "\u{1F534} Credential problem", "A provider credential was disabled."), "credential notice");
+		const provider =
+			event !== null && typeof event === "object" && "provider" in event && typeof event.provider === "string"
+				? event.provider
+				: "unavailable";
+		detach(sessionNotice(ctx, `Credential disabled for ${provider}.`), "credential notice");
 	});
 
 	pi.on("session_shutdown", () => {
@@ -2429,9 +2562,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (ask !== null) {
 			pendingAsk = null;
 			const messageId = ask.messageId;
+			const head = ask.settlementHeads[ask.index];
 			ask.messageId = null;
-			if (config !== null && topicId === null) {
-				detach(closeAskMessage(messageId, "This question is no longer active."), "pending-question close");
+			if (config !== null && topicId === null && head !== undefined) {
+				detach(settleQuestionMessage(messageId, head, "This question is no longer active."), "pending-question close");
 			}
 		}
 		const standing = standingQuestion;
@@ -2441,10 +2575,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			// A topic session's shutdown deletes the whole thread below, question included.
 			if (config !== null && topicId === null) {
 				detach(
-					closeAskMessage(
-						standing.messageId,
-						[standing.closing, "**Session closed.**"].filter((part) => part.length > 0).join("\n\n"),
-					),
+					settleQuestionMessage(standing.messageId, standing.head, "**Session closed.**"),
 					"standing-question close",
 				);
 			}
