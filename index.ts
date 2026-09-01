@@ -88,6 +88,8 @@ interface SessionRecord {
 	recent: number[];
 	/** Standing turn-end question; survives a resume. `closing` is the body to show once it dies unanswered. */
 	standing: { id: string; messageId: number | null; labels: string[]; closing: string } | null;
+	/** Message carrying a live close-session button on a plain green summary. */
+	closeOffer: number | null;
 	/** Message pinned for a red status; unpinned when the next turn starts. */
 	pinned: number | null;
 	/** Draft-stream identifier; a stop press routes back through it. */
@@ -467,6 +469,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let turnSummary: TurnStatus | null = null;
 	let standingSeq = 0;
 	let standingQuestion: { id: string; messageId: number | null; labels: string[]; closing: string } | null = null;
+	let closeOfferMessageId: number | null = null;
 	let statusBlockUsed = false;
 	let badgeEmoji = "";
 	let badgeOverride = "";
@@ -566,6 +569,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			lastNotified: lastNotifiedAt,
 			recent: [...recentMessages],
 			standing: standingQuestion,
+			closeOffer: closeOfferMessageId,
 			pinned: pinnedMessageId,
 			draftId,
 			heartbeat: Date.now(),
@@ -724,6 +728,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** The green-summary close button: strip the button, then let the ordinary shutdown path run. */
 	async function closeSessionFromTelegram(messageId: number | undefined): Promise<void> {
+		if (messageId !== undefined && closeOfferMessageId === messageId) closeOfferMessageId = null;
 		if (config !== null && typeof messageId === "number" && standingQuestion?.messageId !== messageId) {
 			// A standing question is rewritten by session_shutdown; a plain summary only loses its button.
 			await callTelegram(
@@ -735,6 +740,24 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		scheduleTmuxWindowKill();
 		sessionCtx?.shutdown();
+	}
+
+	/** The close offer dies the moment new work starts; a stale destructive button invites accidents. */
+	function retireCloseOffer(withEdit: boolean): void {
+		const messageId = closeOfferMessageId;
+		if (messageId === null) return;
+		closeOfferMessageId = null;
+		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+		if (!withEdit || config === null) return;
+		detach(
+			callTelegram(
+				config,
+				"editMessageReplyMarkup",
+				{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } },
+				10_000,
+			),
+			"close-offer retire",
+		);
 	}
 
 	/** One line per omp window, read from the same pane titles that drive the tmux tabs. */
@@ -2040,6 +2063,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		lastNotifiedAt = typeof previous?.lastNotified === "number" ? previous.lastNotified : 0;
 		pinnedMessageId = typeof previous?.pinned === "number" ? previous.pinned : null;
+		closeOfferMessageId = typeof previous?.closeOffer === "number" ? previous.closeOffer : null;
 		// Topic state must come back before the first record write below, or a
 		// crash-recovered session clobbers it and creates a duplicate forum topic.
 		if (typeof previous?.topicId === "number") {
@@ -2133,6 +2157,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	// submissions that never start a turn, which left the typing status stuck on.
 	pi.on("agent_start", async () => {
 		turnActive = true;
+		retireCloseOffer(true);
 		approvalWaiting = false;
 		typingSentAt = 0;
 		draftText = "";
@@ -2282,7 +2307,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const extra: Record<string, unknown> = { ...urgencyExtras(recorded.urgency) };
 				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
 				const work = notify(ctx, `${heads[recorded.urgency]}${suffix}`, recorded.text + usageFooter(), extra).then(
-					(sent) => (recorded.urgency === "red" ? pinRed(ctx, sent) : undefined),
+					(sent) => {
+						if (recorded.urgency === "red") return pinRed(ctx, sent);
+						if (recorded.urgency === "green" && typeof sent?.message_id === "number") {
+							closeOfferMessageId = sent.message_id;
+							writeSessionRecord(ctx);
+						}
+						return undefined;
+					},
 				);
 				detach(work, "turn-end notice");
 				return;
@@ -2343,6 +2375,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		unsubscribeInput?.();
 		unsubscribeInput = null;
+		retireCloseOffer(topicId === null);
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;

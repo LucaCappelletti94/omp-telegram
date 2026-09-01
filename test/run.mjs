@@ -2592,6 +2592,34 @@ await orphanSess.fire("session_start");
 	delete process.env.TMUX_PANE;
 }
 
+// Starting new work retires a stale close-session button.
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const rt = spawn("01a06006-0000-0000-0000-000000000000", "/home/dev/work/retire");
+	await rt.fire("session_start");
+	await rt.fire("input");
+	await rt.tools
+		.get("notify_status")
+		.execute("r1", { summary: "Everything done.", urgency: "green" }, undefined, undefined, rt.ctx);
+	await rt.fire("session_stop");
+	await settle(150);
+	const offerId = JSON.parse(readFileSync(join(sessionsDir, `${rt.id}.json`), "utf8")).closeOffer;
+	check("a plain green summary records its close-offer message", typeof offerId === "number");
+	await rt.fire("agent_start");
+	await settle(150);
+	const strip = called("editMessageReplyMarkup").find((c) => c.body.message_id === offerId);
+	check(
+		"new work strips the stale close button",
+		strip !== undefined && strip.body.reply_markup.inline_keyboard.length === 0,
+	);
+	check(
+		"the retired offer leaves the record",
+		JSON.parse(readFileSync(join(sessionsDir, `${rt.id}.json`), "utf8")).closeOffer === null,
+	);
+	await rt.fire("agent_end");
+}
+
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);
