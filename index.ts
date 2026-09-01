@@ -181,6 +181,13 @@ interface PendingAsk {
 	finish: (results: AskResult[]) => void;
 }
 
+interface ApprovalNotice {
+	toolCallId: string;
+	toolName: string;
+	messageId: number | null;
+	resolution: { approved: boolean; reason: string } | null;
+}
+
 interface TurnStatus {
 	text: string;
 	urgency: "green" | "orange" | "red";
@@ -480,6 +487,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let turnActive = false;
 	let typingSentAt = 0;
 	let approvalWaiting = false;
+	let approvalNotice: ApprovalNotice | null = null;
 	let pinnedMessageId: number | null = null;
 	let topicIcons: Array<{ emoji?: string; custom_emoji_id?: string }> | null = null;
 	/** The live session context, for record writes outside event handlers. */
@@ -878,6 +886,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
 		return sent;
+	}
+
+	function finishApprovalNotice(ctx: ExtensionContext, notice: ApprovalNotice): void {
+		if (approvalNotice !== notice || notice.messageId === null || notice.resolution === null || config === null) return;
+		approvalNotice = null;
+		const { approved, reason } = notice.resolution;
+		const title = approved ? "Approval granted" : "Approval denied";
+		const detail = reason.length > 0 ? `\nReason: ${reason}` : "";
+		detach(
+			sendOrEdit(
+				config,
+				"editMessageText",
+				{ chat_id: config.chatId, message_id: notice.messageId },
+				withHead(ctx, title, `${notice.toolName} was ${approved ? "approved" : "denied"}.${detail}`),
+			),
+			"approval resolution",
+		);
 	}
 
 	/** The typing status lasts about five seconds; refresh while the agent loop runs and nothing waits on the user. */
@@ -1584,6 +1609,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 							await closeAskMessage(standing.messageId, "Question hidden.");
 						}
+						retireCloseOffer(true);
 					}
 					if (entry.value === "stopturn" && sessionCtx !== null && turnActive) {
 						sessionCtx.abort();
@@ -2155,9 +2181,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	// The agent loop is the only truthful "working" signal: `input` also fires for
 	// submissions that never start a turn, which left the typing status stuck on.
-	pi.on("agent_start", async () => {
+	pi.on("agent_start", async (_event, ctx) => {
 		turnActive = true;
+		statusBlockUsed = false;
+		unpinRed(ctx);
 		retireCloseOffer(true);
+		const standing = standingQuestion;
+		if (standing !== null) {
+			standingQuestion = null;
+			writeSessionRecord(ctx);
+			detach(closeAskMessage(standing.messageId, "Superseded by new work."), "standing-question close");
+		}
 		approvalWaiting = false;
 		typingSentAt = 0;
 		draftText = "";
@@ -2350,21 +2384,36 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("tool_approval_requested", async (event, ctx) => {
 		approvalWaiting = true;
 		if (config === null) return;
-		const named = event !== null && typeof event === "object" && "toolName" in event ? event.toolName : undefined;
-		const tool = typeof named === "string" ? named : "a tool";
+		const tool = event.toolName;
+		const notice: ApprovalNotice = {
+			toolCallId: event.toolCallId,
+			toolName: tool,
+			messageId: null,
+			resolution: null,
+		};
+		approvalNotice = notice;
 		const where = tmuxLocation();
-		detach(
-			notify(
-				ctx,
-				`\u{1F534} Approval needed${where === null ? "" : ` (tmux ${where})`}`,
-				`${tool} is waiting for approval.`,
-			),
-			"approval notice",
-		);
+		const work = notify(
+			ctx,
+			`\u{1F534} Approval needed${where === null ? "" : ` (tmux ${where})`}`,
+			`${tool} is waiting for approval.`,
+		).then((sent) => {
+			notice.messageId = typeof sent?.message_id === "number" ? sent.message_id : null;
+			if (notice.messageId === null && notice.resolution !== null && approvalNotice === notice) {
+				approvalNotice = null;
+				return;
+			}
+			finishApprovalNotice(ctx, notice);
+		});
+		detach(work, "approval notice");
 	});
 
-	pi.on("tool_approval_resolved", async () => {
+	pi.on("tool_approval_resolved", async (event, ctx) => {
 		approvalWaiting = false;
+		const notice = approvalNotice;
+		if (notice === null || notice.toolCallId !== event.toolCallId) return;
+		notice.resolution = { approved: event.approved, reason: event.reason?.trim() ?? "" };
+		finishApprovalNotice(ctx, notice);
 	});
 
 	pi.on("credential_disabled", async (_event, ctx) => {
@@ -2376,6 +2425,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		unsubscribeInput?.();
 		unsubscribeInput = null;
 		retireCloseOffer(topicId === null);
+		const ask = pendingAsk;
+		if (ask !== null) {
+			pendingAsk = null;
+			const messageId = ask.messageId;
+			ask.messageId = null;
+			if (config !== null && topicId === null) {
+				detach(closeAskMessage(messageId, "This question is no longer active."), "pending-question close");
+			}
+		}
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
@@ -2391,6 +2449,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				);
 			}
 		}
+		if (topicId === null && sessionCtx !== null) unpinRed(sessionCtx);
 		if (config !== null && topicId !== null) {
 			mkdirSync(PENDING_TOPICS_DIR, { recursive: true, mode: 0o700 });
 			writeFileAtomic(join(PENDING_TOPICS_DIR, `${sessionId}.json`), JSON.stringify(topicId), 0o600);

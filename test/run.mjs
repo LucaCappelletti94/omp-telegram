@@ -1244,9 +1244,39 @@ const askMsg = lastCall("sendMessage").body.text;
 check("a trailing question gets the orange light", askMsg.includes("\u{1F7E0}") && askMsg.includes("Reply wanted"));
 check("the question itself is the body", askMsg.includes("legacy shim"));
 
-await sem.fire("tool_approval_requested");
+const grantedNoticeId = api.nextMessage;
+await sem.fire("tool_approval_requested", { toolCallId: "approve-1", toolName: "bash" });
 await settle(150);
 check("approval carries the red light", lastCall("sendMessage").body.text.includes("\u{1F534}"));
+await sem.fire("tool_approval_resolved", {
+	toolCallId: "approve-1",
+	toolName: "bash",
+	approved: true,
+});
+await settle(150);
+const grantedEdit = called("editMessageText").find((c) => c.body.message_id === grantedNoticeId);
+check(
+	"an approval grant replaces the waiting notice",
+	grantedEdit?.body.text.includes("Approval granted") && grantedEdit.body.text.includes("bash was approved"),
+);
+
+const deniedNoticeId = api.nextMessage;
+await sem.fire("tool_approval_requested", { toolCallId: "approve-2", toolName: "write" });
+await settle(150);
+await sem.fire("tool_approval_resolved", {
+	toolCallId: "approve-2",
+	toolName: "write",
+	approved: false,
+	reason: "Policy denied it.",
+});
+await settle(150);
+const deniedEdit = called("editMessageText").find((c) => c.body.message_id === deniedNoticeId);
+check(
+	"an approval denial replaces the waiting notice",
+	deniedEdit?.body.text.includes("Approval denied") &&
+		deniedEdit.body.text.includes("write was denied") &&
+		deniedEdit.body.text.includes("Policy denied it"),
+);
 
 const semState = {};
 const semRun = sem.tools
@@ -1317,6 +1347,13 @@ check(
 check(
 	"after the block the fallback message still goes out",
 	lastCall("sendMessage").body.text.includes("Turn finished"),
+);
+
+await rs.fire("agent_start");
+const telegramStop = await rs.fire("session_stop");
+check(
+	"a Telegram-started turn resets the status requirement",
+	telegramStop.some((r) => r?.decision === "block"),
 );
 
 await rs.fire("input");
@@ -1484,6 +1521,30 @@ check(
 writeFileSync(join(inboxOf(tq.id), "994.json"), JSON.stringify({ kind: "callback", value: q5Btn.callback_data }));
 await tq.pump(250);
 check("a press after the terminal answered is refused", lastCall("sendMessage").body.text.includes("closed"));
+
+await tq.tools
+	.get("notify_status")
+	.execute(
+		"q6",
+		{ summary: "Choose again.", urgency: "orange", options: ["Proceed", "Wait"] },
+		undefined,
+		undefined,
+		tq.ctx,
+	);
+await tq.fire("session_stop");
+await settle(150);
+const telegramQuestionId = record(tq.id).standing.messageId;
+const telegramEditsBefore = called("editMessageText").length;
+await tq.fire("agent_start");
+await settle(150);
+const telegramClosures = called("editMessageText").slice(telegramEditsBefore);
+check(
+	"a Telegram-started turn retires the standing question",
+	telegramClosures.some(
+		(c) => c.body.message_id === telegramQuestionId && c.body.text.includes("Superseded by new work"),
+	),
+);
+check("the retired standing question is cleared from the record", record(tq.id).standing === null);
 
 // notify_status validation
 const badOpts = await tq.tools
@@ -1710,6 +1771,25 @@ check(
 	called("editMessageText").some((c) => c.body.text.includes("Question hidden")),
 );
 
+await ux.tools
+	.get("notify_status")
+	.execute("ux-hide", { summary: "Done.", urgency: "green" }, undefined, undefined, ux.ctx);
+await ux.fire("session_stop");
+await settle(150);
+const hiddenOfferId = record(ux.id).closeOffer;
+writeFileSync(join(inboxOf(ux.id), "6111.json"), JSON.stringify({ kind: "command", value: "hidequestions" }));
+await ux.pump(200);
+check(
+	"hidequestions retires the close-session offer",
+	called("editMessageReplyMarkup").some(
+		(c) =>
+			c.body.message_id === hiddenOfferId &&
+			Array.isArray(c.body.reply_markup?.inline_keyboard) &&
+			c.body.reply_markup.inline_keyboard.length === 0,
+	),
+);
+check("hidequestions clears the recorded close-session offer", record(ux.id).closeOffer === null);
+
 heading("/fleet reads the tmux window titles");
 
 // A fake tmux binary on PATH stands in for the real server.
@@ -1765,9 +1845,9 @@ await settle(200);
 const pinnedCall = lastCall("pinChatMessage");
 check("a red status is pinned", pinnedCall !== undefined && typeof pinnedCall.body.message_id === "number");
 check("the pin is recorded for the next session", record(ux.id).pinned === pinnedCall.body.message_id);
-await ux.fire("input");
+await ux.fire("agent_start");
 await settle(150);
-check("the next turn unpins it", lastCall("unpinChatMessage").body.message_id === pinnedCall.body.message_id);
+check("a Telegram-started turn unpins it", lastCall("unpinChatMessage").body.message_id === pinnedCall.body.message_id);
 check("the record clears", record(ux.id).pinned === null);
 
 // Green statuses celebrate.
@@ -2377,6 +2457,37 @@ await orphanSess.fire("session_start");
 	);
 	const record = JSON.parse(readFileSync(join(sessionsDir, `${bye.id}.json`), "utf8"));
 	check("the shutdown clears the standing question from the record", record.standing === null);
+}
+
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const closedAsk = spawn("01a05005-0000-0000-0000-000000000000", "/home/dev/work/closed-ask");
+	await closedAsk.fire("session_start");
+	await closedAsk.tools
+		.get("notify_status")
+		.execute("shutdown-red", { summary: "Blocked.", urgency: "red" }, undefined, undefined, closedAsk.ctx);
+	await closedAsk.fire("session_stop");
+	await settle(150);
+	const shutdownPinId = record(closedAsk.id).pinned;
+	const shutdownAskId = api.nextMessage;
+	void closedAsk.tools
+		.get("ask")
+		.execute("shutdown-ask", singleQuestion, undefined, undefined, stubbornCtx(closedAsk.ctx, {}));
+	await settle(150);
+	await closedAsk.fire("session_shutdown");
+	await settle(150);
+	check(
+		"session shutdown closes the pending ask",
+		called("editMessageText").some(
+			(c) => c.body.message_id === shutdownAskId && c.body.text.includes("This question is no longer active"),
+		),
+	);
+	check(
+		"flat session shutdown unpins the red status",
+		called("unpinChatMessage").some((c) => c.body.message_id === shutdownPinId),
+	);
+	check("flat session shutdown clears the recorded pin", record(closedAsk.id).pinned === null);
 }
 
 // Drafts render the markdown subset, with a plain fallback when the HTML is rejected.
