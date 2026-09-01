@@ -2278,6 +2278,43 @@ await orphanSess.fire("session_start");
 	);
 }
 
+// A session shutdown turns an open standing question into a closing message.
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const bye = spawn("01a06001-0000-0000-0000-000000000000", "/home/dev/work/bye");
+	await bye.fire("session_start");
+	await bye.fire("input");
+	await bye.tools
+		.get("notify_status")
+		.execute(
+			"bye1",
+			{ summary: "Round done.", urgency: "orange", options: ["Continue", "Stop"] },
+			undefined,
+			undefined,
+			bye.ctx,
+		);
+	await bye.fire("session_stop");
+	await settle(150);
+	check(
+		"the shutdown test opens a standing question",
+		lastCall("sendMessage").body.reply_markup.inline_keyboard.flat().length === 2,
+	);
+	await bye.fire("session_shutdown");
+	await settle(150);
+	const closures = called("editMessageText").filter((c) => c.body.text.includes("Session closed."));
+	check(
+		"session shutdown closes the standing question and keeps the summary",
+		closures.some((c) => c.body.text.includes("Round done.")),
+	);
+	check(
+		"the closed question keeps no live buttons",
+		closures.every((c) => (c.body.reply_markup?.inline_keyboard ?? []).flat().length === 0),
+	);
+	const record = JSON.parse(readFileSync(join(sessionsDir, `${bye.id}.json`), "utf8"));
+	check("the shutdown clears the standing question from the record", record.standing === null);
+}
+
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);

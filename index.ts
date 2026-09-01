@@ -86,8 +86,8 @@ interface SessionRecord {
 	lastNotified: number;
 	/** Replying to one of these routes back here. */
 	recent: number[];
-	/** Standing turn-end question; survives a resume. */
-	standing: { id: string; messageId: number | null; labels: string[] } | null;
+	/** Standing turn-end question; survives a resume. `closing` is the body to show once it dies unanswered. */
+	standing: { id: string; messageId: number | null; labels: string[]; closing: string } | null;
 	/** Message pinned for a red status; unpinned when the next turn starts. */
 	pinned: number | null;
 	/** Draft-stream identifier; a stop press routes back through it. */
@@ -430,7 +430,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let unsubscribeInput: (() => void) | null = null;
 	let turnSummary: TurnStatus | null = null;
 	let standingSeq = 0;
-	let standingQuestion: { id: string; messageId: number | null; labels: string[] } | null = null;
+	let standingQuestion: { id: string; messageId: number | null; labels: string[]; closing: string } | null = null;
 	let statusBlockUsed = false;
 	let badgeEmoji = "";
 	let badgeOverride = "";
@@ -1243,7 +1243,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}),
 			body,
 		);
-		standingQuestion = { id, messageId: sent?.message_id ?? null, labels: recorded.options };
+		standingQuestion = {
+			id,
+			messageId: sent?.message_id ?? null,
+			labels: recorded.options,
+			closing: withHead(ctx, title, recorded.text),
+		};
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
 		if (recorded.urgency === "red") await pinRed(ctx, sent);
@@ -1839,7 +1844,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const previous = readSessionRecord(sessionId);
 		badgeOverride = previous?.label ?? "";
 		if (previous?.standing != null && typeof previous.standing.id === "string") {
-			standingQuestion = previous.standing;
+			standingQuestion = {
+				...previous.standing,
+				closing: typeof previous.standing.closing === "string" ? previous.standing.closing : "",
+			};
 		}
 		if (Array.isArray(previous?.recent)) {
 			recentMessages.push(...previous.recent.filter((n): n is number => typeof n === "number"));
@@ -2107,6 +2115,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		unsubscribeInput?.();
 		unsubscribeInput = null;
+		const standing = standingQuestion;
+		if (standing !== null) {
+			standingQuestion = null;
+			if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+			// A topic session's shutdown deletes the whole thread below, question included.
+			if (config !== null && topicId === null) {
+				detach(
+					closeAskMessage(
+						standing.messageId,
+						[standing.closing, "**Session closed.**"].filter((part) => part.length > 0).join("\n\n"),
+					),
+					"standing-question close",
+				);
+			}
+		}
 		if (config !== null && topicId !== null) {
 			mkdirSync(PENDING_TOPICS_DIR, { recursive: true, mode: 0o700 });
 			writeFileAtomic(join(PENDING_TOPICS_DIR, `${sessionId}.json`), JSON.stringify(topicId), 0o600);
