@@ -1296,6 +1296,25 @@ check(
 		rs.tools.get("notify_status").description.includes("Never invent"),
 );
 check(
+	"the block suggests bug-fix follow-ups including mutation testing",
+	firstStop.find((r) => r?.decision === "block").reason.includes("bugs of the same family") &&
+		firstStop.find((r) => r?.decision === "block").reason.includes("mutation testing"),
+);
+check(
+	"the block suggests feature follow-ups including a cleaner abstraction and a maintainer review",
+	firstStop.find((r) => r?.decision === "block").reason.includes("blanket impl") &&
+		firstStop.find((r) => r?.decision === "block").reason.includes("criterion benchmarks") &&
+		firstStop.find((r) => r?.decision === "block").reason.includes("maintainer"),
+);
+check(
+	"notify_status description carries the same follow-up guidance",
+	rs.tools.get("notify_status").description.includes("bugs of the same family") &&
+		rs.tools.get("notify_status").description.includes("mutation testing") &&
+		rs.tools.get("notify_status").description.includes("blanket impl") &&
+		rs.tools.get("notify_status").description.includes("criterion benchmarks") &&
+		rs.tools.get("notify_status").description.includes("maintainer"),
+);
+check(
 	"after the block the fallback message still goes out",
 	lastCall("sendMessage").body.text.includes("Turn finished"),
 );
