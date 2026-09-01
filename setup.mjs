@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -72,7 +72,7 @@ mkdirSync(agentDir, { recursive: true });
 const temp = `${configPath}.tmp`;
 writeFileSync(
 	temp,
-	`${JSON.stringify({ token, chatId, offset, quietSeconds: 45, notifyOnTurnEnd: true }, null, 2)}\n`,
+	`${JSON.stringify({ token, chatId, offset, quietSeconds: 45, notifyOnTurnEnd: true, streamDrafts: true }, null, 2)}\n`,
 	{ mode: 0o600 },
 );
 renameSync(temp, configPath);

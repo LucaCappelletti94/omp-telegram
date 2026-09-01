@@ -1,3 +1,6 @@
+permissions:
+  contents: read
+
 name: CI
 
 on:
@@ -14,11 +17,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
       - run: npm run lint
+      - run: npm run typecheck
       - run: node --check setup.mjs
-      - run: npm test
+      - run: npm run coverage
       - run: npm run preview
+      - name: actionlint
+        run: bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12 && ./actionlint -color
+      - name: zizmor
+        run: pipx run zizmor==1.30.0 --no-progress .github/workflows/

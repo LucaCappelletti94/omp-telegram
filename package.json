@@ -5,11 +5,16 @@
 	"type": "module",
 	"license": "MIT",
 	"omp": {
-		"extensions": ["./index.ts"]
+		"extensions": [
+			"./index.ts"
+		]
 	},
 	"scripts": {
 		"test": "node --disable-warning=ExperimentalWarning test/run.mjs",
-		"lint": "npx -y @biomejs/biome@1.9.4 ci .",
+		"lint": "npx -y @biomejs/biome@2.4.4 ci .",
+		"typecheck": "npm i --no-save --no-audit --no-fund @types/node@24 @oh-my-pi/pi-coding-agent@18 && npx -y -p typescript@5.9.3 tsc --noEmit",
+		"coverage": "npx -y c8@10.1.3 --include index.ts --check-coverage --lines 90 --branches 70 -r text-summary node --disable-warning=ExperimentalWarning test/run.mjs",
+		"mutation": "npx -y @stryker-mutator/core@10.0.0 run",
 		"preview": "node --disable-warning=ExperimentalWarning test/preview.mjs",
 		"setup": "node setup.mjs"
 	},

@@ -4,8 +4,8 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
-	readFileSync,
 	readdirSync,
+	readFileSync,
 	rmSync,
 	statSync,
 	unlinkSync,
@@ -85,9 +85,7 @@ const mod = await import(EXTENSION);
 const chain = new Proxy(() => chain, { get: () => chain, apply: () => chain });
 
 let fails = 0;
-let section = "";
 const heading = (title) => {
-	section = title;
 	console.log(`\n-- ${title}`);
 };
 const check = (label, ok) => {
@@ -526,14 +524,15 @@ check(
 );
 check(
 	"topic queued in case the process dies first",
-	JSON.parse(readFileSync(join(root, "notify-telegram/pending-topics.json"), "utf8")).includes(topicAlpha),
+	existsSync(join(root, "notify-telegram/pending-topics", `${alpha.id}.json`)) &&
+		JSON.parse(readFileSync(join(root, "notify-telegram/pending-topics", `${alpha.id}.json`), "utf8")) === topicAlpha,
 );
 check("session record removed on exit", !existsSync(join(sessionsDir, `${alpha.id}.json`)));
 const sweeper = spawn("01a03700-0000-0000-0000-000000000000", "/home/dev/work/ds4");
 await sweeper.fire("session_start");
 check(
 	"the next start sweeps the delete queue",
-	JSON.parse(readFileSync(join(root, "notify-telegram/pending-topics.json"), "utf8")).length === 0,
+	!existsSync(join(root, "notify-telegram/pending-topics", `${alpha.id}.json`)),
 );
 
 api.topicsEnabled = false;
@@ -555,7 +554,6 @@ const rr2 = spawn("01a03901-0000-0000-0000-000000000000", "/home/dev/work/diesel
 await rr2.fire("session_start");
 await rr1.fire("session_stop");
 await settle();
-const rr1Msg = lastCall("sendMessage").body;
 const rr1Id = called("sendMessage").at(-1) && api.nextMessage - 1;
 await rr2.fire("session_stop");
 await settle();
@@ -884,10 +882,9 @@ const md = [
 	"~~gone~~ and *stars* and _unders_ and ||secret||",
 	"keep snake_case_name and 2 * 3 intact",
 ].join("\n");
-const rendered = mod.__test_render ?? null;
 const mdSession = spawn("01a03e01-0000-0000-0000-000000000000", "/home/dev/work/los");
 await mdSession.fire("session_start");
-const mdRun = mdSession.tools
+mdSession.tools
 	.get("ask")
 	.execute(
 		"md",
@@ -913,7 +910,7 @@ check("bare multiplication is left alone", mdBody.text.includes("2 * 3"));
 
 // An oversized body must still be sent, shrunk to fit.
 const huge = "<".repeat(3500);
-const hugeRun = mdSession.tools
+mdSession.tools
 	.get("ask")
 	.execute(
 		"hg",
@@ -1024,7 +1021,6 @@ check(
 );
 
 // A press on the retired question must be answered, not swallowed.
-const staleAsk = lastCall("sendMessage");
 const beforeStale = called("sendMessage").length;
 writeFileSync(join(inboxOf(esc.id), "950.json"), JSON.stringify({ kind: "callback", value: "o:zzzzz-1:0:0" }));
 await esc.pump(200);
@@ -1209,8 +1205,9 @@ torn.heartbeat();
 const litter = readdirSync(sessionsDir).filter((f) => f.includes(".tmp"));
 check("no temp files are left behind", litter.length === 0);
 
-// An unparseable pending-topics file degrades to an empty queue instead of throwing.
-writeFileSync(join(root, "notify-telegram/pending-topics.json"), "{nope");
+// An unparseable pending-topics entry is silently discarded instead of throwing.
+mkdirSync(join(root, "notify-telegram/pending-topics"), { recursive: true });
+writeFileSync(join(root, "notify-telegram/pending-topics/corrupt.json"), "{nope");
 const sweep2 = spawn("01a04103-0000-0000-0000-000000000000", "/home/dev/work/rats");
 let sweepFailed = false;
 try {
@@ -1519,6 +1516,9 @@ check("packing does not disturb option indices", (await bpRun).details.selectedO
 // ------------------------------------------------------- review-pass regression pins
 heading("review-pass fixes");
 // Fix 2: a resume keeps reply routing to pre-restart messages and keeps recency.
+// Refresh rr1's record heartbeat so a slow suite run cannot let reapDeadSessions
+// delete it before rrBack's session_start reads the previous record.
+rr1.heartbeat();
 const rrBack = spawn(rr1.id, "/home/dev/work/subql");
 await rrBack.fire("session_start");
 const rrRecord = JSON.parse(readFileSync(join(sessionsDir, `${rr1.id}.json`), "utf8"));
@@ -2049,6 +2049,234 @@ await quietDrafts.pump(120);
 check("streamDrafts false silences the draft stream", called("sendMessageDraft").length === draftsQuiet);
 await quietDrafts.fire("agent_end");
 writeConfig();
+
+heading("new behavior regressions");
+
+// a. A markdown link whose URL contains a double quote renders &quot; in the href
+// and the message still goes out as HTML (no plain-text downgrade).
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const nbSess = spawn("01a05020-0000-0000-0000-000000000000", "/home/dev/work/newbeh");
+await nbSess.fire("session_start");
+await nbSess.fire("input");
+await nbSess.tools
+	.get("notify_status")
+	.execute(
+		"nb1",
+		{ summary: 'See [the docs](https://example.com/"quoted"/path).', urgency: "green" },
+		undefined,
+		undefined,
+		nbSess.ctx,
+	);
+await nbSess.fire("session_stop");
+await settle(150);
+const quotedMsg = lastCall("sendMessage").body;
+check(
+	"double-quote in link href renders as &quot;",
+	quotedMsg.text.includes('href="https://example.com/&quot;quoted&quot;/path"'),
+);
+check("parse_mode is still HTML when href contains &quot;", quotedMsg.parse_mode === "HTML");
+
+// b. A NUL-digit-NUL sequence in input does not duplicate the stashed code block
+// and does not leak the stash marker into the output.
+await nbSess.fire("input");
+await nbSess.tools
+	.get("notify_status")
+	.execute(
+		"nb2",
+		{ summary: "Before \u00000\u0000 after and `real code` end.", urgency: "green" },
+		undefined,
+		undefined,
+		nbSess.ctx,
+	);
+await nbSess.fire("session_stop");
+await settle(150);
+const nulMsg = lastCall("sendMessage").body;
+check(
+	"NUL-digit-NUL in input does not duplicate a stashed code block",
+	(nulMsg.text.match(/<code>/g) ?? []).length === 1,
+);
+check("NUL characters are absent from the rendered output", !nulMsg.text.includes("\u0000"));
+
+// c. A very long string of surrogate-pair emoji triggers the 80% truncation loop
+// and the resulting text never ends on a lone high surrogate.
+await nbSess.fire("input");
+await nbSess.tools
+	.get("notify_status")
+	.execute("nb3", { summary: "\uD83D\uDE00".repeat(2501), urgency: "green" }, undefined, undefined, nbSess.ctx);
+await nbSess.fire("session_stop");
+await settle(150);
+const surrogateText = lastCall("sendMessage").body.text;
+const lastCodeUnit = surrogateText.charCodeAt(surrogateText.length - 1);
+check(
+	"surrogate-pair truncation: last code unit is not a lone high surrogate",
+	lastCodeUnit < 0xd800 || lastCodeUnit > 0xdbff,
+);
+
+// d. persistOffset must not lower an offset another process already advanced past.
+writeConfig({ offset: 100 });
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const noRwSess = spawn("01a05000-0000-0000-0000-000000000000", "/home/dev/work/norewind");
+await noRwSess.fire("session_start");
+// Simulate another poller advancing the on-disk offset past what this session knows.
+writeConfig({ offset: 500 });
+api.queued = [{ update_id: 150, message: { message_id: 1, date: 1, chat: { id: CHAT }, text: "late" } }];
+await noRwSess.pump(250);
+check(
+	"persistOffset does not lower an offset already advanced by another process",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset >= 500,
+);
+writeConfig();
+
+// e. Lock-steal batch drop: an in-flight getUpdates whose lock is stolen while
+// awaiting must not deliver to any inbox and must not advance the offset.
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const stealSess = spawn("01a05001-0000-0000-0000-000000000000", "/home/dev/work/steal");
+await stealSess.fire("session_start");
+{
+	let resolveGetUpdates;
+	const stealBase = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		const method = String(url).split("/").pop();
+		if (method === "getUpdates" && resolveGetUpdates === undefined) {
+			await new Promise((r) => {
+				resolveGetUpdates = r;
+			});
+		}
+		return stealBase(url, init);
+	};
+	api.queued = [{ update_id: 999, message: { message_id: 50, date: 1, chat: { id: CHAT }, text: "stolen" } }];
+	const offsetBefore = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+	const inboxBefore = inboxCount(stealSess.id);
+	const pumpP = stealSess.pump(400);
+	await settle(60);
+	writeFileSync(
+		join(root, "notify-telegram/poller.lock"),
+		JSON.stringify({ sessionId: "foreign-0000-0000-0000", pid: 99999, heartbeat: Date.now() }),
+	);
+	resolveGetUpdates?.();
+	await pumpP;
+	globalThis.fetch = stealBase;
+	check("lock-steal drops in-flight batch: inbox not modified", inboxCount(stealSess.id) === inboxBefore);
+	check(
+		"lock-steal drops in-flight batch: offset not advanced",
+		JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === offsetBefore,
+	);
+}
+
+// f. Orphaned-keyboard guard: when the terminal resolves the ask while the next
+// question's sendMessage is still in flight, advance closes the orphan keyboard
+// with "This question is no longer active."
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const orphanSess = spawn("01a05002-0000-0000-0000-000000000000", "/home/dev/work/orphan");
+await orphanSess.fire("session_start");
+{
+	let resolveTerminal;
+	const orphanCtx = {
+		...orphanSess.ctx,
+		invokeTool: () =>
+			new Promise((r) => {
+				resolveTerminal = r;
+			}),
+	};
+	let orphanSendCount = 0;
+	let resolveSendQ2;
+	const orphanBase = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		const method = String(url).split("/").pop();
+		if (method === "sendMessage") {
+			orphanSendCount++;
+			if (orphanSendCount === 2) {
+				await new Promise((r) => {
+					resolveSendQ2 = r;
+				});
+			}
+		}
+		return orphanBase(url, init);
+	};
+	const orphanRun = orphanSess.tools.get("ask").execute(
+		"ork",
+		{
+			questions: [
+				{ id: "a", question: "First?", options: [{ label: "x" }] },
+				{ id: "b", question: "Second?", options: [{ label: "y" }] },
+			],
+		},
+		undefined,
+		undefined,
+		orphanCtx,
+	);
+	await settle(150);
+	const q1Cb = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data;
+	writeFileSync(join(inboxOf(orphanSess.id), "1001.json"), JSON.stringify({ kind: "callback", value: q1Cb }));
+	const orphanPump = orphanSess.pump(600);
+	await settle(80);
+	resolveTerminal?.({ content: [{ type: "text", text: "done at terminal" }], details: {} });
+	await settle(80);
+	resolveSendQ2?.();
+	await orphanPump;
+	globalThis.fetch = orphanBase;
+	void orphanRun.catch(() => undefined);
+	check(
+		"orphaned-keyboard guard closes q2 with the inactive notice",
+		called("editMessageText").some((c) => c.body.text.includes("This question is no longer active.")),
+	);
+}
+
+// g. An inbox entry for an image that cannot be read back sends a service notice
+// and does not fire a reaction ack for that message.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const dropSess = spawn("01a05003-0000-0000-0000-000000000000", "/home/dev/work/drop");
+	await dropSess.fire("session_start");
+	const dropMsgId = 4242;
+	writeFileSync(
+		join(inboxOf(dropSess.id), "2001.json"),
+		JSON.stringify({ kind: "file", value: "/nonexistent/ghost.png", mime: "image/png", messageId: dropMsgId }),
+	);
+	const reactsBefore = called("setMessageReaction").length;
+	await dropSess.pump(250);
+	check(
+		"photo-drop notice: service message sent for unreadable image",
+		called("sendMessage").some((c) => c.body.text?.includes("could not be read back from disk")),
+	);
+	check(
+		"photo-drop notice: no reaction ack for the dropped message",
+		!called("setMessageReaction").some((c) => c.body.message_id === dropMsgId) &&
+			called("setMessageReaction").length === reactsBefore,
+	);
+}
+
+// h. Concurrent shutdown: two topic sessions shut down and write separate
+// pending-topics files; the next start sweeps both with two deleteForumTopic calls.
+{
+	api.topicsEnabled = true;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const concA = spawn("01a05010-0000-0000-0000-000000000000", "/home/dev/work/concA");
+	const concB = spawn("01a05011-0000-0000-0000-000000000000", "/home/dev/work/concB");
+	await concA.fire("session_start");
+	await concB.fire("session_start");
+	await concA.fire("session_shutdown");
+	await concB.fire("session_shutdown");
+	const pendingTopicsDir = join(root, "notify-telegram/pending-topics");
+	check(
+		"concurrent shutdown writes a pending-topics file per session",
+		existsSync(join(pendingTopicsDir, `${concA.id}.json`)) && existsSync(join(pendingTopicsDir, `${concB.id}.json`)),
+	);
+	api.topicsEnabled = false;
+	writeConfig();
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const sweepTwo = spawn("01a05012-0000-0000-0000-000000000000", "/home/dev/work/sweep2");
+	const deletesBeforeSweep = called("deleteForumTopic").length;
+	await sweepTwo.fire("session_start");
+	check(
+		"concurrent shutdown sweep clears both pending-topics files",
+		!existsSync(join(pendingTopicsDir, `${concA.id}.json`)) && !existsSync(join(pendingTopicsDir, `${concB.id}.json`)),
+	);
+	check(
+		"concurrent shutdown sweep calls deleteForumTopic for each pending topic",
+		called("deleteForumTopic").length === deletesBeforeSweep + 2,
+	);
+}
 
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);

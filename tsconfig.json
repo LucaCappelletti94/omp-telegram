@@ -1,0 +1,16 @@
+{
+	"compilerOptions": {
+		"strict": true,
+		"noEmit": true,
+		"module": "nodenext",
+		"moduleResolution": "nodenext",
+		"target": "esnext",
+		"lib": ["esnext"],
+		"types": ["node"],
+		"allowImportingTsExtensions": true,
+		"erasableSyntaxOnly": true,
+		"skipLibCheck": true,
+		"noUncheckedIndexedAccess": true
+	},
+	"include": ["index.ts"]
+}

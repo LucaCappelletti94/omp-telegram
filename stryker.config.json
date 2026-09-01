@@ -1,0 +1,11 @@
+{
+	"$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/core/schema/stryker-core.json",
+	"testRunner": "command",
+	"commandRunner": { "command": "node --disable-warning=ExperimentalWarning test/run.mjs" },
+	"mutate": ["index.ts"],
+	"concurrency": 40,
+	"timeoutMS": 20000,
+	"timeoutFactor": 2,
+	"reporters": ["progress-append-only", "html", "clear-text"],
+	"disableTypeChecks": true
+}

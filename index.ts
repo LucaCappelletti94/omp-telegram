@@ -3,8 +3,8 @@ import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
-	readFileSync,
 	readdirSync,
+	readFileSync,
 	renameSync,
 	rmSync,
 	statSync,
@@ -12,7 +12,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent");
@@ -21,7 +21,7 @@ const STATE_DIR = join(AGENT_DIR, "notify-telegram");
 const LOCK_FILE = join(STATE_DIR, "poller.lock");
 const LEGACY_LOCK_DIR = join(STATE_DIR, "poller.lock.d");
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
-const PENDING_TOPICS = join(STATE_DIR, "pending-topics.json");
+const PENDING_TOPICS_DIR = join(STATE_DIR, "pending-topics");
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const MEDIA_DIR = join(STATE_DIR, "media");
 
@@ -270,7 +270,10 @@ function persistOffset(offset: number): void {
 		return; // Torn read; the next poll cycle persists again.
 	}
 	if (parsed === null || typeof parsed !== "object") return;
-	const next = { ...(parsed as Record<string, unknown>), offset };
+	const record = parsed as Record<string, unknown>;
+	// A stale poller must never rewind an offset another process already advanced past.
+	if (typeof record.offset === "number" && record.offset >= offset) return;
+	const next = { ...record, offset };
 	writeFileAtomic(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, 0o600);
 }
 
@@ -284,17 +287,23 @@ function toTelegramHtml(source: string): string {
 	const escapeHtml = (text: string): string =>
 		text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
-	let work = source.replace(/```([A-Za-z0-9_+-]*)\n?([\s\S]*?)```/g, (_match, language: string, code: string) => {
-		const opener = language.length > 0 ? `<pre><code class="language-${language}">` : "<pre>";
-		const closer = language.length > 0 ? "</code></pre>" : "</pre>";
-		return stash(`${opener}${escapeHtml(code.replace(/\n$/, ""))}${closer}`);
-	});
+	// NUL is the stash marker below; hostile input must not be able to forge or collide with it.
+	let work = source
+		.replaceAll("\u0000", "")
+		.replace(/```([A-Za-z0-9_+-]*)\n?([\s\S]*?)```/g, (_match, language: string, code: string) => {
+			const opener = language.length > 0 ? `<pre><code class="language-${language}">` : "<pre>";
+			const closer = language.length > 0 ? "</code></pre>" : "</pre>";
+			return stash(`${opener}${escapeHtml(code.replace(/\n$/, ""))}${closer}`);
+		});
 	work = work.replace(/`([^`\n]+)`/g, (_match, code: string) => stash(`<code>${escapeHtml(code)}</code>`));
 
 	work = escapeHtml(work);
 	// Headings have no Telegram equivalent and otherwise render as literal hash marks.
 	work = work.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
-	work = work.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>');
+	work = work.replace(
+		/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,
+		(_match, label: string, url: string) => `<a href="${url.replaceAll('"', "&quot;")}">${label}</a>`,
+	);
 	work = work.replace(/\*\*([^\n*]+)\*\*/g, "<b>$1</b>");
 	work = work.replace(/~~([^\n~]+)~~/g, "<s>$1</s>");
 	work = work.replace(/\|\|([^\n|]+)\|\|/g, "<tg-spoiler>$1</tg-spoiler>");
@@ -464,7 +473,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		timeoutMs: number,
 	): Promise<T | null> {
 		return callTelegramRaw<T>(cfg, method, body, timeoutMs, (failure) =>
-			pi.logger.warn("telegram call failed", failure),
+			pi.logger.warn("telegram call failed", { ...failure }),
 		);
 	}
 
@@ -488,6 +497,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		while (toTelegramHtml(source).length > TELEGRAM_TEXT_MAX && source.length > 200) {
 			source = source.slice(0, Math.floor(source.length * 0.8));
 		}
+		// A raw slice can end on the high half of a surrogate pair, which is invalid JSON.
+		const last = source.charCodeAt(source.length - 1);
+		if (last >= 0xd800 && last <= 0xdbff) source = source.slice(0, -1);
 		let sent = await callTelegram<TelegramMessage>(
 			cfg,
 			method,
@@ -590,8 +602,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	let lastMediaReap = 0;
+
 	/** Downloaded Telegram files are working input, not an archive. */
 	function reapOldMedia(): void {
+		if (Date.now() - lastMediaReap < 3_600_000) return;
+		lastMediaReap = Date.now();
 		if (!existsSync(MEDIA_DIR)) return;
 		for (const entry of readdirSync(MEDIA_DIR)) {
 			const path = join(MEDIA_DIR, entry);
@@ -855,24 +871,35 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await callTelegram(config, "editForumTopic", { chat_id: config.chatId, message_thread_id: topicId, name }, 15_000);
 	}
 
-	function readPendingTopics(): number[] {
-		if (!existsSync(PENDING_TOPICS)) return [];
-		try {
-			const parsed: unknown = JSON.parse(readFileSync(PENDING_TOPICS, "utf8"));
-			return Array.isArray(parsed) ? parsed.filter((entry): entry is number => typeof entry === "number") : [];
-		} catch {
-			return [];
+	function readPendingTopics(): { path: string; topicId: number }[] {
+		if (!existsSync(PENDING_TOPICS_DIR)) return [];
+		const pending: { path: string; topicId: number }[] = [];
+		for (const entry of readdirSync(PENDING_TOPICS_DIR)) {
+			const path = join(PENDING_TOPICS_DIR, entry);
+			try {
+				const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+				if (typeof parsed === "number") pending.push({ path, topicId: parsed });
+				else unlinkSync(path);
+			} catch {
+				// An unreadable entry would otherwise wedge the sweep forever.
+				try {
+					unlinkSync(path);
+				} catch {}
+			}
 		}
+		return pending;
 	}
 
-	/** Shutdown cannot await; the next start sweeps the queue. */
+	/** Shutdown cannot await; the next start sweeps the queue. Unlink first claims the entry across processes. */
 	async function sweepPendingTopics(): Promise<void> {
 		if (config === null) return;
-		const pending = readPendingTopics();
-		if (pending.length === 0) return;
-		writeFileAtomic(PENDING_TOPICS, "[]");
-		for (const id of pending) {
-			await callTelegram(config, "deleteForumTopic", { chat_id: config.chatId, message_thread_id: id }, 15_000);
+		for (const { path, topicId } of readPendingTopics()) {
+			try {
+				unlinkSync(path);
+			} catch {
+				continue;
+			}
+			await callTelegram(config, "deleteForumTopic", { chat_id: config.chatId, message_thread_id: topicId }, 15_000);
 		}
 	}
 
@@ -1109,6 +1136,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				(LONG_POLL_S + 10) * 1000,
 			);
 			if (updates === null || updates.length === 0) return;
+			// The long poll can outlive a lock steal; the batch then belongs to the new holder.
+			if (!ownsLock()) return;
 			let highest = config.offset - 1;
 			for (const update of updates) {
 				highest = Math.max(highest, update.update_id);
@@ -1247,6 +1276,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				settledKeyboard(labels, new Set(chosen)),
 			);
 		}
+		if (pendingAsk !== ask) return; // Settled at the terminal while the closing edit was in flight.
 		ask.messageId = null;
 		ask.index += 1;
 		if (ask.index >= ask.questions.length) {
@@ -1254,6 +1284,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 		await presentQuestion(ask, false);
+		if (pendingAsk !== ask) {
+			// The terminal settled this ask while the next question was in flight; close the orphan keyboard.
+			await closeAskMessage(ask.messageId, "This question is no longer active.");
+			ask.messageId = null;
+		}
 	}
 
 	async function applyCallback(ask: PendingAsk, payload: string): Promise<void> {
@@ -1397,7 +1432,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						try {
 							data = readFileSync(entry.value).toString("base64");
 						} catch {}
-						if (data.length === 0) continue;
+						if (data.length === 0) {
+							await serviceNotice("An image you sent could not be read back from disk, so it was not delivered.");
+							continue;
+						}
 						pi.sendUserMessage(
 							[
 								{ type: "image", data, mimeType: entry.mime },
@@ -1464,8 +1502,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const invoke = ctx.invokeTool;
 			if (invoke === undefined) throw new Error("Ask tool requires interactive mode");
-			const questions = params.questions as AskQuestion[];
-			const context = typeof params.context === "string" ? params.context.trim() : "";
+			const p = params as { questions: AskQuestion[]; context?: unknown };
+			const questions = p.questions;
+			const context = typeof p.context === "string" ? p.context.trim() : "";
 			// The native tool is strict: `context` rides inside the first question instead.
 			const nativeParams = {
 				questions: questions.map((question, index) => ({
@@ -1561,23 +1600,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			options: z.array(z.string()).optional(),
 		}),
 		async execute(_toolCallId, params) {
-			const summary = typeof params.summary === "string" ? params.summary.trim() : "";
-			const raw = typeof params.urgency === "string" ? params.urgency.trim().toLowerCase() : "";
+			const p = params as { summary?: unknown; urgency?: unknown; question?: unknown; options?: unknown };
+			const summary = typeof p.summary === "string" ? p.summary.trim() : "";
+			const raw = typeof p.urgency === "string" ? p.urgency.trim().toLowerCase() : "";
 			const urgency = raw === "red" || raw === "orange" || raw === "green" ? raw : "green";
 			if (summary.length === 0) {
 				return { content: [{ type: "text", text: "Error: summary must not be empty" }], isError: true };
 			}
-			const labels = Array.isArray(params.options)
-				? params.options.filter((o): o is string => typeof o === "string" && o.trim().length > 0).map((o) => o.trim())
+			const labels = Array.isArray(p.options)
+				? p.options.filter((o): o is string => typeof o === "string" && o.trim().length > 0).map((o) => o.trim())
 				: [];
-			if (Array.isArray(params.options) && (labels.length < 2 || labels.length > 6)) {
+			if (Array.isArray(p.options) && (labels.length < 2 || labels.length > 6)) {
 				return { content: [{ type: "text", text: "Error: options must be 2 to 6 short labels" }], isError: true };
 			}
 			turnSummary = {
 				text: summary.slice(0, 900),
 				urgency,
-				question:
-					typeof params.question === "string" && params.question.trim().length > 0 ? params.question.trim() : undefined,
+				question: typeof p.question === "string" && p.question.trim().length > 0 ? p.question.trim() : undefined,
 				options: labels.length > 0 ? labels : undefined,
 			};
 			return {
@@ -1598,10 +1637,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			label: z.string().optional(),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (typeof params.emoji === "string" && params.emoji.trim().length > 0) {
-				badgeEmoji = [...params.emoji.trim()].slice(0, 2).join("");
+			const p = params as { emoji?: unknown; label?: unknown };
+			if (typeof p.emoji === "string" && p.emoji.trim().length > 0) {
+				badgeEmoji = [...p.emoji.trim()].slice(0, 2).join("");
 			}
-			if (typeof params.label === "string") badgeOverride = params.label.trim().slice(0, 60);
+			if (typeof p.label === "string") badgeOverride = p.label.trim().slice(0, 60);
 			writeSessionRecord(ctx);
 			detach(renameTopicIfStale(ctx), "topic rename");
 			return { content: [{ type: "text", text: `Badge is now: ${badge(ctx)}` }], details: { badge: badge(ctx) } };
@@ -1618,7 +1658,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	): Promise<T | null> {
 		const form = new FormData();
 		for (const [key, value] of Object.entries(fields)) form.append(key, String(value));
-		for (const file of files) form.append(file.field, new Blob([file.data]), file.name);
+		for (const file of files) form.append(file.field, new Blob([file.data as Uint8Array<ArrayBuffer>]), file.name);
 		try {
 			const response = await fetch(`https://api.telegram.org/bot${cfg.token}/${method}`, {
 				method: "POST",
@@ -1659,14 +1699,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			caption: z.string().optional(),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const p = params as { paths: string[]; caption?: unknown };
 			if (config === null) {
 				return { content: [{ type: "text", text: "Error: Telegram is not configured" }], isError: true };
 			}
-			const caption = typeof params.caption === "string" ? params.caption.trim().slice(0, 1024) : "";
+			const caption = typeof p.caption === "string" ? p.caption.trim().slice(0, 1024) : "";
 			const allowedRoots = [ctx.cwd, tmpdir(), MEDIA_DIR];
 			const loaded: Array<{ path: string; name: string; data: Uint8Array; photo: boolean }> = [];
 			let totalBytes = 0;
-			for (const requested of params.paths as string[]) {
+			for (const requested of p.paths) {
 				const path = resolve(ctx.cwd, requested);
 				if (!allowedRoots.some((root) => path === root || path.startsWith(`${root}/`))) {
 					return {
@@ -1714,7 +1755,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (topicId !== null) base.message_thread_id = topicId;
 			const sentIds: number[] = [];
 			if (loaded.length > 1 && loaded.every((file) => file.photo)) {
-				const media = loaded.map((file, index) => ({
+				const media = loaded.map((_file, index) => ({
 					type: "photo",
 					media: `attach://f${index}`,
 					...(index === 0 && caption.length > 0 ? { caption } : {}),
@@ -1837,6 +1878,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (ctx.hasUI) {
 			unsubscribeInput = ctx.ui.onTerminalInput(() => {
 				lastLocalInput = Date.now();
+				return undefined;
 			});
 		}
 
@@ -1845,6 +1887,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			try {
 				writeSessionRecord(ctx);
 				detach(renameTopicIfStale(ctx), "topic rename");
+				reapOldMedia();
 				if (ownsLock()) refreshLock();
 				else acquireLock();
 			} catch (error) {
@@ -2065,7 +2108,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		unsubscribeInput?.();
 		unsubscribeInput = null;
 		if (config !== null && topicId !== null) {
-			writeFileAtomic(PENDING_TOPICS, JSON.stringify([...readPendingTopics(), topicId]));
+			mkdirSync(PENDING_TOPICS_DIR, { recursive: true, mode: 0o700 });
+			writeFileAtomic(join(PENDING_TOPICS_DIR, `${sessionId}.json`), JSON.stringify(topicId), 0o600);
 			detach(
 				callTelegram(config, "deleteForumTopic", { chat_id: config.chatId, message_thread_id: topicId }, 5_000),
 				"topic delete",
