@@ -1691,6 +1691,51 @@ check(
 	called("editMessageText").some((c) => c.body.text.includes("Question hidden")),
 );
 
+heading("/fleet reads the tmux window titles");
+
+// A fake tmux binary on PATH stands in for the real server.
+const fakeBin = join(root, "fake-bin");
+mkdirSync(fakeBin, { recursive: true });
+const fakeTmux = join(fakeBin, "tmux");
+writeFileSync(
+	fakeTmux,
+	"#!/bin/sh\nprintf '0\\t0\\t0\\t\u03C0 \u280B Fixing the parser\\n'\nprintf '0\\t1\\t0\\t\u03C0 ! Choose a name\\n'\nprintf '0\\t2\\t1\\t\u03C0 > Docs pass\\n'\nprintf '0\\t3\\t0\\t\u03C0 > Sleepy\\n'\nprintf '0\\t4\\t0\\tbash\\n'\n",
+	{ mode: 0o755 },
+);
+const realPath = process.env.PATH;
+process.env.PATH = `${fakeBin}:${realPath}`;
+process.env.TMUX = "/tmp/fake-tmux,1,0";
+api.queued = [{ update_id: 612, message: { message_id: 83, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
+await ux.pump(250);
+const fleetMsg = lastCall("sendMessage").body;
+check(
+	"fleet summarises the states",
+	typeof fleetMsg.text === "string" && fleetMsg.text.includes("1 working, 1 waiting for you, 1 finished, 1 idle"),
+);
+check(
+	"fleet lists each omp window with its glyph",
+	fleetMsg.text.includes("\u{1F7E2} 0 Fixing the parser") &&
+		fleetMsg.text.includes("\u{1F534} 1 Choose a name") &&
+		fleetMsg.text.includes("\u2705 2 Docs pass") &&
+		fleetMsg.text.includes("\u26AA 3 Sleepy"),
+);
+check("fleet skips windows that are not omp", !fleetMsg.text.includes("bash"));
+check("fleet answers the general chat without a thread", fleetMsg.message_thread_id === undefined);
+check("fleet does not touch any session inbox", inboxCount(ux.id) === 0);
+
+// The report is re-read per command: an emptied fleet answers accordingly.
+writeFileSync(fakeTmux, "#!/bin/sh\nprintf '0\\t4\\t0\\tbash\\n'\n", { mode: 0o755 });
+api.queued = [{ update_id: 613, message: { message_id: 84, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
+await ux.pump(250);
+check("an omp-free fleet says so", lastCall("sendMessage").body.text.includes("No omp windows in tmux right now"));
+
+// Without a tmux server the command still answers.
+delete process.env.TMUX;
+api.queued = [{ update_id: 614, message: { message_id: 85, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
+await ux.pump(250);
+check("fleet without tmux explains itself", lastCall("sendMessage").body.text.includes("No tmux server is reachable"));
+process.env.PATH = realPath;
+
 // Red statuses pin until the next turn.
 await ux.fire("input");
 await ux.tools
@@ -2313,6 +2358,40 @@ await orphanSess.fire("session_start");
 	);
 	const record = JSON.parse(readFileSync(join(sessionsDir, `${bye.id}.json`), "utf8"));
 	check("the shutdown clears the standing question from the record", record.standing === null);
+}
+
+// Drafts render the markdown subset, with a plain fallback when the HTML is rejected.
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const md = spawn("01a06002-0000-0000-0000-000000000000", "/home/dev/work/mdraft");
+	await md.fire("session_start");
+	await md.fire("agent_start");
+	await md.fire("message_update", {
+		message: { role: "assistant", content: [{ type: "text", text: "some **bold** and `code` here" }] },
+	});
+	await settle(1600);
+	await md.pump(150);
+	const rendered = lastCall("sendMessageDraft");
+	check(
+		"a draft renders the markdown subset as HTML",
+		rendered?.body.parse_mode === "HTML" &&
+			rendered.body.text.includes("<b>bold</b>") &&
+			rendered.body.text.includes("<code>code</code>"),
+	);
+	api.rejectHtml = true;
+	await md.fire("message_update", {
+		message: { role: "assistant", content: [{ type: "text", text: "plain **fallback** text" }] },
+	});
+	await settle(1600);
+	await md.pump(150);
+	const fallback = lastCall("sendMessageDraft");
+	check(
+		"a rejected draft falls back to the raw text",
+		fallback?.body.parse_mode === undefined && fallback.body.text.includes("**fallback**"),
+	);
+	api.rejectHtml = false;
+	await md.fire("agent_end");
 }
 
 rmSync(root, { recursive: true, force: true });

@@ -647,6 +647,52 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** One line per omp window, read from the same pane titles that drive the tmux tabs. */
+	function fleetReport(): string | null {
+		if (process.env.TMUX === undefined) return null;
+		let out: string;
+		try {
+			out = execFileSync(
+				"tmux",
+				["list-windows", "-a", "-F", "#{session_name}\t#{window_index}\t#{window_bell_flag}\t#{pane_title}"],
+				{ timeout: 2000 },
+			).toString();
+		} catch {
+			return null;
+		}
+		const rows: { session: string; index: string; state: keyof typeof counts; label: string }[] = [];
+		const counts = { working: 0, waiting: 0, finished: 0, idle: 0 };
+		for (const raw of out.split("\n")) {
+			const parts = raw.split("\t");
+			if (parts.length < 4) continue;
+			const title = parts.slice(3).join("\t");
+			if (!title.startsWith("\u03C0 ")) continue;
+			const sep = title.codePointAt(2) ?? 0;
+			const state =
+				sep === 0x21 ? "waiting" : sep >= 0x2800 && sep <= 0x28ff ? "working" : parts[2] === "1" ? "finished" : "idle";
+			counts[state] += 1;
+			rows.push({ session: parts[0] ?? "", index: parts[1] ?? "", state, label: title.slice(4) });
+		}
+		if (rows.length === 0) return "\u{1F535} No omp windows in tmux right now.";
+		const manySessions = new Set(rows.map((row) => row.session)).size > 1;
+		const summary = (
+			[
+				[counts.working, "working"],
+				[counts.waiting, "waiting for you"],
+				[counts.finished, "finished"],
+				[counts.idle, "idle"],
+			] as const
+		)
+			.filter(([count]) => count > 0)
+			.map(([count, word]) => `${count} ${word}`)
+			.join(", ");
+		const glyphs = { working: "\u{1F7E2}", waiting: "\u{1F534}", finished: "\u2705", idle: "\u26AA" };
+		const lines = rows.map(
+			(row) => `${glyphs[row.state]} ${manySessions ? `${row.session}:` : ""}${row.index} ${row.label}`,
+		);
+		return `\u{1F39B} ${summary}\n${lines.join("\n")}`;
+	}
+
 	function lastAssistantTail(ctx: ExtensionContext): string {
 		try {
 			if (typeof ctx.sessionManager.getBranch !== "function") return "";
@@ -745,8 +791,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const lead = tail.charCodeAt(0);
 		if (lead >= 0xdc00 && lead <= 0xdfff) tail = tail.slice(1);
 		const text = [tail, tool].filter((part) => part.length > 0).join("\n\n");
+		const cfg = config;
+		const body = threaded({ draft_id: draftId, can_stop: true });
 		detach(
-			callTelegram(config, "sendMessageDraft", threaded({ draft_id: draftId, text, can_stop: true }), 10_000),
+			(async () => {
+				// Unclosed constructs degrade to literal text in toTelegramHtml, so a rendered draft is safe
+				// mid-stream; a rejected call still falls back to the raw text rather than dropping the tick.
+				const sent = await callTelegram(
+					cfg,
+					"sendMessageDraft",
+					{ ...body, text: toTelegramHtml(text), parse_mode: "HTML" },
+					10_000,
+				);
+				if (sent === null) await callTelegram(cfg, "sendMessageDraft", { ...body, text }, 10_000);
+			})(),
 			"draft stream",
 		);
 	}
@@ -1059,7 +1117,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const replyTo = message.reply_to_message?.message_id;
 		const text = message.text ?? message.caption;
 
-		const command = typeof text === "string" ? /^\/(hidequestions|status)\b/u.exec(text.trim())?.[1] : undefined;
+		const command = typeof text === "string" ? /^\/(hidequestions|status|fleet)\b/u.exec(text.trim())?.[1] : undefined;
+		if (command === "fleet") {
+			const report = fleetReport();
+			await callTelegram(
+				cfg,
+				"sendMessage",
+				{
+					chat_id: cfg.chatId,
+					...(thread === undefined ? {} : { message_thread_id: thread }),
+					text: report ?? "\u{1F535} No tmux server is reachable from this process.",
+				},
+				15_000,
+			);
+			return;
+		}
 		if (command !== undefined) {
 			const scoped = thread === undefined ? null : routeMessage(thread, replyTo);
 			const targets =
@@ -1874,6 +1946,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				{
 					commands: [
 						{ command: "status", description: "Show what each session is doing" },
+						{ command: "fleet", description: "List every tmux omp window and its state" },
 						{ command: "hidequestions", description: "Hide open question buttons" },
 					],
 				},
