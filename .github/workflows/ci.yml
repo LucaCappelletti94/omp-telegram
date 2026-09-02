@@ -25,7 +25,8 @@ jobs:
           node-version: 24
       - run: npm run lint
       - run: npm run typecheck
-      - run: node --check setup.mjs
+      - run: node --disable-warning=ExperimentalWarning test/render.test.mjs
+      - run: node --disable-warning=ExperimentalWarning test/setup.test.mjs
       - run: npm run coverage
       - run: npm run preview
       - name: actionlint

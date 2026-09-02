@@ -16,14 +16,14 @@ cd omp-telegram
 node setup.mjs
 ```
 
-It validates the token, resolves your chat id from one message, and writes `~/.omp/agent/notify-telegram.json`. Then list the checkout in `~/.omp/agent/config.yml` and restart omp:
+It validates the token, then waits for you to message the bot. That message has to be a private one, sent directly to the bot, since the pairing binds a single direct chat and a group message cannot stand in for it. It then writes `~/.omp/agent/notify-telegram.json`. Then list the checkout in `~/.omp/agent/config.yml` and restart omp:
 
 ```yaml
 extensions:
   - ~/path/to/omp-telegram
 ```
 
-In the JSON config, `quietSeconds` (default 45) silences turn end notices while you are typing at the terminal, `notifyOnTurnEnd: false` disables them, and `streamDrafts: false` turns off live draft streaming. Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops omp's own bell from flagging tmux windows.
+In the JSON config, `quietSeconds` (default 45) silences turn end notices while you are typing at the terminal, `notifyOnTurnEnd: false` disables them, and `streamDrafts: false` turns off live draft streaming. `pinnedDashboard: true` adds a pinned message that always shows every live session and rewrites itself in place, no more than once every `dashboardSeconds` (default 30) and only when the text actually changed. Edits apply within about fifteen seconds to sessions already running, so no restart is needed. Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops omp's own bell from flagging tmux windows.
 
 ## Answering
 

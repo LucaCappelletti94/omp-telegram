@@ -35,13 +35,18 @@ const api = {
 	queued: [],
 	rejectHtml: false,
 	topicsEnabled: true,
+	topicHasThread: true,
 	nextTopic: 900,
 	nextMessage: 7,
 	icons: null,
+	filePath: "documents/file_9.oga",
+	fileDownload: "ok",
 };
 globalThis.fetch = async (url, init) => {
 	if (String(url).includes("/file/bot")) {
 		api.calls.push({ method: "fileDownload", body: { url: String(url) } });
+		if (api.fileDownload === "throw") throw new TypeError("fetch failed");
+		if (api.fileDownload === "error") return { ok: false, status: 500 };
 		return { ok: true, arrayBuffer: async () => new TextEncoder().encode("fake-image-bytes").buffer };
 	}
 	const method = String(url).split("/").pop();
@@ -75,9 +80,13 @@ globalThis.fetch = async (url, init) => {
 			: method === "sendMessage"
 				? { message_id: api.nextMessage++ }
 				: method === "createForumTopic"
-					? { message_thread_id: api.nextTopic++ }
+					? api.topicHasThread
+						? { message_thread_id: api.nextTopic++ }
+						: {}
 					: method === "getFile"
-						? { file_path: "documents/file_9.oga" }
+						? api.filePath === null
+							? {}
+							: { file_path: api.filePath }
 						: method === "getForumTopicIconStickers"
 							? (api.icons ?? [])
 							: true;
@@ -344,8 +353,8 @@ heading("steering");
 writeFileSync(join(inboxOf(two.id), "600.json"), JSON.stringify({ kind: "text", value: "switch branches" }));
 await two.pump(120);
 check(
-	"free text with no pending ask becomes a steer",
-	two.steers.length === 1 && two.steers[0].options.deliverAs === "steer",
+	"free text with no pending ask is delivered as a prompt",
+	two.steers.length === 1 && two.steers[0].options === undefined,
 );
 check("inbox is drained", inboxCount(two.id) === 0);
 
@@ -584,9 +593,17 @@ await one.pump(250);
 check("a reply routes to the session that sent that message", inboxCount(rr1.id) === 1);
 check("it beats the more recently notified session", inboxCount(rr2.id) === 0);
 
+// Both sessions notified seconds apart, so a bare message is genuinely ambiguous now:
+// it is held and asked about rather than guessed onto the more recent one.
 api.queued = [{ update_id: 201, message: { message_id: 91, date: 1, chat: { id: CHAT }, text: "no reply target" } }];
 await one.pump(250);
-check("an unreplied message still falls back to recency", inboxCount(rr2.id) === 1);
+check("an unreplied message with two recent notifiers is not guessed", inboxCount(rr2.id) === 0);
+check(
+	"an unreplied message with two recent notifiers asks which session",
+	(lastCall("sendMessage").body.reply_markup?.inline_keyboard ?? [])
+		.flat()
+		.some((b) => b.callback_data?.startsWith("m:")),
+);
 
 api.queued = [
 	{
@@ -964,7 +981,7 @@ check(
 	photoSteer.text[0].data === Buffer.from("not-really-png").toString("base64"),
 );
 check("the caption rides along", photoSteer.text[1].text === "look at this");
-check("the image is steered into the running turn", photoSteer.options.deliverAs === "steer");
+check("the image asks for no explicit steer, so an idle session starts a turn", photoSteer.options === undefined);
 check("delivery is acknowledged with a reaction", lastCall("setMessageReaction").body.message_id === 71);
 
 const filePath = join(mediaDir, "notes.oga");
@@ -1455,12 +1472,10 @@ check(
 );
 
 await rs.fire("input");
-await rs.tools
+const unknownUrgency = await rs.tools
 	.get("notify_status")
 	.execute("n3", { summary: "Two designs possible, opinion wanted.", urgency: "purple" }, undefined, undefined, rs.ctx);
-await rs.fire("session_stop");
-await settle(150);
-check("an unknown urgency degrades to green", lastCall("sendMessage").body.text.includes("\u{1F7E2}"));
+check("an unknown urgency is rejected", unknownUrgency.isError === true);
 
 await rs.fire("input");
 const empty = await rs.tools
@@ -1653,11 +1668,12 @@ check(
 );
 check("the retired standing question is cleared from the record", record(tq.id).standing === null);
 
-// notify_status validation
+// notify_status validation: a bad options list costs the buttons, never the notification.
 const badOpts = await tq.tools
 	.get("notify_status")
 	.execute("q4", { summary: "x", urgency: "green", options: ["only-one"] }, undefined, undefined, tq.ctx);
-check("a single option is rejected", badOpts.isError === true);
+check("a single option still records the status", badOpts.isError !== true);
+check("a single option is reported as too few", /fewer than 2/.test(badOpts.content[0].text));
 
 // ------------------------------------------------------------------ button packing
 heading("button packing");
@@ -1930,7 +1946,7 @@ mkdirSync(fakeBin, { recursive: true });
 const fakeTmux = join(fakeBin, "tmux");
 writeFileSync(
 	fakeTmux,
-	"#!/bin/sh\nprintf '0\\t0\\t0\\t\u03C0 \u280B Fixing the parser\\n'\nprintf '0\\t1\\t0\\t\u03C0 ! Choose a name\\n'\nprintf '0\\t2\\t1\\t\u03C0 > Docs pass\\n'\nprintf '0\\t3\\t0\\t\u03C0 > Sleepy\\n'\nprintf '0\\t4\\t0\\tbash\\n'\n",
+	"#!/bin/sh\nprintf '0\\t0\\t0\\t\\t\u03C0 \u280B Fixing the parser\\n'\nprintf '0\\t1\\t0\\t\\t\u03C0 ! Choose a name\\n'\nprintf '0\\t2\\t1\\t\\t\u03C0 > Docs pass\\n'\nprintf '0\\t3\\t0\\t\\t\u03C0 > Sleepy\\n'\nprintf '0\\t4\\t0\\t\\tbash\\n'\n",
 	{ mode: 0o755 },
 );
 const realPath = process.env.PATH;
@@ -1955,7 +1971,7 @@ check("fleet answers the general chat without a thread", fleetMsg.message_thread
 check("fleet does not touch any session inbox", inboxCount(ux.id) === 0);
 
 // The report is re-read per command: an emptied fleet answers accordingly.
-writeFileSync(fakeTmux, "#!/bin/sh\nprintf '0\\t4\\t0\\tbash\\n'\n", { mode: 0o755 });
+writeFileSync(fakeTmux, "#!/bin/sh\nprintf '0\\t4\\t0\\t\\tbash\\n'\n", { mode: 0o755 });
 api.queued = [{ update_id: 613, message: { message_id: 84, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
 await ux.pump(250);
 check("an omp-free fleet says so", lastCall("sendMessage").body.text.includes("No omp windows in tmux right now"));
@@ -2202,7 +2218,7 @@ writeFileSync(
 	join(tmuxBin, "tmux"),
 	`#!/bin/sh
 case "$*" in
-	*'#{session_name}:#{window_index}.#{pane_index}'*) printf 'work:3.1\\n'
+	*'#{session_name}\t#{window_index}\t#{pane_index}'*) printf 'work\\t3\\t1\\n'
 esac
 `,
 	{ mode: 0o755 },
@@ -3195,6 +3211,1047 @@ await orphanSess.fire("session_start");
 		JSON.parse(readFileSync(join(sessionsDir, `${rt.id}.json`), "utf8")).closeOffer === null,
 	);
 	await rt.fire("agent_end");
+}
+
+heading("oversized message truncation");
+{
+	api.topicsEnabled = false;
+	// A fenced summary would otherwise leave through the native rich path.
+	api.failMethods = ["sendRichMessage"];
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const tr = spawn("01a06010-0000-0000-0000-000000000000", "/home/dev/work/toolong");
+	await tr.fire("session_start");
+
+	// a. A summary whose rendered form blows past the limit keeps the turn's usage
+	// footer and says out loud that it was cut.
+	await tr.fire("agent_start");
+	await tr.fire("message_end", {
+		message: { role: "assistant", usage: { input: 12400, output: 900, cost: { total: 0.0512 } } },
+	});
+	await tr.fire("agent_end");
+	await tr.tools
+		.get("notify_status")
+		.execute("t1", { summary: "&".repeat(900), urgency: "green" }, undefined, undefined, tr.ctx);
+	await tr.fire("session_stop");
+	await settle(150);
+	const cut = lastCall("sendMessage").body.text;
+	check("an oversized summary keeps the usage footer", cut.includes("12.4k in / 900 out"));
+	check("an oversized summary says it was truncated", cut.includes("truncated, full text at the terminal"));
+	check("an oversized summary fits the telegram limit", cut.length <= 4096);
+
+	// b. Escaping inflates the rendered form up to fivefold, so the fit test has to
+	// be on the rendered text and not on the source.
+	await tr.fire("agent_start");
+	await tr.fire("agent_end");
+	await tr.tools
+		.get("notify_status")
+		.execute("t2", { summary: "<".repeat(200), urgency: "green" }, undefined, undefined, tr.ctx);
+	await tr.fire("session_stop");
+	await settle(150);
+	check("a dense-escape summary fits the telegram limit", lastCall("sendMessage").body.text.length <= 4096);
+
+	// c. A cut inside a fenced code block leaves a stray fence that renders as
+	// literal backticks, so the cut has to keep the fences balanced.
+	await tr.fire("agent_start");
+	await tr.fire("agent_end");
+	await tr.tools
+		.get("notify_status")
+		.execute("t3", { summary: `\`\`\`\n${"&".repeat(880)}\n\`\`\``, urgency: "green" }, undefined, undefined, tr.ctx);
+	await tr.fire("session_stop");
+	await settle(150);
+	const fenced = lastCall("sendMessage").body.text;
+	check("a truncated fence leaks no literal backticks", !fenced.includes("```"));
+	check(
+		"a truncated fence stays balanced",
+		(fenced.match(/<pre>/g) ?? []).length === (fenced.match(/<\/pre>/g) ?? []).length,
+	);
+	check("a truncated fenced summary fits the telegram limit", fenced.length <= 4096);
+	api.failMethods = [];
+}
+
+heading("status tool feedback");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const sf = spawn("01a06011-0000-0000-0000-000000000000", "/home/dev/work/statusfeedback");
+	await sf.fire("session_start");
+
+	// a. A colour the tool does not know is a mistake worth surfacing, not a silent green.
+	await sf.fire("input");
+	const yellow = await sf.tools
+		.get("notify_status")
+		.execute("s1", { summary: "Half done.", urgency: "yellow" }, undefined, undefined, sf.ctx);
+	check("an unknown urgency returns an error", yellow.isError === true);
+	check(
+		"the urgency error names the accepted values",
+		["green", "orange", "red"].every((word) => yellow.content[0].text.includes(word)),
+	);
+	const rejectedStop = await sf.fire("session_stop");
+	check(
+		"a rejected urgency records no status",
+		rejectedStop.some((r) => r?.decision === "block"),
+	);
+	await settle(150);
+
+	// b. The 900-character cap is invisible to the agent today, so it never learns to compress.
+	await sf.fire("input");
+	const long = await sf.tools
+		.get("notify_status")
+		.execute("s2", { summary: "x".repeat(1200), urgency: "green" }, undefined, undefined, sf.ctx);
+	check("an over-long summary is still recorded", long.isError !== true);
+	check("an over-long summary reports its truncation", long.content[0].text.includes("truncated"));
+	await sf.fire("session_stop");
+	await settle(150);
+}
+
+heading("surrogate-safe clipping");
+{
+	// a. A topic name cut at 128 UTF-16 units must not end on half an emoji.
+	api.topicsEnabled = true;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const sg = spawn("01a06012-0000-0000-0000-000000000000", `/home/dev/work/${"\u{1F600}".repeat(100)}`);
+	await sg.fire("session_start");
+	await settle(150);
+	await sg.tools.get("session_badge").execute("sb1", { emoji: "\u{1F9EA}" }, undefined, undefined, sg.ctx);
+	await settle(150);
+	const renamed = lastCall("editForumTopic").body.name;
+	check("the topic name is clipped at the 128-unit boundary", renamed.length === 127 || renamed.length === 128);
+	check("a clipped topic name holds no lone surrogate", renamed.isWellFormed());
+
+	// b. A caption cut at 1024 UTF-16 units must not end on half an emoji. FormData
+	// turns the orphaned half into a replacement character, which is what ships.
+	api.topicsEnabled = false;
+	const shot = join(root, "clip.png");
+	writeFileSync(shot, "png-bytes");
+	await sg.tools
+		.get("notify_file")
+		.execute("sb2", { paths: [shot], caption: `${"a".repeat(1023)}\u{1F600}` }, undefined, undefined, sg.ctx);
+	check("a clipped caption holds no replacement character", !lastCall("sendPhoto").body.caption.includes("\uFFFD"));
+}
+
+heading("pending-topic hygiene");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const pendingDir = join(root, "notify-telegram/pending-topics");
+	mkdirSync(pendingDir, { recursive: true });
+	writeFileSync(join(pendingDir, "unreadable.json"), "{not json");
+	writeFileSync(join(pendingDir, "wrongtype.json"), '{"topicId":12}');
+	const pt = spawn("01a06013-0000-0000-0000-000000000000", "/home/dev/work/pending");
+	await pt.fire("session_start");
+	await settle(150);
+	const warned = (file) => pt.warns.some((w) => `${w.m} ${JSON.stringify(w.meta)}`.includes(file));
+	check("an unparseable pending-topic file is named in a warning", warned("unreadable.json"));
+	check("a wrong-shaped pending-topic file is named in a warning", warned("wrongtype.json"));
+	check(
+		"the corrupt pending-topic files are still removed",
+		!existsSync(join(pendingDir, "unreadable.json")) && !existsSync(join(pendingDir, "wrongtype.json")),
+	);
+}
+
+heading("uncovered event handlers");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const ev = spawn("01a06020-0000-0000-0000-000000000000", "/home/dev/work/events");
+	await ev.fire("session_start");
+
+	await ev.fire("credential_disabled", { provider: "anthropic" });
+	await settle(150);
+	check(
+		"a disabled credential reaches the phone",
+		lastCall("sendMessage").body.text.includes("Credential disabled for anthropic."),
+	);
+
+	await ev.fire("agent_start");
+	await ev.fire("retry_fallback_succeeded", { model: "openai/gpt-5" });
+	await settle(150);
+	check(
+		"a recovered fallback names the model",
+		lastCall("sendMessage").body.text.includes("Recovered on openai/gpt-5."),
+	);
+
+	// A failure notice now carries the trigger and action from the start event, so it only speaks
+	// when it saw one. The start itself announces once per turn; the quiet endings add nothing.
+	await ev.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
+	await settle(150);
+	const afterStart = called("sendMessage").length;
+	await ev.fire("auto_compaction_end", { skipped: true });
+	await ev.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
+	await ev.fire("auto_compaction_end", { willRetry: true, aborted: true });
+	await settle(150);
+	check("a skipped or retried compaction says nothing", called("sendMessage").length === afterStart);
+	await ev.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
+	await ev.fire("auto_compaction_end", { aborted: true });
+	await settle(150);
+	check(
+		"an aborted compaction warns about the context window",
+		lastCall("sendMessage").body.text.includes("Context compaction failed."),
+	);
+	await ev.fire("agent_end");
+	await ev.fire("agent_start");
+	await ev.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
+	await ev.fire("auto_compaction_end", { errorMessage: "out of memory" });
+	await settle(150);
+	check(
+		"a failed compaction warns about the context window",
+		lastCall("sendMessage").body.text.includes("Context compaction failed."),
+	);
+	check("a failed compaction names the failure", lastCall("sendMessage").body.text.includes("out of memory"));
+	await ev.fire("agent_end");
+}
+
+heading("media fetch failures");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const mf = spawn("01a06021-0000-0000-0000-000000000000", "/home/dev/work/mediafail");
+	await mf.fire("session_start");
+	// Recency routing would hand these to whichever session notified last, so each update
+	// replies to a message this session actually sent.
+	await mf.fire("input");
+	await mf.tools
+		.get("notify_status")
+		.execute("mf0", { summary: "Ready for files.", urgency: "green" }, undefined, undefined, mf.ctx);
+	await mf.fire("session_stop");
+	await settle(150);
+	const mfMessage = record(mf.id).recent.at(-1);
+	let nextUpdate = 800;
+	const dropped = async (fileId) => {
+		nextUpdate += 1;
+		api.queued = [
+			{
+				update_id: nextUpdate,
+				message: {
+					message_id: nextUpdate,
+					date: 1,
+					chat: { id: CHAT },
+					voice: { file_id: fileId },
+					reply_to_message: { message_id: mfMessage },
+				},
+			},
+		];
+		// The drain empties the inbox in the same pump, so the steer is what proves delivery.
+		const before = mf.steers.length;
+		await mf.pump(250);
+		await mf.pump(250);
+		return { notice: lastCall("sendMessage")?.body.text ?? "", delivered: mf.steers.length > before };
+	};
+
+	api.failMethods = ["getFile"];
+	const refused = await dropped("refused");
+	check("a refused getFile drops the file with a notice", refused.notice.includes("could not be fetched"));
+	check("a refused getFile delivers nothing", !refused.delivered);
+	api.failMethods = [];
+
+	api.filePath = null;
+	const pathless = await dropped("pathless");
+	check("a getFile without a path drops the file with a notice", pathless.notice.includes("could not be fetched"));
+	api.filePath = "";
+	const emptyPath = await dropped("emptypath");
+	check("a getFile with an empty path drops the file with a notice", emptyPath.notice.includes("could not be fetched"));
+	api.filePath = "documents/file_9.oga";
+
+	api.fileDownload = "error";
+	const rejectedBytes = await dropped("rejected");
+	check("a rejected download drops the file with a notice", rejectedBytes.notice.includes("could not be fetched"));
+	api.fileDownload = "throw";
+	const brokenPipe = await dropped("broken");
+	check("a thrown download drops the file with a notice", brokenPipe.notice.includes("could not be fetched"));
+	api.fileDownload = "ok";
+
+	const good = await dropped("good");
+	check("a healthy download still reaches the session", good.delivered);
+}
+
+heading("forum topic creation failures");
+{
+	// Telegram answers createForumTopic without a thread id: the session must fall back to flat messages.
+	api.topicsEnabled = true;
+	api.topicHasThread = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const nt = spawn("01a06022-0000-0000-0000-000000000000", "/home/dev/work/nothread");
+	await nt.fire("session_start");
+	await settle(150);
+	check("a topic without a thread id is not recorded", record(nt.id).topicId === null);
+	await nt.fire("input");
+	await nt.tools
+		.get("notify_status")
+		.execute("nt1", { summary: "Flat it is.", urgency: "green" }, undefined, undefined, nt.ctx);
+	await nt.fire("session_stop");
+	await settle(150);
+	const flat = lastCall("sendMessage").body;
+	check("a thread-less session sends flat messages", flat.message_thread_id === undefined);
+	check("a thread-less session still leads with its badge", flat.text.includes("nothread"));
+	api.topicHasThread = true;
+	api.topicsEnabled = false;
+}
+
+heading("rich status options");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const ro = spawn("01a06030-0000-0000-0000-000000000000", "/home/dev/work/richopts");
+	await ro.fire("session_start");
+
+	await ro.fire("input");
+	await ro.tools.get("notify_status").execute(
+		"ro1",
+		{
+			summary: "Two ways forward.",
+			urgency: "orange",
+			question: "Which one?",
+			options: [
+				{ label: "Merge now", description: "CI is green and the branch is current.", recommended: true },
+				{ label: "Wait a day", description: "Lets the nightly run catch flakes.", lukewarm: true },
+				{ label: "Force push", description: "Rewrites history other people have pulled.", discouraged: true },
+			],
+		},
+		undefined,
+		undefined,
+		ro.ctx,
+	);
+	await ro.fire("session_stop");
+	await settle(150);
+	const rich = lastCall("sendMessage").body;
+	check(
+		"a rich option's description reaches the message body",
+		rich.text.includes("CI is green and the branch is current."),
+	);
+	check("every rich description reaches the body", rich.text.includes("Lets the nightly run catch flakes."));
+	const richButtons = (rich.reply_markup?.inline_keyboard ?? []).flat();
+	const merge = richButtons.find((b) => b.text.startsWith("Merge now"));
+	const wait = richButtons.find((b) => b.text.startsWith("Wait a day"));
+	const force = richButtons.find((b) => b.text.startsWith("Force push"));
+	check("the recommended option gets the success style", merge?.style === "success");
+	check("the recommended option is marked preferable", merge?.text.includes("(preferable)"));
+	check(
+		"the lukewarm option carries its marker and no style",
+		wait?.text.includes("lukewarm") === true && wait.style === undefined,
+	);
+	check("the discouraged option gets the danger style", force?.style === "danger");
+	check(
+		"a rich option still answers by index",
+		richButtons.filter((b) => b.callback_data?.startsWith("c:")).length === 3,
+	);
+
+	// A press still steers the plain label, not the marker-decorated button text.
+	const richTag = record(ro.id).tag;
+	const richId = record(ro.id).standing?.id ?? "none";
+	writeFileSync(
+		join(inboxOf(ro.id), "4001.json"),
+		JSON.stringify({ kind: "callback", value: `c:${richId}:0`, messageId: 9001 }),
+	);
+	await ro.pump(250);
+	check("a rich option press steers the bare label", ro.steers.at(-1)?.text === "Merge now");
+	check(
+		"the rich standing question belongs to this session",
+		typeof richTag === "string" && richId.startsWith(richTag),
+	);
+
+	// Plain strings keep working, with no markers and no descriptions.
+	await ro.fire("input");
+	await ro.tools
+		.get("notify_status")
+		.execute(
+			"ro2",
+			{ summary: "Simple.", urgency: "orange", options: ["Continue", "Stop"] },
+			undefined,
+			undefined,
+			ro.ctx,
+		);
+	await ro.fire("session_stop");
+	await settle(150);
+	const plain = lastCall("sendMessage").body;
+	const plainButtons = plain.reply_markup.inline_keyboard.flat();
+	check("plain string options still render two buttons", plainButtons.length === 2);
+	check(
+		"plain string options carry no stance marker",
+		plainButtons.every((b) => !b.text.includes("(")),
+	);
+	check(
+		"plain string options carry no style",
+		plainButtons.every((b) => b.style === undefined),
+	);
+	check("plain string options add nothing to the body", !plain.text.includes("**Continue**"));
+
+	// A malformed option loses its button, not the whole notification.
+	await ro.fire("input");
+	const bad = await ro.tools
+		.get("notify_status")
+		.execute(
+			"ro3",
+			{ summary: "Bad.", urgency: "orange", options: ["Fine", { note: "no label" }] },
+			undefined,
+			undefined,
+			ro.ctx,
+		);
+	check("an option without a label still records the status", bad.isError !== true);
+	check("an option without a label is named in the result", /1 of 2 options/.test(bad.content[0].text));
+}
+
+heading("aggregated status");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const trio = [];
+	for (const [index, folder] of ["alpha-svc", "beta-svc", "gamma-svc"].entries()) {
+		const s = spawn(`01a0604${index}-0000-0000-0000-000000000000`, `/home/dev/work/${folder}`);
+		await s.fire("session_start");
+		// A notify puts these three at the head of the recency order, so one of them answers.
+		await s.fire("input");
+		await s.tools
+			.get("notify_status")
+			.execute(`agg${index}`, { summary: `${folder} is done.`, urgency: "green" }, undefined, undefined, s.ctx);
+		await s.fire("session_stop");
+		await settle(150);
+		trio.push(s);
+	}
+
+	const before = called("sendMessage").length;
+	api.queued = [{ update_id: 910, message: { message_id: 910, date: 1, chat: { id: CHAT }, text: "/status" } }];
+	// One pump polls, the next drains what it delivered.
+	for (const s of trio) await s.pump(250);
+	for (const s of trio) await s.pump(250);
+	const replies = called("sendMessage").slice(before);
+	const stateReplies = replies.filter((c) => c.body.text?.includes("State:"));
+	check("a flat /status answers exactly once", stateReplies.length === 1);
+	const roll = stateReplies[0]?.body.text ?? "";
+	check(
+		"the one reply lists every live session",
+		["alpha-svc", "beta-svc", "gamma-svc"].every((f) => roll.includes(f)),
+	);
+	check("the reply carries each session's last summary", roll.includes("beta-svc is done."));
+	check("the reply says how long ago each summary landed", /\d+[smh] ago/.test(roll));
+
+	// A session mid-turn reports as working, not idle.
+	await trio[0].fire("input");
+	await trio[0].fire("agent_start");
+	await trio[0].fire("tool_execution_start", { toolName: "bash", intent: "Running tests" });
+	await settle(60);
+	const workingBefore = called("sendMessage").length;
+	api.queued = [{ update_id: 911, message: { message_id: 911, date: 1, chat: { id: CHAT }, text: "/status" } }];
+	for (const s of trio) await s.pump(250);
+	for (const s of trio) await s.pump(250);
+	const workingRoll =
+		called("sendMessage")
+			.slice(workingBefore)
+			.find((c) => c.body.text?.includes("State:"))?.body.text ?? "";
+	check("a busy session reports the tool it is running", workingRoll.includes("bash: Running tests"));
+	await trio[0].fire("tool_execution_end", {});
+	await trio[0].fire("agent_end");
+	await trio[0].fire("session_stop");
+	await settle(150);
+}
+
+heading("thread-scoped status");
+{
+	api.topicsEnabled = true;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const solo = spawn("01a06050-0000-0000-0000-000000000000", "/home/dev/work/solo-svc");
+	await solo.fire("session_start");
+	await settle(150);
+	const soloTopic = record(solo.id).topicId;
+	check("the scoped session has a topic", typeof soloTopic === "number");
+	const before = called("sendMessage").length;
+	api.queued = [
+		{
+			update_id: 920,
+			message: { message_id: 920, date: 1, chat: { id: CHAT }, text: "/status", message_thread_id: soloTopic },
+		},
+	];
+	await solo.pump(250);
+	await solo.pump(250);
+	const scoped =
+		called("sendMessage")
+			.slice(before)
+			.find((c) => c.body.text?.includes("State:"))?.body.text ?? "";
+	check("a thread-scoped /status answers for its own session", scoped.includes("solo-svc"));
+	check(
+		"a thread-scoped /status names no other session",
+		!scoped.includes("alpha-svc") && !scoped.includes("beta-svc") && !scoped.includes("gamma-svc"),
+	);
+	api.topicsEnabled = false;
+}
+
+heading("attention-first /fleet");
+{
+	const SUPERGROUP = -1001234567890;
+	const fleetBin = join(root, "fleet-bin");
+	mkdirSync(fleetBin, { recursive: true });
+	// Five omp windows in one tmux session plus a plain shell. Column four is @omp_priority.
+	const rows = [
+		["0", "0", "", "\u03C0 > Idle one"],
+		["1", "0", "", "\u03C0 \u280B Building"],
+		["2", "0", "", "\u03C0 ! Needs you"],
+		["3", "1", "", "\u03C0 > Done here"],
+		["4", "0", "high", "\u03C0 > Marked urgent"],
+		["5", "0", "", "bash"],
+	];
+	writeFileSync(
+		join(fleetBin, "tmux"),
+		[
+			"#!/bin/sh",
+			'case "$1" in',
+			"  display-message) printf 'main\\t2\\n' ;;",
+			"  list-windows)",
+			...rows.map((r) => `    printf 'main\\t${r[0]}\\t${r[1]}\\t${r[2]}\\t${r[3]}\\n'`),
+			"    ;;",
+			"esac",
+			"",
+		].join("\n"),
+		{ mode: 0o755 },
+	);
+	const priorPath = process.env.PATH;
+	process.env.PATH = `${fleetBin}:${priorPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	process.env.TMUX_PANE = "%42";
+
+	// Topic links only exist in a supergroup, whose chat id carries the -100 prefix.
+	writeConfig({ chatId: SUPERGROUP });
+	api.topicsEnabled = true;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const fl = spawn("01a06060-0000-0000-0000-000000000000", "/home/dev/work/fleeted");
+	await fl.fire("session_start");
+	await settle(150);
+	fl.heartbeat();
+	await settle(150);
+	const flTopic = record(fl.id).topicId;
+	check("the fleet session claims its tmux window", record(fl.id).tmuxWindow === "main:2");
+
+	api.queued = [{ update_id: 930, message: { message_id: 930, date: 1, chat: { id: SUPERGROUP }, text: "/fleet" } }];
+	await fl.pump(250);
+	const report = lastCall("sendMessage").body.text ?? "";
+	const at = (needle) => report.indexOf(needle);
+	check("waiting comes before finished", at("Needs you") < at("Done here"));
+	check("finished comes before working", at("Done here") < at("Building"));
+	check("working comes before idle", at("Building") < at("Idle one"));
+	check("a priority window is marked", /\u2757/u.test(report) && at("\u2757") < at("Marked urgent"));
+	check("an unmarked window carries no priority marker", (report.match(/\u2757/gu) ?? []).length === 1);
+	check("non-omp windows stay out", !report.includes("bash"));
+	check(
+		"the row for a session with a topic links to its thread",
+		report.includes(`<a href="https://t.me/c/1234567890/${flTopic}">Needs you</a>`),
+	);
+	check("a row with no matching session is not linked", !/<a [^>]*>Idle one<\/a>/u.test(report));
+	check("the report renders as HTML", lastCall("sendMessage").body.parse_mode === "HTML");
+
+	api.topicsEnabled = false;
+	writeConfig();
+	process.env.PATH = priorPath;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+}
+
+heading("turn duration in the footer");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const td = spawn("01a06070-0000-0000-0000-000000000000", "/home/dev/work/timed");
+	await td.fire("session_start");
+	await td.fire("input");
+	await td.fire("agent_start");
+	await td.fire("message_end", {
+		message: { role: "assistant", usage: { input: 100, output: 20, cost: { total: 0.002 } } },
+	});
+	await settle(1100);
+	await td.fire("agent_end");
+	await td.tools
+		.get("notify_status")
+		.execute("td1", { summary: "Timed turn.", urgency: "green" }, undefined, undefined, td.ctx);
+	await td.fire("session_stop");
+	await settle(150);
+	// The footer is now one code line per model plus a final line for tools and wall time.
+	const timedText = lastCall("sendMessage").body.text ?? "";
+	const timedFooter = /<code>([^<]*)<\/code>\s*$/u.exec(timedText)?.[1] ?? "";
+	check("the footer still carries tokens and cost", timedText.includes("100 in / 20 out"));
+	check("the footer carries the turn duration", /\b\d+s\b/u.test(timedFooter));
+
+	// The footer describes the last agent loop, so a session where none ever ran has no footer at all.
+	const tdNone = spawn("01a06071-0000-0000-0000-000000000000", "/home/dev/work/untimed");
+	await tdNone.fire("session_start");
+	await tdNone.fire("input");
+	await tdNone.tools
+		.get("notify_status")
+		.execute("td2", { summary: "No loop ran.", urgency: "green" }, undefined, undefined, tdNone.ctx);
+	await tdNone.fire("session_stop");
+	await settle(150);
+	check("a session with no agent loop reports no duration", !/<code>/u.test(lastCall("sendMessage").body.text ?? ""));
+}
+
+heading("replies reach an idle session");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const ir = spawn("01a06080-0000-0000-0000-000000000000", "/home/dev/work/idlereply");
+	await ir.fire("session_start");
+
+	// A finished turn, which is the state the user replies from on a phone.
+	await ir.fire("input");
+	await ir.fire("agent_start");
+	await ir.fire("agent_end");
+	await ir.tools
+		.get("notify_status")
+		.execute("ir1", { summary: "Done, over to you.", urgency: "green" }, undefined, undefined, ir.ctx);
+	await ir.fire("session_stop");
+	await settle(150);
+	const summaryId = record(ir.id).recent.at(-1);
+	check("the summary is recorded for reply routing", typeof summaryId === "number");
+
+	api.queued = [
+		{
+			update_id: 940,
+			message: {
+				message_id: 940,
+				date: 1,
+				chat: { id: CHAT },
+				text: "go on then",
+				reply_to_message: { message_id: summaryId },
+			},
+		},
+	];
+	await ir.pump(250);
+	await ir.pump(250);
+	const delivered = ir.steers.at(-1);
+	check("the reply reaches the session", delivered?.text === "go on then");
+	// A steer interrupts a running turn. An idle session has none, so the message is dropped.
+	check("a reply to an idle session does not ask for a steer", delivered?.options?.deliverAs !== "steer");
+
+	// An image reply lands the same way.
+	const shot = join(root, "idle-shot.png");
+	writeFileSync(shot, "png-bytes");
+	writeFileSync(
+		join(inboxOf(ir.id), "941.json"),
+		JSON.stringify({ kind: "file", value: shot, mime: "image/png", messageId: 941 }),
+	);
+	await ir.pump(250);
+	check("an image to an idle session does not ask for a steer", ir.steers.at(-1)?.options?.deliverAs !== "steer");
+
+	// A blue service message belongs to the session that sent it, so a reply to it routes.
+	writeFileSync(join(inboxOf(ir.id), "942.json"), JSON.stringify({ kind: "command", value: "status" }));
+	await ir.pump(250);
+	// The fake server hands out ids from a counter, so the last one is the notice just sent.
+	const statusMessage = api.nextMessage - 1;
+	check("a service message is recorded for reply routing", record(ir.id).recent.includes(statusMessage));
+}
+
+heading("bad options never lose the status");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const bo = spawn("01a06090-0000-0000-0000-000000000000", "/home/dev/work/badoptions");
+	await bo.fire("session_start");
+
+	const send = async (id, params) => {
+		await bo.fire("input");
+		const result = await bo.tools.get("notify_status").execute(id, params, undefined, undefined, bo.ctx);
+		const stop = await bo.fire("session_stop");
+		await settle(150);
+		const body = lastCall("sendMessage").body;
+		return {
+			note: result.content?.[0]?.text ?? "",
+			isError: result.isError === true,
+			text: body.text ?? "",
+			buttons: (body.reply_markup?.inline_keyboard ?? []).flat().filter((b) => b.callback_data?.startsWith("c:")),
+			blocked: stop.some((r) => r?.decision === "block"),
+		};
+	};
+
+	// a. Every option unusable. The summary is the payload, so it must still ship.
+	const allBad = await send("bo1", {
+		summary: "The work is done.",
+		urgency: "green",
+		question: "What next?",
+		options: [{ note: "no label" }, 42],
+	});
+	check("an unusable options list still sends the summary", allBad.text.includes("The work is done."));
+	check("an unusable options list still asks the question", allBad.text.includes("What next?"));
+	check("an unusable options list is not an error", !allBad.isError);
+	check("an unusable options list explains itself to the agent", /option/i.test(allBad.note));
+	check("an unusable options list does not block the turn", !allBad.blocked);
+	check("an unusable options list offers no buttons", allBad.buttons.length === 0);
+
+	// b. A mix keeps the good ones rather than throwing the lot away.
+	const mixed = await send("bo2", {
+		summary: "Half of these are fine.",
+		urgency: "orange",
+		options: ["Keep going", { label: "Stop here" }, { nope: true }],
+	});
+	check("a mixed options list keeps the valid buttons", mixed.buttons.length === 2);
+	check("a mixed options list still sends the summary", mixed.text.includes("Half of these are fine."));
+	check("a mixed options list reports the dropped one", /option/i.test(mixed.note));
+
+	// c. Too many is a trim, not a loss.
+	const tooMany = await send("bo3", {
+		summary: "Seven choices.",
+		urgency: "orange",
+		options: ["a", "b", "c", "d", "e", "f", "g"],
+	});
+	check("more than six options still send the summary", tooMany.text.includes("Seven choices."));
+	check("more than six options render six buttons", tooMany.buttons.length === 6);
+	check("more than six options say so", /option/i.test(tooMany.note));
+
+	// d. One survivor is not a choice, so no fake single button, but the summary lives.
+	const lonely = await send("bo4", {
+		summary: "Only one left.",
+		urgency: "orange",
+		options: ["Only this", { bad: 1 }],
+	});
+	check("a single usable option still sends the summary", lonely.text.includes("Only one left."));
+	check("a single usable option offers no buttons", lonely.buttons.length === 0);
+
+	// e. A clean list is untouched and draws no complaint.
+	const good = await send("bo5", { summary: "All good.", urgency: "orange", options: ["Yes", "No"] });
+	check("a valid options list still renders", good.buttons.length === 2);
+	check("a valid options list draws no complaint", !/dropped|unusable|ignored/i.test(good.note));
+}
+
+heading("ambiguous plain messages ask which session");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	// Every earlier session in this suite counts as recently notified, which would make
+	// everything ambiguous. Reset them to "never notified" so only the pair below competes.
+	for (const entry of readdirSync(sessionsDir)) {
+		const path = join(sessionsDir, entry);
+		try {
+			const parsed = JSON.parse(readFileSync(path, "utf8"));
+			writeFileSync(path, JSON.stringify({ ...parsed, lastNotified: 0 }));
+		} catch {}
+	}
+
+	const twin = async (id, folder) => {
+		const s = spawn(id, `/home/dev/work/${folder}`);
+		await s.fire("session_start");
+		await s.fire("input");
+		await s.tools
+			.get("notify_status")
+			.execute(`${folder}1`, { summary: `${folder} finished.`, urgency: "green" }, undefined, undefined, s.ctx);
+		await s.fire("session_stop");
+		await settle(150);
+		return s;
+	};
+	const left = await twin("01a060a0-0000-0000-0000-000000000000", "left-repo");
+	const right = await twin("01a060a1-0000-0000-0000-000000000000", "right-repo");
+
+	// a. Two sessions finished seconds apart, so a plain message is held, not guessed.
+	const leftSteers = left.steers.length;
+	const rightSteers = right.steers.length;
+	api.queued = [
+		{ update_id: 950, message: { message_id: 950, date: 1, chat: { id: CHAT }, text: "carry on with that" } },
+	];
+	await left.pump(250);
+	const picker = lastCall("sendMessage").body;
+	const pickerId = api.nextMessage - 1;
+	const pickButtons = (picker.reply_markup?.inline_keyboard ?? [])
+		.flat()
+		.filter((b) => b.callback_data?.startsWith("m:"));
+	check("an ambiguous plain message offers one button per session", pickButtons.length === 2);
+	check("the picker names both candidates", picker.text.includes("left-repo") && picker.text.includes("right-repo"));
+	check("the picker shows what each session last said", picker.text.includes("right-repo finished."));
+	await left.pump(250);
+	await right.pump(250);
+	check(
+		"an ambiguous plain message reaches neither session unasked",
+		left.steers.length === leftSteers && right.steers.length === rightSteers,
+	);
+
+	// b. Tapping a button delivers the held message to exactly that session.
+	const rightTag = record(right.id).tag;
+	api.queued = [
+		{
+			update_id: 951,
+			callback_query: {
+				id: "cbpick",
+				data: `m:950:${rightTag}`,
+				from: { id: CHAT },
+				message: { message_id: pickerId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await left.pump(250);
+	await right.pump(250);
+	check("the chosen session receives the held message", right.steers.at(-1)?.text === "carry on with that");
+	check("the other session still receives nothing", left.steers.length === leftSteers);
+	const settled = called("editMessageText").find((c) => c.body.message_id === pickerId);
+	check("the picker records where the message went", settled?.body.text.includes("right-repo") === true);
+	check("the picker keeps no live buttons", (settled?.body.reply_markup?.inline_keyboard ?? []).flat().length === 0);
+
+	// c. A second tap on the same picker has nothing left to send.
+	api.queued = [
+		{
+			update_id: 952,
+			callback_query: {
+				id: "cbpick2",
+				data: `m:950:${rightTag}`,
+				from: { id: CHAT },
+				message: { message_id: pickerId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await left.pump(250);
+	const answers = called("answerCallbackQuery");
+	check("a stale pick says the message is gone", /no longer waiting/i.test(answers.at(-1)?.body.text ?? ""));
+
+	// d. Sessions that finished far apart are not ambiguous, so the newest just gets it.
+	const leftRecord = JSON.parse(readFileSync(join(sessionsDir, `${left.id}.json`), "utf8"));
+	writeFileSync(
+		join(sessionsDir, `${left.id}.json`),
+		JSON.stringify({ ...leftRecord, lastNotified: Date.now() - 300_000 }),
+	);
+	const rightBefore = right.steers.length;
+	api.queued = [
+		{ update_id: 953, message: { message_id: 953, date: 1, chat: { id: CHAT }, text: "straight through" } },
+	];
+	// `left` holds the poller lock, so it is the one that fetches; `right` only drains.
+	await left.pump(250);
+	await right.pump(250);
+	check("a clear winner gets the message with no picker", right.steers.at(-1)?.text === "straight through");
+	check("a clear winner adds no picker buttons", right.steers.length === rightBefore + 1);
+
+	// e. A reply is never ambiguous, even inside the window.
+	const rightMessage = record(right.id).recent.at(-1);
+	api.queued = [
+		{
+			update_id: 954,
+			message: {
+				message_id: 954,
+				date: 1,
+				chat: { id: CHAT },
+				text: "answering directly",
+				reply_to_message: { message_id: rightMessage },
+			},
+		},
+	];
+	await left.pump(250);
+	await right.pump(250);
+	check("a reply skips the picker entirely", right.steers.at(-1)?.text === "answering directly");
+}
+
+heading("settings apply without a restart");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	writeConfig();
+	const cf = spawn("01a060b0-0000-0000-0000-000000000000", "/home/dev/work/livecfg");
+	await cf.fire("session_start");
+
+	// a. The live draft preview stops once the setting flips, with no restart.
+	await cf.fire("agent_start");
+	await cf.fire("message_update", { message: { role: "assistant", content: [{ type: "text", text: "drafting" }] } });
+	await settle(1600);
+	await cf.pump(150);
+	check("drafts stream while the setting is on", lastCall("sendMessageDraft")?.body.text.includes("drafting") === true);
+	writeConfig({ streamDrafts: false });
+	cf.heartbeat();
+	await settle(60);
+	const draftsBefore = called("sendMessageDraft").length;
+	await cf.fire("message_update", { message: { role: "assistant", content: [{ type: "text", text: "quietly" }] } });
+	await settle(1600);
+	await cf.pump(150);
+	check("drafts stop after the setting is turned off", called("sendMessageDraft").length === draftsBefore);
+	await cf.fire("agent_end");
+
+	// b. Turn-end notices obey the setting too.
+	writeConfig({ notifyOnTurnEnd: false });
+	cf.heartbeat();
+	await settle(60);
+	const sendsBefore = called("sendMessage").length;
+	await cf.fire("input");
+	await cf.tools
+		.get("notify_status")
+		.execute("cf1", { summary: "Should stay quiet.", urgency: "green" }, undefined, undefined, cf.ctx);
+	await cf.fire("session_stop");
+	await settle(150);
+	check("turn-end notices stop after the setting is turned off", called("sendMessage").length === sendsBefore);
+
+	// c. A half-written or invalid file must never disable a working session.
+	writeFileSync(join(root, "notify-telegram.json"), "{ this is not json");
+	cf.heartbeat();
+	await settle(60);
+	writeConfig();
+	cf.heartbeat();
+	await settle(60);
+	await cf.fire("input");
+	await cf.tools
+		.get("notify_status")
+		.execute("cf2", { summary: "Back on the air.", urgency: "green" }, undefined, undefined, cf.ctx);
+	await cf.fire("session_stop");
+	await settle(150);
+	check(
+		"an unreadable config does not disable the session",
+		lastCall("sendMessage").body.text.includes("Back on the air."),
+	);
+
+	// d. The offset advances in memory faster than it reaches disk, so a reload must never rewind it.
+	api.queued = [{ update_id: 5000, message: { message_id: 5000, date: 1, chat: { id: CHAT }, text: "bump" } }];
+	await cf.pump(250);
+	writeConfig({ offset: 10 });
+	cf.heartbeat();
+	await settle(60);
+	await cf.pump(250);
+	check("a reload never rewinds the update offset", (lastCall("getUpdates")?.body.offset ?? 0) > 5000);
+
+	// e. An offset another process pushed ahead is adopted, so nothing is refetched.
+	writeConfig({ offset: 99_000 });
+	cf.heartbeat();
+	await settle(60);
+	await cf.pump(250);
+	check("a reload adopts an offset another process advanced", lastCall("getUpdates")?.body.offset === 99_000);
+	writeConfig();
+}
+
+heading("pinned fleet dashboard");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
+	// The real gap between rewrites is 30 seconds; 0 lets the suite tick freely and leaves the
+	// text comparison as the only thing standing between the board and the rate limit.
+	writeConfig({ pinnedDashboard: true, dashboardSeconds: 0 });
+	const owner = spawn("01a060c0-0000-0000-0000-000000000000", "/home/dev/work/dash-owner");
+	await owner.fire("session_start");
+	await owner.fire("input");
+	await owner.tools
+		.get("notify_status")
+		.execute("d1", { summary: "Owner is done.", urgency: "green" }, undefined, undefined, owner.ctx);
+	await owner.fire("session_stop");
+	await settle(150);
+
+	// a. The lock holder posts the board once and pins it.
+	const pinsBefore = called("pinChatMessage").length;
+	await owner.pump(250);
+	const board = called("sendMessage").at(-1)?.body;
+	const boardId = api.nextMessage - 1;
+	check("the dashboard names the live sessions", board?.text.includes("dash-owner") === true);
+	check("the dashboard reports their state", board?.text.includes("idle") === true);
+	check("the dashboard carries the last summary", board?.text.includes("Owner is done.") === true);
+	check("the dashboard is pinned", called("pinChatMessage").length === pinsBefore + 1);
+	check("the dashboard is pinned silently", called("pinChatMessage").at(-1)?.body.disable_notification === true);
+	check("the dashboard message id is shared on disk", existsSync(join(root, "notify-telegram/dashboard.json")));
+
+	// b. Nothing changed, so a free tick costs no dashboard traffic. This is the assertion that
+	// stops a relative timestamp creeping into the text and editing the board forever. The owner
+	// also polls on every tick, so counting every api call would always grow.
+	const boardCalls = () =>
+		called("sendMessage").length + called("editMessageText").length + called("pinChatMessage").length;
+	const quietBefore = boardCalls();
+	await owner.pump(250);
+	await owner.pump(250);
+	check("an unchanged dashboard makes no api call", boardCalls() === quietBefore);
+
+	// c. A changed state edits the same message rather than posting a second one.
+	const sendsBefore = called("sendMessage").length;
+	await owner.fire("agent_start");
+	await owner.fire("tool_execution_start", { toolName: "bash", intent: "Building" });
+	await settle(60);
+	await owner.pump(250);
+	const edit = called("editMessageText").at(-1);
+	check("a changed dashboard is edited in place", edit?.body.message_id === boardId);
+	check("the edit carries the new state", edit?.body.text.includes("bash: Building") === true);
+	check("a changed dashboard posts no second message", called("sendMessage").length === sendsBefore);
+
+	// d. The configured gap is what actually protects the rate limit.
+	writeConfig({ pinnedDashboard: true, dashboardSeconds: 600 });
+	owner.heartbeat();
+	await settle(60);
+	await owner.fire("tool_execution_end", {});
+	await owner.fire("tool_execution_start", { toolName: "bash", intent: "Something else" });
+	await settle(60);
+	const throttled = boardCalls();
+	await owner.pump(250);
+	check("a change inside the configured gap is not published", boardCalls() === throttled);
+	writeConfig({ pinnedDashboard: true, dashboardSeconds: 0 });
+	owner.heartbeat();
+	await settle(60);
+	await owner.fire("tool_execution_end", {});
+	await owner.fire("agent_end");
+
+	// e. A session that does not hold the lock never touches the board.
+	const bystander = spawn("01a060c1-0000-0000-0000-000000000000", "/home/dev/work/dash-bystander");
+	await bystander.fire("session_start");
+	const untouchedFrom = called("editMessageText").length;
+	await bystander.pump(250);
+	await bystander.pump(250);
+	check(
+		"a session without the lock never edits the dashboard",
+		!called("editMessageText")
+			.slice(untouchedFrom)
+			.some((c) => c.body.message_id === boardId),
+	);
+
+	// f. A board deleted from the chat is replaced rather than lost.
+	api.failMethods = ["editMessageText"];
+	await owner.fire("agent_start");
+	await owner.fire("tool_execution_start", { toolName: "bash", intent: "After deletion" });
+	await settle(60);
+	const resendFrom = called("sendMessage").length;
+	await owner.pump(250);
+	api.failMethods = [];
+	check("a deleted dashboard is posted again", called("sendMessage").length > resendFrom);
+	check("the replacement board is pinned too", called("pinChatMessage").at(-1)?.body.message_id !== boardId);
+	await owner.fire("tool_execution_end", {});
+	await owner.fire("agent_end");
+
+	// g. Turning it off stops it, and the setting applies without a restart.
+	writeConfig({ pinnedDashboard: false, dashboardSeconds: 0 });
+	owner.heartbeat();
+	await settle(60);
+	await owner.fire("agent_start");
+	await owner.fire("tool_execution_start", { toolName: "bash", intent: "Ignored" });
+	await settle(60);
+	const offBefore = boardCalls();
+	await owner.pump(250);
+	check("a disabled dashboard makes no api call", boardCalls() === offBefore);
+	await owner.fire("tool_execution_end", {});
+	await owner.fire("agent_end");
+	writeConfig();
+}
+
+heading("spinner frames match omp exactly");
+{
+	// omp writes one of ten braille frames (title-generator.ts TITLE_SPINNER_FRAMES). Any other
+	// braille character is not omp working, and both repos must agree on that.
+	const frames = ["\u280B", "\u2819", "\u2839", "\u2838", "\u283C", "\u2834", "\u2826", "\u2827", "\u2807", "\u280F"];
+	const spinBin = join(root, "spin-bin");
+	mkdirSync(spinBin, { recursive: true });
+	const rows = [
+		...frames.map((f, i) => `    printf '0\\t${i}\\t0\\t\\t\u03C0 ${f} Frame ${i}\\n'`),
+		`    printf '0\\t90\\t0\\t\\t\u03C0 \u28FF Not an omp frame\\n'`,
+		`    printf '0\\t91\\t0\\t\\t\u03C0 \u2801 Also not a frame\\n'`,
+	];
+	writeFileSync(
+		join(spinBin, "tmux"),
+		[
+			"#!/bin/sh",
+			'case "$1" in',
+			"  display-message) printf 'main\\t0\\n' ;;",
+			"  list-windows)",
+			...rows,
+			"    ;;",
+			"esac",
+			"",
+		].join("\n"),
+		{ mode: 0o755 },
+	);
+	const spinPath = process.env.PATH;
+	process.env.PATH = `${spinBin}:${spinPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	process.env.TMUX_PANE = "%1";
+	api.topicsEnabled = false;
+	writeConfig();
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const sp = spawn("01a060d0-0000-0000-0000-000000000000", "/home/dev/work/spinner");
+	await sp.fire("session_start");
+	api.queued = [{ update_id: 960, message: { message_id: 960, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
+	await sp.pump(250);
+	const spinReport = lastCall("sendMessage").body.text ?? "";
+	check("all ten omp frames count as working", spinReport.includes("10 working"));
+	check("braille characters omp never uses are not working", !spinReport.includes("12 working"));
+	check("the non-frame windows are still listed as idle", spinReport.includes("2 idle"));
+	process.env.PATH = spinPath;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
 }
 
 rmSync(root, { recursive: true, force: true });

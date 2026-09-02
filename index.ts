@@ -14,13 +14,33 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import {
+	type AskQuestion,
+	ago,
+	badgeLine,
+	clip,
+	clockTime,
+	duration,
+	extractQuestionPreviews,
+	fitToTelegram,
+	type InlineButton,
+	packRows,
+	STANCE,
+	type StatusOption,
+	stanceFor,
+	stanceOf,
+	TELEGRAM_TEXT_MAX,
+	toTelegramHtml,
+} from "./render.ts";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "notify-telegram.json");
 const STATE_DIR = join(AGENT_DIR, "notify-telegram");
+const PENDING_MESSAGES_DIR = join(STATE_DIR, "pending-messages");
 const LOCK_FILE = join(STATE_DIR, "poller.lock");
 const LEGACY_LOCK_DIR = join(STATE_DIR, "poller.lock.d");
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
+const DASHBOARD_FILE = join(STATE_DIR, "dashboard.json");
 const PENDING_TOPICS_DIR = join(STATE_DIR, "pending-topics");
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const MEDIA_DIR = join(STATE_DIR, "media");
@@ -29,27 +49,44 @@ const HEARTBEAT_MS = 15_000;
 const LOCK_STALE_MS = 45_000;
 const DRAIN_MS = 1_000;
 const LONG_POLL_S = 25;
+const STATUS_OPTIONS_MIN = 2;
+const STATUS_OPTIONS_MAX = 6;
 const BUTTON_TEXT_MAX = 60;
+/** Two turns finishing this close together is the only genuinely ambiguous case. */
+const AMBIGUOUS_WINDOW_MS = 60_000;
+const HELD_MESSAGE_TTL_MS = 3_600_000;
+/** Recorded state that outranks recency when routing a plain message. */
+const WAITING_ON_QUESTION = "waiting on a question";
 const PREVIEW_MAX = 300;
+const SUMMARY_MAX = 900;
+const TOPIC_NAME_MAX = 128;
+/**
+ * The exact frames omp writes into the pane title while a turn runs
+ * (`title-generator.ts` `TITLE_SPINNER_FRAMES`). omp-tmux matches the same literal set, so both
+ * surfaces classify a window identically. A wider braille range would call any braille glyph work.
+ */
+const SPINNER_FRAMES = new Set([
+	"\u280B",
+	"\u2819",
+	"\u2839",
+	"\u2838",
+	"\u283C",
+	"\u2834",
+	"\u2826",
+	"\u2827",
+	"\u2807",
+	"\u280F",
+]);
+const STATUS_SUMMARY_MAX = 160;
+const CAPTION_MAX = 1024;
 const RECENT_MESSAGE_CAP = 60;
-const TELEGRAM_TEXT_MAX = 4096;
-const TELEGRAM_CAPTION_MAX = 1024;
+
 const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;
 const TYPING_MS = 5_000;
 const DRAFT_MS = 1_500;
 /** The party-popper send effect, verified against the live API; effects exist in private chats only. */
 const GREEN_EFFECT_ID = "5046509860389126442";
-
-/**
- * Single source for stance marker and colour. Telegram button styles offer only
- * red, green and blue, so the middle stance carries its colour in the marker.
- */
-const STANCE = {
-	preferable: { marker: "(preferable)", style: "success" as const },
-	lukewarm: { marker: "\u{1F7E0} (lukewarm)", style: undefined },
-	discouraged: { marker: "(discouraged)", style: "danger" as const },
-};
 
 const BADGE_PALETTE = [
 	"\u{1F98A}", // fox
@@ -73,6 +110,9 @@ interface Config {
 	quietSeconds: number;
 	notifyOnTurnEnd: boolean;
 	streamDrafts: boolean;
+	pinnedDashboard: boolean;
+	/** Minimum gap between board rewrites, which is what actually protects the rate limit. */
+	dashboardSeconds: number;
 }
 
 interface SessionRecord {
@@ -95,6 +135,13 @@ interface SessionRecord {
 	pinned: number | null;
 	/** Draft-stream identifier; a stop press routes back through it. */
 	draftId: number;
+	/** What this session is doing, so one session can answer `/status` for the whole fleet. */
+	state: string;
+	/** `"<tmux session>:<window index>"`, so `/fleet` can join a tmux row to this session. */
+	tmuxWindow: string | null;
+	/** First line of the last turn-end summary, and when it landed. */
+	summary: string;
+	summaryAt: number;
 	heartbeat: number;
 }
 
@@ -124,40 +171,6 @@ interface TelegramUpdate {
 	message?: TelegramMessage;
 	callback_query?: TelegramCallbackQuery;
 	stopped_message_generation?: { chat: { id: number }; message_thread_id?: number; draft_id: number };
-}
-
-interface InlineButton {
-	text: string;
-	callback_data: string;
-	style?: "danger" | "success" | "primary";
-	disabled?: Record<string, never>;
-}
-
-interface AskOption {
-	label: string;
-	description?: string;
-	preview?: string;
-	/** Workable, but not the pick. */
-	lukewarm?: boolean;
-	/** Present only for contrast. */
-	discouraged?: boolean;
-}
-
-interface AskQuestion {
-	id: string;
-	question: string;
-	options: AskOption[];
-	header?: string;
-	multi?: boolean;
-	recommended?: number;
-}
-
-/** Preferable wins over discouraged, which wins over lukewarm, when a caller marks contradictions. */
-function stanceOf(question: AskQuestion, option: AskOption, index: number) {
-	if (question.recommended === index) return STANCE.preferable;
-	if (option.discouraged === true) return STANCE.discouraged;
-	if (option.lukewarm === true) return STANCE.lukewarm;
-	return null;
 }
 
 interface AskResult {
@@ -194,7 +207,27 @@ interface TurnStatus {
 	text: string;
 	urgency: "green" | "orange" | "red";
 	question?: string;
-	options?: string[];
+	options?: StatusOption[];
+}
+
+/** A bare string is the label. Anything else must be an object carrying one. `null` means malformed. */
+function parseStatusOption(raw: unknown): StatusOption | null {
+	if (typeof raw === "string") {
+		const label = raw.trim();
+		return label.length > 0 ? { label } : null;
+	}
+	if (raw === null || typeof raw !== "object") return null;
+	const source = raw as Record<string, unknown>;
+	const label = typeof source.label === "string" ? source.label.trim() : "";
+	if (label.length === 0) return null;
+	const description = typeof source.description === "string" ? source.description.trim() : "";
+	return {
+		label,
+		description: description.length > 0 ? description : undefined,
+		recommended: source.recommended === true,
+		lukewarm: source.lukewarm === true,
+		discouraged: source.discouraged === true,
+	};
 }
 
 interface StandingQuestion {
@@ -218,6 +251,8 @@ interface InboxEntry {
 	messageId?: number;
 	/** Message id the sender replied to. */
 	replyTo?: number;
+	/** A command that arrived inside a session's own forum thread answers for that session alone. */
+	scoped?: boolean;
 	caption?: string;
 	mime?: string;
 }
@@ -283,6 +318,9 @@ function loadConfig(): Config | null {
 		quietSeconds: typeof raw.quietSeconds === "number" ? raw.quietSeconds : 45,
 		notifyOnTurnEnd: raw.notifyOnTurnEnd !== false,
 		streamDrafts: raw.streamDrafts !== false,
+		// Opt-in: a permanently pinned message is too strong an opinion to impose by default.
+		pinnedDashboard: raw.pinnedDashboard === true,
+		dashboardSeconds: typeof raw.dashboardSeconds === "number" ? raw.dashboardSeconds : 30,
 	};
 }
 
@@ -301,86 +339,38 @@ function persistOffset(offset: number): void {
 	writeFileAtomic(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, 0o600);
 }
 
-/** Markdown subset to Telegram HTML. Code is stashed first so emphasis cannot touch it. */
-function toTelegramHtml(source: string): string {
-	const blocks: string[] = [];
-	const stash = (html: string): string => {
-		blocks.push(html);
-		return `\u0000${blocks.length - 1}\u0000`;
-	};
-	const escapeHtml = (text: string): string =>
-		text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-
-	// NUL is the stash marker below; hostile input must not be able to forge or collide with it.
-	let work = source
-		.replaceAll("\u0000", "")
-		.replace(/```([A-Za-z0-9_+-]*)\n?([\s\S]*?)```/g, (_match, language: string, code: string) => {
-			const opener = language.length > 0 ? `<pre><code class="language-${language}">` : "<pre>";
-			const closer = language.length > 0 ? "</code></pre>" : "</pre>";
-			return stash(`${opener}${escapeHtml(code.replace(/\n$/, ""))}${closer}`);
-		});
-	work = work.replace(/`([^`\n]+)`/g, (_match, code: string) => stash(`<code>${escapeHtml(code)}</code>`));
-
-	work = escapeHtml(work);
-	// Headings have no Telegram equivalent and otherwise render as literal hash marks.
-	work = work.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
-	work = work.replace(
-		/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,
-		(_match, label: string, url: string) => `<a href="${url.replaceAll('"', "&quot;")}">${label}</a>`,
-	);
-	work = work.replace(/\*\*([^\n*]+)\*\*/g, "<b>$1</b>");
-	work = work.replace(/~~([^\n~]+)~~/g, "<s>$1</s>");
-	work = work.replace(/\|\|([^\n|]+)\|\|/g, "<tg-spoiler>$1</tg-spoiler>");
-	// Single-delimiter emphasis runs last so it cannot eat the doubled forms above. Both require a
-	// boundary before the opener, which keeps snake_case identifiers and multiplication intact.
-	work = work.replace(/(^|[\s(])\*([^\n*]+)\*(?=[\s).,:!?]|$)/g, "$1<i>$2</i>");
-	work = work.replace(/(^|[\s(])_([^\n_]+)_(?=[\s).,:!?]|$)/g, "$1<i>$2</i>");
-	work = work.replace(/^&gt;\s?(.*)$/gm, "<blockquote>$1</blockquote>");
-	work = work.replace(/<\/blockquote>\n<blockquote>/g, "\n");
-	// biome-ignore lint/suspicious/noControlCharactersInRegex: NUL is the stash marker
-	return work.replace(/\u0000(\d+)\u0000/g, (_match, index: string) => blocks[Number(index)] ?? "");
-}
-
-/** Best-effort question texts from a half-streamed ask tool-call JSON, tolerant of a cut mid-string. */
-function extractQuestionPreviews(partialJson: string): string[] {
-	const previews: string[] = [];
-	const opener = /(?<!\\)"question"\s*:\s*"/g;
-	let match = opener.exec(partialJson);
-	while (match !== null) {
-		let i = opener.lastIndex;
-		let out = "";
-		let closed = false;
-		while (i < partialJson.length && !closed) {
-			const ch = partialJson[i] ?? "";
-			if (ch === '"') {
-				closed = true;
-			} else if (ch === "\\") {
-				const esc = partialJson[i + 1];
-				if (esc === undefined) break;
-				if (esc === "u") {
-					const hex = partialJson.slice(i + 2, i + 6);
-					if (!/^[0-9a-fA-F]{4}$/u.test(hex)) break;
-					out += String.fromCharCode(Number.parseInt(hex, 16));
-					i += 6;
-				} else {
-					out += esc === "n" ? "\n" : esc === "t" ? "\t" : esc;
-					i += 2;
-				}
-			} else {
-				out += ch;
-				i += 1;
-			}
-		}
-		if (out.trim().length > 0) previews.push(out);
-		match = opener.exec(partialJson);
-	}
-	return previews;
-}
-
 interface TelegramFailure {
 	method: string;
 	status: number;
 	description: string;
+}
+
+interface TelegramEnvelope {
+	ok?: unknown;
+	result?: unknown;
+	description?: unknown;
+	parameters?: { retry_after?: unknown };
+}
+
+/**
+ * Telegram throttles a bot to roughly one message per second per chat. Several sessions ending a
+ * turn together will hit it, and dropping those notifications silently is the wrong answer, so a
+ * short retry-after is honoured exactly once. `send` is re-invoked rather than reused, since a
+ * request body is spent by its first attempt.
+ */
+async function sendWithRetry(
+	send: () => Promise<Response>,
+): Promise<{ response: Response; envelope: TelegramEnvelope | null }> {
+	for (let attempt = 0; ; attempt++) {
+		const response = await send();
+		const payload: unknown = await response.json().catch(() => null);
+		const envelope = payload !== null && typeof payload === "object" ? (payload as TelegramEnvelope) : null;
+		const retryAfter = envelope?.parameters?.retry_after;
+		if (attempt > 0 || response.status !== 429 || typeof retryAfter !== "number" || retryAfter > 30) {
+			return { response, envelope };
+		}
+		await new Promise((wake) => setTimeout(wake, (retryAfter + 0.5) * 1000));
+	}
 }
 
 async function callTelegramRaw<T>(
@@ -389,26 +379,15 @@ async function callTelegramRaw<T>(
 	body: Record<string, unknown>,
 	timeoutMs: number,
 	onFailure: (failure: TelegramFailure) => void,
-	attempt = 0,
 ): Promise<T | null> {
-	const response = await fetch(`https://api.telegram.org/bot${config.token}/${method}`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(timeoutMs),
-	});
-	const payload: unknown = await response.json().catch(() => null);
-	const envelope =
-		payload !== null && typeof payload === "object"
-			? (payload as { ok?: unknown; result?: unknown; description?: unknown; parameters?: { retry_after?: unknown } })
-			: null;
-	// Telegram throttles a bot to roughly one message per second per chat. Several sessions ending a
-	// turn together will hit it, and dropping those notifications silently is the wrong answer.
-	const retryAfter = envelope?.parameters?.retry_after;
-	if (response.status === 429 && typeof retryAfter === "number" && retryAfter <= 30 && attempt === 0) {
-		await new Promise((resolve) => setTimeout(resolve, (retryAfter + 0.5) * 1000));
-		return await callTelegramRaw<T>(config, method, body, timeoutMs, onFailure, 1);
-	}
+	const { response, envelope } = await sendWithRetry(() =>
+		fetch(`https://api.telegram.org/bot${config.token}/${method}`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+			signal: AbortSignal.timeout(timeoutMs),
+		}),
+	);
 	if (!response.ok || envelope === null || envelope.ok !== true) {
 		onFailure({
 			method,
@@ -418,31 +397,6 @@ async function callTelegramRaw<T>(
 		return null;
 	}
 	return envelope.result as T;
-}
-
-/**
- * Telegram offers no button sizing: a row spans the message width, split equally among its buttons.
- * Adaptive size therefore means adaptive packing: short labels share a row, long labels get a full
- * row. Two-up when both fit 16 cells and 26 combined, three-up when all fit 9, measured on the rendered text.
- */
-function packRows(buttons: InlineButton[]): InlineButton[][] {
-	const rows: InlineButton[][] = [];
-	let row: InlineButton[] = [];
-	for (const button of buttons) {
-		const width = [...button.text].length;
-		const total = row.reduce((n, b) => n + [...b.text].length, 0) + width;
-		const canJoin =
-			(row.length === 1 && width <= 16 && total <= 26) ||
-			(row.length === 2 && width <= 9 && total <= 24 && row.every((b) => [...b.text].length <= 9));
-		if (row.length === 0 || canJoin) {
-			row.push(button);
-		} else {
-			rows.push(row);
-			row = [button];
-		}
-	}
-	if (row.length > 0) rows.push(row);
-	return rows;
 }
 
 /** Renders the keyboard for one question. Selected labels get a check mark so multi-select reads correctly. */
@@ -491,8 +445,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let turnSummary: TurnStatus | null = null;
 	let standingSeq = 0;
 	let standingQuestion: StandingQuestion | null = null;
+	/** Refreshed on the heartbeat, not per write: a tmux query per tool call is not worth the accuracy. */
+	let tmuxWindowKey: string | null = null;
 	let closeOfferMessageId: number | null = null;
 	let statusBlockUsed = false;
+	let lastState = "";
+	let lastSummary = "";
+	let lastSummaryAt = 0;
 	let badgeEmoji = "";
 	let badgeOverride = "";
 	let topicId: number | null = null;
@@ -501,6 +460,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastNotifiedAt = 0;
 	let turnActive = false;
 	let typingSentAt = 0;
+	let dashboardPublishedAt = 0;
 	let approvalWaiting = false;
 	let approvalNotice: ApprovalNotice | null = null;
 	let pinnedMessageId: number | null = null;
@@ -517,6 +477,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let turnStartingModel = "unavailable";
 	let turnTools = 0;
 	const turnUsageByModel = new Map<string, ModelUsage>();
+	let turnStartedAt = 0;
+	let turnEndedAt = 0;
 	const noticedKinds = new Set<string>();
 	let activeCompaction: { trigger: string; action: string } | null = null;
 
@@ -555,15 +517,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		method: "sendMessage" | "editMessageText",
 		body: Record<string, unknown>,
 		plain: string,
+		keep = "",
 	): Promise<TelegramMessage | null> {
 		const quiet = { link_preview_options: { is_disabled: true } };
-		let source = plain;
-		while (toTelegramHtml(source).length > TELEGRAM_TEXT_MAX && source.length > 200) {
-			source = source.slice(0, Math.floor(source.length * 0.8));
-		}
-		// A raw slice can end on the high half of a surrogate pair, which is invalid JSON.
-		const last = source.charCodeAt(source.length - 1);
-		if (last >= 0xd800 && last <= 0xdbff) source = source.slice(0, -1);
+		const source = fitToTelegram(plain, keep);
 		let sent = await callTelegram<TelegramMessage>(
 			cfg,
 			method,
@@ -579,7 +536,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return sent;
 	}
 
+	/** What this session is doing right now, in the words `/status` uses. */
+	function sessionState(): string {
+		if (pendingAsk !== null) return WAITING_ON_QUESTION;
+		if (approvalWaiting) return "waiting on a tool approval";
+		if (!turnActive) return "idle";
+		return currentTool.length > 0 ? `working (${currentTool})` : "working";
+	}
+
 	function writeSessionRecord(ctx: ExtensionContext): void {
+		lastState = sessionState();
 		const record: SessionRecord = {
 			pid: process.pid,
 			tag: sessionTag,
@@ -595,9 +561,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			closeOffer: closeOfferMessageId,
 			pinned: pinnedMessageId,
 			draftId,
+			state: lastState,
+			tmuxWindow: tmuxWindowKey,
+			summary: lastSummary,
+			summaryAt: lastSummaryAt,
 			heartbeat: Date.now(),
 		};
 		writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(record), 0o600);
+	}
+
+	/** The record is the only thing another session can read, so a state change has to reach disk. */
+	function noteState(): void {
+		if (sessionCtx === null || sessionState() === lastState) return;
+		writeSessionRecord(sessionCtx);
 	}
 
 	function readSessionRecord(id: string): SessionRecord | null {
@@ -683,13 +659,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function badge(ctx: ExtensionContext): string {
-		const folder =
-			ctx.cwd
-				.split("/")
-				.filter((part) => part.length > 0)
-				.pop() ?? ctx.cwd;
 		const detail = badgeOverride.length > 0 ? badgeOverride : (ctx.sessionManager.getSessionName() ?? "");
-		return `${badgeEmoji} ${folder} \u00B7 ${detail.length > 0 ? detail.slice(0, 60) : sessionTag}`;
+		return badgeLine(badgeEmoji, ctx.cwd, detail, sessionTag);
+	}
+
+	/** The same badge for a session this process does not own, rebuilt from its record. */
+	function badgeOf(record: SessionRecord): string {
+		return badgeLine(record.emoji, record.cwd, record.label.length > 0 ? record.label : record.name, record.tag);
 	}
 	function taskName(ctx: ExtensionContext): string {
 		const named = badgeOverride.length > 0 ? badgeOverride : (ctx.sessionManager.getSessionName() ?? "");
@@ -708,22 +684,35 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return topicId === null ? base : { ...base, message_thread_id: topicId };
 	}
 
-	/** Re-read per message because tmux windows can move. */
-	function tmuxLocation(): string | null {
+	/** Re-read per message because tmux windows can move. One query serves both consumers below. */
+	function tmuxWindow(): { session: string; index: string; pane: string } | null {
 		const pane = process.env.TMUX_PANE;
 		if (process.env.TMUX === undefined || pane === undefined) return null;
 		try {
 			const out = execFileSync(
 				"tmux",
-				["display-message", "-p", "-t", pane, "#{session_name}:#{window_index}.#{pane_index}"],
+				["display-message", "-p", "-t", pane, "#{session_name}\t#{window_index}\t#{pane_index}"],
 				{ timeout: 2000 },
 			)
 				.toString()
 				.trim();
-			return out.length > 0 ? out : null;
+			const [session, index, pane_index] = out.split("\t");
+			if (session === undefined || index === undefined || index.length === 0) return null;
+			return { session, index, pane: pane_index ?? "0" };
 		} catch {
 			return null;
 		}
+	}
+
+	function refreshTmuxWindowKey(): void {
+		const where = tmuxWindow();
+		tmuxWindowKey = where === null ? null : `${where.session}:${where.index}`;
+	}
+
+	/** The human-readable location shown in notifications, as `session:window.pane`. */
+	function tmuxLocation(): string | null {
+		const where = tmuxWindow();
+		return where === null ? null : `${where.session}:${where.index}.${where.pane}`;
 	}
 
 	/** Puts this session's window in front for the user's return, but never while they are typing elsewhere. */
@@ -763,17 +752,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {}
 	}
 
+	/** Drops every button from a message and leaves its text standing. */
+	async function stripKeyboard(messageId: number): Promise<void> {
+		if (config === null) return;
+		await callTelegram(
+			config,
+			"editMessageReplyMarkup",
+			{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } },
+			10_000,
+		);
+	}
+
 	/** The green-summary close button: strip the button, then let the ordinary shutdown path run. */
 	async function closeSessionFromTelegram(messageId: number | undefined): Promise<void> {
 		if (messageId !== undefined && closeOfferMessageId === messageId) closeOfferMessageId = null;
-		if (config !== null && typeof messageId === "number" && standingQuestion?.messageId !== messageId) {
+		if (typeof messageId === "number" && standingQuestion?.messageId !== messageId) {
 			// A standing question is rewritten by session_shutdown; a plain summary only loses its button.
-			await callTelegram(
-				config,
-				"editMessageReplyMarkup",
-				{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } },
-				10_000,
-			);
+			await stripKeyboard(messageId);
 		}
 		scheduleTmuxWindowKill();
 		sessionCtx?.shutdown();
@@ -785,16 +780,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (messageId === null) return;
 		closeOfferMessageId = null;
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-		if (!withEdit || config === null) return;
-		detach(
-			callTelegram(
-				config,
-				"editMessageReplyMarkup",
-				{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } },
-				10_000,
-			),
-			"close-offer retire",
-		);
+		if (!withEdit) return;
+		detach(stripKeyboard(messageId), "close-offer retire");
 	}
 
 	/** One line per omp window, read from the same pane titles that drive the tmux tabs. */
@@ -804,24 +791,41 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		try {
 			out = execFileSync(
 				"tmux",
-				["list-windows", "-a", "-F", "#{session_name}\t#{window_index}\t#{window_bell_flag}\t#{pane_title}"],
+				[
+					"list-windows",
+					"-a",
+					"-F",
+					"#{session_name}\t#{window_index}\t#{window_bell_flag}\t#{@omp_priority}\t#{pane_title}",
+				],
 				{ timeout: 2000 },
 			).toString();
 		} catch {
 			return null;
 		}
-		const rows: { session: string; index: string; state: keyof typeof counts; label: string }[] = [];
+		const rows: {
+			session: string;
+			index: string;
+			state: keyof typeof counts;
+			label: string;
+			priority: boolean;
+		}[] = [];
 		const counts = { working: 0, waiting: 0, finished: 0, idle: 0 };
 		for (const raw of out.split("\n")) {
 			const parts = raw.split("\t");
-			if (parts.length < 4) continue;
-			const title = parts.slice(3).join("\t");
+			if (parts.length < 5) continue;
+			const title = parts.slice(4).join("\t");
 			if (!title.startsWith("\u03C0 ")) continue;
-			const sep = title.codePointAt(2) ?? 0;
+			const sep = title.slice(2, 3);
 			const state =
-				sep === 0x21 ? "waiting" : sep >= 0x2800 && sep <= 0x28ff ? "working" : parts[2] === "1" ? "finished" : "idle";
+				sep === "!" ? "waiting" : SPINNER_FRAMES.has(sep) ? "working" : parts[2] === "1" ? "finished" : "idle";
 			counts[state] += 1;
-			rows.push({ session: parts[0] ?? "", index: parts[1] ?? "", state, label: title.slice(4) });
+			rows.push({
+				session: parts[0] ?? "",
+				index: parts[1] ?? "",
+				state,
+				label: title.slice(4),
+				priority: parts[3] === "high",
+			});
 		}
 		if (rows.length === 0) return "\u{1F535} No omp windows in tmux right now.";
 		const manySessions = new Set(rows.map((row) => row.session)).size > 1;
@@ -837,15 +841,41 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			.map(([count, word]) => `${count} ${word}`)
 			.join(", ");
 		const glyphs = { working: "\u{1F7E2}", waiting: "\u{1F534}", finished: "\u2705", idle: "\u26AA" };
-		const lines = rows.map(
-			(row) => `${glyphs[row.state]} ${manySessions ? `${row.session}:` : ""}${row.index} ${row.label}`,
-		);
+		// Whatever wants a human first, then what it can hand over, then what is still busy.
+		const rank = { waiting: 0, finished: 1, working: 2, idle: 3 };
+		const threads = topicLinks();
+		const lines = rows
+			.sort((a, b) => rank[a.state] - rank[b.state])
+			.map((row) => {
+				const mark = row.priority ? "\u2757 " : "";
+				const where = manySessions ? `${row.session}:` : "";
+				const link = threads.get(`${row.session}:${row.index}`);
+				const label = link === undefined ? row.label : `[${row.label}](${link})`;
+				return `${glyphs[row.state]} ${mark}${where}${row.index} ${label}`;
+			});
 		return `\u{1F39B} ${summary}\n${lines.join("\n")}`;
 	}
 
 	function sessionContextLine(ctx: ExtensionContext): string {
 		const model = ctx.model === undefined ? "unavailable" : `${ctx.model.provider}/${ctx.model.id}`;
 		return `Task: ${taskName(ctx)} | Model: ${model} | Tmux: ${tmuxLocation() ?? "not attached"}`;
+	}
+
+	/**
+	 * Deep links from a tmux window to the forum thread of the session sitting in it. Only a
+	 * supergroup has threads, and only its `-100`-prefixed id maps onto a `t.me/c/` link.
+	 */
+	function topicLinks(): Map<string, string> {
+		const links = new Map<string, string>();
+		const id = config === null ? "" : String(config.chatId);
+		if (!id.startsWith("-100")) return links;
+		const internal = id.slice(4);
+		for (const { record } of allRecords()) {
+			if (typeof record.tmuxWindow !== "string" || typeof record.topicId !== "number") continue;
+			if (Date.now() - record.heartbeat > LOCK_STALE_MS) continue;
+			links.set(record.tmuxWindow, `https://t.me/c/${internal}/${record.topicId}`);
+		}
+		return links;
 	}
 
 	function lastAssistantTail(ctx: ExtensionContext): string {
@@ -878,14 +908,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return `${head}**${title}**\n${body}`;
 	}
 
-	/** `thread` overrides the session topic for replies into a foreign thread. */
-	async function serviceNotice(text: string, thread?: number): Promise<void> {
+	/**
+	 * `thread` overrides the session topic for replies into a foreign thread. A notice the session
+	 * makes about itself is tracked, so replying to it routes back here. A poller-level refusal about
+	 * someone else's message is not: replying to that would mean nothing.
+	 */
+	async function serviceNotice(text: string, thread?: number, routable = true): Promise<void> {
 		if (config === null) return;
 		const body: Record<string, unknown> =
 			thread === undefined
 				? threaded({ text: `\u{1F535} ${text}` })
 				: { chat_id: config.chatId, message_thread_id: thread, text: `\u{1F535} ${text}` };
-		await callTelegram(config, "sendMessage", body, 15_000);
+		const sent = await callTelegram<TelegramMessage>(config, "sendMessage", body, 15_000);
+		if (!routable) return;
+		trackSent(sent);
+		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 	}
 
 	async function sessionNotice(ctx: ExtensionContext, text: string): Promise<void> {
@@ -897,12 +934,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		cfg: Config,
 		body: Record<string, unknown>,
 		plain: string,
+		keep = "",
 	): Promise<TelegramMessage | null> {
 		if (/```|(^|\n)\|.+\|/.test(plain)) {
 			const sent = await callTelegram<TelegramMessage>(
 				cfg,
 				"sendRichMessage",
-				{ ...body, rich_message: { markdown: plain } },
+				{ ...body, rich_message: { markdown: plain + keep } },
 				15_000,
 			);
 			if (sent !== null) {
@@ -910,17 +948,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				return sent;
 			}
 		}
-		return await sendOrEdit(cfg, "sendMessage", body, plain);
+		return await sendOrEdit(cfg, "sendMessage", body, plain, keep);
 	}
 
+	/** `keep` is a short tail exempt from truncation, so an oversized body cannot swallow the usage footer. */
 	async function notify(
 		ctx: ExtensionContext,
 		title: string,
 		body: string,
 		extra: Record<string, unknown> = {},
+		keep = "",
 	): Promise<TelegramMessage | null> {
 		if (config === null) return null;
-		const sent = await sendStructured(config, threaded(extra), withHead(ctx, title, body));
+		const sent = await sendStructured(config, threaded(extra), withHead(ctx, title, body), keep);
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
 		return sent;
@@ -940,6 +980,107 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				withHead(ctx, title, `${notice.toolName} was ${approved ? "approved" : "denied"}.${detail}`),
 			),
 			"approval resolution",
+		);
+	}
+
+	/** One session's `/status` paragraph, built entirely from its record. */
+	function statusLine(record: SessionRecord): string {
+		const lines = [badgeOf(record), `State: ${record.state.length > 0 ? record.state : "unknown"}.`];
+		if (record.summary.length > 0) lines.push(`Last: ${record.summary} (${ago(record.summaryAt)})`);
+		if (record.standing !== null) lines.push("A choice question stands open.");
+		if (record.pinned !== null) lines.push("A red status is pinned.");
+		return lines.join("\n");
+	}
+
+	/** Every live session in one message, busiest attention first. */
+	function statusReport(): string {
+		const live = allRecords()
+			.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
+			.sort((a, b) => b.record.lastNotified - a.record.lastNotified);
+		if (live.length === 0) return "No live omp sessions.";
+		return live.map(({ record }) => statusLine(record)).join("\n\n");
+	}
+
+	/**
+	 * One compact line per session for the pinned board. Deliberately no relative time: the board
+	 * is rewritten only when its text differs, and "4m ago" would differ every single second.
+	 */
+	function dashboardReport(): string {
+		const live = allRecords()
+			.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
+			.sort((a, b) => b.record.lastNotified - a.record.lastNotified);
+		if (live.length === 0) return "\u{1F39B} No live omp sessions.";
+		const lines = live.map(({ record }) => {
+			const state = record.state.length > 0 ? record.state : "unknown";
+			const flags = [record.standing !== null ? "choice open" : "", record.pinned !== null ? "red pinned" : ""].filter(
+				(flag) => flag.length > 0,
+			);
+			const tail = flags.length > 0 ? ` [${flags.join(", ")}]` : "";
+			const said = record.summary.length > 0 ? `\n    ${record.summary} (${clockTime(record.summaryAt)})` : "";
+			return `${badgeOf(record)} \u00B7 ${state}${tail}${said}`;
+		});
+		return `\u{1F39B} Fleet\n${lines.join("\n")}`;
+	}
+
+	function readDashboard(): { messageId: number; text: string } | null {
+		if (!existsSync(DASHBOARD_FILE)) return null;
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(DASHBOARD_FILE, "utf8"));
+			if (parsed === null || typeof parsed !== "object") return null;
+			const shown = parsed as { messageId?: unknown; text?: unknown };
+			if (typeof shown.messageId !== "number" || typeof shown.text !== "string") return null;
+			return { messageId: shown.messageId, text: shown.text };
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * The lock holder owns the board, so sessions sharing a chat cannot fight over it. The message
+	 * id lives in a shared file rather than a session record, so the next lock holder adopts it.
+	 */
+	function maybeDashboard(): void {
+		if (config === null || !config.pinnedDashboard || !ownsLock()) return;
+		if (Date.now() - dashboardPublishedAt < config.dashboardSeconds * 1000) return;
+		const text = dashboardReport();
+		const shown = readDashboard();
+		// The rate limit is the scarce resource, and Telegram rejects an edit that changes nothing.
+		if (shown !== null && shown.text === text) return;
+		dashboardPublishedAt = Date.now();
+		detach(publishDashboard(config, text, shown), "fleet dashboard");
+	}
+
+	async function publishDashboard(
+		cfg: Config,
+		text: string,
+		shown: { messageId: number; text: string } | null,
+	): Promise<void> {
+		const rendered = {
+			text: toTelegramHtml(text),
+			parse_mode: "HTML",
+			link_preview_options: { is_disabled: true },
+		};
+		if (shown !== null) {
+			const edited = await callTelegram(
+				cfg,
+				"editMessageText",
+				{ chat_id: cfg.chatId, message_id: shown.messageId, ...rendered },
+				10_000,
+			);
+			if (edited !== null) {
+				writeFileAtomic(DASHBOARD_FILE, JSON.stringify({ messageId: shown.messageId, text }), 0o600);
+				return;
+			}
+			// The board was deleted from the chat, so start a fresh one below.
+		}
+		const sent = await callTelegram<TelegramMessage>(cfg, "sendMessage", { chat_id: cfg.chatId, ...rendered }, 15_000);
+		if (typeof sent?.message_id !== "number") return;
+		writeFileAtomic(DASHBOARD_FILE, JSON.stringify({ messageId: sent.message_id, text }), 0o600);
+		await callTelegram(
+			cfg,
+			"pinChatMessage",
+			{ chat_id: cfg.chatId, message_id: sent.message_id, disable_notification: true },
+			10_000,
 		);
 	}
 
@@ -1008,7 +1149,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		detach(ctx === undefined ? serviceNotice(text) : sessionNotice(ctx, text), "transparency notice");
 	}
 
-	/** Usage lines stay grouped by model. */
+	/** Usage lines stay grouped by model, with the turn's tool count and wall time last. */
 	function usageFooter(): string {
 		const lines: string[] = [];
 		for (const [model, usage] of turnUsageByModel) {
@@ -1022,7 +1163,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (usage.cost > 0) parts.push(`$${usage.cost >= 0.095 ? usage.cost.toFixed(2) : usage.cost.toFixed(3)}`);
 			lines.push(`\`${parts.join(" \u00B7 ")}\``);
 		}
-		if (turnTools > 0) lines.push(`\`${turnTools} ${turnTools === 1 ? "tool" : "tools"}\``);
+		const tail: string[] = [];
+		if (turnTools > 0) tail.push(`${turnTools} ${turnTools === 1 ? "tool" : "tools"}`);
+		// A stop with no `agent_end` behind it is still running as far as the clock is concerned.
+		if (turnStartedAt > 0) {
+			tail.push(duration((turnEndedAt > turnStartedAt ? turnEndedAt : Date.now()) - turnStartedAt));
+		}
+		if (tail.length > 0) lines.push(`\`${tail.join(" \u00B7 ")}\``);
 		return lines.length === 0 ? "" : `\n\n${lines.join("\n")}`;
 	}
 
@@ -1081,7 +1228,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		const colours = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047];
 		const index = Math.max(0, BADGE_PALETTE.indexOf(badgeEmoji)) % colours.length;
-		const name = badge(ctx).slice(0, 128);
+		const name = clip(badge(ctx), TOPIC_NAME_MAX);
 		if (topicIcons === null) {
 			const stickers = await callTelegram<Array<{ emoji?: string; custom_emoji_id?: string }>>(
 				config,
@@ -1118,27 +1265,34 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** The session title lands after the first turn. */
 	async function renameTopicIfStale(ctx: ExtensionContext): Promise<void> {
 		if (config === null || topicId === null) return;
-		const name = badge(ctx).slice(0, 128);
+		const name = clip(badge(ctx), TOPIC_NAME_MAX);
 		if (name === topicName) return;
 		topicName = name;
 		await callTelegram(config, "editForumTopic", { chat_id: config.chatId, message_thread_id: topicId, name }, 15_000);
 	}
 
+	/** A discarded entry loses a forum topic that nothing else will ever clean up, so it gets named. */
 	function readPendingTopics(): { path: string; topicId: number }[] {
 		if (!existsSync(PENDING_TOPICS_DIR)) return [];
 		const pending: { path: string; topicId: number }[] = [];
 		for (const entry of readdirSync(PENDING_TOPICS_DIR)) {
 			const path = join(PENDING_TOPICS_DIR, entry);
+			let reason = "";
 			try {
 				const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-				if (typeof parsed === "number") pending.push({ path, topicId: parsed });
-				else unlinkSync(path);
-			} catch {
-				// An unreadable entry would otherwise wedge the sweep forever.
-				try {
-					unlinkSync(path);
-				} catch {}
+				if (typeof parsed === "number") {
+					pending.push({ path, topicId: parsed });
+					continue;
+				}
+				reason = `expected a topic id, found ${parsed === null ? "null" : typeof parsed}`;
+			} catch (error) {
+				reason = error instanceof Error ? error.message : String(error);
 			}
+			// An unreadable entry would otherwise wedge the sweep forever.
+			pi.logger.warn("notify-telegram: discarding a corrupt pending-topic file", { path, reason });
+			try {
+				unlinkSync(path);
+			} catch {}
 		}
 		return pending;
 	}
@@ -1263,6 +1417,127 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return path;
 	}
 
+	/**
+	 * Live sessions whose last notification is within a minute of the most recent one. Two turns
+	 * finishing together is the only case where a plain message genuinely could belong to either.
+	 */
+	function ambiguousTargets(): Array<{ id: string; record: SessionRecord }> {
+		const live = allRecords().filter(
+			({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS && record.lastNotified > 0,
+		);
+		let newest = 0;
+		for (const { record } of live) newest = Math.max(newest, record.lastNotified);
+		return live.filter(({ record }) => newest - record.lastNotified <= AMBIGUOUS_WINDOW_MS);
+	}
+
+	function heldMessagePath(updateId: string): string {
+		return join(PENDING_MESSAGES_DIR, `${updateId}.json`);
+	}
+
+	function readHeldMessage(updateId: string): { text: string; messageId?: number } | null {
+		if (!/^\d+$/u.test(updateId) || !existsSync(heldMessagePath(updateId))) return null;
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(heldMessagePath(updateId), "utf8"));
+			if (parsed === null || typeof parsed !== "object") return null;
+			const held = parsed as { text?: unknown; messageId?: unknown };
+			if (typeof held.text !== "string" || held.text.length === 0) return null;
+			return { text: held.text, messageId: typeof held.messageId === "number" ? held.messageId : undefined };
+		} catch {
+			return null;
+		}
+	}
+
+	/** A picker nobody ever tapped leaves the message on disk; it is stale long before this. */
+	function reapHeldMessages(): void {
+		if (!existsSync(PENDING_MESSAGES_DIR)) return;
+		for (const entry of readdirSync(PENDING_MESSAGES_DIR)) {
+			try {
+				const path = join(PENDING_MESSAGES_DIR, entry);
+				if (Date.now() - statSync(path).mtimeMs > HELD_MESSAGE_TTL_MS) unlinkSync(path);
+			} catch {}
+		}
+	}
+
+	/** Holds the message and asks, rather than guessing and landing it in the wrong project. */
+	async function askWhichSession(
+		cfg: Config,
+		update: TelegramUpdate,
+		text: string,
+		messageId: number | undefined,
+		rivals: Array<{ id: string; record: SessionRecord }>,
+	): Promise<void> {
+		mkdirSync(PENDING_MESSAGES_DIR, { recursive: true, mode: 0o700 });
+		writeFileAtomic(heldMessagePath(String(update.update_id)), JSON.stringify({ text, messageId }), 0o600);
+		const blocks = [
+			`\u{1F535} ${rivals.length} sessions finished within a minute of each other, so I did not guess. Which one did you mean?`,
+			...rivals.map(({ record }) => statusLine(record)),
+		];
+		await callTelegram(
+			cfg,
+			"sendMessage",
+			{
+				chat_id: cfg.chatId,
+				text: toTelegramHtml(blocks.join("\n\n")),
+				parse_mode: "HTML",
+				link_preview_options: { is_disabled: true },
+				reply_markup: {
+					inline_keyboard: packRows(
+						rivals.map(({ record }) => ({
+							text: clip(badgeOf(record), BUTTON_TEXT_MAX),
+							callback_data: `m:${update.update_id}:${record.tag}`,
+						})),
+					),
+				},
+			},
+			15_000,
+		);
+	}
+
+	/** A press on the picker delivers the held message to the chosen session. */
+	async function deliverHeldMessage(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
+		const [, rawUpdate = "", tag = ""] = (callback.data ?? "").split(":");
+		const held = readHeldMessage(rawUpdate);
+		const owner = allRecords().find(
+			({ record }) => record.tag === tag && Date.now() - record.heartbeat <= LOCK_STALE_MS,
+		);
+		const gone = held === null || owner === undefined;
+		await callTelegram(
+			cfg,
+			"answerCallbackQuery",
+			{
+				callback_query_id: callback.id,
+				text: gone ? "That message is no longer waiting." : "Sending it there.",
+			},
+			10_000,
+		);
+		const closing = gone
+			? "\u{1F535} That message is no longer waiting."
+			: `\u{1F535} Sent to ${badgeOf(owner.record)}.`;
+		if (!gone) {
+			deliver(owner.id, Number.parseInt(rawUpdate, 10), {
+				kind: "text",
+				value: held.text,
+				messageId: held.messageId,
+			});
+			try {
+				unlinkSync(heldMessagePath(rawUpdate));
+			} catch {}
+		}
+		if (typeof callback.message?.message_id !== "number") return;
+		await callTelegram(
+			cfg,
+			"editMessageText",
+			{
+				chat_id: cfg.chatId,
+				message_id: callback.message.message_id,
+				text: toTelegramHtml(closing),
+				parse_mode: "HTML",
+				reply_markup: { inline_keyboard: [] },
+			},
+			10_000,
+		);
+	}
+
 	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<void> {
 		const stopped = update.stopped_message_generation;
 		if (stopped !== undefined) {
@@ -1281,6 +1556,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					chat: callback.message?.chat.id,
 					from: callback.from?.id,
 				});
+				return;
+			}
+			if (callback.data.startsWith("m:")) {
+				await deliverHeldMessage(cfg, callback);
 				return;
 			}
 			const owner = routeByAskId(callback.data.split(":")[1] ?? "");
@@ -1321,14 +1600,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 		const command = typeof text === "string" ? /^\/(hidequestions|status|fleet)\b/u.exec(text.trim())?.[1] : undefined;
 		if (command === "fleet") {
-			const report = fleetReport();
+			// Rendered rather than sent through sendOrEdit: the row links need HTML, but a fleet
+			// listing is not a session message and must stay out of the reply-routing history.
+			const report = fitToTelegram(fleetReport() ?? "\u{1F535} No tmux server is reachable from this process.", "");
 			await callTelegram(
 				cfg,
 				"sendMessage",
 				{
 					chat_id: cfg.chatId,
 					...(thread === undefined ? {} : { message_thread_id: thread }),
-					text: report ?? "\u{1F535} No tmux server is reachable from this process.",
+					text: toTelegramHtml(report),
+					parse_mode: "HTML",
+					link_preview_options: { is_disabled: true },
 				},
 				15_000,
 			);
@@ -1336,14 +1619,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		if (command !== undefined) {
 			const scoped = thread === undefined ? null : routeMessage(thread, replyTo);
-			const targets =
-				scoped !== null
-					? [scoped]
+			// `/status` answers for the whole fleet from the records, so exactly one session composes it.
+			const broadcast =
+				command === "status"
+					? [routeMessage(undefined, undefined)].filter((id): id is string => id !== null)
 					: allRecords()
 							.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
 							.map(({ id }) => id);
+			const targets = scoped !== null ? [scoped] : broadcast;
 			for (const target of targets) {
-				deliver(target, update.update_id, { kind: "command", value: command });
+				deliver(target, update.update_id, { kind: "command", value: command, scoped: scoped !== null });
 			}
 			return;
 		}
@@ -1352,12 +1637,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (media !== null) {
 			const target = routeMessage(thread, replyTo);
 			if (target === null) {
-				await serviceNotice("No live omp session owns that message, so it was dropped.", thread);
+				await serviceNotice("No live omp session owns that message, so it was dropped.", thread, false);
 				return;
 			}
 			const saved = await downloadMedia(cfg, media, update.update_id);
 			if (saved === null) {
-				await serviceNotice("That file could not be fetched (20 MB is the ceiling), so it was dropped.", thread);
+				await serviceNotice("That file could not be fetched (20 MB is the ceiling), so it was dropped.", thread, false);
 				return;
 			}
 			deliver(target, update.update_id, {
@@ -1375,6 +1660,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			await serviceNotice(
 				"That message type does not reach the agent. Send text, a photo, a voice note, an audio file, or a document.",
 				thread,
+				false,
 			);
 			return;
 		}
@@ -1384,15 +1670,45 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			await serviceNotice(
 				"No live omp session owns that message, so it was dropped. Reply to a message from the session you mean.",
 				thread,
+				false,
 			);
 			return;
 		}
-		deliver(target, update.update_id, {
+		// A plain message with no reply attached is the only one that can be misrouted, and only
+		// when two sessions finished together. Ask instead of guessing.
+		let routed = target;
+		if (thread === undefined && replyTo === undefined) {
+			const rivals = ambiguousTargets();
+			if (rivals.length > 1) {
+				// An open question outranks recency: a bare message plainly answers it.
+				const asking = rivals.filter(({ record }) => record.state === WAITING_ON_QUESTION);
+				if (asking.length !== 1 || asking[0] === undefined) {
+					await askWhichSession(cfg, update, text, message.message_id, rivals);
+					return;
+				}
+				routed = asking[0].id;
+			}
+		}
+		deliver(routed, update.update_id, {
 			kind: "text",
 			value: text,
 			messageId: message.message_id,
 			replyTo,
 		});
+	}
+
+	/**
+	 * Settings get edited by hand while sessions run, so a change has to land without a restart.
+	 * The offset is the exception: it advances in memory long before it reaches disk, and adopting
+	 * a lower value would refetch updates this session has already delivered.
+	 */
+	function reloadConfig(): void {
+		if (config === null) return;
+		const fresh = loadConfig();
+		// A half-written or hand-mangled file must never disable a working session.
+		if (fresh === null) return;
+		fresh.offset = Math.max(fresh.offset, config.offset);
+		config = fresh;
 	}
 
 	async function pollOnce(): Promise<void> {
@@ -1477,18 +1793,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		ask.messageId = sentMessage?.message_id ?? null;
 	}
 
-	/** Settled options survive as dead grey buttons. */
+	/** Settled options survive as dead grey buttons. `settled`, not `keep`, which now means an untruncatable tail. */
 	async function settleQuestionMessage(
 		messageId: number | null,
 		head: string,
 		result: string,
-		keep?: InlineButton[][],
+		settled?: InlineButton[][],
 	): Promise<void> {
 		if (config === null || messageId === null) return;
 		const inline_keyboard =
-			keep === undefined
+			settled === undefined
 				? []
-				: keep.map((row) => row.map((button) => ({ ...button, callback_data: "x", disabled: {} })));
+				: settled.map((row) => row.map((button) => ({ ...button, callback_data: "x", disabled: {} })));
 		await sendOrEdit(
 			config,
 			"editMessageText",
@@ -1498,23 +1814,37 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/** Blocks nothing: a press starts the next turn. Only the latest stands. */
-	async function sendStandingQuestion(ctx: ExtensionContext, title: string, recorded: TurnStatus): Promise<void> {
+	async function sendStandingQuestion(
+		ctx: ExtensionContext,
+		title: string,
+		recorded: TurnStatus,
+		keep = "",
+	): Promise<void> {
 		if (config === null || recorded.options === undefined) return;
 		const superseded = standingQuestion;
 		standingSeq += 1;
 		const id = `${sessionTag}-n${standingSeq.toString(36)}`;
 		const prompt = recorded.question?.trim() || recorded.text;
 		const settlementHead = `${sessionContextLine(ctx)}\n\n${prompt}`;
-		const body = withHead(
-			ctx,
-			title,
-			`${recorded.text}${recorded.question === undefined ? "" : `\n\n${recorded.question}`}`,
-		);
+		// An option earns a body block only when it says more than its button already does.
+		const blocks = [`${recorded.text}${recorded.question === undefined ? "" : `\n\n${recorded.question}`}`];
+		for (const option of recorded.options) {
+			const stance = stanceFor(option.recommended === true, option);
+			if (option.description === undefined && stance === null) continue;
+			const head = stance === null ? `**${option.label}**` : `**${option.label}** ${stance.marker}`;
+			blocks.push(option.description === undefined ? head : `${head}\n${option.description}`);
+		}
+		const body = withHead(ctx, title, blocks.join("\n\n"));
 		const keyboard = packRows(
-			recorded.options.map((label, index) => ({
-				text: label.slice(0, BUTTON_TEXT_MAX),
-				callback_data: `c:${id}:${index}`,
-			})),
+			recorded.options.map((option, index) => {
+				const stance = stanceFor(option.recommended === true, option);
+				const button: InlineButton = {
+					text: `${option.label}${stance === null ? "" : ` ${stance.marker}`}`.slice(0, BUTTON_TEXT_MAX),
+					callback_data: `c:${id}:${index}`,
+				};
+				if (stance?.style !== undefined) button.style = stance.style;
+				return button;
+			}),
 		);
 		if (recorded.urgency === "green") keyboard.push([closeSessionButton()]);
 		const sent = await sendStructured(
@@ -1524,11 +1854,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				...urgencyExtras(recorded.urgency),
 			}),
 			body,
+			keep,
 		);
 		standingQuestion = {
 			id,
 			messageId: sent?.message_id ?? null,
-			labels: recorded.options,
+			labels: recorded.options.map((option) => option.label),
 			head: settlementHead,
 		};
 		lastNotifiedAt = Date.now();
@@ -1682,22 +2013,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						detach(sessionNotice(sessionCtx, "Stopping at your request."), "stop notice");
 					}
 					if (entry.value === "status" && sessionCtx !== null) {
-						const state =
-							pendingAsk !== null
-								? "waiting on a question"
-								: approvalWaiting
-									? "waiting on a tool approval"
-									: turnActive
-										? currentTool.length > 0
-											? `working (${currentTool})`
-											: "working"
-										: "idle";
-						const lines = [
-							`State: ${state}.`,
-							standingQuestion !== null ? "A choice question stands open." : "",
-							pinnedMessageId !== null ? "A red status is pinned." : "",
-						].filter((line) => line.length > 0);
-						await sessionNotice(sessionCtx, lines.join("\n"));
+						// Our own line has to be current before it is read back with everyone else's.
+						writeSessionRecord(sessionCtx);
+						const own = readSessionRecord(sessionId);
+						const report = entry.scoped === true && own !== null ? statusLine(own) : statusReport();
+						// Context-prefixed even for the fleet answer, so the reply says which session composed it.
+						await sessionNotice(sessionCtx, report);
 					}
 					continue;
 				}
@@ -1748,18 +2069,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							await serviceNotice("An image you sent could not be read back from disk, so it was not delivered.");
 							continue;
 						}
-						pi.sendUserMessage(
-							[
-								{ type: "image", data, mimeType: entry.mime },
-								{ type: "text", text: caption.length > 0 ? caption : "(image sent from Telegram)" },
-							],
-							{ deliverAs: "steer" },
-						);
+						// No `deliverAs`: omp steers a running turn and starts one when idle. An explicit
+						// steer only interrupts, so on a finished session it delivered nothing at all.
+						pi.sendUserMessage([
+							{ type: "image", data, mimeType: entry.mime },
+							{ type: "text", text: caption.length > 0 ? caption : "(image sent from Telegram)" },
+						]);
 					} else {
 						const tail = caption.length > 0 ? ` Caption: ${caption}` : "";
 						pi.sendUserMessage(
 							`The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`,
-							{ deliverAs: "steer" },
 						);
 					}
 					ackDelivered(entry.messageId);
@@ -1773,7 +2092,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					await advance(ask);
 					continue;
 				}
-				pi.sendUserMessage(entry.value, { deliverAs: "steer" });
+				pi.sendUserMessage(entry.value);
 				ackDelivered(entry.messageId);
 			}
 		} finally {
@@ -1903,6 +2222,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				throw error;
 			} finally {
 				pendingAsk = null;
+				// The record still says "waiting on a question" until this runs, which would send
+				// the next plain message to a session that is no longer asking anything.
+				noteState();
 			}
 		},
 	});
@@ -1911,38 +2233,77 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "notify_status",
 		label: "Notify Status",
 		description:
-			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two plain sentences when no choice is attached, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 short `options` drawn from those real next steps. The notification must be answerable from a phone without terminal context. Options are bare labels, so the `summary` must name the decision, explain why it is needed now, and state what each option does or costs. Each option must name the action. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices.",
+			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two plain sentences when no choice is attached, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 short `options` drawn from those real next steps. The notification must be answerable from a phone without terminal context. Options are bare labels, so the `summary` must name the decision, explain why it is needed now, and state what each option does or costs. Each option must name the action. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices. An option may instead be an object with `label` plus an optional one-line `description` shown under the summary, and at most one of `recommended`, `lukewarm` or `discouraged` to colour the button. Describe an option only when its label cannot carry the tradeoff on its own.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
 			summary: z.string(),
 			urgency: z.string(),
 			question: z.string().optional(),
-			options: z.array(z.string()).optional(),
+			options: z
+				.array(
+					z.union([
+						z.string(),
+						z.object({
+							label: z.string(),
+							description: z.string().optional(),
+							recommended: z.boolean().optional(),
+							lukewarm: z.boolean().optional(),
+							discouraged: z.boolean().optional(),
+						}),
+					]),
+				)
+				.optional(),
 		}),
 		async execute(_toolCallId, params) {
 			const p = params as { summary?: unknown; urgency?: unknown; question?: unknown; options?: unknown };
 			const summary = typeof p.summary === "string" ? p.summary.trim() : "";
 			const raw = typeof p.urgency === "string" ? p.urgency.trim().toLowerCase() : "";
-			const urgency = raw === "red" || raw === "orange" || raw === "green" ? raw : "green";
+			if (raw !== "red" && raw !== "orange" && raw !== "green") {
+				return {
+					content: [{ type: "text", text: `Error: urgency must be green, orange or red, not "${raw}"` }],
+					isError: true,
+				};
+			}
+			const urgency = raw;
 			if (summary.length === 0) {
 				return { content: [{ type: "text", text: "Error: summary must not be empty" }], isError: true };
 			}
-			const labels = Array.isArray(p.options)
-				? p.options.filter((o): o is string => typeof o === "string" && o.trim().length > 0).map((o) => o.trim())
-				: [];
-			if (Array.isArray(p.options) && (labels.length < 2 || labels.length > 6)) {
-				return { content: [{ type: "text", text: "Error: options must be 2 to 6 short labels" }], isError: true };
+			// Buttons ride on top of the summary. A bad list costs the buttons, never the notification.
+			const requested = Array.isArray(p.options) ? p.options : [];
+			const parsed = requested.map(parseStatusOption);
+			const usable = parsed.filter((option): option is StatusOption => option !== null);
+			const offered = usable.length >= STATUS_OPTIONS_MIN ? usable.slice(0, STATUS_OPTIONS_MAX) : [];
+			const notes: string[] = [];
+			if (usable.length < parsed.length) {
+				notes.push(
+					`${parsed.length - usable.length} of ${parsed.length} options were neither a short label nor an object carrying one`,
+				);
 			}
+			if (offered.length > 0 && usable.length > offered.length) {
+				notes.push(`only the first ${STATUS_OPTIONS_MAX} options were kept`);
+			}
+			if (requested.length > 0 && offered.length === 0) {
+				notes.push(`fewer than ${STATUS_OPTIONS_MIN} usable options remained, so the summary went out without buttons`);
+			}
+			const clipped = summary.length > SUMMARY_MAX;
 			turnSummary = {
-				text: summary.slice(0, 900),
+				text: summary.slice(0, SUMMARY_MAX),
 				urgency,
 				question: typeof p.question === "string" && p.question.trim().length > 0 ? p.question.trim() : undefined,
-				options: labels.length > 0 ? labels : undefined,
+				options: offered.length > 0 ? offered : undefined,
 			};
+			const told = [`Status recorded (${urgency}${offered.length > 0 ? ", with choices" : ""}).`];
+			if (clipped) told.push(`The summary was truncated to ${SUMMARY_MAX} characters, write a shorter one.`);
+			if (notes.length > 0) told.push(`${notes.join(", and ")}.`);
 			return {
-				content: [{ type: "text", text: `Status recorded (${urgency}${labels.length > 0 ? ", with choices" : ""}).` }],
-				details: { urgency, options: labels },
+				content: [{ type: "text", text: told.join(" ") }],
+				details: {
+					urgency,
+					options: offered.map((option) => option.label),
+					truncated: clipped,
+					droppedOptions: requested.length - offered.length,
+				},
 			};
 		},
 	});
@@ -1975,27 +2336,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		method: string,
 		fields: Record<string, string | number>,
 		files: Array<{ field: string; name: string; data: Uint8Array }>,
-		attempt = 0,
 	): Promise<T | null> {
-		const form = new FormData();
-		for (const [key, value] of Object.entries(fields)) form.append(key, String(value));
-		for (const file of files) form.append(file.field, new Blob([file.data as Uint8Array<ArrayBuffer>]), file.name);
 		try {
-			const response = await fetch(`https://api.telegram.org/bot${cfg.token}/${method}`, {
-				method: "POST",
-				body: form,
-				signal: AbortSignal.timeout(120_000),
+			const { response, envelope } = await sendWithRetry(() => {
+				const form = new FormData();
+				for (const [key, value] of Object.entries(fields)) form.append(key, String(value));
+				for (const file of files) {
+					form.append(file.field, new Blob([file.data as Uint8Array<ArrayBuffer>]), file.name);
+				}
+				return fetch(`https://api.telegram.org/bot${cfg.token}/${method}`, {
+					method: "POST",
+					body: form,
+					signal: AbortSignal.timeout(120_000),
+				});
 			});
-			const payload: unknown = await response.json().catch(() => null);
-			const envelope =
-				payload !== null && typeof payload === "object"
-					? (payload as { ok?: unknown; result?: unknown; parameters?: { retry_after?: unknown } })
-					: null;
-			const retryAfter = envelope?.parameters?.retry_after;
-			if (response.status === 429 && typeof retryAfter === "number" && retryAfter <= 30 && attempt === 0) {
-				await new Promise((wake) => setTimeout(wake, (retryAfter + 0.5) * 1000));
-				return await uploadTelegram<T>(cfg, method, fields, files, 1);
-			}
 			if (envelope === null || envelope.ok !== true) {
 				pi.logger.warn("telegram upload failed", { method, status: response.status });
 				return null;
@@ -2027,10 +2381,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const requestedCaption = typeof p.caption === "string" ? p.caption.trim() : "";
 			const context = sessionContextLine(ctx);
 			const separator = requestedCaption.length > 0 ? "\n\n" : "";
-			const callerLimit = Math.max(0, TELEGRAM_CAPTION_MAX - context.length - separator.length);
-			let callerCaption = requestedCaption.slice(0, callerLimit);
-			const trailing = callerCaption.charCodeAt(callerCaption.length - 1);
-			if (trailing >= 0xd800 && trailing <= 0xdbff) callerCaption = callerCaption.slice(0, -1);
+			const callerLimit = Math.max(0, CAPTION_MAX - context.length - separator.length);
+			const callerCaption = clip(requestedCaption, callerLimit);
 			const caption = callerCaption.length > 0 ? `${context}${separator}${callerCaption}` : context;
 			const allowedRoots = [ctx.cwd, tmpdir(), MEDIA_DIR];
 			const loaded: Array<{ path: string; name: string; data: Uint8Array; photo: boolean }> = [];
@@ -2164,6 +2516,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// Base-36 tag as a number: stable across resumes, unique across live sessions.
 		draftId = Number.parseInt(sessionTag, 36) + 1;
 		badgeEmoji = claimBadge();
+		refreshTmuxWindowKey();
 		const previous = readSessionRecord(sessionId);
 		badgeOverride = previous?.label ?? "";
 		if (previous?.standing != null && typeof previous.standing.id === "string") {
@@ -2218,9 +2571,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// Timers before any network call: a failed start must still receive.
 		ctx.setInterval(() => {
 			try {
+				reloadConfig();
+				refreshTmuxWindowKey();
 				writeSessionRecord(ctx);
 				detach(renameTopicIfStale(ctx), "topic rename");
 				reapOldMedia();
+				reapHeldMessages();
 				if (ownsLock()) refreshLock();
 				else acquireLock();
 			} catch (error) {
@@ -2235,6 +2591,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				detach(drainInbox(), "inbox drain");
 				maybeType();
 				maybeDraft();
+				maybeDashboard();
 				// Re-read rather than trusting a boolean: two pollers caused 918 Telegram conflicts.
 				if (ownsLock()) detach(pollOnce(), "telegram poll");
 			} catch (error) {
@@ -2296,17 +2653,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnStartingModel = ctx.model === undefined ? "unavailable" : `${ctx.model.provider}/${ctx.model.id}`;
 		turnTools = 0;
 		turnUsageByModel.clear();
+		turnStartedAt = Date.now();
+		turnEndedAt = 0;
 		noticedKinds.clear();
+		noteState();
 	});
 
 	pi.on("agent_end", async () => {
 		turnActive = false;
+		turnEndedAt = Date.now();
 		approvalWaiting = false;
 		draftText = "";
 		draftDirty = false;
 		currentTool = "";
 		askStream = null;
 		askPreview = "";
+		noteState();
 	});
 
 	pi.on("message_update", async (event) => {
@@ -2404,11 +2766,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const intent = typeof event.intent === "string" && event.intent.length > 0 ? `: ${event.intent}` : "";
 		currentTool = `${typeof event.toolName === "string" ? event.toolName : "tool"}${intent}`.slice(0, 80);
 		draftDirty = true;
+		noteState();
 	});
 
 	pi.on("tool_execution_end", async () => {
 		currentTool = "";
 		draftDirty = true;
+		noteState();
 	});
 
 	pi.on("auto_retry_start", async (event, ctx) => {
@@ -2466,29 +2830,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			};
 			const recorded = turnSummary;
 			turnSummary = null;
+			// The record keeps the headline only: `/status` lists it beside every other session.
+			lastSummary = clip(recorded.text.split("\n")[0]?.trim() ?? "", STATUS_SUMMARY_MAX);
+			lastSummaryAt = Date.now();
 			if (recorded.options === undefined) {
 				const extra: Record<string, unknown> = { ...urgencyExtras(recorded.urgency) };
 				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
-				const work = notify(ctx, `${heads[recorded.urgency]}${suffix}`, recorded.text + usageFooter(), extra).then(
-					(sent) => {
-						if (recorded.urgency === "red") return pinRed(ctx, sent);
-						if (recorded.urgency === "green" && typeof sent?.message_id === "number") {
-							closeOfferMessageId = sent.message_id;
-							writeSessionRecord(ctx);
-						}
-						return undefined;
-					},
-				);
+				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
+				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
+				const work = notify(ctx, `${heads[recorded.urgency]}${suffix}`, body, extra, usageFooter()).then((sent) => {
+					if (recorded.urgency === "red") return pinRed(ctx, sent);
+					if (recorded.urgency === "green" && typeof sent?.message_id === "number") {
+						closeOfferMessageId = sent.message_id;
+						writeSessionRecord(ctx);
+					}
+					return undefined;
+				});
 				detach(work, "turn-end notice");
 				return;
 			}
-			detach(
-				sendStandingQuestion(ctx, heads[recorded.urgency] + suffix, {
-					...recorded,
-					text: recorded.text + usageFooter(),
-				}),
-				"turn-end question",
-			);
+			detach(sendStandingQuestion(ctx, heads[recorded.urgency] + suffix, recorded, usageFooter()), "turn-end question");
 			return;
 		}
 
@@ -2505,13 +2866,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const wantsReply = /\?\s*$/m.test(tail);
 		const title = `${wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished"}${suffix}`;
 		detach(
-			notify(ctx, title, (tail.length > 0 ? tail : "Awaiting your next instruction.") + usageFooter()),
+			notify(ctx, title, tail.length > 0 ? tail : "Awaiting your next instruction.", {}, usageFooter()),
 			"turn-end notice",
 		);
 	});
 
 	pi.on("tool_approval_requested", async (event, ctx) => {
 		approvalWaiting = true;
+		noteState();
 		if (config === null) return;
 		const tool = event.toolName;
 		const notice: ApprovalNotice = {
@@ -2539,6 +2901,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	pi.on("tool_approval_resolved", async (event, ctx) => {
 		approvalWaiting = false;
+		noteState();
 		const notice = approvalNotice;
 		if (notice === null || notice.toolCallId !== event.toolCallId) return;
 		notice.resolution = { approved: event.approved, reason: event.reason?.trim() ?? "" };
