@@ -1,6 +1,7 @@
 // Full suite against a stubbed Telegram API; sends nothing.
 
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -3349,6 +3350,31 @@ heading("pending-topic hygiene");
 	);
 }
 
+heading("a discarded inbox entry is never silent");
+{
+	api.topicsEnabled = false;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const ib = spawn("01a06014-0000-0000-0000-000000000000", "/home/dev/work/inbox-drop");
+	await ib.fire("session_start");
+	await settle(150);
+	// The entry is deleted before it is parsed, so a poison file cannot loop forever. That makes
+	// the log the only remaining trace, and a message the user typed is what is at stake.
+	const dir = join(root, "notify-telegram/inbox", ib.id);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "900.json"), '"a bare string"');
+	writeFileSync(join(dir, "901.json"), '{"kind":"text","value":""}');
+	writeFileSync(join(dir, "902.json"), '{"kind":"text"}');
+	await ib.pump(250);
+	const trace = (needle) => ib.warns.some((w) => `${w.m} ${JSON.stringify(w.meta ?? {})}`.includes(needle));
+	check("an inbox entry that is not an object is named in a warning", trace("900.json"));
+	check("an inbox entry with an empty value is named in a warning", trace("901.json"));
+	check("an inbox entry with no value at all is named in a warning", trace("902.json"));
+	check(
+		"the discarded inbox entries are still removed",
+		!existsSync(join(dir, "900.json")) && !existsSync(join(dir, "901.json")),
+	);
+}
+
 heading("uncovered event handlers");
 {
 	api.topicsEnabled = false;
@@ -3438,15 +3464,21 @@ heading("media fetch failures");
 		return { notice: lastCall("sendMessage")?.body.text ?? "", delivered: mf.steers.length > before };
 	};
 
+	// Each path must also leave a trace naming which one fired. A lost file with an identical
+	// generic notice for five causes is undiagnosable, which is how one image vanished untraced.
+	const traced = (reason) => mf.warns.some((w) => `${w.m} ${JSON.stringify(w.meta ?? {})}`.includes(reason));
+
 	api.failMethods = ["getFile"];
 	const refused = await dropped("refused");
 	check("a refused getFile drops the file with a notice", refused.notice.includes("could not be fetched"));
 	check("a refused getFile delivers nothing", !refused.delivered);
+	check("a refused getFile leaves a trace", traced("getFile"));
 	api.failMethods = [];
 
 	api.filePath = null;
 	const pathless = await dropped("pathless");
 	check("a getFile without a path drops the file with a notice", pathless.notice.includes("could not be fetched"));
+	check("a missing file path leaves a trace", traced("no file path"));
 	api.filePath = "";
 	const emptyPath = await dropped("emptypath");
 	check("a getFile with an empty path drops the file with a notice", emptyPath.notice.includes("could not be fetched"));
@@ -3455,9 +3487,11 @@ heading("media fetch failures");
 	api.fileDownload = "error";
 	const rejectedBytes = await dropped("rejected");
 	check("a rejected download drops the file with a notice", rejectedBytes.notice.includes("could not be fetched"));
+	check("a rejected download leaves a trace", traced("download rejected"));
 	api.fileDownload = "throw";
 	const brokenPipe = await dropped("broken");
 	check("a thrown download drops the file with a notice", brokenPipe.notice.includes("could not be fetched"));
+	check("a thrown download leaves a trace", traced("download failed"));
 	api.fileDownload = "ok";
 
 	const good = await dropped("good");
@@ -4106,6 +4140,13 @@ heading("pinned fleet dashboard");
 	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
+	rmSync(join(root, "notify-telegram/dashboard.lock"), { force: true });
+	// Records left by earlier headings keep aging out of the live window mid-heading, which
+	// rewrites the board for a real reason and makes the no-traffic assertions below meaningless.
+	// The board is a fleet view, so the fleet has to be fixed for the duration.
+	for (const stale of readdirSync(join(root, "notify-telegram/sessions"))) {
+		rmSync(join(root, "notify-telegram/sessions", stale), { force: true });
+	}
 	// The real gap between rewrites is 30 seconds; 0 lets the suite tick freely and leaves the
 	// text comparison as the only thing standing between the board and the rate limit.
 	writeConfig({ pinnedDashboard: true, dashboardSeconds: 0 });
@@ -4205,6 +4246,90 @@ heading("pinned fleet dashboard");
 	check("a disabled dashboard makes no api call", boardCalls() === offBefore);
 	await owner.fire("tool_execution_end", {});
 	await owner.fire("agent_end");
+	// h. omp loads this extension from a live working tree, so a long-lived session keeps running
+	// whatever the code said when it started. A lock holder from before the board existed must not
+	// suppress the board for every newer session, which is what "not working" looked like in practice.
+	writeConfig({ pinnedDashboard: true, dashboardSeconds: 0 });
+	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
+	const staleHolder = "01a060cf-0000-0000-0000-000000000000";
+	writeFileSync(
+		join(root, "notify-telegram/sessions", `${staleHolder}.json`),
+		JSON.stringify({
+			pid: process.pid,
+			tag: "old",
+			name: "",
+			topicId: null,
+			topicName: "",
+			cwd: "/home/dev/work/old-code",
+			emoji: "\u{1F535}",
+			label: "old-code",
+			lastNotified: 0,
+			recent: [],
+			standing: null,
+			closeOffer: null,
+			pinned: null,
+			draftId: 0,
+			state: "idle",
+			tmuxWindow: null,
+			summary: "",
+			summaryAt: 0,
+			heartbeat: Date.now(),
+		}),
+	);
+	writeFileSync(
+		join(root, "notify-telegram/poller.lock"),
+		JSON.stringify({ sessionId: staleHolder, pid: process.pid, heartbeat: Date.now() }),
+	);
+	writeConfig({ pinnedDashboard: true, dashboardSeconds: 0 });
+	owner.heartbeat();
+	await settle(60);
+	const strandedFrom = called("sendMessage").length;
+	await owner.pump(250);
+	check("a lock holder that cannot publish does not strand the board", called("sendMessage").length > strandedFrom);
+	rmSync(join(root, "notify-telegram/sessions", `${staleHolder}.json`), { force: true });
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+
+	// i. A record written by older code has none of the fields added since. Blind-casting it and
+	// reading `record.state.length` threw on every tick in the real fleet, which killed the whole
+	// drain and took polling with it. Only a partial record reproduces that.
+	writeFileSync(
+		join(root, "notify-telegram/sessions", "01a060df-0000-0000-0000-000000000000.json"),
+		JSON.stringify({ pid: 4242, tag: "ancient", cwd: "/home/dev/work/ancient", heartbeat: Date.now() }),
+	);
+	writeConfig({ pinnedDashboard: true, dashboardSeconds: 0 });
+	owner.heartbeat();
+	await settle(60);
+	const beforeAncient = called("sendMessage").length + called("editMessageText").length;
+	await owner.pump(250);
+	check(
+		"a record from older code does not break the board",
+		called("sendMessage").length + called("editMessageText").length > beforeAncient,
+	);
+	check("a record from older code does not break the drain", !owner.warns.some((w) => w.m.includes("drain failed")));
+	check(
+		"a record from older code still appears on the board",
+		(called("editMessageText").at(-1)?.body.text ?? called("sendMessage").at(-1)?.body.text ?? "").includes("ancient"),
+	);
+	rmSync(join(root, "notify-telegram/sessions", "01a060df-0000-0000-0000-000000000000.json"), { force: true });
+
+	// j. An owner that cannot draw must hand the board back. A live session held the claim while
+	// throwing on every tick, which stranded the board for the whole fleet exactly as an incapable
+	// lock holder did. An unreadable records directory is a reachable way to make the report throw.
+	writeConfig({ pinnedDashboard: true, dashboardSeconds: 0 });
+	owner.heartbeat();
+	await settle(60);
+	chmodSync(join(root, "notify-telegram/sessions"), 0o000);
+	await owner.pump(250);
+	chmodSync(join(root, "notify-telegram/sessions"), 0o700);
+	check(
+		"an owner that cannot draw the board gives up the claim",
+		!existsSync(join(root, "notify-telegram/dashboard.lock")),
+	);
+	check(
+		"giving up the board is logged",
+		owner.warns.some((w) => w.m.includes("gave up the fleet board")),
+	);
+
 	writeConfig();
 }
 

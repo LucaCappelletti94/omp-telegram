@@ -41,6 +41,7 @@ const LOCK_FILE = join(STATE_DIR, "poller.lock");
 const LEGACY_LOCK_DIR = join(STATE_DIR, "poller.lock.d");
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
 const DASHBOARD_FILE = join(STATE_DIR, "dashboard.json");
+const DASHBOARD_LOCK_FILE = join(STATE_DIR, "dashboard.lock");
 const PENDING_TOPICS_DIR = join(STATE_DIR, "pending-topics");
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const MEDIA_DIR = join(STATE_DIR, "media");
@@ -576,13 +577,43 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		writeSessionRecord(sessionCtx);
 	}
 
+	/**
+	 * A record on disk was written by whatever code that session started with, and omp loads this
+	 * extension from a working tree, so a fleet routinely mixes versions. Every field is therefore
+	 * filled in here rather than asserted by a cast: one record missing `state` used to throw on
+	 * every drain tick, which killed the board and the poll along with it.
+	 */
 	function readSessionRecord(id: string): SessionRecord | null {
 		const path = join(SESSIONS_DIR, `${id}.json`);
 		if (!existsSync(path)) return null;
 		try {
 			const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
 			if (parsed === null || typeof parsed !== "object") return null;
-			return parsed as SessionRecord;
+			const raw = parsed as Partial<SessionRecord>;
+			const text = (value: unknown): string => (typeof value === "string" ? value : "");
+			const count = (value: unknown): number => (typeof value === "number" ? value : 0);
+			const messageId = (value: unknown): number | null => (typeof value === "number" ? value : null);
+			return {
+				pid: count(raw.pid),
+				tag: text(raw.tag),
+				name: text(raw.name),
+				topicId: messageId(raw.topicId),
+				topicName: text(raw.topicName),
+				cwd: text(raw.cwd),
+				emoji: text(raw.emoji),
+				label: text(raw.label),
+				lastNotified: count(raw.lastNotified),
+				recent: Array.isArray(raw.recent) ? raw.recent.filter((m) => typeof m === "number") : [],
+				standing: typeof raw.standing === "object" && raw.standing !== null ? raw.standing : null,
+				closeOffer: messageId(raw.closeOffer),
+				pinned: messageId(raw.pinned),
+				draftId: count(raw.draftId),
+				state: text(raw.state),
+				tmuxWindow: typeof raw.tmuxWindow === "string" ? raw.tmuxWindow : null,
+				summary: text(raw.summary),
+				summaryAt: count(raw.summaryAt),
+				heartbeat: count(raw.heartbeat),
+			};
 		} catch {
 			return null;
 		}
@@ -1036,14 +1067,37 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * The lock holder owns the board, so sessions sharing a chat cannot fight over it. The message
-	 * id lives in a shared file rather than a session record, so the next lock holder adopts it.
+	 * The board has its own claim rather than riding the poller lock. omp loads this extension from
+	 * a working tree, so a fleet routinely mixes code versions, and a session started before the
+	 * board existed holds the poller lock for hours while being unable to draw one. Old code never
+	 * claims this file, so ownership lands on a session that can actually publish. The message id
+	 * lives in a shared file rather than a session record, so the next owner adopts the board.
 	 */
+	function claimsBoard(): boolean {
+		if (ownsLock(DASHBOARD_LOCK_FILE)) {
+			refreshLock(DASHBOARD_LOCK_FILE);
+			return true;
+		}
+		return acquireLock(DASHBOARD_LOCK_FILE);
+	}
+
 	function maybeDashboard(): void {
-		if (config === null || !config.pinnedDashboard || !ownsLock()) return;
+		if (config === null || !config.pinnedDashboard || !claimsBoard()) return;
 		if (Date.now() - dashboardPublishedAt < config.dashboardSeconds * 1000) return;
-		const text = dashboardReport();
-		const shown = readDashboard();
+		let text: string;
+		let shown: { messageId: number; text: string } | null;
+		try {
+			text = dashboardReport();
+			shown = readDashboard();
+		} catch (error) {
+			// Keeping a claim we cannot draw strands the board for every other session, which is the
+			// same failure as a lock holder that has no board code at all.
+			releaseLock(DASHBOARD_LOCK_FILE);
+			pi.logger.warn("notify-telegram: gave up the fleet board", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return;
+		}
 		// The rate limit is the scarce resource, and Telegram rejects an edit that changes nothing.
 		if (shown !== null && shown.text === text) return;
 		dashboardPublishedAt = Date.now();
@@ -1074,7 +1128,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			// The board was deleted from the chat, so start a fresh one below.
 		}
 		const sent = await callTelegram<TelegramMessage>(cfg, "sendMessage", { chat_id: cfg.chatId, ...rendered }, 15_000);
-		if (typeof sent?.message_id !== "number") return;
+		if (typeof sent?.message_id !== "number") {
+			pi.logger.warn("notify-telegram: the fleet board could not be posted", { chatId: cfg.chatId });
+			return;
+		}
 		writeFileAtomic(DASHBOARD_FILE, JSON.stringify({ messageId: sent.message_id, text }), 0o600);
 		await callTelegram(
 			cfg,
@@ -1311,10 +1368,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/** One poller only, or Telegram 409s. Atomic `wx` create; ownership re-read, never cached. */
-	function readLock(): { sessionId: string; pid: number; heartbeat: number } | null {
-		if (!existsSync(LOCK_FILE)) return null;
+	function readLock(file: string = LOCK_FILE): { sessionId: string; pid: number; heartbeat: number } | null {
+		if (!existsSync(file)) return null;
 		try {
-			const parsed: unknown = JSON.parse(readFileSync(LOCK_FILE, "utf8"));
+			const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
 			if (parsed === null || typeof parsed !== "object") return null;
 			const raw = parsed as { sessionId?: unknown; pid?: unknown; heartbeat?: unknown };
 			if (typeof raw.sessionId !== "string" || typeof raw.heartbeat !== "number") return null;
@@ -1324,38 +1381,38 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	function acquireLock(): boolean {
+	function acquireLock(file: string = LOCK_FILE): boolean {
 		const mine = JSON.stringify({ sessionId, pid: process.pid, heartbeat: Date.now() });
 		try {
-			writeFileSync(LOCK_FILE, mine, { flag: "wx" });
+			writeFileSync(file, mine, { flag: "wx" });
 		} catch {
-			const held = readLock();
+			const held = readLock(file);
 			if (held !== null && Date.now() - held.heartbeat < LOCK_STALE_MS) return false;
 			try {
-				unlinkSync(LOCK_FILE);
+				unlinkSync(file);
 			} catch {}
 			try {
-				writeFileSync(LOCK_FILE, mine, { flag: "wx" });
+				writeFileSync(file, mine, { flag: "wx" });
 			} catch {
 				return false;
 			}
 		}
-		return readLock()?.sessionId === sessionId;
+		return readLock(file)?.sessionId === sessionId;
 	}
 
-	function ownsLock(): boolean {
-		return readLock()?.sessionId === sessionId;
+	function ownsLock(file: string = LOCK_FILE): boolean {
+		return readLock(file)?.sessionId === sessionId;
 	}
 
-	function refreshLock(): void {
-		if (!ownsLock()) return;
-		writeFileAtomic(LOCK_FILE, JSON.stringify({ sessionId, pid: process.pid, heartbeat: Date.now() }));
+	function refreshLock(file: string = LOCK_FILE): void {
+		if (!ownsLock(file)) return;
+		writeFileAtomic(file, JSON.stringify({ sessionId, pid: process.pid, heartbeat: Date.now() }));
 	}
 
-	function releaseLock(): void {
-		if (!ownsLock()) return;
+	function releaseLock(file: string = LOCK_FILE): void {
+		if (!ownsLock(file)) return;
 		try {
-			unlinkSync(LOCK_FILE);
+			unlinkSync(file);
 		} catch {}
 	}
 
@@ -1390,12 +1447,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		writeFileAtomic(join(dir, `${updateId}.json`), JSON.stringify(entry), 0o600);
 	}
 
-	/** Bot API refuses getFile beyond 20 MB; larger uploads get a notice instead of silence. */
+	/**
+	 * Bot API refuses getFile beyond 20 MB; larger uploads get a notice instead of silence. Every
+	 * abandoned path logs its own reason: the user-facing notice is necessarily generic, so without
+	 * this a lost file leaves nothing to diagnose.
+	 */
 	async function downloadMedia(cfg: Config, media: IncomingFile, updateId: number): Promise<string | null> {
-		if (media.size !== undefined && media.size > MEDIA_MAX_BYTES) return null;
+		const give = (reason: string, meta: Record<string, unknown> = {}): null => {
+			pi.logger.warn(`notify-telegram: media ${reason}`, { fileId: media.fileId, updateId, ...meta });
+			return null;
+		};
+		if (media.size !== undefined && media.size > MEDIA_MAX_BYTES) {
+			return give("oversized before download", { size: media.size, ceiling: MEDIA_MAX_BYTES });
+		}
 		const file = await callTelegram<{ file_path?: string }>(cfg, "getFile", { file_id: media.fileId }, 30_000);
 		const remote = file?.file_path;
-		if (typeof remote !== "string" || remote.length === 0) return null;
+		if (typeof remote !== "string" || remote.length === 0) return give("no file path from getFile");
 		// A thrown fetch here must not escape: pollOnce would never advance the update
 		// offset, refetching the batch and re-delivering its earlier updates forever.
 		let bytes: Uint8Array;
@@ -1403,12 +1470,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const response = await fetch(`https://api.telegram.org/file/bot${cfg.token}/${remote}`, {
 				signal: AbortSignal.timeout(60_000),
 			});
-			if (!response.ok) return null;
+			if (!response.ok) return give("download rejected", { status: response.status });
 			bytes = new Uint8Array(await response.arrayBuffer());
-		} catch {
-			return null;
+		} catch (error) {
+			return give("download failed", { error: error instanceof Error ? error.message : String(error) });
 		}
-		if (bytes.byteLength > MEDIA_MAX_BYTES) return null;
+		if (bytes.byteLength > MEDIA_MAX_BYTES) {
+			return give("oversized after download", { bytes: bytes.byteLength, ceiling: MEDIA_MAX_BYTES });
+		}
 		const base = (media.name ?? remote).split("/").at(-1) ?? "file";
 		const safe = base.replaceAll(/[^\w.-]/gu, "_").slice(-80);
 		mkdirSync(MEDIA_DIR, { recursive: true, mode: 0o700 });
@@ -1982,9 +2051,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					pi.logger.warn("notify-telegram: discarded an unparseable inbox entry", { name });
 					continue;
 				}
-				if (parsed === null || typeof parsed !== "object") continue;
+				if (parsed === null || typeof parsed !== "object") {
+					pi.logger.warn("notify-telegram: discarded an inbox entry that is not an object", {
+						name,
+						raw: clip(raw, 200),
+					});
+					continue;
+				}
 				const entry = parsed as Partial<InboxEntry>;
-				if (typeof entry.value !== "string" || entry.value.length === 0) continue;
+				if (typeof entry.value !== "string" || entry.value.length === 0) {
+					pi.logger.warn("notify-telegram: discarded an inbox entry with no value", { name, raw: clip(raw, 200) });
+					continue;
+				}
 				// A reply or an answer means attention is on this session: put its window in front for the return.
 				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
 					focusTmuxWindow();
@@ -2954,5 +3032,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			unlinkSync(join(SESSIONS_DIR, `${sessionId}.json`));
 		}
 		releaseLock();
+		// Handing the board on rather than leaving the next owner to wait out a stale claim.
+		releaseLock(DASHBOARD_LOCK_FILE);
 	});
 }
