@@ -39,17 +39,17 @@ jobs:
           path: coverage/lcov.info
           if-no-files-found: error
       - name: Upload coverage to Codecov
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: ./coverage/lcov.info
           disable_search: true
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
-      - name: Upload coverage to Codecov from a fork
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        # A fork run cannot read the token, so this upload is unauthenticated
-        # and must never fail a contributor's build.
+      - name: Upload coverage to Codecov without a token
+        # A fork or Dependabot run cannot read the token, and an unauthenticated
+        # upload must never fail their build.
+        if: github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login == 'dependabot[bot]')
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: ./coverage/lcov.info
@@ -60,8 +60,8 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # A pull request from a fork cannot read SONAR_TOKEN.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # Neither a fork nor a Dependabot pull request can read SONAR_TOKEN.
+    if: github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
