@@ -642,6 +642,20 @@ unbadged.heartbeat();
 await settle(150);
 check("the heartbeat claims a badge once the claim frees up", record(unbadged.id).emoji.length > 0);
 
+// A badge chosen while the heartbeat waits for the claim outranks the placeholder it was about to
+// write, and the discarded attempt must not clear it either.
+writeFileSync(badgeLock, JSON.stringify({ sessionId: "someone-else", pid: 1, token: "t", heartbeat: Date.now() }));
+const patient = spawn("01a03493-0000-0000-0000-000000000000", "/home/dev/work/patient");
+await patient.fire("session_start");
+check("the waiting session starts with no emoji", record(patient.id).emoji === "");
+patient.heartbeat();
+await settle(40);
+rmSync(badgeLock, { force: true });
+await patient.tools.get("session_badge").execute("p1", { emoji: "\u{1F40D}" }, undefined, undefined, patient.ctx);
+await settle(700);
+check("the heartbeat does not replace a chosen badge", record(patient.id).emoji === "\u{1F40D}");
+check("the chosen badge stays deliberate", record(patient.id).emojiChosen === true);
+
 // A resumed session keeps the emoji its agent picked, and is not asked again.
 const rebadged = spawn(two.id, "/home/dev/work/diesel");
 const rebadgedAsk = await rebadged

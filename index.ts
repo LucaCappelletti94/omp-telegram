@@ -827,12 +827,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** A session that lost the startup race for the claim shows no emoji until it wins one. */
 	async function claimBadgeIfMissing(ctx: ExtensionContext): Promise<void> {
+		let placed = false;
 		const claimed = await withBadgeClaim(
 			() => {
+				// Waiting for the claim takes long enough for the agent to have chosen a badge, and a
+				// chosen emoji outranks any placeholder this would put in its place.
+				if (badgeEmoji.length > 0) return;
 				badgeEmoji = freeBadge(new Set(badgesInUse().keys()));
+				placed = badgeEmoji.length > 0;
 				writeSessionRecord(ctx);
 			},
 			() => {
+				if (!placed) return;
+				placed = false;
 				badgeEmoji = "";
 				writeSessionRecord(ctx);
 			},
