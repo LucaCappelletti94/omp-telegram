@@ -67,12 +67,16 @@ globalThis.fetch = async (url, init) => {
 	const body = JSON.parse(init.body);
 	api.calls.push({ method, body });
 	if ((api.failMethods ?? []).includes(method)) {
-		// Telegram's description is the only thing distinguishing a vanished message from a
-		// transient refusal, so a test has to be able to choose it.
+		// The status and the description are what a caller decides from, so a test chooses both.
+		// A rate limit carries retry_after, which is what sendWithRetry reads.
 		return {
 			ok: false,
-			status: 400,
-			json: async () => ({ ok: false, description: api.failDescription ?? "failed by test" }),
+			status: api.failStatus ?? 400,
+			json: async () => ({
+				ok: false,
+				description: api.failDescription ?? "failed by test",
+				...(api.failRetryAfter === undefined ? {} : { parameters: { retry_after: api.failRetryAfter } }),
+			}),
 		};
 	}
 	if (method === "createForumTopic" && !api.topicsEnabled) {
@@ -505,6 +509,48 @@ check(
 	"the rejection is logged",
 	two.warns.some((w) => w.m.includes("rich send rejected")),
 );
+
+// A real rate limit: 429 with a retry_after past the ceiling sendWithRetry is willing to wait, so
+// it declines and hands the refusal up. Re-sending on that adds a request to the thing already
+// refusing them and strips formatting that was never at fault.
+api.failMethods = ["sendMessage"];
+api.failStatus = 429;
+api.failRetryAfter = 60;
+api.failDescription = "Too Many Requests: retry after 60";
+const beforeThrottled = called("sendMessage").length;
+await two.fire("input");
+await two.tools
+	.get("notify_status")
+	.execute("thr1", { summary: "A throttled summary.", urgency: "green" }, undefined, undefined, two.ctx);
+await two.fire("session_stop");
+await settle(200);
+api.failMethods = [];
+api.failStatus = undefined;
+api.failRetryAfter = undefined;
+api.failDescription = undefined;
+const throttledAttempts = called("sendMessage").slice(beforeThrottled);
+check("a rate-limited send is not re-sent", throttledAttempts.length === 1);
+check("a rate-limited send keeps its formatting", throttledAttempts[0]?.body.parse_mode === "HTML");
+check(
+	"a rate-limited send is logged with what Telegram actually said",
+	two.warns.some((w) => JSON.stringify(w.meta ?? {}).includes("Too Many Requests")),
+);
+
+// A complaint about the buttons also says "parse", but the plain retry keeps the same buttons, so
+// re-sending repeats the identical malformed request.
+api.failMethods = ["sendMessage"];
+api.failDescription = "Bad Request: can't parse reply markup JSON object";
+const beforeMarkup = called("sendMessage").length;
+await two.fire("input");
+await two.tools
+	.get("notify_status")
+	.execute("mk1", { summary: "A summary with a button.", urgency: "green" }, undefined, undefined, two.ctx);
+await two.fire("session_stop");
+await settle(200);
+api.failMethods = [];
+api.failDescription = undefined;
+const markupAttempts = called("sendMessage").slice(beforeMarkup);
+check("a rejected keyboard is not re-sent unchanged", markupAttempts.length === 1);
 api.rejectHtml = false;
 writeFileSync(join(inboxOf(two.id), "700.json"), JSON.stringify({ kind: "callback", value: `o:${richAskId}:0:0` }));
 await two.pump(150);
@@ -1990,6 +2036,80 @@ const uxToast = called("answerCallbackQuery").find((c) => c.body.callback_query_
 check(
 	"a standing press answers with a toast",
 	uxToast !== undefined && uxToast.body.text === "Starting the next turn.",
+);
+
+// A settled question keeps its options as dead buttons carrying `x`. A press on one is not a
+// routing failure, and saying the session is gone is a different and more alarming claim.
+api.queued = [
+	{
+		update_id: 6120,
+		callback_query: { id: "cbdead", data: "x", from: { id: CHAT }, message: { message_id: 7, chat: { id: CHAT } } },
+	},
+];
+await ux.pump(250);
+const deadToast = called("answerCallbackQuery").find((c) => c.body.callback_query_id === "cbdead");
+check(
+	"a settled button says the question is already answered",
+	deadToast?.body.text.includes("already answered") === true,
+);
+check("a settled button does not claim the session died", deadToast?.body.text.includes("session is gone") !== true);
+
+// The poller hands a press to the owning session and cannot know whether it still fits the open
+// question: a double tap arrives after the ask has moved on and is discarded. Claiming it was
+// recorded is a claim the poller is in no position to make.
+await ux.fire("input");
+const dtState = {};
+const dtPair = {
+	questions: [
+		{ id: "d1", question: "First?", options: [{ label: "yes" }, { label: "no" }] },
+		{ id: "d2", question: "Second?", options: [{ label: "alpha" }, { label: "beta" }] },
+	],
+};
+const runDouble = ux.tools.get("ask").execute("dt1", dtPair, undefined, undefined, stubbornCtx(ux.ctx, dtState));
+await settle(150);
+const dtAsk = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
+for (const id of ["cbtap1", "cbtap2"]) {
+	api.queued = [
+		{
+			update_id: id === "cbtap1" ? 6121 : 6122,
+			callback_query: {
+				id,
+				data: `o:${dtAsk}:0:0`,
+				from: { id: CHAT },
+				message: { message_id: 7, chat: { id: CHAT } },
+			},
+		},
+	];
+	await ux.pump(250);
+	await ux.pump(250);
+}
+const secondTap = called("answerCallbackQuery").find((c) => c.body.callback_query_id === "cbtap2");
+// The press has to be acknowledged, or the button spins until Telegram gives up, and the wording
+// has to claim only what the poller did rather than an outcome it cannot know.
+check("a discarded second tap is acknowledged", secondTap !== undefined);
+check("a discarded second tap is not confirmed as recorded", secondTap?.body.text === "Sent to that session.");
+writeFileSync(join(inboxOf(ux.id), "6123.json"), JSON.stringify({ kind: "callback", value: `o:${dtAsk}:1:1` }));
+await ux.pump(250);
+check("the double-tapped ask still finishes", (await runDouble).details.results.length === 2);
+
+// The toast describes a delivery, so it must not precede the write that performs it.
+chmodSync(inboxOf(ux.id), 0o500);
+api.queued = [
+	{
+		update_id: 6124,
+		callback_query: {
+			id: "cbundeliverable",
+			data: `c:${record(ux.id).tag}-n1:0`,
+			from: { id: CHAT },
+			message: { message_id: 7, chat: { id: CHAT } },
+		},
+	},
+];
+await ux.pump(250);
+chmodSync(inboxOf(ux.id), 0o700);
+check(
+	"a press that could not be delivered is not acknowledged as sent",
+	!called("answerCallbackQuery").some((c) => c.body.callback_query_id === "cbundeliverable"),
 );
 
 // hidequestions closes the open buttons.
@@ -3785,6 +3905,83 @@ heading("aggregated status");
 			.find((c) => c.body.text?.includes("State:"))?.body.text ?? "";
 	check("a busy session reports the tool it is running", workingRoll.includes("bash: Running tests"));
 	await trio[0].fire("tool_execution_end", {});
+
+	// The blue notices are the only sends with no length cap, and the /status answer grows with the
+	// fleet: one block per live session, each carrying a summary clipped to 160 characters. Past the
+	// limit Telegram refuses it outright, so the command gets no answer at all.
+	const swollen = [];
+	for (let i = 0; i < 40; i++) {
+		const id = `01a060ee-0000-0000-0000-0000000000${String(i).padStart(2, "0")}`;
+		swollen.push(id);
+		writeFileSync(
+			join(root, "notify-telegram/sessions", `${id}.json`),
+			JSON.stringify({
+				pid: 3000 + i,
+				tag: `y${String(i).padStart(4, "0")}`,
+				name: `swollen ${i}`,
+				topicId: null,
+				topicName: "",
+				cwd: `/home/dev/work/project-number-${i}`,
+				emoji: "\u{1F41D}",
+				label: "",
+				lastNotified: Date.now() - i,
+				recent: [],
+				standing: null,
+				closeOffer: null,
+				pinned: null,
+				draftId: 700 + i,
+				state: "working (bash: a tool label of a realistic length)",
+				tmuxWindow: null,
+				summary: "S".repeat(160),
+				summaryAt: Date.now(),
+				heartbeat: Date.now(),
+			}),
+		);
+	}
+	// Delivered straight to a live session: the synthetic records above are the newest notifiers, so
+	// the poller would route the command into an inbox no process drains.
+	const swollenFrom = api.calls.length;
+	writeFileSync(join(inboxOf(trio[0].id), "912.json"), JSON.stringify({ kind: "command", value: "status" }));
+	await trio[0].pump(300);
+	const bigStatus = api.calls
+		.slice(swollenFrom)
+		.find((c) => typeof c.body.text === "string" && c.body.text.includes("State:"));
+	check("a fleet too big for one message still gets a /status answer", bigStatus !== undefined);
+	check("the /status answer is cut to the limit", (bigStatus?.body.text.length ?? 0) <= 4096);
+	// The answer goes out as plain text, which Telegram never escapes, so budgeting for escaping
+	// would cut a summary dense in ampersands about five times earlier than it has to.
+	for (const f of readdirSync(join(root, "notify-telegram/sessions"))) {
+		if (!f.startsWith("01a060ee")) continue;
+		const path = join(root, "notify-telegram/sessions", f);
+		writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), summary: "&".repeat(160) }));
+	}
+	const denseFrom = api.calls.length;
+	writeFileSync(join(inboxOf(trio[0].id), "914.json"), JSON.stringify({ kind: "command", value: "status" }));
+	await trio[0].pump(300);
+	const denseStatus = api.calls
+		.slice(denseFrom)
+		.find((c) => typeof c.body.text === "string" && c.body.text.includes("State:"));
+	check("a /status dense in special characters still fits", (denseStatus?.body.text.length ?? 0) <= 4096);
+	check("a /status dense in special characters is not cut early", (denseStatus?.body.text.length ?? 0) > 3500);
+
+	// The picker that asks which session a bare message belongs to carries the same blocks, and in
+	// a fleet this size every session is a rival.
+	const pickerFrom = api.calls.length;
+	api.queued = [{ update_id: 913, message: { message_id: 913, date: 1, chat: { id: CHAT }, text: "which of you?" } }];
+	for (const s of trio) await s.pump(250);
+	const bigPicker = api.calls
+		.slice(pickerFrom)
+		.find((c) => (c.body.reply_markup?.inline_keyboard ?? []).flat().some((b) => b.callback_data?.startsWith("m:")));
+	check("a which-session picker is still sent for a big fleet", bigPicker !== undefined);
+	check("the which-session picker is cut to the limit", (bigPicker?.body.text.length ?? 0) <= 4096);
+	// A shortened list with every button intact would offer a choice the reader cannot see, so the
+	// buttons and the listed sessions have to be the same set.
+	const pickerButtons = (bigPicker?.body.reply_markup.inline_keyboard ?? []).flat().length;
+	const pickerBlocks = (bigPicker?.body.text.match(/State:/g) ?? []).length;
+	check("the picker offers a button for every session it lists", pickerButtons === pickerBlocks);
+	check("the picker offers no button for a session it left out", pickerButtons < 43);
+	check("the picker says some sessions are not listed", bigPicker?.body.text.includes("not listed") === true);
+	for (const id of swollen) rmSync(join(root, "notify-telegram/sessions", `${id}.json`), { force: true });
 	await trio[0].fire("agent_end");
 	await trio[0].fire("session_stop");
 	await settle(150);

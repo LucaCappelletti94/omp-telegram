@@ -22,8 +22,10 @@ import {
 	clockTime,
 	duration,
 	extractQuestionPreviews,
+	fitPlainToTelegram,
 	fitToTelegram,
 	type InlineButton,
+	isMarkupFailure,
 	packRows,
 	STANCE,
 	type StatusOption,
@@ -53,6 +55,8 @@ const LONG_POLL_S = 25;
 const STATUS_OPTIONS_MIN = 2;
 const STATUS_OPTIONS_MAX = 6;
 const BUTTON_TEXT_MAX = 60;
+/** Carried by the dead buttons a settled question keeps, so a press on one is recognisable. */
+const SETTLED_CALLBACK = "x";
 /** Two turns finishing this close together is the only genuinely ambiguous case. */
 const AMBIGUOUS_WINDOW_MS = 60_000;
 const HELD_MESSAGE_TTL_MS = 3_600_000;
@@ -391,6 +395,10 @@ async function sendWithRetry(
 	}
 }
 
+/**
+ * The one place a Telegram call is made. Every caller decides what a failure means from the
+ * description, rather than from the bare absence of a result.
+ */
 async function callTelegramRaw<T>(
 	config: Config,
 	method: string,
@@ -443,7 +451,7 @@ function settledKeyboard(labels: string[], chosen: Set<string>): InlineButton[][
 	return packRows(
 		labels.map((label) => ({
 			text: `${chosen.has(label) ? "\u2713 " : ""}${label}`.slice(0, BUTTON_TEXT_MAX),
-			callback_data: "x",
+			callback_data: SETTLED_CALLBACK,
 		})),
 	);
 }
@@ -535,7 +543,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 	}
 
-	/** A rejected HTML send retries as plain text; the size limit is on the rendered form. */
+	/**
+	 * A send rejected over its markup retries as plain text, and the size limit is on the rendered
+	 * form. Nothing else retries: re-sending into a refusal adds a request to whatever is refusing
+	 * them, and drops formatting that was never at fault.
+	 */
 	async function sendOrEdit(
 		cfg: Config,
 		method: "sendMessage" | "editMessageText",
@@ -545,16 +557,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	): Promise<TelegramMessage | null> {
 		const quiet = { link_preview_options: { is_disabled: true } };
 		const source = fitToTelegram(plain, keep);
-		let sent = await callTelegram<TelegramMessage>(
+		let refusal = "";
+		let sent = await callTelegramRaw<TelegramMessage>(
 			cfg,
 			method,
 			{ ...quiet, ...body, text: toTelegramHtml(source), parse_mode: "HTML" },
 			15_000,
+			(failure) => {
+				refusal = failure.description;
+			},
 		);
-		if (sent === null) {
-			pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method });
+		if (sent === null && isMarkupFailure(refusal)) {
+			pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method, description: refusal });
 			const { message_effect_id: _effect, ...safe } = body;
 			sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: source }, 15_000);
+		} else if (sent === null) {
+			pi.logger.warn("telegram: send refused", { method, description: refusal });
 		}
 		if (method === "sendMessage") trackSent(sent);
 		return sent;
@@ -969,10 +987,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 */
 	async function serviceNotice(text: string, thread?: number, routable = true): Promise<void> {
 		if (config === null) return;
+		// `/status` grows a block per live session, so this is the one notice that can outgrow the
+		// message limit. Unfitted, Telegram refuses it and the command gets no answer at all.
+		const shown = fitPlainToTelegram(`\u{1F535} ${text}`);
 		const body: Record<string, unknown> =
 			thread === undefined
-				? threaded({ text: `\u{1F535} ${text}` })
-				: { chat_id: config.chatId, message_thread_id: thread, text: `\u{1F535} ${text}` };
+				? threaded({ text: shown })
+				: { chat_id: config.chatId, message_thread_id: thread, text: shown };
 		const sent = await callTelegram<TelegramMessage>(config, "sendMessage", body, 15_000);
 		if (!routable) return;
 		trackSent(sent);
@@ -1587,21 +1608,38 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	): Promise<void> {
 		mkdirSync(PENDING_MESSAGES_DIR, { recursive: true, mode: 0o700 });
 		writeFileAtomic(heldMessagePath(String(update.update_id)), JSON.stringify({ text, messageId }), 0o600);
-		const blocks = [
-			`\u{1F535} ${rivals.length} sessions finished within a minute of each other, so I did not guess. Which one did you mean?`,
-			...rivals.map(({ record }) => statusLine(record)),
-		];
+		const header = `\u{1F535} ${rivals.length} sessions finished within a minute of each other, so I did not guess. Which one did you mean?`;
+		// One block per rival and a whole fleet can be rivals, so the list can outgrow one message.
+		// It is cut by whole entries and the keyboard is built from the same ones: a shortened list
+		// beside a full keyboard would offer a choice the reader cannot see.
+		const note = (count: number): string => `\n\n(${count} not listed. Reply to a message from the session you mean.)`;
+		const worst = note(rivals.length);
+		const listed: Array<{ id: string; record: SessionRecord }> = [];
+		let body = header;
+		for (const rival of rivals) {
+			const grown = `${body}\n\n${statusLine(rival.record)}`;
+			if (toTelegramHtml(grown + worst).length > TELEGRAM_TEXT_MAX) break;
+			body = grown;
+			listed.push(rival);
+		}
+		// A picker with no options is no use, so one entry survives even if it has to be truncated.
+		const first = rivals[0];
+		if (listed.length === 0 && first !== undefined) {
+			listed.push(first);
+			body = `${header}\n\n${statusLine(first.record)}`;
+		}
+		const omitted = rivals.length - listed.length;
 		await callTelegram(
 			cfg,
 			"sendMessage",
 			{
 				chat_id: cfg.chatId,
-				text: toTelegramHtml(blocks.join("\n\n")),
+				text: toTelegramHtml(fitToTelegram(omitted > 0 ? body + note(omitted) : body, "")),
 				parse_mode: "HTML",
 				link_preview_options: { is_disabled: true },
 				reply_markup: {
 					inline_keyboard: packRows(
-						rivals.map(({ record }) => ({
+						listed.map(({ record }) => ({
 							text: clip(badgeOf(record), BUTTON_TEXT_MAX),
 							callback_data: `m:${update.update_id}:${record.tag}`,
 						})),
@@ -1681,7 +1719,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await deliverHeldMessage(cfg, callback);
 				return;
 			}
+			// A press on a settled question's dead buttons is not a routing failure, and saying the
+			// session is gone claims something alarming and untrue.
+			if (callback.data === SETTLED_CALLBACK) {
+				await callTelegram(
+					cfg,
+					"answerCallbackQuery",
+					{ callback_query_id: callback.id, text: "That question is already answered." },
+					10_000,
+				);
+				return;
+			}
 			const owner = routeByAskId(callback.data.split(":")[1] ?? "");
+			// Delivered first: every wording below describes work already done, and a toast must not
+			// promise a delivery the write that follows it could still fail to make.
+			if (owner !== null) {
+				deliver(owner, update.update_id, {
+					kind: "callback",
+					value: callback.data,
+					messageId: callback.message?.message_id,
+				});
+			}
 			await callTelegram(
 				cfg,
 				"answerCallbackQuery",
@@ -1694,16 +1752,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								? "Closing the session."
 								: callback.data.startsWith("c:")
 									? "Starting the next turn."
-									: "Answer recorded.",
+									: // Whether the press still fits the open question is decided in the session, which
+										// discards a tap the ask has moved past. The poller reports only what it did.
+										"Sent to that session.",
 				},
 				10_000,
 			);
-			if (owner !== null)
-				deliver(owner, update.update_id, {
-					kind: "callback",
-					value: callback.data,
-					messageId: callback.message?.message_id,
-				});
 			return;
 		}
 
@@ -1924,7 +1978,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const inline_keyboard =
 			settled === undefined
 				? []
-				: settled.map((row) => row.map((button) => ({ ...button, callback_data: "x", disabled: {} })));
+				: settled.map((row) => row.map((button) => ({ ...button, callback_data: SETTLED_CALLBACK, disabled: {} })));
 		await sendOrEdit(
 			config,
 			"editMessageText",

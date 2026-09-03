@@ -6,7 +6,9 @@ import {
 	clip,
 	duration,
 	extractQuestionPreviews,
+	fitPlainToTelegram,
 	fitToTelegram,
+	isMarkupFailure,
 	packRows,
 	stanceOf,
 	TELEGRAM_TEXT_MAX,
@@ -73,7 +75,43 @@ heading("fitting a message to the telegram limit");
 	const cutEmoji = fitToTelegram(emoji, "");
 	const lastUnit = cutEmoji.charCodeAt(cutEmoji.indexOf("\n\n(truncated") - 1);
 	check("a cut between surrogate halves is pulled back", lastUnit < 0xd800 || lastUnit > 0xdbff);
+
+	// A plain-text send is never escaped, so budgeting for escaping cuts it needlessly early: the
+	// HTML-aware fitter keeps about a fifth of what Telegram would actually accept.
+	const plainDense = "&".repeat(5000);
+	const plainCut = fitPlainToTelegram(plainDense);
+	check("a plain oversized body is cut to fit", plainCut.length <= TELEGRAM_TEXT_MAX);
+	check("the plain cut says it happened", plainCut.includes("truncated, full text at the terminal"));
+	check("the plain cut keeps what escaping would have cost", plainCut.length > 4000);
+	check(
+		"the plain fitter keeps far more than the html one",
+		plainCut.length > fitToTelegram(plainDense, "").length * 4,
+	);
+	const plainEmoji = fitPlainToTelegram("\u{1F600}".repeat(5000));
+	const plainLast = plainEmoji.charCodeAt(plainEmoji.indexOf("\n\n(truncated") - 1);
+	check("a plain cut between surrogate halves is pulled back", plainLast < 0xd800 || plainLast > 0xdbff);
+	check("plain text under the limit is untouched", fitPlainToTelegram(short) === short);
 }
+
+heading("classifying a telegram refusal");
+check(
+	"a text-entity complaint is a markup failure",
+	isMarkupFailure('Bad Request: can\'t parse entities: Unsupported start tag "b" at byte offset 12'),
+);
+check(
+	"the older message-text wording is too",
+	isMarkupFailure("Bad Request: can't parse message text: Can't find end of the entity starting at byte offset 40"),
+);
+// The plain retry keeps the same keyboard, so re-sending would repeat the identical request.
+check("a keyboard complaint is not", !isMarkupFailure("Bad Request: can't parse reply markup JSON object"));
+check(
+	"a keyboard complaint naming a tag is not either",
+	!isMarkupFailure("Bad Request: can't parse reply markup JSON object: Unsupported start tag"),
+);
+check("a rate limit is not", !isMarkupFailure("Too Many Requests: retry after 60"));
+check("a missing message is not", !isMarkupFailure("Bad Request: message to edit not found"));
+check("an unrelated refusal naming a tag is not", !isMarkupFailure("Bad Request: sticker set tag is invalid"));
+check("a refusal with no description is not", !isMarkupFailure("no description"));
 
 heading("clipping to a length cap");
 check("text under the cap is untouched", clip("abc", 10) === "abc");

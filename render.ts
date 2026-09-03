@@ -151,14 +151,10 @@ export function clip(text: string, max: number): string {
 	return text.length <= max ? text : dropLoneHighSurrogate(text.slice(0, max));
 }
 
-/**
- * Telegram measures the rendered form, which escaping inflates up to fivefold, so the longest
- * fitting prefix is searched rather than computed. `keep` is a short tail, today the usage footer,
- * that survives the cut.
- */
-export function fitToTelegram(plain: string, keep: string): string {
+/** The longest fitting prefix under `measure`, searched because escaping is not a fixed cost. */
+function fitBy(plain: string, keep: string, measure: (text: string) => number): string {
 	const whole = plain + keep;
-	if (toTelegramHtml(whole).length <= TELEGRAM_TEXT_MAX) return dropLoneHighSurrogate(whole);
+	if (measure(whole) <= TELEGRAM_TEXT_MAX) return dropLoneHighSurrogate(whole);
 	const build = (n: number): string => {
 		let head = dropLoneHighSurrogate(plain.slice(0, n).trimEnd());
 		// An odd fence count means the cut landed inside a code block, which would otherwise
@@ -170,10 +166,36 @@ export function fitToTelegram(plain: string, keep: string): string {
 	let high = plain.length;
 	while (low < high) {
 		const mid = Math.ceil((low + high) / 2);
-		if (toTelegramHtml(build(mid)).length <= TELEGRAM_TEXT_MAX) low = mid;
+		if (measure(build(mid)) <= TELEGRAM_TEXT_MAX) low = mid;
 		else high = mid - 1;
 	}
 	return build(low);
+}
+
+/**
+ * For a send that carries `parse_mode`, where Telegram measures the rendered form and escaping
+ * inflates it up to fivefold. `keep` is a short tail, today the usage footer, that survives the cut.
+ */
+export function fitToTelegram(plain: string, keep: string): string {
+	return fitBy(plain, keep, (text) => toTelegramHtml(text).length);
+}
+
+/**
+ * For a send with no `parse_mode`, where nothing is escaped. Measuring the escaped form here would
+ * cut a notice dense in ampersands or angle brackets around five times earlier than Telegram needs.
+ */
+export function fitPlainToTelegram(plain: string): string {
+	return fitBy(plain, "", (text) => text.length);
+}
+
+/**
+ * Telegram's phrase for a text-entity failure, which is the only refusal that plain text can fix.
+ * A complaint about the keyboard also says "parse" and may name a tag, but the plain retry keeps
+ * the same keyboard, so re-sending would repeat the identical malformed request.
+ */
+export function isMarkupFailure(description: string): boolean {
+	const said = description.toLowerCase();
+	return said.includes("can't parse entities") || said.includes("can't parse message text");
 }
 
 /** Best-effort question texts from a half-streamed ask tool-call JSON, tolerant of a cut mid-string. */
