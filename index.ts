@@ -1613,20 +1613,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// It is cut by whole entries and the keyboard is built from the same ones: a shortened list
 		// beside a full keyboard would offer a choice the reader cannot see.
 		const note = (count: number): string => `\n\n(${count} not listed. Reply to a message from the session you mean.)`;
-		const worst = note(rivals.length);
-		const listed: Array<{ id: string; record: SessionRecord }> = [];
-		let body = header;
-		for (const rival of rivals) {
-			const grown = `${body}\n\n${statusLine(rival.record)}`;
-			if (toTelegramHtml(grown + worst).length > TELEGRAM_TEXT_MAX) break;
-			body = grown;
-			listed.push(rival);
-		}
-		// A picker with no options is no use, so one entry survives even if it has to be truncated.
-		const first = rivals[0];
-		if (listed.length === 0 && first !== undefined) {
-			listed.push(first);
-			body = `${header}\n\n${statusLine(first.record)}`;
+		const whole = [header, ...rivals.map(({ record }) => statusLine(record))].join("\n\n");
+		let listed = rivals;
+		let body = whole;
+		// Room for the note is reserved only once something must actually be omitted. Reserving it
+		// unconditionally costs the last session its place, and its button, to a note nobody needs.
+		if (toTelegramHtml(whole).length > TELEGRAM_TEXT_MAX) {
+			const worst = note(rivals.length);
+			listed = [];
+			body = header;
+			for (const rival of rivals) {
+				const grown = `${body}\n\n${statusLine(rival.record)}`;
+				if (toTelegramHtml(grown + worst).length > TELEGRAM_TEXT_MAX) break;
+				body = grown;
+				listed.push(rival);
+			}
+			// A picker with no options is no use, so one entry survives even if it has to be truncated.
+			const first = rivals[0];
+			if (listed.length === 0 && first !== undefined) {
+				listed = [first];
+				body = `${header}\n\n${statusLine(first.record)}`;
+			}
 		}
 		const omitted = rivals.length - listed.length;
 		await callTelegram(

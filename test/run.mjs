@@ -4369,6 +4369,41 @@ heading("ambiguous plain messages ask which session");
 	await left.pump(250);
 	await right.pump(250);
 	check("a reply skips the picker entirely", right.steers.at(-1)?.text === "answering directly");
+
+	// f. Room for the omission note is reserved while the list is built, so a list that would fit
+	// whole can lose its last session to a note that was never needed. The window between "fits"
+	// and "fits with the note" is about sixty characters, far narrower than one session block, so
+	// the fixture is calibrated from a real picker rather than guessed.
+	const measure = (from) =>
+		api.calls
+			.slice(from)
+			.find((c) => (c.body.reply_markup?.inline_keyboard ?? []).flat().some((b) => b.callback_data?.startsWith("m:")));
+	// Cases a to e take real time, and liveness and rivalry both depend on the clock, so the pair
+	// is refreshed and everything else set to "never notified" before measuring anything.
+	for (const entry of readdirSync(sessionsDir)) {
+		const path = join(sessionsDir, entry);
+		try {
+			const parsed = JSON.parse(readFileSync(path, "utf8"));
+			const mine = entry.startsWith(left.id) || entry.startsWith(right.id);
+			writeFileSync(path, JSON.stringify({ ...parsed, lastNotified: mine ? Date.now() : 0, heartbeat: Date.now() }));
+		} catch {}
+	}
+	const gaugeFrom = api.calls.length;
+	api.queued = [{ update_id: 955, message: { message_id: 955, date: 1, chat: { id: CHAT }, text: "gauge" } }];
+	await left.pump(250);
+	const gauge = measure(gaugeFrom)?.body.text.length ?? 0;
+	// Padding with a character HTML never escapes keeps the rendered length equal to the plain one.
+	const rightPath = join(sessionsDir, `${right.id}.json`);
+	const rightRecord = JSON.parse(readFileSync(rightPath, "utf8"));
+	writeFileSync(rightPath, JSON.stringify({ ...rightRecord, summary: "B".repeat(4090 - gauge) }));
+	const brimFrom = api.calls.length;
+	api.queued = [{ update_id: 956, message: { message_id: 956, date: 1, chat: { id: CHAT }, text: "brim full" } }];
+	await left.pump(250);
+	const brim = measure(brimFrom)?.body;
+	check("a picker filled to the brim still fits", (brim?.text.length ?? 0) <= 4096);
+	check("a list that fits whole omits nobody", brim?.text.includes("not listed") !== true);
+	check("a list that fits whole keeps every button", (brim?.reply_markup.inline_keyboard ?? []).flat().length === 2);
+	writeFileSync(rightPath, JSON.stringify(rightRecord));
 }
 
 heading("settings apply without a restart");
