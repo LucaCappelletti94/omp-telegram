@@ -2,7 +2,9 @@
 
 import {
 	ago,
+	BUTTON_TEXT_MAX,
 	badgeLine,
+	buttonText,
 	clip,
 	duration,
 	extractQuestionPreviews,
@@ -118,6 +120,13 @@ check("text under the cap is untouched", clip("abc", 10) === "abc");
 check("text at the cap is untouched", clip("abcde", 5) === "abcde");
 check("a clip between surrogate halves drops the orphan", clip(`ab${"\u{1F600}"}`, 3) === "ab");
 check("a clip on a whole pair keeps it", clip(`ab${"\u{1F600}"}cd`, 4) === `ab${"\u{1F600}"}`);
+
+heading("budgeting a button label against its marker");
+check("a label that fits keeps its marker", buttonText("ok", " (preferable)") === "ok (preferable)");
+const longMarked = buttonText("x".repeat(80), " \u{1F7E0} (lukewarm)");
+check("a long label yields to the marker", longMarked.endsWith(" \u{1F7E0} (lukewarm)"));
+check("a budgeted label fits the cap", longMarked.length <= BUTTON_TEXT_MAX);
+check("a budgeted cut never orphans a surrogate", buttonText(`${"x".repeat(59)}\u{1F600}`).length === 59);
 
 heading("packing buttons into rows");
 const button = (text) => ({ text, callback_data: "x" });
