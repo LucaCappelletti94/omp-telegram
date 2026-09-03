@@ -18,6 +18,7 @@ import {
 	type AskQuestion,
 	ago,
 	badgeLine,
+	buttonText,
 	clip,
 	clockTime,
 	duration,
@@ -54,7 +55,6 @@ const DRAIN_MS = 1_000;
 const LONG_POLL_S = 25;
 const STATUS_OPTIONS_MIN = 2;
 const STATUS_OPTIONS_MAX = 6;
-const BUTTON_TEXT_MAX = 60;
 /** Carried by the dead buttons a settled question keeps, so a press on one is recognisable. */
 const SETTLED_CALLBACK = "x";
 /** Two turns finishing this close together is the only genuinely ambiguous case. */
@@ -435,7 +435,7 @@ function questionKeyboard(ask: PendingAsk, question: AskQuestion): InlineButton[
 		const stance = stanceOf(question, option, optionIndex);
 		const suffix = stance === null ? "" : ` ${stance.marker}`;
 		const button: InlineButton = {
-			text: `${mark}${option.label}${suffix}`.slice(0, BUTTON_TEXT_MAX),
+			text: buttonText(`${mark}${option.label}`, suffix),
 			callback_data: `o:${ask.askId}:${ask.index}:${optionIndex}`,
 		};
 		if (stance?.style !== undefined) button.style = stance.style;
@@ -452,7 +452,7 @@ function questionKeyboard(ask: PendingAsk, question: AskQuestion): InlineButton[
 function settledKeyboard(labels: string[], chosen: Set<string>): InlineButton[][] {
 	return packRows(
 		labels.map((label) => ({
-			text: `${chosen.has(label) ? "\u2713 " : ""}${label}`.slice(0, BUTTON_TEXT_MAX),
+			text: buttonText(`${chosen.has(label) ? "\u2713 " : ""}${label}`),
 			callback_data: SETTLED_CALLBACK,
 		})),
 	);
@@ -1666,7 +1666,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				reply_markup: {
 					inline_keyboard: packRows(
 						listed.map(({ record }) => ({
-							text: clip(badgeOf(record), BUTTON_TEXT_MAX),
+							text: buttonText(badgeOf(record)),
 							callback_data: `m:${update.update_id}:${record.tag}`,
 						})),
 					),
@@ -2039,7 +2039,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			recorded.options.map((option, index) => {
 				const stance = stanceFor(option.recommended === true, option);
 				const button: InlineButton = {
-					text: `${option.label}${stance === null ? "" : ` ${stance.marker}`}`.slice(0, BUTTON_TEXT_MAX),
+					text: buttonText(option.label, stance === null ? "" : ` ${stance.marker}`),
 					callback_data: `c:${id}:${index}`,
 				};
 				if (stance?.style !== undefined) button.style = stance.style;

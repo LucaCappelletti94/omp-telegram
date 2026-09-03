@@ -6,6 +6,7 @@
 
 export const TELEGRAM_TEXT_MAX = 4096;
 export const TRUNCATION_NOTE = "\n\n(truncated, full text at the terminal)";
+export const BUTTON_TEXT_MAX = 60;
 
 /**
  * Single source for stance marker and colour. Telegram button styles offer only
@@ -149,6 +150,13 @@ function dropLoneHighSurrogate(text: string): string {
 /** A UTF-16 length cap that never cuts an emoji in half. */
 export function clip(text: string, max: number): string {
 	return text.length <= max ? text : dropLoneHighSurrogate(text.slice(0, max));
+}
+
+/**
+ * A lukewarm button has no colour of its own, so the marker outranks the tail of a long label.
+ */
+export function buttonText(label: string, marker = ""): string {
+	return `${clip(label, Math.max(0, BUTTON_TEXT_MAX - marker.length))}${marker}`;
 }
 
 /** The longest fitting prefix under `measure`, searched because escaping is not a fixed cost. */

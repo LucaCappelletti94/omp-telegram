@@ -1304,6 +1304,11 @@ const stanceAsk = {
 				{ label: "the bad one", description: "here for contrast", discouraged: true },
 				{ label: "bare option" },
 				{ label: "the meh one", description: "works, but slow", lukewarm: true },
+				{
+					label: "Add a code marker to the record and have a health-aware session take the board over",
+					description: "long enough that the button text has to be cut",
+					lukewarm: true,
+				},
 			],
 		},
 	],
@@ -1323,6 +1328,11 @@ check("body marks the discouraged option the same way", stBody.text.includes("<b
 check("the lukewarm option carries no colour of its own", stRows[4][0].style === undefined);
 check("the lukewarm button carries the orange marker", stRows[4][0].text.includes("\u{1F7E0} (lukewarm)"));
 check("body marks the lukewarm option the same way", stBody.text.includes("<b>the meh one</b> \u{1F7E0} (lukewarm)"));
+check(
+	"a long lukewarm label keeps the marker its colour depends on",
+	stRows[5][0].text.endsWith("\u{1F7E0} (lukewarm)"),
+);
+check("a cut button label still fits the button", stRows[5][0].text.length <= 60);
 check("a neutral option with nothing to add is omitted from the body", !stBody.text.includes("bare option"));
 check(
 	"the terminal sees the discouraged marker too",
@@ -3776,7 +3786,11 @@ heading("rich status options");
 			question: "Which one?",
 			options: [
 				{ label: "Merge now", description: "CI is green and the branch is current.", recommended: true },
-				{ label: "Wait a day", description: "Lets the nightly run catch flakes.", lukewarm: true },
+				{
+					label: "Wait a day for the nightly run to finish before merging this branch",
+					description: "Lets the nightly run catch flakes.",
+					lukewarm: true,
+				},
 				{ label: "Force push", description: "Rewrites history other people have pulled.", discouraged: true },
 			],
 		},
@@ -3800,8 +3814,9 @@ heading("rich status options");
 	check("the recommended option is marked preferable", merge?.text.includes("(preferable)"));
 	check(
 		"the lukewarm option carries its marker and no style",
-		wait?.text.includes("lukewarm") === true && wait.style === undefined,
+		wait?.text.endsWith("\u{1F7E0} (lukewarm)") === true && wait.style === undefined,
 	);
+	check("a cut lukewarm label still fits the button", (wait?.text.length ?? 0) <= 60);
 	check("the discouraged option gets the danger style", force?.style === "danger");
 	check(
 		"a rich option still answers by index",
