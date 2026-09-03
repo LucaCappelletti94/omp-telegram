@@ -588,6 +588,12 @@ check(
 await two.tools.get("session_badge").execute("c7", { emoji: "rat" }, undefined, undefined, two.ctx);
 check("a word is not accepted as an emoji", record(two.id).emoji !== "ra");
 
+// A flag and a keycap are single emoji whose first code point is not pictographic.
+await two.tools.get("session_badge").execute("c7a", { emoji: "1\uFE0F\u20E3" }, undefined, undefined, two.ctx);
+check("a keycap counts as one emoji", record(two.id).emoji === "1\uFE0F\u20E3");
+await two.tools.get("session_badge").execute("c7b", { emoji: "\u{1F1FA}\u{1F1F8}" }, undefined, undefined, two.ctx);
+check("a flag counts as one emoji", record(two.id).emoji === "\u{1F1FA}\u{1F1F8}");
+
 await two.tools
 	.get("session_badge")
 	.execute("c8", { emoji: "\u{1F400}", label: "rat metabolism" }, undefined, undefined, two.ctx);
@@ -2443,6 +2449,40 @@ await settle();
 check(
 	"an emoji inside the icon set becomes the topic icon",
 	lastCall("editForumTopic").body.icon_custom_emoji_id === "icon-\u{1F401}",
+);
+
+// A refused topic edit changed nothing on Telegram, so the next heartbeat has to try again.
+api.failMethods = ["editForumTopic"];
+await iconic.tools.get("session_badge").execute("i3", { emoji: "\u{1F9F0}" }, undefined, undefined, iconic.ctx);
+await settle();
+api.failMethods = [];
+iconic.heartbeat();
+await settle(150);
+check("a refused topic edit is retried", lastCall("editForumTopic").body.name.includes("\u{1F9F0}"));
+
+// A refused sticker lookup is not an empty sticker set, and caching one would strip every icon.
+api.icons = [...api.icons, { emoji: "\u{1F41E}", custom_emoji_id: "icon-\u{1F41E}" }];
+api.failMethods = ["getForumTopicIconStickers"];
+const stickerless = spawn("01a04901-0000-0000-0000-000000000000", "/home/dev/work/stickerless");
+await stickerless.fire("session_start");
+check(
+	"a refused sticker lookup leaves the new topic iconless",
+	lastCall("createForumTopic").body.icon_custom_emoji_id === undefined,
+);
+await stickerless.tools
+	.get("session_badge")
+	.execute("s1", { emoji: "\u{1F41E}" }, undefined, undefined, stickerless.ctx);
+await settle();
+check(
+	"a refused sticker lookup does not strip the icon",
+	lastCall("editForumTopic").body.icon_custom_emoji_id === undefined,
+);
+api.failMethods = [];
+stickerless.heartbeat();
+await settle(150);
+check(
+	"the icon lands once the sticker set answers",
+	lastCall("editForumTopic").body.icon_custom_emoji_id === "icon-\u{1F41E}",
 );
 api.topicsEnabled = false;
 api.icons = null;
