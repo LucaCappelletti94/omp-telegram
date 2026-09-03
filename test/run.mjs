@@ -67,7 +67,13 @@ globalThis.fetch = async (url, init) => {
 	const body = JSON.parse(init.body);
 	api.calls.push({ method, body });
 	if ((api.failMethods ?? []).includes(method)) {
-		return { ok: false, status: 400, json: async () => ({ ok: false, description: "failed by test" }) };
+		// Telegram's description is the only thing distinguishing a vanished message from a
+		// transient refusal, so a test has to be able to choose it.
+		return {
+			ok: false,
+			status: 400,
+			json: async () => ({ ok: false, description: api.failDescription ?? "failed by test" }),
+		};
 	}
 	if (method === "createForumTopic" && !api.topicsEnabled) {
 		return { ok: false, status: 400, json: async () => ({ ok: false, description: "TOPICS_DISABLED" }) };
@@ -4327,16 +4333,102 @@ heading("pinned fleet dashboard");
 			.some((c) => c.body.message_id === boardId),
 	);
 
-	// f. A board deleted from the chat is replaced rather than lost.
+	const boardFile = () => JSON.parse(readFileSync(join(root, "notify-telegram/dashboard.json"), "utf8"));
+
+	// f. A refusal that says nothing about the board still existing is not evidence that it is gone.
+	// Re-posting on one is what put a second board in the chat every thirty seconds, each with its
+	// own pin, and a pin makes Telegram narrate it back as an incoming message.
 	api.failMethods = ["editMessageText"];
+	api.failDescription = "Too Many Requests: retry after 3";
 	await owner.fire("agent_start");
+	await owner.fire("tool_execution_start", { toolName: "bash", intent: "Throttled" });
+	await settle(60);
+	const keptId = boardFile().messageId;
+	const keptSends = called("sendMessage").length;
+	const keptPins = called("pinChatMessage").length;
+	await owner.pump(250);
+	api.failMethods = [];
+	api.failDescription = undefined;
+	check("a refused board edit posts no duplicate", called("sendMessage").length === keptSends);
+	check("a refused board edit pins nothing", called("pinChatMessage").length === keptPins);
+	check("a refused board edit keeps the recorded message id", boardFile().messageId === keptId);
+	// The recorded text has to stay behind as well, or the next tick reads the board as current.
+	check("a refused board edit leaves the recorded text behind", !boardFile().text.includes("bash: Throttled"));
+
+	// g. Telegram rejecting an edit as unchanged means the board already shows this text, which two
+	// sessions publishing the same fleet reach routinely. Adopting it is what stops the churn.
+	api.failMethods = ["editMessageText"];
+	api.failDescription =
+		"Bad Request: message is not modified: specified new message content and reply markup are exactly the same";
+	await owner.fire("tool_execution_end", {});
+	await owner.fire("tool_execution_start", { toolName: "bash", intent: "Same again" });
+	await settle(60);
+	const adoptSends = called("sendMessage").length;
+	const adoptId = boardFile().messageId;
+	await owner.pump(250);
+	api.failMethods = [];
+	api.failDescription = undefined;
+	check("an unchanged-edit rejection posts no duplicate", called("sendMessage").length === adoptSends);
+	check("an unchanged-edit rejection keeps the board", boardFile().messageId === adoptId);
+	check("an unchanged-edit rejection records the text it sent", boardFile().text.includes("bash: Same again"));
+	const adoptedQuiet = boardCalls();
+	await owner.pump(250);
+	check("an adopted board costs no further call", boardCalls() === adoptedQuiet);
+
+	// h. A board Telegram says is gone is replaced rather than lost.
+	api.failMethods = ["editMessageText"];
+	api.failDescription = "Bad Request: message to edit not found";
+	await owner.fire("tool_execution_end", {});
 	await owner.fire("tool_execution_start", { toolName: "bash", intent: "After deletion" });
 	await settle(60);
 	const resendFrom = called("sendMessage").length;
 	await owner.pump(250);
 	api.failMethods = [];
+	api.failDescription = undefined;
 	check("a deleted dashboard is posted again", called("sendMessage").length > resendFrom);
 	check("the replacement board is pinned too", called("pinChatMessage").at(-1)?.body.message_id !== boardId);
+
+	// i. The board is the only message whose length nothing bounds: it grows with the fleet, and
+	// past the limit Telegram rejects both the edit and the replacement, so it stops updating.
+	const filler = [];
+	for (let i = 0; i < 40; i++) {
+		const id = `01a060ff-0000-0000-0000-0000000000${String(i).padStart(2, "0")}`;
+		filler.push(id);
+		writeFileSync(
+			join(root, "notify-telegram/sessions", `${id}.json`),
+			JSON.stringify({
+				pid: 9000 + i,
+				tag: `z${String(i).padStart(4, "0")}`,
+				name: `filler ${i}`,
+				topicId: null,
+				topicName: "",
+				cwd: `/home/dev/work/project-number-${i}`,
+				emoji: "\u{1F41D}",
+				label: "",
+				lastNotified: Date.now() - i,
+				recent: [],
+				standing: null,
+				closeOffer: null,
+				pinned: null,
+				draftId: i,
+				state: "working (bash: a tool label of a realistic length)",
+				tmuxWindow: null,
+				summary: "S".repeat(160),
+				summaryAt: Date.now(),
+				heartbeat: Date.now(),
+			}),
+		);
+	}
+	const fillerFrom = api.calls.length;
+	await owner.pump(300);
+	// api.calls is the only call-ordered view: two `called()` lists concatenated group by method.
+	const bigBoard = api.calls
+		.slice(fillerFrom)
+		.filter((c) => typeof c.body.text === "string" && c.body.text.includes("Fleet"))
+		.at(-1);
+	check("a fleet too big for one message is cut to the limit", (bigBoard?.body.text.length ?? 0) <= 4096);
+	check("the cut board says it was cut", bigBoard?.body.text.includes("truncated") === true);
+	for (const id of filler) rmSync(join(root, "notify-telegram/sessions", `${id}.json`), { force: true });
 	await owner.fire("tool_execution_end", {});
 	await owner.fire("agent_end");
 

@@ -1072,7 +1072,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const said = record.summary.length > 0 ? `\n    ${record.summary} (${clockTime(record.summaryAt)})` : "";
 			return `${badgeOf(record)} \u00B7 ${state}${tail}${said}`;
 		});
-		return `\u{1F39B} Fleet\n${lines.join("\n")}`;
+		// Fitted here rather than at the send, so the text compared, recorded and sent are one
+		// string: a board past the limit would otherwise differ every tick and never stop editing.
+		return fitToTelegram(`\u{1F39B} Fleet\n${lines.join("\n")}`, "");
 	}
 
 	function readDashboard(): { messageId: number; text: string } | null {
@@ -1126,6 +1128,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		detach(publishDashboard(config, text, shown), "fleet dashboard");
 	}
 
+	/**
+	 * A second board in the chat needs its own pin, and a pin comes back as an incoming message, so
+	 * re-posting on a refusal that says nothing about the message having vanished is expensive and
+	 * self-sustaining. Only Telegram naming a missing message earns a replacement.
+	 */
+	function boardVerdict(description: string): "gone" | "current" | "keep" {
+		const said = description.toLowerCase();
+		if (said.includes("not found") || said.includes("message_id_invalid")) return "gone";
+		// The board already carries this text, which is what two publishers of one fleet collide on.
+		if (said.includes("not modified")) return "current";
+		return "keep";
+	}
+
 	async function publishDashboard(
 		cfg: Config,
 		text: string,
@@ -1136,25 +1151,38 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			parse_mode: "HTML",
 			link_preview_options: { is_disabled: true },
 		};
+		const remember = (messageId: number): void =>
+			writeFileAtomic(DASHBOARD_FILE, JSON.stringify({ messageId, text }), 0o600);
 		if (shown !== null) {
-			const edited = await callTelegram(
+			let refusal = "";
+			const edited = await callTelegramRaw<TelegramMessage>(
 				cfg,
 				"editMessageText",
 				{ chat_id: cfg.chatId, message_id: shown.messageId, ...rendered },
 				10_000,
+				(failure) => {
+					refusal = failure.description;
+				},
 			);
 			if (edited !== null) {
-				writeFileAtomic(DASHBOARD_FILE, JSON.stringify({ messageId: shown.messageId, text }), 0o600);
+				remember(shown.messageId);
 				return;
 			}
-			// The board was deleted from the chat, so start a fresh one below.
+			const verdict = boardVerdict(refusal);
+			pi.logger.warn("notify-telegram: the fleet board edit was refused", { description: refusal, verdict });
+			if (verdict === "current") {
+				remember(shown.messageId);
+				return;
+			}
+			// Keeping the board leaves the recorded text stale, which is what makes the next tick retry.
+			if (verdict === "keep") return;
 		}
 		const sent = await callTelegram<TelegramMessage>(cfg, "sendMessage", { chat_id: cfg.chatId, ...rendered }, 15_000);
 		if (typeof sent?.message_id !== "number") {
 			pi.logger.warn("notify-telegram: the fleet board could not be posted", { chatId: cfg.chatId });
 			return;
 		}
-		writeFileAtomic(DASHBOARD_FILE, JSON.stringify({ messageId: sent.message_id, text }), 0o600);
+		remember(sent.message_id);
 		await callTelegram(
 			cfg,
 			"pinChatMessage",
