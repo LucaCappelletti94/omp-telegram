@@ -286,6 +286,58 @@ const typed = await runTyped;
 check("typed text becomes customInput", typed.details.customInput === "use duckdb");
 check("typed text is not also treated as a steer", two.steers.length === 0);
 
+// The prompt that "Type an answer" posts must be replyable the instant it exists. Its id only
+// reaches the poller through the session record, so a send that leaves the id in memory until the
+// next heartbeat loses the answer entirely.
+const stateP = {};
+const runPrompted = two.tools
+	.get("ask")
+	.execute("c2b", singleQuestion, undefined, undefined, stubbornCtx(two.ctx, stateP));
+await settle(150);
+const promptedQuestion = api.nextMessage - 1;
+const typeThrough = lastCall("sendMessage")
+	.body.reply_markup.inline_keyboard.flat()
+	.find((b) => b.text === "Type an answer").callback_data;
+api.queued = [
+	{
+		update_id: 101,
+		callback_query: {
+			id: "cb2b",
+			data: typeThrough,
+			from: { id: CHAT },
+			message: { message_id: promptedQuestion, chat: { id: CHAT } },
+		},
+	},
+];
+await one.pump(250);
+await two.pump(150);
+const promptId = api.nextMessage - 1;
+check("the typed-answer prompt is recorded for reply routing", record(two.id).recent.includes(promptId));
+const beforePromptReply = called("sendMessage").length;
+api.queued = [
+	{
+		update_id: 102,
+		message: {
+			message_id: 92,
+			date: 1,
+			chat: { id: CHAT },
+			text: "use duckdb",
+			reply_to_message: { message_id: promptId },
+		},
+	},
+];
+await one.pump(250);
+const promptRefused = called("sendMessage").length > beforePromptReply;
+check("a reply to the prompt is not refused", !promptRefused);
+if (promptRefused) {
+	// A refused reply never settles the ask, which would hang every later ask test. Answer it
+	// directly, purely so the suite can carry on: the assertion below still reports the failure.
+	writeFileSync(join(inboxOf(two.id), "202.json"), JSON.stringify({ kind: "text", value: "unrouted" }));
+}
+await two.pump(150);
+const prompted = await runPrompted;
+check("a reply to the prompt becomes the answer", prompted.details.customInput === "use duckdb");
+
 const multi = {
 	questions: [
 		{
@@ -325,6 +377,9 @@ await settle(150);
 const pairAsk = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
 writeFileSync(join(inboxOf(two.id), "400.json"), JSON.stringify({ kind: "callback", value: `o:${pairAsk}:0:0` }));
 await two.pump(150);
+// Question two is a fresh message, and while it is still open a reply to it can only route
+// through the record, so its id has to be there before the ask settles and flushes anyway.
+check("a later question is recorded for reply routing", record(two.id).recent.includes(api.nextMessage - 1));
 writeFileSync(join(inboxOf(two.id), "401.json"), JSON.stringify({ kind: "callback", value: `o:${pairAsk}:1:1` }));
 await two.pump(150);
 const pairResult = await runPair;
@@ -1024,6 +1079,57 @@ check(
 		!ownerlessNotice.includes("Model: ") &&
 		!ownerlessNotice.includes("Tmux: "),
 );
+
+// Pinning the fleet board or a red status makes Telegram post its own "pinned a message" notice
+// back into the chat, and creating a topic does the same. Those are chat events, not something the
+// user typed, so they pass in silence rather than earn a lecture about supported types.
+const beforePin = called("sendMessage").length;
+api.queued = [
+	{
+		update_id: 506,
+		message: {
+			message_id: 75,
+			date: 1,
+			chat: { id: CHAT },
+			pinned_message: { message_id: 40, date: 1, chat: { id: CHAT }, text: "fleet board" },
+		},
+	},
+];
+await voiceSession.pump(250);
+check("a pin notice draws no reply", called("sendMessage").length === beforePin);
+
+const beforeTopic = called("sendMessage").length;
+api.queued = [
+	{
+		update_id: 507,
+		message: {
+			message_id: 76,
+			date: 1,
+			chat: { id: CHAT },
+			message_thread_id: 901,
+			forum_topic_created: { name: "omp subql" },
+		},
+	},
+];
+await voiceSession.pump(250);
+check("a new-topic notice draws no reply", called("sendMessage").length === beforeTopic);
+
+// A stale topic name gets rewritten with editForumTopic, which narrates itself the same way.
+const beforeRename = called("sendMessage").length;
+api.queued = [
+	{
+		update_id: 508,
+		message: {
+			message_id: 77,
+			date: 1,
+			chat: { id: CHAT },
+			message_thread_id: 901,
+			forum_topic_edited: { name: "omp diesel" },
+		},
+	},
+];
+await voiceSession.pump(250);
+check("a renamed-topic notice draws no reply", called("sendMessage").length === beforeRename);
 
 // ------------------------------------------------------ terminal cancellation and closure
 heading("cancellation and message closure");

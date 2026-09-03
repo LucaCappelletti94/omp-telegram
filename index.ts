@@ -158,6 +158,10 @@ interface TelegramMessage {
 	voice?: { file_id: string; file_size?: number; mime_type?: string };
 	audio?: { file_id: string; file_size?: number; mime_type?: string; file_name?: string };
 	document?: { file_id: string; file_size?: number; mime_type?: string; file_name?: string };
+	/** Telegram's own narration of a chat event, all three of which this extension causes itself. */
+	pinned_message?: unknown;
+	forum_topic_created?: unknown;
+	forum_topic_edited?: unknown;
 }
 
 interface TelegramCallbackQuery {
@@ -291,6 +295,19 @@ function pickMedia(message: TelegramMessage): IncomingFile | null {
 		};
 	}
 	return null;
+}
+
+/**
+ * Telegram narrates its own chat events back into the chat as contentless messages: pinning the
+ * fleet board or a red status, and creating or renaming a topic. This extension causes all of
+ * them, and none is user input, so they must not be mistaken for an unsupported message type.
+ */
+function isChatEvent(message: TelegramMessage): boolean {
+	return (
+		message.pinned_message !== undefined ||
+		message.forum_topic_created !== undefined ||
+		message.forum_topic_edited !== undefined
+	);
 }
 
 /** Temp plus rename: a reader in another omp process must never see a torn file. */
@@ -504,12 +521,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
+	/**
+	 * The record is the only thing the poller can match a reply against, so an id kept in memory is
+	 * a reply that gets refused until the next heartbeat rewrites the file. Persisting here rather
+	 * than at each send site is what keeps a newly added message replyable from the moment it exists.
+	 */
 	function trackSent(sent: TelegramMessage | null): void {
 		if (typeof sent?.message_id !== "number") return;
 		recentMessages.push(sent.message_id);
 		if (recentMessages.length > RECENT_MESSAGE_CAP) {
 			recentMessages.splice(0, recentMessages.length - RECENT_MESSAGE_CAP);
 		}
+		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 	}
 
 	/** A rejected HTML send retries as plain text; the size limit is on the rendered form. */
@@ -953,7 +976,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const sent = await callTelegram<TelegramMessage>(config, "sendMessage", body, 15_000);
 		if (!routable) return;
 		trackSent(sent);
-		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 	}
 
 	async function sessionNotice(ctx: ExtensionContext, text: string): Promise<void> {
@@ -1663,6 +1685,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pi.logger.warn("telegram: rejected a message from an unexpected chat", { chat: message.chat.id });
 			return;
 		}
+		if (isChatEvent(message)) return;
 		const thread = message.message_thread_id;
 		const replyTo = message.reply_to_message?.message_id;
 		const text = message.text ?? message.caption;
