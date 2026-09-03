@@ -195,6 +195,10 @@ check(
 	"a trailing slash does not empty the folder",
 	badgeLine("x", "/home/dev/work/subql/", "d", "t") === "x subql \u00B7 d",
 );
+check(
+	"a badge without an emoji does not open with a space",
+	badgeLine("", "/home/dev/work/subql", "index work", "t1") === "subql \u00B7 index work",
+);
 
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);

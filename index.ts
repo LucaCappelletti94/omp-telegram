@@ -48,10 +48,13 @@ const DASHBOARD_LOCK_FILE = join(STATE_DIR, "dashboard.lock");
 const PENDING_TOPICS_DIR = join(STATE_DIR, "pending-topics");
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const MEDIA_DIR = join(STATE_DIR, "media");
+/** Held only across a badge validate-and-persist, which is two file writes long. */
+const BADGE_LOCK_FILE = join(STATE_DIR, "badge.lock");
 
 const HEARTBEAT_MS = 15_000;
 const LOCK_STALE_MS = 45_000;
 const DRAIN_MS = 1_000;
+const BADGE_CLAIM_STALE_MS = 5_000;
 const LONG_POLL_S = 25;
 const STATUS_OPTIONS_MIN = 2;
 const STATUS_OPTIONS_MAX = 6;
@@ -107,6 +110,13 @@ const BADGE_PALETTE = [
 	"\u{1F9F2}", // magnet
 	"\u{1F94C}", // curling stone
 ];
+/**
+ * A badge is one glyph beside the folder name, so a badge is one emoji: modifiers, variation
+ * selectors and ZWJ sequences belong to it, a word does not. Truncating "rat" to two code points
+ * used to ship "ra" as the badge.
+ */
+const BADGE_EMOJI =
+	/^\p{Extended_Pictographic}(?:[\uFE0F\u{1F3FB}-\u{1F3FF}\u{E0020}-\u{E007F}]|\u200D\p{Extended_Pictographic})*$/u;
 
 interface Config {
 	token: string;
@@ -128,6 +138,8 @@ interface SessionRecord {
 	topicName: string;
 	cwd: string;
 	emoji: string;
+	/** True once an agent picked the emoji for its task; a palette placeholder is not a choice. */
+	emojiChosen: boolean;
 	label: string;
 	lastNotified: number;
 	/** Replying to one of these routes back here. */
@@ -484,6 +496,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastSummaryAt = 0;
 	let badgeEmoji = "";
 	let badgeOverride = "";
+	let badgeChosen = false;
+	/** The emoji whose icon the forum topic currently wears, so a rename can spot a stale one. */
+	let topicIconEmoji = "";
 	let topicId: number | null = null;
 	let topicName = "";
 	const recentMessages: number[] = [];
@@ -601,6 +616,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			topicName,
 			cwd: ctx.cwd,
 			emoji: badgeEmoji,
+			emojiChosen: badgeChosen,
 			label: badgeOverride,
 			lastNotified: lastNotifiedAt,
 			recent: [...recentMessages],
@@ -657,6 +673,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				topicName: text(raw.topicName),
 				cwd: text(raw.cwd),
 				emoji: text(raw.emoji),
+				emojiChosen: raw.emojiChosen === true,
 				label: text(raw.label),
 				lastNotified: count(raw.lastNotified),
 				recent: Array.isArray(raw.recent) ? raw.recent.filter((m) => typeof m === "number") : [],
@@ -693,15 +710,116 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			.map(({ record }) => record);
 	}
 
-	function claimBadge(): string {
-		const taken = new Set(otherLiveRecords().map((record) => record.emoji));
-		const previous = readSessionRecord(sessionId)?.emoji;
-		if (previous !== undefined && previous.length > 0 && !taken.has(previous)) return previous;
-		const free = BADGE_PALETTE.find((candidate) => !taken.has(candidate));
-		if (free !== undefined) return free;
-		let hash = 0;
-		for (const char of sessionId) hash = (hash * 31 + char.charCodeAt(0)) % BADGE_PALETTE.length;
-		return BADGE_PALETTE[hash] ?? BADGE_PALETTE[0] ?? "";
+	/** Emoji in use by another live session, keyed to the badge that shows who holds each one. */
+	function badgesInUse(): Map<string, SessionRecord> {
+		const held = new Map<string, SessionRecord>();
+		for (const record of otherLiveRecords()) {
+			if (record.emoji.length > 0) held.set(record.emoji, record);
+		}
+		return held;
+	}
+
+	/**
+	 * The palette is a courtesy for a session whose agent has not chosen yet, and a badge is only
+	 * worth having while it is unique, so an exhausted palette yields nothing rather than a second
+	 * copy of somebody else's emoji. Such a session shows no emoji until its agent picks one.
+	 */
+	function freeBadge(taken: Set<string>): string {
+		return BADGE_PALETTE.find((candidate) => !taken.has(candidate)) ?? "";
+	}
+
+	/** The claim file verbatim: breaking one is only safe while it is byte-for-byte the one inspected. */
+	function badgeClaimBytes(): string | null {
+		try {
+			return readFileSync(BADGE_LOCK_FILE, "utf8");
+		} catch {
+			return null;
+		}
+	}
+
+	/** What a claim has to prove: who holds it, and when they took it. */
+	function badgeClaimOf(raw: string): { token: string; heartbeat: number | null } | null {
+		try {
+			const parsed: unknown = JSON.parse(raw);
+			if (parsed === null || typeof parsed !== "object") return null;
+			return {
+				token: "token" in parsed && typeof parsed.token === "string" ? parsed.token : "",
+				heartbeat: "heartbeat" in parsed && typeof parsed.heartbeat === "number" ? parsed.heartbeat : null,
+			};
+		} catch {
+			return null;
+		}
+	}
+
+	/** The token of a won claim, or null when the claim is held elsewhere. */
+	function takeBadgeClaim(): string | null {
+		const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+		try {
+			writeFileSync(BADGE_LOCK_FILE, JSON.stringify({ sessionId, pid: process.pid, token, heartbeat: Date.now() }), {
+				flag: "wx",
+			});
+			return token;
+		} catch {}
+		const raw = badgeClaimBytes();
+		if (raw === null) return null;
+		const beat = badgeClaimOf(raw)?.heartbeat ?? null;
+		// The claim spans two file writes, so anything older than seconds died holding it. An
+		// unreadable claim proves no liveness at all and must not wedge every badge behind it.
+		if (beat !== null && Date.now() - beat < BADGE_CLAIM_STALE_MS) return null;
+		// Break only the exact file just inspected: a claim written since then carries a fresh random
+		// token, and deleting that one would hand two sessions the same emoji.
+		if (badgeClaimBytes() === raw) {
+			try {
+				unlinkSync(BADGE_LOCK_FILE);
+			} catch {}
+		}
+		return null;
+	}
+
+	/** Releasing somebody else's claim is what lets a third session in, so ownership is proved first. */
+	function releaseBadgeClaim(token: string): boolean {
+		const raw = badgeClaimBytes();
+		if (raw === null || badgeClaimOf(raw)?.token !== token) return false;
+		try {
+			unlinkSync(BADGE_LOCK_FILE);
+		} catch {}
+		return true;
+	}
+
+	/**
+	 * Claiming a badge reads every live record and then writes this one, and two sessions can
+	 * interleave those halves into a shared emoji. An exclusive claim file closes that window:
+	 * whoever holds it checks and persists alone. A caller told the claim was unavailable retries
+	 * rather than proceeding, because an unchecked write is exactly the duplicate being prevented.
+	 */
+	async function withBadgeClaim<T>(work: () => T): Promise<{ ok: true; value: T } | { ok: false }> {
+		for (let attempt = 0; attempt < 24; attempt++) {
+			const token = takeBadgeClaim();
+			if (token !== null) {
+				let value: T;
+				try {
+					value = work();
+				} catch (error) {
+					releaseBadgeClaim(token);
+					throw error;
+				}
+				// A claim broken as stale mid-work means the check that ran against the records on disk
+				// was not exclusive after all, so the whole attempt is redone rather than trusted.
+				if (releaseBadgeClaim(token)) return { ok: true, value };
+				continue;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		return { ok: false };
+	}
+
+	/** A session that lost the startup race for the claim shows no emoji until it wins one. */
+	async function claimBadgeIfMissing(ctx: ExtensionContext): Promise<void> {
+		const claimed = await withBadgeClaim(() => {
+			badgeEmoji = freeBadge(new Set(badgesInUse().keys()));
+			writeSessionRecord(ctx);
+		});
+		if (!claimed.ok) pi.logger.warn("notify-telegram: badge claim still unavailable, this session shows no emoji");
 	}
 
 	/** Session id prefixes are timestamps and collide; routing needs a random token. */
@@ -1365,17 +1483,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	async function ensureTopic(ctx: ExtensionContext): Promise<void> {
-		if (config === null) return;
-		const previous = readSessionRecord(sessionId);
-		if (typeof previous?.topicId === "number") {
-			topicId = previous.topicId;
-			topicName = previous.topicName;
-			return;
-		}
-		const colours = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047];
-		const index = Math.max(0, BADGE_PALETTE.indexOf(badgeEmoji)) % colours.length;
-		const name = clip(badge(ctx), TOPIC_NAME_MAX);
+	/** Only the free sticker set can be a topic icon, so most chosen emoji have none. */
+	async function topicIcon(emoji: string): Promise<string | undefined> {
+		if (config === null) return undefined;
 		if (topicIcons === null) {
 			const stickers = await callTelegram<Array<{ emoji?: string; custom_emoji_id?: string }>>(
 				config,
@@ -1385,7 +1495,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			);
 			topicIcons = Array.isArray(stickers) ? stickers : [];
 		}
-		const icon = topicIcons.find((sticker) => sticker.emoji === badgeEmoji)?.custom_emoji_id;
+		return topicIcons.find((sticker) => sticker.emoji === emoji)?.custom_emoji_id;
+	}
+
+	async function ensureTopic(ctx: ExtensionContext): Promise<void> {
+		if (config === null) return;
+		const previous = readSessionRecord(sessionId);
+		if (typeof previous?.topicId === "number") {
+			topicId = previous.topicId;
+			topicName = previous.topicName;
+			topicIconEmoji = previous.emoji;
+			return;
+		}
+		const colours = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047];
+		const index = Math.max(0, BADGE_PALETTE.indexOf(badgeEmoji)) % colours.length;
+		const name = clip(badge(ctx), TOPIC_NAME_MAX);
+		const icon = await topicIcon(badgeEmoji);
 		const created = await callTelegram<unknown>(
 			config,
 			"createForumTopic",
@@ -1407,15 +1532,31 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		topicId = thread;
 		topicName = name;
+		topicIconEmoji = badgeEmoji;
 	}
 
-	/** The session title lands after the first turn. */
+	/** The session title lands after the first turn, and the badge emoji changes with the task. */
 	async function renameTopicIfStale(ctx: ExtensionContext): Promise<void> {
 		if (config === null || topicId === null) return;
 		const name = clip(badge(ctx), TOPIC_NAME_MAX);
-		if (name === topicName) return;
+		const staleIcon = topicIconEmoji !== badgeEmoji;
+		if (name === topicName && !staleIcon) return;
 		topicName = name;
-		await callTelegram(config, "editForumTopic", { chat_id: config.chatId, message_thread_id: topicId, name }, 15_000);
+		// An empty id removes the icon: a chosen emoji the sticker set lacks must leave the topic its
+		// plain colour rather than the placeholder's icon, which would contradict the name beside it.
+		const icon = staleIcon ? ((await topicIcon(badgeEmoji)) ?? "") : undefined;
+		topicIconEmoji = badgeEmoji;
+		await callTelegram(
+			config,
+			"editForumTopic",
+			{
+				chat_id: config.chatId,
+				message_thread_id: topicId,
+				name,
+				...(icon === undefined ? {} : { icon_custom_emoji_id: icon }),
+			},
+			15_000,
+		);
 	}
 
 	/** A discarded entry loses a forum topic that nothing else will ever clean up, so it gets named. */
@@ -2521,7 +2662,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "session_badge",
 		label: "Session Badge",
 		description:
-			"Change how this session identifies itself in Telegram notifications. `emoji` replaces the badge emoji (a single emoji) and `label` replaces the descriptive text (up to 60 characters). A badge is assigned automatically at startup, so call this only when the automatic emoji collides with another running session or the folder name does not describe the work.",
+			"Name this session in Telegram, where every running session competes for the same chat. `emoji` is one emoji depicting the work as closely as a single glyph can: a rat for a rat's metabolism, a lock for an auth bug, a broom for a cleanup. `label` is up to 60 characters naming the work. Call it as soon as the task is clear, and again when the work becomes something else. The emoji must be unique among live sessions: one already in use is refused, along with the list of what is taken, so choose the next-best depiction rather than a near-duplicate. A palette emoji is assigned at startup and describes nothing, so leaving it in place is the one wrong answer.",
 		approval: "read",
 		parameters: z.object({
 			emoji: z.string().optional(),
@@ -2529,14 +2670,67 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const p = params as { emoji?: unknown; label?: unknown };
-			if (typeof p.emoji === "string" && p.emoji.trim().length > 0) {
-				badgeEmoji = [...p.emoji.trim()].slice(0, 2).join("");
+			const wanted = typeof p.emoji === "string" ? p.emoji.trim() : "";
+			const label = typeof p.label === "string" ? p.label.trim().slice(0, 60) : null;
+			const refuse = (text: string) => ({
+				content: [{ type: "text" as const, text }],
+				details: { badge: badge(ctx), applied: false },
+			});
+			if (wanted.length > 0 && !BADGE_EMOJI.test(wanted)) {
+				return refuse(
+					`"${wanted}" is not a single emoji, so the badge is unchanged. Pass one emoji that depicts the work.`,
+				);
 			}
-			if (typeof p.label === "string") badgeOverride = p.label.trim().slice(0, 60);
-			writeSessionRecord(ctx);
+			const claimed = await withBadgeClaim(() => {
+				const rival = wanted.length === 0 ? undefined : badgesInUse().get(wanted);
+				if (rival !== undefined) return rival;
+				if (wanted.length > 0) {
+					badgeEmoji = wanted;
+					badgeChosen = true;
+				}
+				if (label !== null) badgeOverride = label;
+				writeSessionRecord(ctx);
+				return null;
+			});
+			if (!claimed.ok) {
+				return refuse("Another session is claiming a badge right now, so nothing changed. Call this again.");
+			}
+			if (claimed.value !== null) {
+				const taken = [...badgesInUse().keys()].join(" ");
+				return refuse(
+					`${wanted} is already in use by ${badgeOf(claimed.value)}, so the badge is unchanged. In use: ${taken}. Pick another emoji that depicts this work.`,
+				);
+			}
 			detach(renameTopicIfStale(ctx), "topic rename");
-			return { content: [{ type: "text", text: `Badge is now: ${badge(ctx)}` }], details: { badge: badge(ctx) } };
+			return {
+				content: [{ type: "text", text: `Badge is now: ${badge(ctx)}` }],
+				details: { badge: badge(ctx), applied: true },
+			};
 		},
+	});
+
+	/**
+	 * The startup badge comes from a fixed palette and says nothing about the work, and only the
+	 * model knows what the work is. The request rides the turn as hidden context and stops the
+	 * moment a badge is chosen: a session that complies never sees it twice, one that ignores it is
+	 * asked again next turn.
+	 */
+	pi.on("before_agent_start", async () => {
+		if (config === null || badgeChosen) return undefined;
+		const taken = [...badgesInUse().keys()].join(" ");
+		const standing =
+			badgeEmoji.length === 0
+				? "This session carries no emoji in Telegram: every placeholder is already held by another session."
+				: `This session shows ${badgeEmoji} in Telegram, a placeholder from a fixed palette that describes nothing.`;
+		return {
+			message: {
+				customType: "telegram-badge",
+				display: false,
+				content:
+					`${standing} Call session_badge with an emoji that depicts this task as closely as one glyph can, plus a short label naming it, so its notifications are recognisable among the other sessions.` +
+					(taken.length === 0 ? "" : ` Held by other live sessions and therefore refused: ${taken}.`),
+			},
+		};
 	});
 
 	/** Multipart upload for outbound files; JSON callTelegram cannot carry bytes. */
@@ -2724,7 +2918,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		sessionTag = claimTag();
 		// Base-36 tag as a number: stable across resumes, unique across live sessions.
 		draftId = Number.parseInt(sessionTag, 36) + 1;
-		badgeEmoji = claimBadge();
 		refreshTmuxWindowKey();
 		const previous = readSessionRecord(sessionId);
 		badgeOverride = previous?.label ?? "";
@@ -2745,12 +2938,28 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (typeof previous?.topicId === "number") {
 			topicId = previous.topicId;
 			topicName = typeof previous.topicName === "string" ? previous.topicName : "";
+			topicIconEmoji = previous.emoji;
 		}
 		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
 			rmSync(LOCK_FILE, { recursive: true, force: true });
 		}
 		rmSync(LEGACY_LOCK_DIR, { recursive: true, force: true });
-		writeSessionRecord(ctx);
+		// The badge is claimed and persisted under one claim, so a session starting at the same moment
+		// cannot validate the same free emoji before this record exists.
+		const claimed = await withBadgeClaim(() => {
+			const taken = new Set(badgesInUse().keys());
+			const keeps = previous !== null && previous.emoji.length > 0 && !taken.has(previous.emoji);
+			badgeEmoji = keeps ? previous.emoji : freeBadge(taken);
+			badgeChosen = keeps && previous.emojiChosen;
+			writeSessionRecord(ctx);
+		});
+		if (!claimed.ok) {
+			// Nothing about the badge is written outside the claim: a duplicate emoji defeats the point
+			// of having one, so the session starts badge-less and the heartbeat keeps trying. The record
+			// itself has to exist regardless, because routing a reply reads it.
+			pi.logger.warn("notify-telegram: badge claim unavailable at startup, retrying on the heartbeat");
+			writeSessionRecord(ctx);
+		}
 		acquireLock();
 
 		detach(
@@ -2783,6 +2992,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				reloadConfig();
 				refreshTmuxWindowKey();
 				writeSessionRecord(ctx);
+				if (badgeEmoji.length === 0) detach(claimBadgeIfMissing(ctx), "badge claim");
 				detach(renameTopicIfStale(ctx), "topic rename");
 				reapOldMedia();
 				reapHeldMessages();
