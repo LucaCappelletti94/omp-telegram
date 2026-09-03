@@ -65,14 +65,18 @@ export function stanceOf(question: AskQuestion, option: AskOption, index: number
 	return stanceFor(question.recommended === index, option);
 }
 
-/** Emoji, then the working folder, then whatever names the work. */
+/**
+ * Emoji, then the working folder, then whatever names the work. A session past the placeholder
+ * palette carries no emoji rather than a duplicate, so the leading space goes with it.
+ */
 export function badgeLine(emoji: string, cwd: string, detail: string, fallback: string): string {
 	const folder =
 		cwd
 			.split("/")
 			.filter((part) => part.length > 0)
 			.pop() ?? cwd;
-	return `${emoji} ${folder} \u00B7 ${detail.length > 0 ? detail.slice(0, 60) : fallback}`;
+	const head = emoji.length > 0 ? `${emoji} ` : "";
+	return `${head}${folder} \u00B7 ${detail.length > 0 ? detail.slice(0, 60) : fallback}`;
 }
 
 /** Coarse elapsed time; a fleet overview never needs seconds past a minute. */

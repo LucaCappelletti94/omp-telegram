@@ -557,12 +557,164 @@ await two.pump(150);
 check("the rich question answers after the retry", (await runRich).details.selectedOptions[0] === "yes");
 
 // ----------------------------------------------------------------- badge tools
-heading("badge override");
+heading("badge choice");
+const firstAsk = await two.fire("before_agent_start", { prompt: "Model the metabolism of a rat" });
+const askText = firstAsk.map((r) => (typeof r?.message?.content === "string" ? r.message.content : "")).join("");
+check(
+	"the turn is asked for an emoji that depicts the work",
+	askText.includes("session_badge") && /depict/i.test(askText),
+);
+check("the ask names an emoji another live session holds", askText.includes(record(one.id).emoji));
+check(
+	"the ask stays out of the transcript",
+	firstAsk.some((r) => r?.message !== undefined && r.message.display === false),
+);
+const secondAsk = await two.fire("before_agent_start", { prompt: "still the rat" });
+check(
+	"the ask repeats while the badge is still a placeholder",
+	secondAsk.some((r) => typeof r?.message?.content === "string"),
+);
+
+// Uniqueness is the point of the badge, so a taken emoji is refused rather than duplicated.
+const held = record(one.id).emoji;
+const collision = await two.tools.get("session_badge").execute("c6", { emoji: held }, undefined, undefined, two.ctx);
+check("an emoji a live session holds is refused", record(two.id).emoji !== held);
+check(
+	"the refusal names what is taken",
+	collision.content[0].text.includes(held) && /in use/i.test(collision.content[0].text),
+);
+
+// A word truncated to two code points used to become the badge.
+await two.tools.get("session_badge").execute("c7", { emoji: "rat" }, undefined, undefined, two.ctx);
+check("a word is not accepted as an emoji", record(two.id).emoji !== "ra");
+
+// A flag and a keycap are single emoji whose first code point is not pictographic.
+await two.tools.get("session_badge").execute("c7a", { emoji: "1\uFE0F\u20E3" }, undefined, undefined, two.ctx);
+check("a keycap counts as one emoji", record(two.id).emoji === "1\uFE0F\u20E3");
+await two.tools.get("session_badge").execute("c7b", { emoji: "\u{1F1FA}\u{1F1F8}" }, undefined, undefined, two.ctx);
+check("a flag counts as one emoji", record(two.id).emoji === "\u{1F1FA}\u{1F1F8}");
+
 await two.tools
 	.get("session_badge")
-	.execute("c8", { emoji: "\u{1F9EA}", label: "index work" }, undefined, undefined, two.ctx);
-check("emoji override persisted", record(two.id).emoji === "\u{1F9EA}");
-check("label override persisted", record(two.id).label === "index work");
+	.execute("c8", { emoji: "\u{1F400}", label: "rat metabolism" }, undefined, undefined, two.ctx);
+check("emoji override persisted", record(two.id).emoji === "\u{1F400}");
+check("label override persisted", record(two.id).label === "rat metabolism");
+check("a deliberate choice is recorded as one", record(two.id).emojiChosen === true);
+const afterChoice = await two.fire("before_agent_start", { prompt: "onwards" });
+check(
+	"a chosen badge ends the asking",
+	afterChoice.every((r) => r?.message === undefined),
+);
+
+// The claim is exclusive: read-then-write across processes would hand two sessions one emoji.
+const badgeLock = join(root, "notify-telegram/badge.lock");
+writeFileSync(badgeLock, JSON.stringify({ sessionId: "someone-else", pid: 1, heartbeat: Date.now() }));
+const blocked = await two.tools
+	.get("session_badge")
+	.execute("c9", { emoji: "\u{1F9AB}", label: "rat metabolism" }, undefined, undefined, two.ctx);
+check("a held claim refuses rather than racing", record(two.id).emoji === "\u{1F400}");
+check("the refusal asks for another attempt", /again/i.test(blocked.content[0].text));
+writeFileSync(badgeLock, JSON.stringify({ sessionId: "someone-else", pid: 1, heartbeat: Date.now() - 600_000 }));
+await two.tools
+	.get("session_badge")
+	.execute("c10", { emoji: "\u{1F42D}", label: "rat metabolism" }, undefined, undefined, two.ctx);
+check("a stale claim does not wedge the badge", record(two.id).emoji === "\u{1F42D}");
+check("the claim is released after use", !existsSync(badgeLock));
+// A claim broken as stale mid-work is not a claim, so the tool must not trust that pass. The
+// corrupt file stands in for a claim written by a version that never carried a token.
+writeFileSync(badgeLock, "not json at all");
+await two.tools.get("session_badge").execute("c11", { emoji: "\u{1F430}" }, undefined, undefined, two.ctx);
+check("an unreadable claim does not wedge the badge", record(two.id).emoji === "\u{1F430}");
+check("the unreadable claim is cleared away", !existsSync(badgeLock));
+
+// A session that cannot take the claim starts without an emoji rather than duplicating one, and
+// the heartbeat keeps trying.
+writeFileSync(badgeLock, JSON.stringify({ sessionId: "someone-else", pid: 1, token: "t", heartbeat: Date.now() }));
+const unbadged = spawn("01a03492-0000-0000-0000-000000000000", "/home/dev/work/unbadged");
+await unbadged.fire("session_start");
+check("a session that lost the claim starts with no emoji", record(unbadged.id).emoji === "");
+check(
+	"the missing badge is logged",
+	unbadged.warns.some((w) => w.m.includes("badge claim unavailable")),
+);
+rmSync(badgeLock, { force: true });
+unbadged.heartbeat();
+await settle(150);
+check("the heartbeat claims a badge once the claim frees up", record(unbadged.id).emoji.length > 0);
+
+// A badge chosen while the heartbeat waits for the claim outranks the placeholder it was about to
+// write, and the discarded attempt must not clear it either.
+writeFileSync(badgeLock, JSON.stringify({ sessionId: "someone-else", pid: 1, token: "t", heartbeat: Date.now() }));
+const patient = spawn("01a03493-0000-0000-0000-000000000000", "/home/dev/work/patient");
+await patient.fire("session_start");
+check("the waiting session starts with no emoji", record(patient.id).emoji === "");
+patient.heartbeat();
+await settle(40);
+rmSync(badgeLock, { force: true });
+await patient.tools.get("session_badge").execute("p1", { emoji: "\u{1F40D}" }, undefined, undefined, patient.ctx);
+await settle(700);
+check("the heartbeat does not replace a chosen badge", record(patient.id).emoji === "\u{1F40D}");
+check("the chosen badge stays deliberate", record(patient.id).emojiChosen === true);
+
+// A resumed session keeps the emoji its agent picked, and is not asked again.
+const rebadged = spawn(two.id, "/home/dev/work/diesel");
+const rebadgedAsk = await rebadged
+	.fire("session_start")
+	.then(() => rebadged.fire("before_agent_start", { prompt: "x" }));
+check("a resume keeps the chosen emoji", record(two.id).emoji === "\u{1F430}");
+check(
+	"a resume with a chosen badge is not asked again",
+	rebadgedAsk.every((r) => r?.message === undefined),
+);
+
+// Twelve live sessions exhaust the placeholder palette, and a thirteenth carries no emoji rather
+// than a copy of one; its agent still gets to claim a contextual one.
+const crowd = [
+	"\u{1F98A}",
+	"\u{1F419}",
+	"\u{1F335}",
+	"\u{1F3B8}",
+	"\u{1F680}",
+	"\u{1F41D}",
+	"\u{1F344}",
+	"\u{1F9ED}",
+	"\u{1F42C}",
+	"\u{1F3A9}",
+	"\u{1F9F2}",
+	"\u{1F94C}",
+].map((emoji, index) => {
+	const id = `01a03490-0000-0000-0000-0000000000${(10 + index).toString(36).padStart(2, "0")}`;
+	const path = join(sessionsDir, `${id}.json`);
+	writeFileSync(
+		path,
+		JSON.stringify({
+			pid: 4000 + index,
+			tag: `c${index}`.padEnd(5, "0"),
+			name: "",
+			topicId: null,
+			topicName: "",
+			cwd: `/home/dev/work/crowd-${index}`,
+			emoji,
+			emojiChosen: false,
+			label: "",
+			lastNotified: 0,
+			recent: [],
+			heartbeat: Date.now(),
+		}),
+	);
+	return path;
+});
+const crowded = spawn("01a03491-0000-0000-0000-000000000000", "/home/dev/work/thirteenth");
+await crowded.fire("session_start");
+check("an exhausted palette leaves a session without an emoji", record(crowded.id).emoji === "");
+const crowdedAsk = await crowded.fire("before_agent_start", { prompt: "pick one" });
+check(
+	"a session with no emoji is told as much",
+	crowdedAsk.some((r) => /carries no emoji/.test(r?.message?.content ?? "")),
+);
+await crowded.tools.get("session_badge").execute("x1", { emoji: "\u{1F9F1}" }, undefined, undefined, crowded.ctx);
+check("it can still claim a contextual emoji", record(crowded.id).emoji === "\u{1F9F1}");
+for (const path of crowd) rmSync(path, { force: true });
 
 // ---------------------------------------------------------------------- reaper
 heading("stale session reaping");
@@ -2271,12 +2423,80 @@ api.icons = [
 	"\u{1F3A9}",
 	"\u{1F9F2}",
 	"\u{1F94C}",
+	"\u{1F401}",
 ].map((emoji) => ({ emoji, custom_emoji_id: `icon-${emoji}` }));
-const iconic = spawn("01a04900-0000-0000-0000-000000000000", "/home/dev/work/duckpond");
+// A resume carries the badge the agent chose, so the emoji under test is not the luck of the palette.
+const iconicId = "01a04900-0000-0000-0000-000000000000";
+writeFileSync(
+	join(sessionsDir, `${iconicId}.json`),
+	JSON.stringify({
+		pid: 4321,
+		tag: "icon1",
+		name: "",
+		topicId: null,
+		topicName: "",
+		cwd: "/home/dev/work/duckpond",
+		emoji: "\u{1F401}",
+		emojiChosen: true,
+		label: "",
+		lastNotified: 0,
+		recent: [],
+		heartbeat: Date.now(),
+	}),
+);
+const iconic = spawn(iconicId, "/home/dev/work/duckpond");
 await iconic.fire("session_start");
+check("the resumed session kept its chosen emoji", record(iconic.id).emoji === "\u{1F401}");
 check(
 	"the topic icon matches the badge emoji",
-	lastCall("createForumTopic").body.icon_custom_emoji_id === `icon-${record(iconic.id).emoji}`,
+	lastCall("createForumTopic").body.icon_custom_emoji_id === "icon-\u{1F401}",
+);
+// The badge is what the topic wears, so a chosen emoji takes the icon with it.
+await iconic.tools.get("session_badge").execute("i1", { emoji: "\u{1F9AB}" }, undefined, undefined, iconic.ctx);
+await settle();
+check(
+	"an emoji outside the icon set clears the stale topic icon",
+	lastCall("editForumTopic").body.icon_custom_emoji_id === "",
+);
+await iconic.tools.get("session_badge").execute("i2", { emoji: "\u{1F401}" }, undefined, undefined, iconic.ctx);
+await settle();
+check(
+	"an emoji inside the icon set becomes the topic icon",
+	lastCall("editForumTopic").body.icon_custom_emoji_id === "icon-\u{1F401}",
+);
+
+// A refused topic edit changed nothing on Telegram, so the next heartbeat has to try again.
+api.failMethods = ["editForumTopic"];
+await iconic.tools.get("session_badge").execute("i3", { emoji: "\u{1F9F0}" }, undefined, undefined, iconic.ctx);
+await settle();
+api.failMethods = [];
+iconic.heartbeat();
+await settle(150);
+check("a refused topic edit is retried", lastCall("editForumTopic").body.name.includes("\u{1F9F0}"));
+
+// A refused sticker lookup is not an empty sticker set, and caching one would strip every icon.
+api.icons = [...api.icons, { emoji: "\u{1F41E}", custom_emoji_id: "icon-\u{1F41E}" }];
+api.failMethods = ["getForumTopicIconStickers"];
+const stickerless = spawn("01a04901-0000-0000-0000-000000000000", "/home/dev/work/stickerless");
+await stickerless.fire("session_start");
+check(
+	"a refused sticker lookup leaves the new topic iconless",
+	lastCall("createForumTopic").body.icon_custom_emoji_id === undefined,
+);
+await stickerless.tools
+	.get("session_badge")
+	.execute("s1", { emoji: "\u{1F41E}" }, undefined, undefined, stickerless.ctx);
+await settle();
+check(
+	"a refused sticker lookup does not strip the icon",
+	lastCall("editForumTopic").body.icon_custom_emoji_id === undefined,
+);
+api.failMethods = [];
+stickerless.heartbeat();
+await settle(150);
+check(
+	"the icon lands once the sticker set answers",
+	lastCall("editForumTopic").body.icon_custom_emoji_id === "icon-\u{1F41E}",
 );
 api.topicsEnabled = false;
 api.icons = null;

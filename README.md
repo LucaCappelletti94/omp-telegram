@@ -7,7 +7,7 @@
 
 Telegram notifications and remote control for [Oh My Pi](https://github.com/can1357/oh-my-pi) sessions. Turn ends arrive as a short agent-written summary of a sentence or two with an urgency light and optional tappable choices whose label starts the next turn. `ask` questions appear at the terminal and on Telegram at once, and the first answer wins.
 
-Parallel sessions share one bot. Each session message names its task, current model, and exact tmux `session:window.pane` when attached, while its badge keeps replies routed to that session. If the target Telegram group has forum topics enabled, each session gets its own thread instead.
+Parallel sessions share one bot. Each session message names its task, current model, and exact tmux `session:window.pane` when attached, while its badge keeps replies routed to that session. A badge emoji is chosen by the session's own agent to depict its task, and is unique among live sessions. If the target Telegram group has forum topics enabled, each session gets its own thread instead.
 
 ## Setup
 
