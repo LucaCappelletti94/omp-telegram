@@ -142,6 +142,8 @@ interface SessionRecord {
 	draftId: number;
 	/** What this session is doing, so one session can answer `/status` for the whole fleet. */
 	state: string;
+	/** Provider weather for the current turn: a retry, a fallback, or a recovery. */
+	health: string;
 	/** `"<tmux session>:<window index>"`, so `/fleet` can join a tmux row to this session. */
 	tmuxWindow: string | null;
 	/** First line of the last turn-end summary, and when it landed. */
@@ -476,6 +478,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let closeOfferMessageId: number | null = null;
 	let statusBlockUsed = false;
 	let lastState = "";
+	let lastHealth = "";
+	let turnHealth = "";
 	let lastSummary = "";
 	let lastSummaryAt = 0;
 	let badgeEmoji = "";
@@ -588,6 +592,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	function writeSessionRecord(ctx: ExtensionContext): void {
 		lastState = sessionState();
+		lastHealth = turnHealth;
 		const record: SessionRecord = {
 			pid: process.pid,
 			tag: sessionTag,
@@ -604,6 +609,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pinned: pinnedMessageId,
 			draftId,
 			state: lastState,
+			health: lastHealth,
 			tmuxWindow: tmuxWindowKey,
 			summary: lastSummary,
 			summaryAt: lastSummaryAt,
@@ -612,10 +618,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(record), 0o600);
 	}
 
-	/** The record is the only thing another session can read, so a state change has to reach disk. */
+	/** The record is the only thing another session can read, so anything it shows has to reach disk. */
 	function noteState(): void {
-		if (sessionCtx === null || sessionState() === lastState) return;
+		if (sessionCtx === null || (sessionState() === lastState && turnHealth === lastHealth)) return;
 		writeSessionRecord(sessionCtx);
+	}
+
+	/**
+	 * A crippled cluster hits every session in the same turn, so provider trouble rides the record
+	 * and the board draws it once instead of sending a message per session.
+	 */
+	function healthNote(text: string): void {
+		turnHealth = text;
+		noteState();
 	}
 
 	/**
@@ -650,6 +665,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				pinned: messageId(raw.pinned),
 				draftId: count(raw.draftId),
 				state: text(raw.state),
+				health: text(raw.health),
 				tmuxWindow: typeof raw.tmuxWindow === "string" ? raw.tmuxWindow : null,
 				summary: text(raw.summary),
 				summaryAt: count(raw.summaryAt),
@@ -1060,6 +1076,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** One session's `/status` paragraph, built entirely from its record. */
 	function statusLine(record: SessionRecord): string {
 		const lines = [badgeOf(record), `State: ${record.state.length > 0 ? record.state : "unknown"}.`];
+		if (record.health.length > 0) lines.push(`Provider: ${record.health}.`);
 		if (record.summary.length > 0) lines.push(`Last: ${record.summary} (${ago(record.summaryAt)})`);
 		if (record.standing !== null) lines.push("A choice question stands open.");
 		if (record.pinned !== null) lines.push("A red status is pinned.");
@@ -1086,9 +1103,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (live.length === 0) return "\u{1F39B} No live omp sessions.";
 		const lines = live.map(({ record }) => {
 			const state = record.state.length > 0 ? record.state : "unknown";
-			const flags = [record.standing !== null ? "choice open" : "", record.pinned !== null ? "red pinned" : ""].filter(
-				(flag) => flag.length > 0,
-			);
+			const flags = [
+				record.health,
+				record.standing !== null ? "choice open" : "",
+				record.pinned !== null ? "red pinned" : "",
+			].filter((flag) => flag.length > 0);
 			const tail = flags.length > 0 ? ` [${flags.join(", ")}]` : "";
 			const said = record.summary.length > 0 ? `\n    ${record.summary} (${clockTime(record.summaryAt)})` : "";
 			return `${badgeOf(record)} \u00B7 ${state}${tail}${said}`;
@@ -1270,11 +1289,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/** One notice per kind per turn keeps recovery details concise. */
-	function transparencyNotice(kind: string, text: string, ctx?: ExtensionContext): void {
+	function transparencyNotice(kind: string, text: string, ctx: ExtensionContext): void {
 		if (config === null || noticedKinds.has(kind)) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
 		noticedKinds.add(kind);
-		detach(ctx === undefined ? serviceNotice(text) : sessionNotice(ctx, text), "transparency notice");
+		detach(sessionNotice(ctx, text), "transparency notice");
 	}
 
 	/** Usage lines stay grouped by model, with the turn's tool count and wall time last. */
@@ -2846,6 +2865,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnStartedAt = Date.now();
 		turnEndedAt = 0;
 		noticedKinds.clear();
+		// The note describes the turn that hit the trouble, so a fresh turn starts clean.
+		turnHealth = "";
 		noteState();
 	});
 
@@ -2965,17 +2986,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		noteState();
 	});
 
-	pi.on("auto_retry_start", async (event, ctx) => {
+	pi.on("auto_retry_start", async (event) => {
 		if (typeof event.attempt !== "number" || event.attempt < 2) return;
-		transparencyNotice("retry", `Provider trouble, retrying (${event.attempt}/${event.maxAttempts}).`, ctx);
+		healthNote(`retrying (${event.attempt}/${event.maxAttempts})`);
 	});
 
-	pi.on("retry_fallback_applied", async (event, ctx) => {
-		transparencyNotice("fallback", `Model fell back from ${event.from} to ${event.to}.`, ctx);
+	pi.on("retry_fallback_applied", async (event) => {
+		healthNote(`fell back to ${event.to}`);
 	});
 
-	pi.on("retry_fallback_succeeded", async (event, ctx) => {
-		transparencyNotice("fallback-ok", `Recovered on ${event.model}.`, ctx);
+	pi.on("retry_fallback_succeeded", async (event) => {
+		healthNote(`recovered on ${event.model}`);
 	});
 
 	pi.on("auto_compaction_start", async (event, ctx) => {
