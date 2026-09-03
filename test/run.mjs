@@ -2431,20 +2431,27 @@ check(
 		!resetFooter.includes("2 tools"),
 );
 
-// Transparency notices, once per kind per turn.
+// Provider trouble lands on the record rather than the chat: a crippled cluster fires it in every
+// session at once, and one message each buried everything worth reading.
 await fx.fire("agent_start");
+const healthBefore = called("sendMessage").length;
+await fx.fire("auto_retry_start", { attempt: 1, maxAttempts: 8 });
+await settle(120);
+check("a first attempt is not provider trouble", record(fx.id).health === "");
 await fx.fire("auto_retry_start", { attempt: 2, maxAttempts: 8 });
 await settle(120);
-check("a retry shows a notice", lastCall("sendMessage").body.text.includes("retrying (2/8)"));
-check("a retry notice begins with session context", lastCall("sendMessage").body.text.startsWith(fxSessionContext));
-const noticesBefore = called("sendMessage").length;
-await fx.fire("auto_retry_start", { attempt: 3, maxAttempts: 8 });
-await settle(120);
-check("the notice does not repeat within a turn", called("sendMessage").length === noticesBefore);
+check("a retry lands on the session record", record(fx.id).health === "retrying (2/8)");
 await fx.fire("retry_fallback_applied", { from: "a/x", to: "b/y" });
 await settle(120);
-check("a model fallback shows a notice", lastCall("sendMessage").body.text.includes("fell back from a/x to b/y"));
-check("a fallback notice begins with session context", lastCall("sendMessage").body.text.startsWith(fxSessionContext));
+check("a fallback replaces the retry note", record(fx.id).health === "fell back to b/y");
+check("provider trouble costs no message", called("sendMessage").length === healthBefore);
+writeFileSync(join(inboxOf(fx.id), "690.json"), JSON.stringify({ kind: "command", value: "status" }));
+await fx.pump(250);
+check("status carries the provider note", lastCall("sendMessage").body.text.includes("Provider: fell back to b/y."));
+await fx.fire("agent_end");
+await fx.fire("agent_start");
+await settle(120);
+check("a new turn clears the provider note", record(fx.id).health === "");
 const tmuxBin = join(root, "bin");
 mkdirSync(tmuxBin);
 writeFileSync(
@@ -2726,9 +2733,12 @@ await rv.fire("agent_start");
 await rv.fire("message_end", {
 	message: { role: "assistant", usage: { input: 200, output: 50, cost: { total: 0.01 } } },
 });
-await rv.fire("auto_retry_start", { attempt: 2, maxAttempts: 5 });
+await rv.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
 await settle(120);
-check("retry notice fires in the first turn", lastCall("sendMessage").body.text.includes("retrying (2/5)"));
+check(
+	"a transparency notice fires in the first turn",
+	lastCall("sendMessage").body.text.includes("Context is being compacted (overflow)"),
+);
 await rv.fire("agent_end");
 await rv.tools.get("notify_status").execute("r1", { summary: "One.", urgency: "green" }, undefined, undefined, rv.ctx);
 await rv.fire("session_stop");
@@ -2739,10 +2749,10 @@ await rv.fire("agent_start");
 await rv.fire("message_end", {
 	message: { role: "assistant", usage: { input: 100, output: 30, cost: { total: 0.005 } } },
 });
-const secondRetryBefore = called("sendMessage").length;
-await rv.fire("auto_retry_start", { attempt: 2, maxAttempts: 5 });
+const secondNoticeBefore = called("sendMessage").length;
+await rv.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
 await settle(120);
-check("the notice dedupe resets with the new turn", called("sendMessage").length === secondRetryBefore + 1);
+check("the notice dedupe resets with the new turn", called("sendMessage").length === secondNoticeBefore + 1);
 await rv.fire("agent_end");
 await rv.tools.get("notify_status").execute("r2", { summary: "Two.", urgency: "green" }, undefined, undefined, rv.ctx);
 await rv.fire("session_stop");
@@ -3624,10 +3634,7 @@ heading("uncovered event handlers");
 	await ev.fire("agent_start");
 	await ev.fire("retry_fallback_succeeded", { model: "openai/gpt-5" });
 	await settle(150);
-	check(
-		"a recovered fallback names the model",
-		lastCall("sendMessage").body.text.includes("Recovered on openai/gpt-5."),
-	);
+	check("a recovered fallback names the model", record(ev.id).health === "recovered on openai/gpt-5");
 
 	// A failure notice now carries the trigger and action from the start event, so it only speaks
 	// when it saw one. The start itself announces once per turn; the quiet endings add nothing.
@@ -4535,6 +4542,17 @@ heading("pinned fleet dashboard");
 	check("a changed dashboard is edited in place", edit?.body.message_id === boardId);
 	check("the edit carries the new state", edit?.body.text.includes("bash: Building") === true);
 	check("a changed dashboard posts no second message", called("sendMessage").length === sendsBefore);
+
+	// c2. Provider trouble edits the line it explains, so a whole crippled fleet costs one edit.
+	const healthSends = called("sendMessage").length;
+	await owner.fire("retry_fallback_applied", { from: "a/x", to: "b/y" });
+	await settle(60);
+	await owner.pump(250);
+	check(
+		"the dashboard carries a provider note",
+		called("editMessageText").at(-1)?.body.text.includes("fell back to b/y") === true,
+	);
+	check("a provider note posts no message", called("sendMessage").length === healthSends);
 
 	// d. The configured gap is what actually protects the rate limit.
 	writeConfig({ pinnedDashboard: true, dashboardSeconds: 600 });
