@@ -287,6 +287,7 @@ interface InboxEntry {
 }
 
 interface IncomingFile {
+	kind: "photo" | "voice" | "audio" | "document";
 	fileId: string;
 	mime: string;
 	size?: number;
@@ -296,13 +297,14 @@ interface IncomingFile {
 /** Largest photo size wins; Telegram photos are always JPEG. */
 function pickMedia(message: TelegramMessage): IncomingFile | null {
 	const photo = message.photo?.at(-1);
-	if (photo !== undefined) return { fileId: photo.file_id, mime: "image/jpeg", size: photo.file_size };
+	if (photo !== undefined) return { kind: "photo", fileId: photo.file_id, mime: "image/jpeg", size: photo.file_size };
 	const voice = message.voice;
 	if (voice !== undefined)
-		return { fileId: voice.file_id, mime: voice.mime_type ?? "audio/ogg", size: voice.file_size };
+		return { kind: "voice", fileId: voice.file_id, mime: voice.mime_type ?? "audio/ogg", size: voice.file_size };
 	const audio = message.audio;
 	if (audio !== undefined) {
 		return {
+			kind: "audio",
 			fileId: audio.file_id,
 			mime: audio.mime_type ?? "audio/mpeg",
 			size: audio.file_size,
@@ -312,6 +314,7 @@ function pickMedia(message: TelegramMessage): IncomingFile | null {
 	const document = message.document;
 	if (document !== undefined) {
 		return {
+			kind: "document",
 			fileId: document.file_id,
 			mime: document.mime_type ?? "application/octet-stream",
 			size: document.file_size,
@@ -339,6 +342,48 @@ function writeFileAtomic(path: string, content: string, mode?: number): void {
 	const temp = `${path}.${process.pid}.${Date.now().toString(36)}.tmp`;
 	writeFileSync(temp, content, mode === undefined ? {} : { mode });
 	renameSync(temp, path);
+}
+
+/** Colons are illegal in filenames on Windows and awkward in shells; the rest of ISO-8601 sorts as it reads. */
+function utcStamp(at: number): string {
+	return new Date(at)
+		.toISOString()
+		.replace(/\.\d{3}Z$/u, "Z")
+		.replaceAll(":", "-");
+}
+
+/** Both ways a session is identified: the tag routing uses, the emoji the chat shows. */
+function fileOwner(tag: string, emoji: string): string {
+	const named = tag.length === 0 ? "unknown" : tag;
+	return emoji.length === 0 ? named : `${named}-${emoji}`;
+}
+
+const STANDARD_NAME = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__[^_]+__[^_]+__(?:u\d+__)?/u;
+
+/**
+ * One shape for every file this extension writes or uploads: when, what, whose, which update, then
+ * the original name, so a chat search or a `grep` on any of those finds it.
+ */
+function standardFileName(parts: {
+	at: number;
+	kind: string;
+	owner: string;
+	updateId?: number;
+	original: string;
+}): string {
+	// A file received from Telegram can be sent back, and two stacked prefixes name nothing extra.
+	const bare = parts.original.replace(STANDARD_NAME, "");
+	const dot = bare.lastIndexOf(".");
+	const stem = (dot > 0 ? bare.slice(0, dot) : bare).replaceAll(/[^\w-]/gu, "_").slice(0, 60) || "file";
+	const ext =
+		dot > 0
+			? bare
+					.slice(dot)
+					.replaceAll(/[^\w.]/gu, "_")
+					.slice(0, 16)
+			: "";
+	const update = parts.updateId === undefined ? "" : `u${parts.updateId}__`;
+	return `${utcStamp(parts.at)}__${parts.kind}__${parts.owner}__${update}${stem}${ext}`;
 }
 
 function loadConfig(): Config | null {
@@ -511,6 +556,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastNotifiedAt = 0;
 	let turnActive = false;
 	let typingSentAt = 0;
+	/** Cleared when the turn carrying the answer ends: typing is chat-wide, so no session may hold it idly. */
+	let replyOwed = false;
 	let dashboardPublishedAt = 0;
 	let approvalWaiting = false;
 	let approvalNotice: ApprovalNotice | null = null;
@@ -1374,14 +1421,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	/** The typing status lasts about five seconds; refresh while the agent loop runs and nothing waits on the user. */
+	/** Typing is chat-wide but a turn is not, so only a session that owes the user an answer claims it. */
 	function maybeType(): void {
-		if (config === null || !turnActive || pendingAsk !== null || approvalWaiting) return;
+		if (config === null || !turnActive || !replyOwed || pendingAsk !== null || approvalWaiting) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
 		if (Date.now() - draftSentAt < 10_000) return;
 		if (Date.now() - typingSentAt < TYPING_MS) return;
 		typingSentAt = Date.now();
 		detach(callTelegram(config, "sendChatAction", threaded({ action: "typing" }), 10_000), "typing action");
+	}
+
+	/** Telegram's own upload status, for the seconds a file spends going up. */
+	function showUploading(action: "upload_photo" | "upload_document"): void {
+		if (config === null) return;
+		detach(callTelegram(config, "sendChatAction", threaded({ action }), 10_000), "upload action");
 	}
 
 	/** Streams the turn as an ephemeral draft bubble with a native stop control. */
@@ -1716,7 +1769,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * abandoned path logs its own reason: the user-facing notice is necessarily generic, so without
 	 * this a lost file leaves nothing to diagnose.
 	 */
-	async function downloadMedia(cfg: Config, media: IncomingFile, updateId: number): Promise<string | null> {
+	async function downloadMedia(
+		cfg: Config,
+		media: IncomingFile,
+		updateId: number,
+		owner: string,
+	): Promise<string | null> {
 		const give = (reason: string, meta: Record<string, unknown> = {}): null => {
 			pi.logger.warn(`notify-telegram: media ${reason}`, { fileId: media.fileId, updateId, ...meta });
 			return null;
@@ -1742,10 +1800,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (bytes.byteLength > MEDIA_MAX_BYTES) {
 			return give("oversized after download", { bytes: bytes.byteLength, ceiling: MEDIA_MAX_BYTES });
 		}
-		const base = (media.name ?? remote).split("/").at(-1) ?? "file";
-		const safe = base.replaceAll(/[^\w.-]/gu, "_").slice(-80);
+		const original = (media.name ?? remote).split("/").at(-1) ?? "file";
 		mkdirSync(MEDIA_DIR, { recursive: true, mode: 0o700 });
-		const path = join(MEDIA_DIR, `${updateId}-${safe}`);
+		const path = join(MEDIA_DIR, standardFileName({ at: Date.now(), kind: media.kind, owner, updateId, original }));
 		writeFileSync(path, bytes, { mode: 0o600 });
 		return path;
 	}
@@ -2014,7 +2071,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await serviceNotice("No live omp session owns that message, so it was dropped.", thread, false);
 				return;
 			}
-			const saved = await downloadMedia(cfg, media, update.update_id);
+			const record = readSessionRecord(target);
+			const owner = record === null ? "unknown" : fileOwner(record.tag, record.emoji);
+			const saved = await downloadMedia(cfg, media, update.update_id, owner);
 			if (saved === null) {
 				await serviceNotice("That file could not be fetched (20 MB is the ceiling), so it was dropped.", thread, false);
 				return;
@@ -2372,6 +2431,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
 					focusTmuxWindow();
 				}
+				// `replyOwed` is set where the entry reaches the agent, never before: an entry answered
+				// locally, such as an unreadable file, leaves no answer for this session to write.
 
 				const ask = pendingAsk;
 				if (entry.kind === "command") {
@@ -2424,7 +2485,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							label === undefined ? "This question is closed." : `**Chosen:** ${label}`,
 							label === undefined ? undefined : settledKeyboard(standing.labels, new Set([label])),
 						);
-						if (label !== undefined) pi.sendUserMessage(label);
+						if (label !== undefined) {
+							pi.sendUserMessage(label);
+							replyOwed = true;
+						}
 					} else if (sessionCtx !== null) {
 						await sessionNotice(sessionCtx, "That question is closed. It was superseded or already answered.");
 					} else {
@@ -2433,8 +2497,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					continue;
 				}
 				if (entry.kind === "callback") {
-					if (ask !== null) await applyCallback(ask, entry.value);
-					else if (sessionCtx !== null) {
+					if (ask !== null) {
+						await applyCallback(ask, entry.value);
+						replyOwed = true;
+					} else if (sessionCtx !== null) {
 						await sessionNotice(sessionCtx, "That question is closed. It was answered or cancelled at the terminal.");
 					} else {
 						await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
@@ -2464,6 +2530,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							`The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`,
 						);
 					}
+					replyOwed = true;
 					ackDelivered(entry.messageId);
 					continue;
 				}
@@ -2472,10 +2539,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					ask.awaitingText = false;
 					ask.custom[ask.index] = entry.value;
 					ask.selected[ask.index] = new Set<string>();
+					replyOwed = true;
 					await advance(ask);
 					continue;
 				}
 				pi.sendUserMessage(entry.value);
+				replyOwed = true;
 				ackDelivered(entry.messageId);
 			}
 		} finally {
@@ -2811,7 +2880,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "notify_file",
 		label: "Notify File",
 		description:
-			"Send files from disk to the user's Telegram chat, for artifacts the user should see on their phone: a screenshot, a rendered diff, a report, a build output. `paths`: 1 to 10 file paths under the session workspace or the system tmp directory (copy anything else into the workspace first). Images arrive as photos and several images become one album, everything else arrives as a document (50 MB per file, 100 MB per call). `caption`: optional short plain text shown with the first file.",
+			"Send files from disk to the user's Telegram chat, for artifacts the user should see on their phone: a screenshot, a rendered diff, a report, a build output. `paths`: 1 to 10 file paths under the session workspace or the system tmp directory (copy anything else into the workspace first). Images arrive as photos and several images become one album, everything else arrives as a document (50 MB per file, 100 MB per call). Each file is renamed `<UTC stamp>__<kind>__<session>__<original name>` and carries that name in its caption, so the user can search for it. `caption`: optional short plain text shown with the first file.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -2826,11 +2895,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const requestedCaption = typeof p.caption === "string" ? p.caption.trim() : "";
 			const context = sessionContextLine(ctx);
 			const separator = requestedCaption.length > 0 ? "\n\n" : "";
-			const callerLimit = Math.max(0, CAPTION_MAX - context.length - separator.length);
-			const callerCaption = clip(requestedCaption, callerLimit);
-			const caption = callerCaption.length > 0 ? `${context}${separator}${callerCaption}` : context;
+			const at = Date.now();
+			const owner = fileOwner(sessionTag, badgeEmoji);
+			const nameOf = (original: string, kind: string): string => standardFileName({ at, kind, owner, original });
 			const allowedRoots = [ctx.cwd, tmpdir(), MEDIA_DIR];
-			const loaded: Array<{ path: string; name: string; data: Uint8Array; photo: boolean }> = [];
+			const loaded: Array<{ path: string; original: string; data: Uint8Array; photo: boolean }> = [];
 			let totalBytes = 0;
 			for (const requested of p.paths) {
 				const path = resolve(ctx.cwd, requested);
@@ -2871,25 +2940,35 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				} catch {
 					return { content: [{ type: "text", text: `Error: cannot read ${path}` }], isError: true };
 				}
-				const name = (path.split("/").at(-1) ?? "file").replaceAll(/[^\w.-]/gu, "_").slice(-80);
-				const photo = /\.(png|jpe?g|gif|webp|bmp)$/iu.test(name) && data.byteLength <= 10 * 1024 * 1024;
-				loaded.push({ path, name, data, photo });
+				const original = path.split("/").at(-1) ?? "file";
+				const photo = /\.(png|jpe?g|gif|webp|bmp)$/iu.test(original) && data.byteLength <= 10 * 1024 * 1024;
+				loaded.push({ path, original, data, photo });
 			}
+
+			// Telegram strips a photo's filename, so the name rides in the caption; its room is
+			// reserved before the caller's text is clipped, at the longer of the two kind words.
+			const longest = Math.max(...loaded.map((file) => nameOf(file.original, "document").length));
+			const callerLimit = Math.max(0, CAPTION_MAX - context.length - separator.length - longest - 2);
+			const callerCaption = clip(requestedCaption, callerLimit);
+			const head = callerCaption.length > 0 ? `${context}${separator}${callerCaption}` : context;
+			const captionOf = (name: string, lead: boolean): string => (lead ? `${head}\n\n${name}` : name);
 
 			const base: Record<string, string | number> = { chat_id: config.chatId };
 			if (topicId !== null) base.message_thread_id = topicId;
 			const sentIds: number[] = [];
 			if (loaded.length > 1 && loaded.every((file) => file.photo)) {
+				const names = loaded.map((file) => nameOf(file.original, "photo"));
 				const media = loaded.map((_file, index) => ({
 					type: "photo",
 					media: `attach://f${index}`,
-					...(index === 0 && caption.length > 0 ? { caption } : {}),
+					caption: captionOf(names[index] ?? "", index === 0),
 				}));
+				showUploading("upload_photo");
 				const sent = await uploadTelegram<TelegramMessage[]>(
 					config,
 					"sendMediaGroup",
 					{ ...base, media: JSON.stringify(media) },
-					loaded.map((file, index) => ({ field: `f${index}`, name: file.name, data: file.data })),
+					loaded.map((file, index) => ({ field: `f${index}`, name: names[index] ?? file.original, data: file.data })),
 				);
 				if (sent === null) {
 					return { content: [{ type: "text", text: "Error: Telegram rejected the album upload" }], isError: true };
@@ -2900,20 +2979,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 			} else {
 				for (const [index, file] of loaded.entries()) {
-					const fields: Record<string, string | number> = { ...base };
-					if (index === 0 && caption.length > 0) fields.caption = caption;
 					const kind = file.photo ? "photo" : "document";
+					const name = nameOf(file.original, kind);
+					const fields: Record<string, string | number> = { ...base, caption: captionOf(name, index === 0) };
 					fields[kind] = "attach://f0";
+					showUploading(file.photo ? "upload_photo" : "upload_document");
 					let sent = await uploadTelegram<TelegramMessage>(config, file.photo ? "sendPhoto" : "sendDocument", fields, [
-						{ field: "f0", name: file.name, data: file.data },
+						{ field: "f0", name, data: file.data },
 					]);
 					// Telegram rejects photos over its dimension limits; the same bytes go through as a document.
 					if (sent === null && file.photo) {
-						const retry: Record<string, string | number> = { ...base };
-						if (index === 0 && caption.length > 0) retry.caption = caption;
-						retry.document = "attach://f0";
+						const fallback = nameOf(file.original, "document");
+						const retry: Record<string, string | number> = {
+							...base,
+							caption: captionOf(fallback, index === 0),
+							document: "attach://f0",
+						};
+						showUploading("upload_document");
 						sent = await uploadTelegram<TelegramMessage>(config, "sendDocument", retry, [
-							{ field: "f0", name: file.name, data: file.data },
+							{ field: "f0", name: fallback, data: file.data },
 						]);
 					}
 					if (sent === null) {
@@ -3130,6 +3214,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	pi.on("agent_end", async () => {
 		turnActive = false;
+		replyOwed = false;
 		turnEndedAt = Date.now();
 		approvalWaiting = false;
 		draftText = "";
@@ -3285,6 +3370,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	pi.on("session_stop", async (_event, ctx) => {
 		turnActive = false;
+		replyOwed = false;
 		approvalWaiting = false;
 		if (config === null || !config.notifyOnTurnEnd) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;

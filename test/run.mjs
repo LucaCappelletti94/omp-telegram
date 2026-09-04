@@ -53,10 +53,15 @@ globalThis.fetch = async (url, init) => {
 	const method = String(url).split("/").pop();
 	if (init?.body instanceof FormData) {
 		const body = {};
+		const files = {};
 		for (const [key, value] of init.body.entries()) {
-			body[key] = typeof value === "string" ? value : `<file ${value.size}b>`;
+			if (typeof value === "string") body[key] = value;
+			else {
+				body[key] = `<file ${value.size}b>`;
+				files[key] = value.name;
+			}
 		}
-		api.calls.push({ method, body });
+		api.calls.push({ method, body, files });
 		if ((api.failMethods ?? []).includes(method)) {
 			return { ok: false, status: 400, json: async () => ({ ok: false, description: "failed by test" }) };
 		}
@@ -1221,6 +1226,50 @@ check(
 );
 const mediaDir = join(root, "notify-telegram/media");
 check("the audio lands on disk", existsSync(mediaDir) && readdirSync(mediaDir).length > 0);
+const savedVoice = readdirSync(mediaDir)[0];
+const liveTags = readdirSync(sessionsDir).map((f) => JSON.parse(readFileSync(join(sessionsDir, f), "utf8")).tag);
+check("a saved file leads with a sortable UTC stamp", /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__/u.test(savedVoice));
+check(
+	"a saved file names its kind, its owning session and its update",
+	savedVoice.includes("__voice__") &&
+		liveTags.includes(savedVoice.split("__")[2].split("-")[0]) &&
+		savedVoice.includes("__u500__"),
+);
+check("a saved file keeps the telegram name and extension last", savedVoice.endsWith("__file_9.oga"));
+
+// An audio file and a document carry their own Telegram name, which survives sanitised.
+api.queued = [
+	{
+		update_id: 510,
+		message: {
+			message_id: 74,
+			date: 1,
+			chat: { id: CHAT },
+			audio: { file_id: "a1", mime_type: "audio/mpeg", file_name: "riff take 3.mp3" },
+		},
+	},
+];
+await voiceSession.pump(250);
+await voiceSession.pump(250);
+const savedAudio = readdirSync(mediaDir).find((f) => f.includes("__u510__")) ?? "";
+check("an audio file is named as audio and keeps its own name", savedAudio.endsWith("__riff_take_3.mp3"));
+check("an audio file names its kind", savedAudio.includes("__audio__"));
+api.queued = [
+	{
+		update_id: 511,
+		message: {
+			message_id: 75,
+			date: 1,
+			chat: { id: CHAT },
+			document: { file_id: "d1", mime_type: "application/pdf", file_name: "review notes.pdf" },
+		},
+	},
+];
+await voiceSession.pump(250);
+await voiceSession.pump(250);
+const savedDoc = readdirSync(mediaDir).find((f) => f.includes("__u511__")) ?? "";
+check("a document is named as a document and keeps its own name", savedDoc.endsWith("__review_notes.pdf"));
+check("a document names its kind", savedDoc.includes("__document__"));
 
 // Drain side, delivered directly: an image becomes an image block, other files travel as paths.
 mkdirSync(mediaDir, { recursive: true });
@@ -2121,19 +2170,50 @@ const ux = spawn("01a04800-0000-0000-0000-000000000000", "/home/dev/work/pgvecto
 await ux.fire("session_start");
 check("the command menu is registered", called("setMyCommands").length > 0);
 
-// Typing indicator follows the agent loop, not raw input events.
+// Typing is chat-wide, so a session claims it only while it owes the user an answer.
 const typingBefore = called("sendChatAction").length;
 await ux.fire("input");
-await ux.pump(150);
-check("input alone does not show typing", called("sendChatAction").length === typingBefore);
 await ux.fire("agent_start");
 await ux.pump(150);
-check("a running agent loop shows a typing status", called("sendChatAction").length === typingBefore + 1);
-check("the action is typing", lastCall("sendChatAction").body.action === "typing");
-await ux.fire("agent_start"); // resets the typing throttle, so only agent_end can explain silence below
-await ux.fire("agent_end");
+check("a turn started at the terminal shows no typing", called("sendChatAction").length === typingBefore);
+writeFileSync(join(inboxOf(ux.id), "6098.json"), JSON.stringify({ kind: "text", value: "carry on", messageId: 78 }));
 await ux.pump(150);
-check("the loop's end stops the typing refresh", called("sendChatAction").length === typingBefore + 1);
+await ux.pump(150);
+check("a reply arriving mid-turn shows typing", called("sendChatAction").length === typingBefore + 1);
+check("the action is typing", lastCall("sendChatAction").body.action === "typing");
+await ux.fire("agent_end");
+await ux.fire("agent_start");
+await ux.pump(150);
+check("typing stops once the answer has gone out", called("sendChatAction").length === typingBefore + 1);
+// A reply that lands on an idle session types on the turn it starts.
+await ux.fire("agent_end");
+writeFileSync(join(inboxOf(ux.id), "6099.json"), JSON.stringify({ kind: "text", value: "and rebase", messageId: 79 }));
+await ux.pump(150);
+check("an idle session does not type before its turn starts", called("sendChatAction").length === typingBefore + 1);
+await ux.fire("agent_start");
+await ux.pump(150);
+check("the turn answering a delivered reply types", called("sendChatAction").length === typingBefore + 2);
+await ux.fire("agent_end");
+// An entry answered locally owes nothing: an unreadable image never reaches the agent.
+writeFileSync(
+	join(inboxOf(ux.id), "6100.json"),
+	JSON.stringify({ kind: "file", value: join(root, "gone.png"), mime: "image/png", messageId: 77 }),
+);
+await ux.pump(150);
+await ux.fire("agent_start");
+await ux.pump(150);
+check("an entry answered locally shows no typing", called("sendChatAction").length === typingBefore + 2);
+await ux.fire("agent_end");
+// Message text that happens to look like a close press is still a message.
+writeFileSync(
+	join(inboxOf(ux.id), "6101.json"),
+	JSON.stringify({ kind: "text", value: "k: keep going", messageId: 76 }),
+);
+await ux.pump(150);
+await ux.fire("agent_start");
+await ux.pump(150);
+check("text that looks like a close press still types", called("sendChatAction").length === typingBefore + 3);
+await ux.fire("agent_end");
 
 // A text reply to the question message answers it, no button needed.
 const uxState = {};
@@ -2905,26 +2985,45 @@ const photoSend = await fx.tools
 	.get("notify_file")
 	.execute("f4", { paths: [artefact], caption: "the screenshot" }, undefined, undefined, fx.ctx);
 check("a png goes out as a photo", lastCall("sendPhoto").body.photo === "attach://f0");
-const fileContext = `Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
+check("sending a photo shows an upload status", lastCall("sendChatAction").body.action === "upload_photo");
+const photoName = lastCall("sendPhoto").files.f0;
 check(
-	"a single file caption carries context first",
-	lastCall("sendPhoto").body.caption === `${fileContext}\n\nthe screenshot`,
+	"an uploaded photo carries the standard name",
+	/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__photo__[a-z0-9]{5}\S*__artefact\.png$/u.test(photoName),
+);
+const fileContext = `Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
+// Telegram strips a photo's filename, so the caption is the only place it stays searchable.
+check(
+	"a single file caption carries context first and the name last",
+	lastCall("sendPhoto").body.caption === `${fileContext}\n\nthe screenshot\n\n${photoName}`,
 );
 check("the tool reports success", photoSend.isError !== true);
 const artefact2 = join(root, "artefact2.jpg");
 writeFileSync(artefact2, "jpg-bytes");
 await fx.tools.get("notify_file").execute("f5", { paths: [artefact, artefact2] }, undefined, undefined, fx.ctx);
 check("two images go out as one album", JSON.parse(lastCall("sendMediaGroup").body.media).length === 2);
+const albumNames = lastCall("sendMediaGroup").files;
+check(
+	"every album member carries the standard name",
+	/__photo__\S+__artefact\.png$/u.test(albumNames.f0) && /__photo__\S+__artefact2\.jpg$/u.test(albumNames.f1),
+);
 const contextualAlbumMedia = JSON.parse(lastCall("sendMediaGroup").body.media);
 check(
-	"an album carries context only on its first item",
-	contextualAlbumMedia[0].caption === fileContext && !("caption" in contextualAlbumMedia[1]),
+	"an album leads with context and names each item in its own caption",
+	contextualAlbumMedia[0].caption === `${fileContext}\n\n${albumNames.f0}` &&
+		contextualAlbumMedia[1].caption === albumNames.f1,
 );
 const logFile = join(root, "build.log");
 writeFileSync(logFile, "log-bytes");
 await fx.tools.get("notify_file").execute("f6", { paths: [logFile] }, undefined, undefined, fx.ctx);
 check("a log goes out as a document", lastCall("sendDocument").body.document === "attach://f0");
-check("a captionless document still carries context", lastCall("sendDocument").body.caption === fileContext);
+check("sending a document shows an upload status", lastCall("sendChatAction").body.action === "upload_document");
+const documentName = lastCall("sendDocument").files.f0;
+check("an uploaded document carries the standard name", /__document__\S+__build\.log$/u.test(documentName));
+check(
+	"a captionless document still carries context",
+	lastCall("sendDocument").body.caption === `${fileContext}\n\n${documentName}`,
+);
 
 api.failMethods = ["sendPhoto"];
 const fallbackSend = await fx.tools
@@ -2934,7 +3033,12 @@ api.failMethods = [];
 check("a rejected photo falls back to a document", fallbackSend.isError !== true);
 check(
 	"photo fallback reuses the contextual caption",
-	lastCall("sendDocument").body.caption === `${fileContext}\n\nfallback artifact`,
+	lastCall("sendDocument").body.caption ===
+		`${fileContext}\n\nfallback artifact\n\n${lastCall("sendDocument").files.f0}`,
+);
+check(
+	"a photo that falls back is named a document",
+	/__document__\S+__artefact\.png$/u.test(lastCall("sendDocument").files.f0),
 );
 
 const longCallerCaption = "z".repeat(2_000);
@@ -2943,10 +3047,11 @@ await fx.tools
 	.execute("f6-long", { paths: [logFile], caption: longCallerCaption }, undefined, undefined, fx.ctx);
 const boundedCaption = lastCall("sendDocument").body.caption;
 check(
-	"a long caller caption is truncated after the complete context",
+	"a long caller caption is truncated between the context and the name",
 	boundedCaption.startsWith(`${fileContext}\n\n`) &&
-		boundedCaption.length === 1024 &&
-		boundedCaption.slice(fileContext.length + 2).length === 1022 - fileContext.length,
+		boundedCaption.endsWith(`\n\n${lastCall("sendDocument").files.f0}`) &&
+		boundedCaption.length <= 1024 &&
+		boundedCaption.length > 1000,
 );
 const missing = await fx.tools
 	.get("notify_file")
@@ -3073,7 +3178,7 @@ check(
 );
 await rv.fire("agent_end");
 
-// Album captions sit only on the first item; the sandbox refuses foreign paths.
+// Every album item names itself and the first leads with context; the sandbox refuses foreign paths.
 const chartA = join(root, "chart-a.png");
 const chartB = join(root, "chart-b.png");
 writeFileSync(chartA, "a");
@@ -3082,11 +3187,12 @@ await rv.tools
 	.get("notify_file")
 	.execute("r5", { paths: [chartA, chartB], caption: "the chart" }, undefined, undefined, rv.ctx);
 const albumMedia = JSON.parse(lastCall("sendMediaGroup").body.media);
+const albumFiles = lastCall("sendMediaGroup").files;
 check(
-	"the album caption sits only on the first item",
+	"the album context sits only on the first item, each carrying its own name",
 	albumMedia[0].caption ===
-		`Task: htmlq [${record(rv.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached\n\nthe chart` &&
-		!("caption" in albumMedia[1]),
+		`Task: htmlq [${record(rv.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached\n\nthe chart\n\n${albumFiles.f0}` &&
+		albumMedia[1].caption === albumFiles.f1,
 );
 const outside = await rv.tools
 	.get("notify_file")
@@ -3111,7 +3217,7 @@ check(
 );
 
 // Downloaded media is private on disk.
-const downloaded = readdirSync(mediaDir).find((f) => f.startsWith("500-"));
+const downloaded = readdirSync(mediaDir).find((f) => f.includes("__u500__"));
 check(
 	"downloaded media is private",
 	downloaded !== undefined && (statSync(join(mediaDir, downloaded)).mode & 0o777) === 0o600,
