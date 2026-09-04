@@ -2880,17 +2880,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "notify_file",
 		label: "Notify File",
 		description:
-			"Send files from disk to the user's Telegram chat, for artifacts the user should see on their phone: a screenshot, a rendered diff, a report, a build output. `paths`: 1 to 10 file paths under the session workspace or the system tmp directory (copy anything else into the workspace first). Images arrive as photos and several images become one album, everything else arrives as a document (50 MB per file, 100 MB per call). Each file is renamed `<UTC stamp>__<kind>__<session>__<original name>` and carries that name in its caption, so the user can search for it. `caption`: optional short plain text shown with the first file.",
+			"Send files from disk to the user's Telegram chat, for artifacts the user should see on their phone: a screenshot, a rendered diff, a report, a build output. `paths`: 1 to 10 file paths under the session workspace or the system tmp directory (copy anything else into the workspace first). Images arrive as photos and several images become one album, everything else arrives as a document (50 MB per file, 100 MB per call). Each file is renamed `<UTC stamp>__<kind>__<session>__<original name>` and carries that name in its caption, so the user can search for it. `caption`: optional short plain text shown with the first file. `mode`: `auto` lets Telegram compress and downscale a recognised image into a photo, `document` uploads the original bytes untouched under the same standard name, which is what a user asking for a lossless or full-resolution image wants.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
 			paths: z.array(z.string()).min(1).max(10),
 			caption: z.string().optional(),
+			mode: z.string().optional(),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const p = params as { paths: string[]; caption?: unknown };
+			const p = params as { paths: string[]; caption?: unknown; mode?: unknown };
 			if (config === null) {
 				return { content: [{ type: "text", text: "Error: Telegram is not configured" }], isError: true };
+			}
+			const requestedMode = typeof p.mode === "string" ? p.mode.trim().toLowerCase() : "";
+			const mode = requestedMode.length === 0 ? "auto" : requestedMode;
+			if (mode !== "auto" && mode !== "document") {
+				return {
+					content: [{ type: "text", text: `Error: mode must be auto or document, not "${requestedMode}"` }],
+					isError: true,
+				};
 			}
 			const requestedCaption = typeof p.caption === "string" ? p.caption.trim() : "";
 			const context = sessionContextLine(ctx);
@@ -2941,7 +2950,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					return { content: [{ type: "text", text: `Error: cannot read ${path}` }], isError: true };
 				}
 				const original = path.split("/").at(-1) ?? "file";
-				const photo = /\.(png|jpe?g|gif|webp|bmp)$/iu.test(original) && data.byteLength <= 10 * 1024 * 1024;
+				// Document delivery is the caller's explicit choice, so no extension or size test applies.
+				const photo =
+					mode === "auto" && /\.(png|jpe?g|gif|webp|bmp)$/iu.test(original) && data.byteLength <= 10 * 1024 * 1024;
 				loaded.push({ path, original, data, photo });
 			}
 
