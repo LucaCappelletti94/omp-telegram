@@ -2160,6 +2160,26 @@ await ux.fire("agent_start");
 await ux.pump(150);
 check("the turn answering a delivered reply types", called("sendChatAction").length === typingBefore + 2);
 await ux.fire("agent_end");
+// An entry answered locally owes nothing: an unreadable image never reaches the agent.
+writeFileSync(
+	join(inboxOf(ux.id), "6100.json"),
+	JSON.stringify({ kind: "file", value: join(root, "gone.png"), mime: "image/png", messageId: 77 }),
+);
+await ux.pump(150);
+await ux.fire("agent_start");
+await ux.pump(150);
+check("an entry answered locally shows no typing", called("sendChatAction").length === typingBefore + 2);
+await ux.fire("agent_end");
+// Message text that happens to look like a close press is still a message.
+writeFileSync(
+	join(inboxOf(ux.id), "6101.json"),
+	JSON.stringify({ kind: "text", value: "k: keep going", messageId: 76 }),
+);
+await ux.pump(150);
+await ux.fire("agent_start");
+await ux.pump(150);
+check("text that looks like a close press still types", called("sendChatAction").length === typingBefore + 3);
+await ux.fire("agent_end");
 
 // A text reply to the question message answers it, no button needed.
 const uxState = {};

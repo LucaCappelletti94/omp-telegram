@@ -2431,10 +2431,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
 					focusTmuxWindow();
 				}
-				// Everything but a command and a close press is the user waiting on an answer.
-				if (entry.kind !== "command" && !entry.value.startsWith("k:")) {
-					replyOwed = true;
-				}
+				// `replyOwed` is set where the entry reaches the agent, never before: an entry answered
+				// locally, such as an unreadable file, leaves no answer for this session to write.
 
 				const ask = pendingAsk;
 				if (entry.kind === "command") {
@@ -2487,7 +2485,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							label === undefined ? "This question is closed." : `**Chosen:** ${label}`,
 							label === undefined ? undefined : settledKeyboard(standing.labels, new Set([label])),
 						);
-						if (label !== undefined) pi.sendUserMessage(label);
+						if (label !== undefined) {
+							pi.sendUserMessage(label);
+							replyOwed = true;
+						}
 					} else if (sessionCtx !== null) {
 						await sessionNotice(sessionCtx, "That question is closed. It was superseded or already answered.");
 					} else {
@@ -2496,8 +2497,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					continue;
 				}
 				if (entry.kind === "callback") {
-					if (ask !== null) await applyCallback(ask, entry.value);
-					else if (sessionCtx !== null) {
+					if (ask !== null) {
+						await applyCallback(ask, entry.value);
+						replyOwed = true;
+					} else if (sessionCtx !== null) {
 						await sessionNotice(sessionCtx, "That question is closed. It was answered or cancelled at the terminal.");
 					} else {
 						await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
@@ -2527,6 +2530,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							`The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`,
 						);
 					}
+					replyOwed = true;
 					ackDelivered(entry.messageId);
 					continue;
 				}
@@ -2535,10 +2539,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					ask.awaitingText = false;
 					ask.custom[ask.index] = entry.value;
 					ask.selected[ask.index] = new Set<string>();
+					replyOwed = true;
 					await advance(ask);
 					continue;
 				}
 				pi.sendUserMessage(entry.value);
+				replyOwed = true;
 				ackDelivered(entry.messageId);
 			}
 		} finally {
