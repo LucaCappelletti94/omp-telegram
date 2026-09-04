@@ -54,14 +54,16 @@ globalThis.fetch = async (url, init) => {
 	if (init?.body instanceof FormData) {
 		const body = {};
 		const files = {};
+		const bytes = {};
 		for (const [key, value] of init.body.entries()) {
 			if (typeof value === "string") body[key] = value;
 			else {
 				body[key] = `<file ${value.size}b>`;
 				files[key] = value.name;
+				bytes[key] = new Uint8Array(await value.arrayBuffer());
 			}
 		}
-		api.calls.push({ method, body, files });
+		api.calls.push({ method, body, files, bytes });
 		if ((api.failMethods ?? []).includes(method)) {
 			return { ok: false, status: 400, json: async () => ({ ok: false, description: "failed by test" }) };
 		}
@@ -3040,6 +3042,68 @@ check(
 	"a photo that falls back is named a document",
 	/__document__\S+__artefact\.png$/u.test(lastCall("sendDocument").files.f0),
 );
+
+// An uncompressed image needs no disguise: the caller asks for document delivery and the
+// original bytes go out under the standard name, extension intact.
+const photoCallsBeforeForced = called("sendPhoto").length;
+const documentsBeforeForced = called("sendDocument").length;
+const forcedSend = await fx.tools
+	.get("notify_file")
+	.execute(
+		"f6-forced",
+		{ paths: [artefact], mode: "document", caption: "full resolution" },
+		undefined,
+		undefined,
+		fx.ctx,
+	);
+check("a forced document reports success", forcedSend.isError !== true);
+check("an image sent as a document never reaches sendPhoto", called("sendPhoto").length === photoCallsBeforeForced);
+check(
+	"an image sent as a document reaches sendDocument",
+	called("sendDocument").length === documentsBeforeForced + 1 &&
+		lastCall("sendDocument").body.document === "attach://f0",
+);
+check(
+	"a forced document keeps the image extension under the standard name",
+	/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__document__[a-z0-9]{5}\S*__artefact\.png$/u.test(
+		lastCall("sendDocument").files.f0,
+	),
+);
+// Lossless delivery is the whole point, so the upload is compared byte for byte with the file.
+check(
+	"a forced document uploads the file byte for byte",
+	Buffer.from(lastCall("sendDocument").bytes.f0).equals(readFileSync(artefact)),
+);
+check(
+	"a forced document shows the document upload status",
+	lastCall("sendChatAction").body.action === "upload_document",
+);
+
+// The album gate would otherwise re-compress a batch the caller asked to keep intact.
+const albumsBeforeForced = called("sendMediaGroup").length;
+const documentsBeforeBatch = called("sendDocument").length;
+await fx.tools
+	.get("notify_file")
+	.execute("f6-forced-batch", { paths: [artefact, artefact2], mode: "document" }, undefined, undefined, fx.ctx);
+check("a forced batch is never turned into an album", called("sendMediaGroup").length === albumsBeforeForced);
+check("a forced batch sends every file as a document", called("sendDocument").length === documentsBeforeBatch + 2);
+
+const photosBeforeAuto = called("sendPhoto").length;
+const autoSend = await fx.tools
+	.get("notify_file")
+	.execute("f6-auto", { paths: [artefact], mode: "auto" }, undefined, undefined, fx.ctx);
+check(
+	"auto mode still compresses an image",
+	autoSend.isError !== true &&
+		called("sendPhoto").length === photosBeforeAuto + 1 &&
+		lastCall("sendPhoto").body.photo === "attach://f0",
+);
+
+const badMode = await fx.tools
+	.get("notify_file")
+	.execute("f6-badmode", { paths: [artefact], mode: "raw" }, undefined, undefined, fx.ctx);
+check("an unknown mode is a clean error", badMode.isError === true);
+check("an unknown mode names the accepted values", /auto|document/u.test(badMode.content[0].text));
 
 const longCallerCaption = "z".repeat(2_000);
 await fx.tools
