@@ -1237,6 +1237,40 @@ check(
 );
 check("a saved file keeps the telegram name and extension last", savedVoice.endsWith("__file_9.oga"));
 
+// An audio file and a document carry their own Telegram name, which survives sanitised.
+api.queued = [
+	{
+		update_id: 510,
+		message: {
+			message_id: 74,
+			date: 1,
+			chat: { id: CHAT },
+			audio: { file_id: "a1", mime_type: "audio/mpeg", file_name: "riff take 3.mp3" },
+		},
+	},
+];
+await voiceSession.pump(250);
+await voiceSession.pump(250);
+const savedAudio = readdirSync(mediaDir).find((f) => f.includes("__u510__")) ?? "";
+check("an audio file is named as audio and keeps its own name", savedAudio.endsWith("__riff_take_3.mp3"));
+check("an audio file names its kind", savedAudio.includes("__audio__"));
+api.queued = [
+	{
+		update_id: 511,
+		message: {
+			message_id: 75,
+			date: 1,
+			chat: { id: CHAT },
+			document: { file_id: "d1", mime_type: "application/pdf", file_name: "review notes.pdf" },
+		},
+	},
+];
+await voiceSession.pump(250);
+await voiceSession.pump(250);
+const savedDoc = readdirSync(mediaDir).find((f) => f.includes("__u511__")) ?? "";
+check("a document is named as a document and keeps its own name", savedDoc.endsWith("__review_notes.pdf"));
+check("a document names its kind", savedDoc.includes("__document__"));
+
 // Drain side, delivered directly: an image becomes an image block, other files travel as paths.
 mkdirSync(mediaDir, { recursive: true });
 const photoPath = join(mediaDir, "photo-test.png");
