@@ -5407,6 +5407,10 @@ heading("caller text kept whole inside its own quote");
 	await fencedAsk;
 
 	// b. The snippet label is capped at 120, which must not land between two halves of an emoji.
+	const numbered = await cut.tools
+		.get("notify_snippet")
+		.execute("cut3", { purpose: 42, text: "paste me" }, undefined, undefined, cut.ctx);
+	check("a snippet label that is not text is refused", numbered.isError === true);
 	await cut.tools
 		.get("notify_snippet")
 		.execute("cut2", { purpose: `${"z".repeat(119)}\u{1F600}tail`, text: "paste me" }, undefined, undefined, cut.ctx);
