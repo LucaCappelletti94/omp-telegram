@@ -251,7 +251,7 @@ await settle(150);
 const keyboard = lastCall("sendMessage").body.reply_markup.inline_keyboard;
 const flatButtons = keyboard.flat();
 const pick = flatButtons.find((b) => b.text.startsWith("Postgres")).callback_data;
-check("a stance-suffixed option refuses to pair beyond the budget", keyboard.length === 3 && keyboard[0].length === 1);
+check("a stance-suffixed option refuses to pair beyond the budget", keyboard.length === 2 && keyboard[0].length === 1);
 check("callback payload carries the asking session's tag", pick.split(":")[1].split("-")[0] === record(two.id).tag);
 check("context is stripped before delegating to the native tool", !("context" in stateA.params));
 
@@ -269,72 +269,22 @@ const single = await runSingle;
 check("the answer reaches the agent", single.details.selectedOptions[0] === "Postgres");
 check("the terminal dialog is aborted", stateA.aborted === true);
 
+// A bare message typed while a question is open is its answer. The question itself opens the
+// reply field, and nothing else can reach the agent until the ask resolves, so no button is needed.
 const stateB = {};
 const runTyped = two.tools.get("ask").execute("c2", singleQuestion, undefined, undefined, stubbornCtx(two.ctx, stateB));
 await settle(150);
-const typeButton = lastCall("sendMessage")
-	.body.reply_markup.inline_keyboard.flat()
-	.find((b) => b.text === "Type an answer").callback_data;
-writeFileSync(join(inboxOf(two.id), "200.json"), JSON.stringify({ kind: "callback", value: typeButton }));
-await two.pump(150);
-check("choosing to type opens a forced reply", lastCall("sendMessage").body.reply_markup.force_reply === true);
+const typedMarkup = lastCall("sendMessage").body.reply_markup;
+check("the question opens the reply field itself", typedMarkup.force_reply === true);
+check(
+	"no button is offered for typing an answer",
+	!typedMarkup.inline_keyboard.flat().some((b) => b.text === "Type an answer"),
+);
 writeFileSync(join(inboxOf(two.id), "201.json"), JSON.stringify({ kind: "text", value: "use duckdb" }));
 await two.pump(150);
 const typed = await runTyped;
-check("typed text becomes customInput", typed.details.customInput === "use duckdb");
-check("typed text is not also treated as a steer", two.steers.length === 0);
-
-// The prompt that "Type an answer" posts must be replyable the instant it exists. Its id only
-// reaches the poller through the session record, so a send that leaves the id in memory until the
-// next heartbeat loses the answer entirely.
-const stateP = {};
-const runPrompted = two.tools
-	.get("ask")
-	.execute("c2b", singleQuestion, undefined, undefined, stubbornCtx(two.ctx, stateP));
-await settle(150);
-const promptedQuestion = api.nextMessage - 1;
-const typeThrough = lastCall("sendMessage")
-	.body.reply_markup.inline_keyboard.flat()
-	.find((b) => b.text === "Type an answer").callback_data;
-api.queued = [
-	{
-		update_id: 101,
-		callback_query: {
-			id: "cb2b",
-			data: typeThrough,
-			from: { id: CHAT },
-			message: { message_id: promptedQuestion, chat: { id: CHAT } },
-		},
-	},
-];
-await one.pump(250);
-await two.pump(150);
-const promptId = api.nextMessage - 1;
-check("the typed-answer prompt is recorded for reply routing", record(two.id).recent.includes(promptId));
-const beforePromptReply = called("sendMessage").length;
-api.queued = [
-	{
-		update_id: 102,
-		message: {
-			message_id: 92,
-			date: 1,
-			chat: { id: CHAT },
-			text: "use duckdb",
-			reply_to_message: { message_id: promptId },
-		},
-	},
-];
-await one.pump(250);
-const promptRefused = called("sendMessage").length > beforePromptReply;
-check("a reply to the prompt is not refused", !promptRefused);
-if (promptRefused) {
-	// A refused reply never settles the ask, which would hang every later ask test. Answer it
-	// directly, purely so the suite can carry on: the assertion below still reports the failure.
-	writeFileSync(join(inboxOf(two.id), "202.json"), JSON.stringify({ kind: "text", value: "unrouted" }));
-}
-await two.pump(150);
-const prompted = await runPrompted;
-check("a reply to the prompt becomes the answer", prompted.details.customInput === "use duckdb");
+check("bare text becomes customInput", typed.details.customInput === "use duckdb");
+check("bare text is not also treated as a steer", two.steers.length === 0);
 
 const multi = {
 	questions: [
@@ -987,10 +937,6 @@ await mq.pump(300);
 await mq.pump(300);
 check("Done advances past the multi-select", lastCall("sendMessage").body.text.includes("Free form?"));
 
-api.queued = [cb(`t:${mixAsk}:2`, 404)];
-await mq.pump(300);
-await mq.pump(300);
-check("typing is offered on the final question", lastCall("sendMessage").body.reply_markup?.force_reply === true);
 api.queued = [{ update_id: 405, message: { message_id: 60, date: 1, chat: { id: CHAT }, text: "something bespoke" } }];
 await mq.pump(300);
 await mq.pump(300);
@@ -1273,7 +1219,7 @@ const escCtx = {
 const escRun = esc.tools.get("ask").execute("e1", escAsk, undefined, undefined, escCtx);
 await settle(150);
 const escMessageId = called("sendMessage").at(-1) ? api.nextMessage - 1 : null;
-check("question was sent with buttons", lastCall("sendMessage").body.reply_markup.inline_keyboard.flat().length === 3);
+check("question was sent with buttons", lastCall("sendMessage").body.reply_markup.inline_keyboard.flat().length === 2);
 rejectLocal(new Error("Ask tool was cancelled by the user"));
 let threw = null;
 await escRun.catch((e) => {
@@ -1935,7 +1881,7 @@ const shape = bpRows.map((r) => r.map((b) => b.text));
 check("three tiny labels share one row", shape[0].length === 3 && shape[0].join(",") === "Yes,No,Skip");
 check("two medium labels pair up", shape[1].length === 2 && shape[1][0] === "Continue");
 check("a long label gets a full row", shape[2].length === 1 && shape[2][0].startsWith("A very long"));
-check("the tail row stays separate from options", shape.at(-1).includes("Type an answer"));
+check("no tail row follows the options", shape.length === 3);
 const bpPick = bpRows.flat().find((b) => b.text === "Review the diff").callback_data;
 writeFileSync(join(inboxOf(bp.id), "995.json"), JSON.stringify({ kind: "callback", value: bpPick }));
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });

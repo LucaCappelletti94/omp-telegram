@@ -212,7 +212,6 @@ interface PendingAsk {
 	messageId: number | null;
 	selected: Set<string>[];
 	custom: Array<string | undefined>;
-	awaitingText: boolean;
 	finish: (results: AskResult[]) => void;
 }
 
@@ -489,11 +488,11 @@ function questionKeyboard(ask: PendingAsk, question: AskQuestion): InlineButton[
 		if (stance?.style !== undefined) button.style = stance.style;
 		return button;
 	});
-	const tail: InlineButton[] = [{ text: "Type an answer", callback_data: `t:${ask.askId}:${ask.index}` }];
+	const rows = packRows(optionButtons);
 	if (question.multi === true) {
-		tail.unshift({ text: "Done", callback_data: `d:${ask.askId}:${ask.index}`, style: "success" });
+		rows.push([{ text: "Done", callback_data: `d:${ask.askId}:${ask.index}`, style: "success" }]);
 	}
-	return [...packRows(optionButtons), ...packRows(tail)];
+	return rows;
 }
 
 /** The options stay visible but dead, with the chosen answers ticked. */
@@ -2161,21 +2160,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const question = ask.questions[ask.index];
 		if (question === undefined) return;
 
-		if (action === "t") {
-			ask.awaitingText = true;
-			if (config !== null) {
-				await sendOrEdit(
-					config,
-					"sendMessage",
-					{
-						chat_id: config.chatId,
-						reply_markup: { force_reply: true, input_field_placeholder: "Your answer" },
-					},
-					`Type your answer to: ${question.question}`,
-				);
-			}
-			return;
-		}
 		if (action === "d") {
 			await advance(ask);
 			return;
@@ -2341,9 +2325,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					ackDelivered(entry.messageId);
 					continue;
 				}
-				const isReplyToQuestion = ask !== null && typeof entry.replyTo === "number" && entry.replyTo === ask.messageId;
-				if (ask !== null && (ask.awaitingText || isReplyToQuestion)) {
-					ask.awaitingText = false;
+				// The ask blocks the turn, so text arriving now can only be its answer: the question opens
+				// the reply field itself, and a plain message routed here by the open question is the same.
+				if (ask !== null) {
 					ask.custom[ask.index] = entry.value;
 					ask.selected[ask.index] = new Set<string>();
 					replyOwed = true;
@@ -2428,7 +2412,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				messageId: null,
 				selected: questions.map(() => new Set<string>()),
 				custom: questions.map(() => undefined),
-				awaitingText: false,
 				finish: remote.resolve,
 			};
 			pendingAsk = ask;
