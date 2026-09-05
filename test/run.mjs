@@ -2183,6 +2183,34 @@ check(
 );
 check("hidequestions clears the recorded close-session offer", record(ux.id).closeOffer === null);
 
+// /hidequestions on a native ask retires its Telegram message but leaves the question open at the
+// terminal, so the retired message says so and the terminal can still answer it.
+const hideState = {};
+const hideRun = ux.tools
+	.get("ask")
+	.execute(
+		"ux-hide-ask",
+		{ questions: [{ id: "h", question: "Hide me?", options: [{ label: "yes" }, { label: "no" }] }] },
+		undefined,
+		undefined,
+		stubbornCtx(ux.ctx, hideState),
+	);
+await settle(150);
+const hideAskId = api.nextMessage - 1;
+writeFileSync(join(inboxOf(ux.id), "6112.json"), JSON.stringify({ kind: "command", value: "hidequestions" }));
+await ux.pump(200);
+const hiddenAsk = called("editMessageText").findLast((c) => c.body.message_id === hideAskId);
+check(
+	"hidequestions retires an open native ask under its badge",
+	hiddenAsk?.body.text.startsWith(badgeHead(ux.id, "pgvector")) === true &&
+		hiddenAsk.body.text.includes("Hide me?") &&
+		hiddenAsk.body.text.includes("stays open at the terminal"),
+);
+check("the hidden ask is still waiting at the terminal", hideState.aborted !== true);
+writeFileSync(join(inboxOf(ux.id), "6113.json"), JSON.stringify({ kind: "text", value: "yes, hide" }));
+await ux.pump(200);
+check("a typed answer still settles the hidden ask", (await hideRun).details.customInput === "yes, hide");
+
 heading("/fleet reads the tmux window titles");
 
 // A fake tmux binary on PATH stands in for the real server.
