@@ -5372,6 +5372,55 @@ heading("a snippet arrives ready to copy");
 	check("a snippet from an unconfigured session is refused", unconfigured.isError === true);
 }
 
+heading("caller text kept whole inside its own quote");
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const cut = spawn("01a06110-0000-0000-0000-000000000000", "/home/dev/work/halfemoji");
+	await cut.fire("session_start");
+
+	// a. A preview carrying its own fence must stay inside the block that quotes it.
+	const fencedState = {};
+	const fencedAsk = cut.tools.get("ask").execute(
+		"cut1",
+		{
+			questions: [
+				{
+					id: "q",
+					question: "Apply it?",
+					options: [{ label: "yes", description: "applies the patch", preview: "```sh\nnpm test\n```" }],
+				},
+			],
+		},
+		undefined,
+		undefined,
+		stubbornCtx(cut.ctx, fencedState),
+	);
+	await settle(150);
+	const quoted = lastCall("sendMessage").body.text;
+	check("a preview carrying its own fence stays in one block", quoted.includes("<pre>```sh\nnpm test\n```</pre>"));
+	check("a quoted preview leaves exactly one block", (quoted.match(/<pre>/g) ?? []).length === 1);
+	const press = (lastCall("sendMessage").body.reply_markup?.inline_keyboard ?? [])
+		.flat()
+		.find((b) => b.callback_data?.startsWith("o:"));
+	writeFileSync(join(inboxOf(cut.id), "8901.json"), JSON.stringify({ kind: "callback", value: press.callback_data }));
+	await cut.pump(250);
+	await fencedAsk;
+
+	// b. The snippet label is capped at 120, which must not land between two halves of an emoji.
+	await cut.tools
+		.get("notify_snippet")
+		.execute("cut2", { purpose: `${"z".repeat(119)}\u{1F600}tail`, text: "paste me" }, undefined, undefined, cut.ctx);
+	check("a capped snippet label holds no lone surrogate", lastCall("sendMessage").body.text.isWellFormed());
+
+	// c. An event without a tool name still labels the tool rather than saying undefined.
+	await cut.fire("agent_start");
+	await cut.fire("tool_execution_start", { intent: "Reading a file" });
+	await settle(120);
+	check("a nameless tool call is still labelled", record(cut.id).state === "working (tool: Reading a file)");
+	await cut.fire("tool_execution_end");
+	await cut.fire("agent_end");
+}
+
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);

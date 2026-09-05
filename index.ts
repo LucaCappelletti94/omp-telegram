@@ -2053,7 +2053,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (description.length > 0) lines.push(description);
 			if (preview.length > 0) {
 				const clipped = clip(preview, PREVIEW_MAX);
-				lines.push(`\`\`\`\n${clipped}\n\`\`\``);
+				// A preview is caller text: a fence run inside it would close the quote and spill the rest.
+				const fence = fenceFor(clipped);
+				lines.push(`${fence}\n${clipped}\n${fence}`);
 				if (preview.length > PREVIEW_MAX) lines.push("(preview truncated)");
 			}
 			blocks.push(lines.join("\n"));
@@ -2899,7 +2901,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (config === null) {
 				return { content: [{ type: "text", text: "Error: Telegram is not configured" }], isError: true };
 			}
-			const purpose = typeof p.purpose === "string" ? p.purpose.trim().slice(0, SNIPPET_PURPOSE_MAX) : "";
+			const purpose = typeof p.purpose === "string" ? clip(p.purpose.trim(), SNIPPET_PURPOSE_MAX) : "";
 			// Trailing newlines are invisible in a code block and only cost room, never meaning.
 			const payload = typeof p.text === "string" ? p.text.replace(/\n+$/, "") : "";
 			const language = typeof p.language === "string" ? p.language.trim() : "";
@@ -3234,7 +3236,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("tool_execution_start", async (event) => {
 		turnTools += 1;
 		const intent = typeof event.intent === "string" && event.intent.length > 0 ? `: ${event.intent}` : "";
-		currentTool = clip(`${event.toolName}${intent}`, 80);
+		currentTool = clip(`${typeof event.toolName === "string" ? event.toolName : "tool"}${intent}`, 80);
 		draftDirty = true;
 		noteState();
 	});
