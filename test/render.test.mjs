@@ -12,6 +12,7 @@ import {
 	fitToTelegram,
 	isMarkupFailure,
 	packRows,
+	plainStamps,
 	relativeTime,
 	stanceOf,
 	TELEGRAM_TEXT_MAX,
@@ -88,6 +89,26 @@ heading("fitting a message to the telegram limit");
 	const cutStamp = fitToTelegram(stamped, "");
 	check("the probe cut would land inside the stamp", cutStamp.indexOf("(truncated") > 4040);
 	check("a cut never lands inside a time stamp", !cutStamp.includes("<tg-time") || cutStamp.includes("</tg-time>"));
+
+	// Telegram does not count a stamp's tag markup, so neither may the budget: forty stamped rows
+	// whose visible text just fits must go out whole rather than lose rows to markup.
+	const row = `${"r".repeat(90)} (${relativeTime(0)})`;
+	const rows = Array.from({ length: 40 }, () => row).join("\n");
+	const visible = rows.replace(/<tg-time[^>]*>|<\/tg-time>/g, "").length;
+	check("the probe's visible text fits while its markup does not", visible <= 4096 && rows.length > 4096);
+	check("stamp markup costs nothing in the budget", fitToTelegram(rows, "") === rows);
+
+	// Only the exact stamp grammar is a stamp. A literal that merely starts like one is text in
+	// every path: it costs budget, it is never dropped at a cut, and the plain form keeps it.
+	const lookalike = `${"z".repeat(4020)} <tg-time example ${"w".repeat(100)}`;
+	const cutLookalike = fitToTelegram(lookalike, "");
+	check("a stamp-like literal is not dropped at a cut", cutLookalike.includes("<tg-time example"));
+	const padded = `${"p".repeat(4090)} <tg-time example>`;
+	check("a stamp-like literal costs budget", fitToTelegram(padded, "") !== padded);
+	check(
+		"the plain form keeps a stamp-like literal and unwraps a real stamp",
+		plainStamps(`<tg-time example> and ${relativeTime(0)}`) === `<tg-time example> and ${clockTime(0)}`,
+	);
 }
 
 heading("classifying a telegram refusal");

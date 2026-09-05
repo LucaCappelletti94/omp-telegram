@@ -4928,7 +4928,7 @@ heading("pinned fleet dashboard");
 		.slice(fillerFrom)
 		.filter((c) => typeof c.body.text === "string" && c.body.text.includes("Fleet"))
 		.at(-1);
-	check("a fleet too big for one message is cut to the limit", (bigBoard?.body.text.length ?? 0) <= 4096);
+	check("a fleet too big for one message is cut to the limit", wireLength(bigBoard?.body.text ?? "") <= 4096);
 	check("the cut board says it was cut", bigBoard?.body.text.includes("truncated") === true);
 	for (const id of filler) rmSync(join(root, "notify-telegram/sessions", `${id}.json`), { force: true });
 	await owner.fire("tool_execution_end", {});

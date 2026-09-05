@@ -95,11 +95,23 @@ export function clockTime(when: number): string {
 }
 
 /**
+ * The one piece of HTML the markdown source carries: a time stamp exactly as `relativeTime` writes
+ * it. Every path that treats a stamp specially matches this and nothing looser, so a literal that
+ * merely starts like one stays ordinary text everywhere.
+ */
+const STAMP = /<tg-time unix="(\d+)"(?: format="([A-Za-z]*)")?>([^<\n]*)<\/tg-time>/g;
+
+/**
  * A stamp the phone renders relative to now ("4 minutes ago") and keeps current itself. The wire
  * text never changes, so a board compared by text is not rewritten every minute for it.
  */
 export function relativeTime(when: number): string {
 	return `<tg-time unix="${Math.floor(when / 1000)}" format="r">${clockTime(when)}</tg-time>`;
+}
+
+/** The text with every stamp reduced to its clock fallback, for a send that carries no entities. */
+export function plainStamps(text: string): string {
+	return text.replace(STAMP, "$3");
 }
 
 /**
@@ -139,12 +151,8 @@ export function toTelegramHtml(source: string): string {
 			},
 		);
 	work = work.replace(/`([^`\n]+)`/g, (_match, code: string) => stash(`<code>${escapeHtml(code)}</code>`));
-	work = work.replace(
-		/<tg-time unix="(\d+)"(?: format="([A-Za-z]*)")?>([^<\n]*)<\/tg-time>/g,
-		(_match, unix: string, format: string | undefined, text: string) =>
-			stash(
-				`<tg-time unix="${unix}"${format === undefined ? "" : ` format="${format}"`}>${escapeHtml(text)}</tg-time>`,
-			),
+	work = work.replace(STAMP, (_match, unix: string, format: string | undefined, text: string) =>
+		stash(`<tg-time unix="${unix}"${format === undefined ? "" : ` format="${format}"`}>${escapeHtml(text)}</tg-time>`),
 	);
 
 	work = escapeHtml(work);
@@ -188,28 +196,32 @@ export function buttonText(label: string, marker = ""): string {
 /**
  * Telegram's 4096 applies to the text after its entities are parsed, verified against the live
  * API: HTML tags and escapes such as `&lt;` cost nothing, and the limit counts code points, so a
- * message of 4096 emoji goes through. The markdown source is therefore the budget, and measuring
- * it in UTF-16 units leaves the fit a little conservative in both directions rather than wrong.
- * `keep` is a short tail, today the usage footer, that survives the cut.
+ * message of 4096 emoji goes through. The markdown source less its stamp markup is therefore the
+ * budget, and measuring it in UTF-16 units leaves the fit a little conservative in both
+ * directions rather than wrong. `keep` is a short tail, today the usage footer, that survives the cut.
  */
 export function fitToTelegram(plain: string, keep: string): string {
+	const budget = (text: string): number => plainStamps(text).length;
 	const whole = plain + keep;
-	if (whole.length <= TELEGRAM_TEXT_MAX) return dropLoneHighSurrogate(whole);
+	if (budget(whole) <= TELEGRAM_TEXT_MAX) return dropLoneHighSurrogate(whole);
+	// A cut inside a stamp would ship its tag as literal text, so a cut pulls back to its start.
+	const stamps: Array<[number, number]> = [...plain.matchAll(STAMP)].map((match) => [
+		match.index,
+		match.index + match[0].length,
+	]);
 	const build = (n: number): string => {
-		let head = dropLoneHighSurrogate(plain.slice(0, n).trimEnd());
+		const inside = stamps.find(([start, end]) => n > start && n < end);
+		let head = dropLoneHighSurrogate(plain.slice(0, inside === undefined ? n : inside[0]).trimEnd());
 		// An odd fence count means the cut landed inside a code block, which would otherwise
 		// degrade to literal backticks for the whole remaining message.
 		if ((head.match(/```/g)?.length ?? 0) % 2 === 1) head += "\n```";
-		// A cut inside a time stamp would ship its tag as literal text.
-		const stamp = head.lastIndexOf("<tg-time");
-		if (stamp >= 0 && !head.includes("</tg-time>", stamp)) head = head.slice(0, stamp).trimEnd();
 		return `${head}${TRUNCATION_NOTE}${keep}`;
 	};
 	let low = 0;
 	let high = plain.length;
 	while (low < high) {
 		const mid = Math.ceil((low + high) / 2);
-		if (build(mid).length <= TELEGRAM_TEXT_MAX) low = mid;
+		if (budget(build(mid)) <= TELEGRAM_TEXT_MAX) low = mid;
 		else high = mid - 1;
 	}
 	return build(low);

@@ -27,6 +27,7 @@ import {
 	type InlineButton,
 	isMarkupFailure,
 	packRows,
+	plainStamps,
 	relativeTime,
 	STANCE,
 	type StatusOption,
@@ -621,9 +622,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (sent === null && isMarkupFailure(refusal)) {
 			pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method, description: refusal });
 			const { message_effect_id: _effect, ...safe } = body;
-			// A time stamp is the one tag the source carries; plain text keeps its clock fallback.
-			const text = source.replace(/<tg-time[^>]*>([^<]*)<\/tg-time>/g, "$1");
-			sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text }, 15_000);
+			sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: plainStamps(source) }, 15_000);
 		} else if (sent === null) {
 			pi.logger.warn("telegram: send refused", { method, description: refusal });
 		}
