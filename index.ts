@@ -1629,14 +1629,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return join(PENDING_MESSAGES_DIR, `${updateId}.json`);
 	}
 
-	function readHeldMessage(updateId: string): { text: string; messageId?: number } | null {
+	/** The held entry is the exact inbox entry the tap delivers, so a command survives the hold unchanged. */
+	function readHeldMessage(updateId: string): InboxEntry | null {
 		if (!/^\d+$/u.test(updateId) || !existsSync(heldMessagePath(updateId))) return null;
 		try {
 			const parsed: unknown = JSON.parse(readFileSync(heldMessagePath(updateId), "utf8"));
 			if (parsed === null || typeof parsed !== "object") return null;
-			const held = parsed as { text?: unknown; messageId?: unknown };
-			if (typeof held.text !== "string" || held.text.length === 0) return null;
-			return { text: held.text, messageId: typeof held.messageId === "number" ? held.messageId : undefined };
+			const held = parsed as Partial<InboxEntry>;
+			if (held.kind !== "text" && held.kind !== "command") return null;
+			if (typeof held.value !== "string" || held.value.length === 0) return null;
+			return {
+				kind: held.kind,
+				value: held.value,
+				...(typeof held.messageId === "number" ? { messageId: held.messageId } : {}),
+			};
 		} catch {
 			return null;
 		}
@@ -1653,17 +1659,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** Holds the message and asks, rather than guessing and landing it in the wrong project. */
+	/** Holds the entry and asks, rather than guessing and landing it in the wrong session. */
 	async function askWhichSession(
 		cfg: Config,
 		update: TelegramUpdate,
-		text: string,
-		messageId: number | undefined,
+		entry: InboxEntry,
+		header: string,
 		rivals: Array<{ id: string; record: SessionRecord }>,
 	): Promise<void> {
 		mkdirSync(PENDING_MESSAGES_DIR, { recursive: true, mode: 0o700 });
-		writeFileAtomic(heldMessagePath(String(update.update_id)), JSON.stringify({ text, messageId }), 0o600);
-		const header = `\u{1F535} ${rivals.length} sessions finished within a minute of each other, so I did not guess. Which one did you mean?`;
+		writeFileAtomic(heldMessagePath(String(update.update_id)), JSON.stringify(entry), 0o600);
 		// One block per rival and a whole fleet can be rivals, so the list can outgrow one message.
 		// It is cut by whole entries and the keyboard is built from the same ones: a shortened list
 		// beside a full keyboard would offer a choice the reader cannot see.
@@ -1712,7 +1717,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	/** A press on the picker delivers the held message to the chosen session. */
+	/** A press on the picker delivers the held entry to the chosen session. */
 	async function deliverHeldMessage(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
 		const [, rawUpdate = "", tag = ""] = (callback.data ?? "").split(":");
 		const held = readHeldMessage(rawUpdate);
@@ -1720,24 +1725,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			({ record }) => record.tag === tag && Date.now() - record.heartbeat <= LOCK_STALE_MS,
 		);
 		const gone = held === null || owner === undefined;
+		const stopping = held?.kind === "command";
 		await callTelegram(
 			cfg,
 			"answerCallbackQuery",
 			{
 				callback_query_id: callback.id,
-				text: gone ? "That message is no longer waiting." : "Sending it there.",
+				text: gone ? "That message is no longer waiting." : stopping ? "Stopping it." : "Sending it there.",
 			},
 			10_000,
 		);
 		const closing = gone
 			? "\u{1F535} That message is no longer waiting."
-			: `\u{1F535} Sent to ${badgeOf(owner.record)}.`;
+			: `\u{1F535} ${stopping ? "Stopping" : "Sent to"} ${badgeOf(owner.record)}.`;
 		if (!gone) {
-			deliver(owner.id, Number.parseInt(rawUpdate, 10), {
-				kind: "text",
-				value: held.text,
-				messageId: held.messageId,
-			});
+			deliver(owner.id, Number.parseInt(rawUpdate, 10), held);
 			try {
 				unlinkSync(heldMessagePath(rawUpdate));
 			} catch {}
@@ -1843,8 +1845,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 		if (command === "stop") {
-			// Aborting the wrong turn is worse than asking: a bare /stop goes only to the one session
-			// mid-turn, and a reply names its target outright.
+			// Aborting the wrong turn is worse than guessing: a reply names its target outright, a
+			// bare /stop goes to the one session mid-turn, and with several the user picks. A session
+			// on its first turn may have sent nothing replyable yet, so a picker is the only way in.
 			if (replyTo !== undefined) {
 				const target = routeMessage(replyTo);
 				if (target === null) {
@@ -1858,15 +1861,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				({ record }) =>
 					Date.now() - record.heartbeat <= LOCK_STALE_MS && record.state.length > 0 && record.state !== "idle",
 			);
+			if (running.length === 0) {
+				await serviceNotice("No turn is running.", false);
+				return;
+			}
 			if (running.length === 1 && running[0] !== undefined) {
 				deliver(running[0].id, update.update_id, { kind: "command", value: command });
 				return;
 			}
-			await serviceNotice(
-				running.length === 0
-					? "No turn is running."
-					: `${running.length} sessions are running a turn. Reply /stop to a message from the one you mean.`,
-				false,
+			await askWhichSession(
+				cfg,
+				update,
+				{ kind: "command", value: command },
+				`\u{1F535} ${running.length} sessions are running a turn. Which one should stop?`,
+				running,
 			);
 			return;
 		}
@@ -1934,7 +1942,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				// An open question outranks recency: a bare message plainly answers it.
 				const asking = rivals.filter(({ record }) => record.state === WAITING_ON_QUESTION);
 				if (asking.length !== 1 || asking[0] === undefined) {
-					await askWhichSession(cfg, update, text, message.message_id, rivals);
+					await askWhichSession(
+						cfg,
+						update,
+						{ kind: "text", value: text, messageId: message.message_id },
+						`\u{1F535} ${rivals.length} sessions finished within a minute of each other, so I did not guess. Which one did you mean?`,
+						rivals,
+					);
 					return;
 				}
 				routed = asking[0].id;

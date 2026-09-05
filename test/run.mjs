@@ -4397,16 +4397,37 @@ heading("stopping a turn from the chat");
 	check("the running session aborts", busy.aborts === 1);
 	check("the idle session is untouched", still.aborts === 0);
 
-	// b. Two sessions running: the poller refuses rather than guessing which turn to kill.
+	// b. Two sessions running, neither of which need have sent a replyable message yet: the poller
+	// offers one button per running session instead of guessing or demanding a reply.
 	const other = spawn("01a060c2-0000-0000-0000-000000000000", "/home/dev/work/other");
 	await other.fire("session_start");
 	await other.fire("agent_start");
+	await busy.fire("agent_start");
 	const before = called("sendMessage").length;
 	api.queued = [{ update_id: 941, message: { message_id: 941, date: 1, chat: { id: CHAT }, text: "/stop" } }];
 	await still.pump(250);
-	check("an ambiguous stop reaches no session", inboxCount(busy.id) === 0 && inboxCount(other.id) === 0);
-	const refusal = called("sendMessage").slice(before).at(-1)?.body.text ?? "";
-	check("an ambiguous stop asks for a reply", /2 sessions/.test(refusal) && /reply/i.test(refusal));
+	check("an ambiguous stop reaches no session by itself", inboxCount(busy.id) === 0 && inboxCount(other.id) === 0);
+	const stopPicker = called("sendMessage").slice(before).at(-1)?.body;
+	const stopButtons = stopPicker?.reply_markup?.inline_keyboard?.flat() ?? [];
+	check("an ambiguous stop asks which session", /2 sessions/.test(stopPicker?.text ?? "") && stopButtons.length === 2);
+	const stopOther = stopButtons.find((b) => b.text.includes("other"))?.callback_data ?? "m:941:none";
+	api.queued = [
+		{
+			update_id: 9411,
+			callback_query: {
+				id: "cbstop",
+				data: stopOther,
+				from: { id: CHAT },
+				message: { message_id: api.nextMessage - 1, chat: { id: CHAT } },
+			},
+		},
+	];
+	await still.pump(250);
+	check("the tap delivers the stop to the chosen session", inboxCount(other.id) === 1 && inboxCount(busy.id) === 0);
+	await other.pump(250);
+	check("the chosen session aborts", other.aborts === 1);
+	check("the other running session keeps going", busy.aborts === 1);
+	check("the picker says which session is stopping", /Stopping .*other/.test(lastCall("editMessageText").body.text));
 
 	// c. Nothing running: the poller says so instead of staying silent.
 	await busy.fire("agent_end");
