@@ -152,8 +152,6 @@ interface SessionRecord {
 	closeOffer: number | null;
 	/** Message pinned for a red status; unpinned when the next turn starts. */
 	pinned: number | null;
-	/** Draft-stream identifier; a stop press routes back through it. */
-	draftId: number;
 	/** What this session is doing, so one session can answer `/status` for the whole fleet. */
 	state: string;
 	/** Provider weather for the current turn: a retry, a fallback, or a recovery. */
@@ -190,7 +188,6 @@ interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
 	callback_query?: TelegramCallbackQuery;
-	stopped_message_generation?: { chat: { id: number }; draft_id: number };
 }
 
 interface AskResult {
@@ -651,7 +648,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			standing: standingQuestion,
 			closeOffer: closeOfferMessageId,
 			pinned: pinnedMessageId,
-			draftId,
 			state: lastState,
 			health: lastHealth,
 			summary: lastSummary,
@@ -705,7 +701,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				standing: typeof raw.standing === "object" && raw.standing !== null ? raw.standing : null,
 				closeOffer: messageId(raw.closeOffer),
 				pinned: messageId(raw.pinned),
-				draftId: count(raw.draftId),
 				state: text(raw.state),
 				health: text(raw.health),
 				summary: text(raw.summary),
@@ -1403,7 +1398,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		const text = tail.length > 0 ? `${prefix}${tail}${suffix}` : `${context}${suffix}`;
 		const cfg = config;
-		const body = { chat_id: cfg.chatId, draft_id: draftId, can_stop: true };
+		const body = { chat_id: cfg.chatId, draft_id: draftId };
 		detach(
 			(async () => {
 				// Unclosed constructs degrade to literal text in toTelegramHtml, so a rendered draft is safe
@@ -1763,16 +1758,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<void> {
-		const stopped = update.stopped_message_generation;
-		if (stopped !== undefined) {
-			if (stopped.chat.id === cfg.chatId) {
-				const owner = allRecords().find(
-					({ record }) => record.draftId === stopped.draft_id && Date.now() - record.heartbeat <= LOCK_STALE_MS,
-				)?.id;
-				if (owner !== undefined) deliver(owner, update.update_id, { kind: "command", value: "stopturn" });
-			}
-			return;
-		}
 		const callback = update.callback_query;
 		if (callback !== undefined && callback.data !== undefined) {
 			if (callback.message?.chat.id !== cfg.chatId || callback.from?.id !== cfg.chatId) {
@@ -1838,10 +1823,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const replyTo = message.reply_to_message?.message_id;
 		const text = message.text ?? message.caption;
 
-		const command = typeof text === "string" ? /^\/(hidequestions|status|fleet)\b/u.exec(text.trim())?.[1] : undefined;
+		const command =
+			typeof text === "string" ? /^\/(hidequestions|status|fleet|stop)\b/u.exec(text.trim())?.[1] : undefined;
 		if (command === "fleet") {
-			// Rendered rather than sent through sendOrEdit: the row links need HTML, but a fleet
-			// listing is not a session message and must stay out of the reply-routing history.
+			// Sent directly rather than through sendOrEdit: a fleet listing is not a session message
+			// and must stay out of the reply-routing history.
 			const report = fitToTelegram(fleetReport() ?? "\u{1F535} No tmux server is reachable from this process.", "");
 			await callTelegram(
 				cfg,
@@ -1853,6 +1839,34 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					link_preview_options: { is_disabled: true },
 				},
 				15_000,
+			);
+			return;
+		}
+		if (command === "stop") {
+			// Aborting the wrong turn is worse than asking: a bare /stop goes only to the one session
+			// mid-turn, and a reply names its target outright.
+			if (replyTo !== undefined) {
+				const target = routeMessage(replyTo);
+				if (target === null) {
+					await serviceNotice("No live omp session owns that message, so nothing was stopped.", false);
+					return;
+				}
+				deliver(target, update.update_id, { kind: "command", value: command });
+				return;
+			}
+			const running = allRecords().filter(
+				({ record }) =>
+					Date.now() - record.heartbeat <= LOCK_STALE_MS && record.state.length > 0 && record.state !== "idle",
+			);
+			if (running.length === 1 && running[0] !== undefined) {
+				deliver(running[0].id, update.update_id, { kind: "command", value: command });
+				return;
+			}
+			await serviceNotice(
+				running.length === 0
+					? "No turn is running."
+					: `${running.length} sessions are running a turn. Reply /stop to a message from the one you mean.`,
+				false,
 			);
 			return;
 		}
@@ -1958,7 +1972,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				{
 					offset: config.offset,
 					timeout: LONG_POLL_S,
-					allowed_updates: ["message", "callback_query", "stopped_message_generation"],
+					allowed_updates: ["message", "callback_query"],
 				},
 				(LONG_POLL_S + 10) * 1000,
 			);
@@ -2245,9 +2259,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						}
 						retireCloseOffer(true);
 					}
-					if (entry.value === "stopturn" && sessionCtx !== null && turnActive) {
-						sessionCtx.abort();
-						detach(sessionNotice(sessionCtx, "Stopping at your request."), "stop notice");
+					if (entry.value === "stop" && sessionCtx !== null) {
+						if (turnActive) {
+							sessionCtx.abort();
+							detach(sessionNotice(sessionCtx, "Stopping at your request."), "stop notice");
+						} else {
+							detach(sessionNotice(sessionCtx, "No turn is running here."), "stop notice");
+						}
 					}
 					if (entry.value === "status" && sessionCtx !== null) {
 						// Our own line has to be current before it is read back with everyone else's.
@@ -2894,6 +2912,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						{ command: "status", description: "Show what each session is doing" },
 						{ command: "fleet", description: "List every tmux omp window and its state" },
 						{ command: "hidequestions", description: "Hide open question buttons" },
+						{ command: "stop", description: "Abort the running turn, reply to pick the session" },
 					],
 				},
 				15_000,

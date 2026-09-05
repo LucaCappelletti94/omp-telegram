@@ -396,8 +396,8 @@ check(
 	one.warns.some((w) => w.m.includes("unexpected origin")),
 );
 check(
-	"allowed_updates asks for all three kinds",
-	lastCall("getUpdates").body.allowed_updates.join(",") === "message,callback_query,stopped_message_generation",
+	"allowed_updates asks for messages and button presses",
+	lastCall("getUpdates").body.allowed_updates.join(",") === "message,callback_query",
 );
 check(
 	"offset advances past rejected updates",
@@ -2290,12 +2290,13 @@ rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 const fx = spawn("01a04b00-0000-0000-0000-000000000000", "/home/dev/work/quackml");
 await fx.fire("session_start");
 check(
-	"the status command is registered",
-	lastCall("setMyCommands").body.commands.some((c) => c.command === "status"),
+	"the status and stop commands are registered",
+	["status", "stop"].every((name) => lastCall("setMyCommands").body.commands.some((c) => c.command === name)),
 );
 check("the menu button exposes commands", lastCall("setChatMenuButton").body.menu_button.type === "commands");
 
-// Drafts stream the partial answer with a native stop control.
+// Drafts stream the partial answer. No stop control: with several sessions streaming, one bubble
+// flips between them and the button would abort whichever painted last.
 await fx.fire("agent_start");
 await fx.fire("message_update", {
 	message: { role: "assistant", content: [{ type: "text", text: "Partial answer" }] },
@@ -2303,8 +2304,8 @@ await fx.fire("message_update", {
 await fx.pump(150);
 const draft = lastCall("sendMessageDraft");
 check("a partial answer streams as a draft", draft?.body.text.includes("Partial answer") === true);
-check("the draft carries a stop control", draft.body.can_stop === true);
-check("the draft id matches the session record", draft.body.draft_id === record(fx.id).draftId);
+check("the draft carries no stop control", draft.body.can_stop === undefined);
+check("the draft has a stable non-zero id", typeof draft.body.draft_id === "number" && draft.body.draft_id !== 0);
 const draftContext = `Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
 check("every draft starts with session context", draft.body.text.startsWith(draftContext));
 
@@ -2327,17 +2328,9 @@ check(
 	) &&
 		switchedDraft.text.includes("Partial answer after fallback") &&
 		switchedDraft.text.includes("bash: Running tests") &&
-		switchedDraft.can_stop === true,
+		switchedDraft.can_stop === undefined,
 );
 fx.ctx.model = { provider: "openai", id: "gpt-5.6-sol" };
-
-// A stop press on the draft aborts the running turn.
-api.queued = [{ update_id: 700, stopped_message_generation: { chat: { id: CHAT }, draft_id: record(fx.id).draftId } }];
-await fx.pump(250);
-await fx.pump(250);
-check("a stop press aborts the running turn", fx.aborts === 1);
-const fxSessionContext = `\u{1F535} Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
-check("a stop notice begins with session context", lastCall("sendMessage").body.text.startsWith(fxSessionContext));
 
 // Usage lands as a footer on the turn-end summary.
 await fx.fire("message_end", {
@@ -2624,6 +2617,7 @@ fx.ctx.model = { provider: "openai", id: "gpt-5.6-sol" };
 process.env.PATH = pathBeforeTmuxTest;
 await fx.fire("agent_end");
 
+const fxSessionContext = `\u{1F535} Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
 // /status answers from the extension without touching the agent.
 writeFileSync(join(inboxOf(fx.id), "701.json"), JSON.stringify({ kind: "command", value: "status" }));
 await fx.pump(250);
@@ -2901,11 +2895,12 @@ await settle(1500);
 await rv.pump(80);
 check("the throttle releases after its window", called("sendMessageDraft").length === draftCount + 1);
 
-// A stop command while idle is a no-op.
+// /stop at an idle session aborts nothing and says so.
 await rv.fire("agent_end");
-writeFileSync(join(inboxOf(rv.id), "801.json"), JSON.stringify({ kind: "command", value: "stopturn" }));
+writeFileSync(join(inboxOf(rv.id), "801.json"), JSON.stringify({ kind: "command", value: "stop" }));
 await rv.pump(200);
 check("a stop command while idle does not abort", rv.aborts === 0);
+check("a stop command while idle explains itself", /no turn is running/i.test(lastCall("sendMessage").body.text));
 
 // /status names the running tool.
 await rv.fire("input");
@@ -2977,20 +2972,38 @@ check(
 	downloaded !== undefined && (statSync(join(mediaDir, downloaded)).mode & 0o777) === 0o600,
 );
 
-// A stop press routes to the drafting session, not to the poller.
+// /stop as a reply targets the replied-to session, not the poller.
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 const rvA = spawn("01a04d00-0000-0000-0000-000000000000", "/home/dev/work/polars");
 await rvA.fire("session_start");
 const rvB = spawn("01a04d01-0000-0000-0000-000000000000", "/home/dev/work/arrow");
 await rvB.fire("session_start");
+await rvB.fire("input");
+await rvB.tools
+	.get("notify_status")
+	.execute("rvb1", { summary: "Arrow round done.", urgency: "green" }, undefined, undefined, rvB.ctx);
+await rvB.fire("session_stop");
+await settle(150);
+const rvBMessage = record(rvB.id).recent.at(-1);
 await rvB.fire("agent_start");
-api.queued = [{ update_id: 730, stopped_message_generation: { chat: { id: CHAT }, draft_id: record(rvB.id).draftId } }];
+api.queued = [
+	{
+		update_id: 730,
+		message: {
+			message_id: 730,
+			date: 1,
+			chat: { id: CHAT },
+			text: "/stop",
+			reply_to_message: { message_id: rvBMessage },
+		},
+	},
+];
 await rvA.pump(250);
-check("the stop routes to the drafting session's inbox", inboxCount(rvB.id) === 1);
+check("the stop routes to the replied-to session's inbox", inboxCount(rvB.id) === 1);
 const stopEntry = readdirSync(inboxOf(rvB.id))[0];
 check("inbox entries are private", (statSync(join(inboxOf(rvB.id), stopEntry)).mode & 0o777) === 0o600);
 await rvB.pump(250);
-check("the drafting session aborts", rvB.aborts === 1);
+check("the replied-to session aborts", rvB.aborts === 1);
 check("the poller session does not", rvA.aborts === 0);
 
 // streamDrafts: false silences the stream entirely.
@@ -4357,6 +4370,53 @@ heading("ambiguous plain messages ask which session");
 	check("a list that fits whole omits nobody", brim?.text.includes("not listed") !== true);
 	check("a list that fits whole keeps every button", (brim?.reply_markup.inline_keyboard ?? []).flat().length === 2);
 	writeFileSync(rightPath, JSON.stringify(rightRecord));
+}
+
+heading("stopping a turn from the chat");
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	// A bare /stop goes to the one session mid-turn, so every earlier session has to read as idle.
+	for (const entry of readdirSync(sessionsDir)) {
+		const path = join(sessionsDir, entry);
+		try {
+			const parsed = JSON.parse(readFileSync(path, "utf8"));
+			writeFileSync(path, JSON.stringify({ ...parsed, state: "idle" }));
+		} catch {}
+	}
+	const still = spawn("01a060c0-0000-0000-0000-000000000000", "/home/dev/work/still");
+	await still.fire("session_start");
+	const busy = spawn("01a060c1-0000-0000-0000-000000000000", "/home/dev/work/busy");
+	await busy.fire("session_start");
+	await busy.fire("agent_start");
+
+	// a. Exactly one session is running a turn: a bare /stop reaches it.
+	api.queued = [{ update_id: 940, message: { message_id: 940, date: 1, chat: { id: CHAT }, text: "/stop" } }];
+	await still.pump(250);
+	check("a bare stop reaches the one running session", inboxCount(busy.id) === 1 && inboxCount(still.id) === 0);
+	await busy.pump(250);
+	check("the running session aborts", busy.aborts === 1);
+	check("the idle session is untouched", still.aborts === 0);
+
+	// b. Two sessions running: the poller refuses rather than guessing which turn to kill.
+	const other = spawn("01a060c2-0000-0000-0000-000000000000", "/home/dev/work/other");
+	await other.fire("session_start");
+	await other.fire("agent_start");
+	const before = called("sendMessage").length;
+	api.queued = [{ update_id: 941, message: { message_id: 941, date: 1, chat: { id: CHAT }, text: "/stop" } }];
+	await still.pump(250);
+	check("an ambiguous stop reaches no session", inboxCount(busy.id) === 0 && inboxCount(other.id) === 0);
+	const refusal = called("sendMessage").slice(before).at(-1)?.body.text ?? "";
+	check("an ambiguous stop asks for a reply", /2 sessions/.test(refusal) && /reply/i.test(refusal));
+
+	// c. Nothing running: the poller says so instead of staying silent.
+	await busy.fire("agent_end");
+	await other.fire("agent_end");
+	const quiet = called("sendMessage").length;
+	api.queued = [{ update_id: 942, message: { message_id: 942, date: 1, chat: { id: CHAT }, text: "/stop" } }];
+	await still.pump(250);
+	const nothing = called("sendMessage").slice(quiet).at(-1)?.body.text ?? "";
+	check("a stop with nothing running says so", /no turn is running/i.test(nothing));
+	check("it reaches no session", inboxCount(busy.id) === 0 && inboxCount(other.id) === 0);
 }
 
 heading("settings apply without a restart");
