@@ -233,18 +233,42 @@ check("badges differ between live sessions", record(one.id).emoji !== record(two
 
 // ---------------------------------------------------------------- quiet window
 heading("quiet window");
+// Typing at the terminal means the summary can wait, not that it can vanish: it still lands in
+// the chat, without a sound, so the record stays complete for later and for /status.
 writeConfig({ quietSeconds: 3600 });
 const quiet = spawn("01a03410-0000-0000-0000-000000000000", "/home/dev/work/los");
 await quiet.fire("session_start");
+await quiet.tools
+	.get("notify_status")
+	.execute("q1", { summary: "Quietly done.", urgency: "green" }, undefined, undefined, quiet.ctx);
 await quiet.fire("session_stop");
 await settle();
-check("turn end suppressed while the human is typing", record(quiet.id).lastNotified === 0);
+const quietSent = lastCall("sendMessage").body;
+check("turn end still lands while the human is typing", record(quiet.id).lastNotified > 0);
+check(
+	"it goes out without a sound",
+	quietSent.disable_notification === true && quietSent.text.includes("Quietly done."),
+);
+check("the record keeps the quiet summary for /status", record(quiet.id).summary === "Quietly done.");
+await quiet.tools
+	.get("notify_status")
+	.execute(
+		"q2",
+		{ summary: "Quiet choice.", urgency: "orange", options: ["Go", "Wait"] },
+		undefined,
+		undefined,
+		quiet.ctx,
+	);
+await quiet.fire("session_stop");
+await settle();
+check("a quiet standing question is silent too", lastCall("sendMessage").body.disable_notification === true);
 writeConfig();
 const loud = spawn("01a03411-0000-0000-0000-000000000000", "/home/dev/work/los");
 await loud.fire("session_start");
 await loud.fire("session_stop");
 await settle();
 check("turn end delivered once the quiet window lapses", record(loud.id).lastNotified > 0);
+check("a turn end outside the window rings", lastCall("sendMessage").body.disable_notification === undefined);
 
 // ------------------------------------------------------------------- answering
 heading("answering a question");
