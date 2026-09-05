@@ -1460,8 +1460,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	/** Green gets the celebration effect; red gets pinned by the caller. */
-	function urgencyExtras(urgency: TurnStatus["urgency"]): Record<string, unknown> {
+	/**
+	 * Green gets the celebration effect; red gets pinned by the caller. A turn ending while the
+	 * user is typing at the terminal still lands, without a sound and without the confetti.
+	 */
+	function urgencyExtras(urgency: TurnStatus["urgency"], quiet: boolean): Record<string, unknown> {
+		if (quiet) return { disable_notification: true };
 		if (urgency !== "green" || config === null || config.chatId <= 0) return {};
 		return { message_effect_id: GREEN_EFFECT_ID };
 	}
@@ -2094,6 +2098,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		ctx: ExtensionContext,
 		title: string,
 		recorded: TurnStatus,
+		quiet: boolean,
 		keep = "",
 	): Promise<void> {
 		if (config === null || recorded.options === undefined) return;
@@ -2129,7 +2134,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			{
 				chat_id: config.chatId,
 				reply_markup: { inline_keyboard: keyboard, force_reply: true },
-				...urgencyExtras(recorded.urgency),
+				...urgencyExtras(recorded.urgency, quiet),
 			},
 			body,
 			keep,
@@ -3178,7 +3183,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		replyOwed = false;
 		approvalWaiting = false;
 		if (config === null || !config.notifyOnTurnEnd) return;
-		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
+		const quiet = Date.now() - lastLocalInput < config.quietSeconds * 1000;
 		const where = tmuxLocation();
 		const suffix = where === null ? "" : ` (tmux ${where})`;
 
@@ -3194,7 +3199,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			lastSummary = clip(recorded.text.split("\n")[0]?.trim() ?? "", STATUS_SUMMARY_MAX);
 			lastSummaryAt = Date.now();
 			if (recorded.options === undefined) {
-				const extra: Record<string, unknown> = { ...urgencyExtras(recorded.urgency) };
+				const extra: Record<string, unknown> = { ...urgencyExtras(recorded.urgency, quiet) };
 				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
 				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
@@ -3209,7 +3214,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				detach(work, "turn-end notice");
 				return;
 			}
-			detach(sendStandingQuestion(ctx, heads[recorded.urgency] + suffix, recorded, usageFooter()), "turn-end question");
+			detach(
+				sendStandingQuestion(ctx, heads[recorded.urgency] + suffix, recorded, quiet, usageFooter()),
+				"turn-end question",
+			);
 			return;
 		}
 
@@ -3226,7 +3234,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const wantsReply = /\?\s*$/m.test(tail);
 		const title = `${wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished"}${suffix}`;
 		detach(
-			notify(ctx, title, tail.length > 0 ? tail : "Awaiting your next instruction.", {}, usageFooter()),
+			notify(
+				ctx,
+				title,
+				tail.length > 0 ? tail : "Awaiting your next instruction.",
+				quiet ? { disable_notification: true } : {},
+				usageFooter(),
+			),
 			"turn-end notice",
 		);
 	});

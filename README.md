@@ -26,7 +26,7 @@ extensions:
   - ~/path/to/omp-telegram
 ```
 
-In the JSON config, `quietSeconds` (default 45) silences turn end notices while you are typing at the terminal, `notifyOnTurnEnd: false` disables them, and `streamDrafts: false` turns off live draft streaming. `pinnedDashboard: true` adds a pinned message that always shows every live session and rewrites itself in place, no more than once every `dashboardSeconds` (default 30) and only when the text actually changed. Edits apply within about fifteen seconds to sessions already running, so no restart is needed. Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops omp's own bell from flagging tmux windows.
+In the JSON config, `quietSeconds` (default 45) makes turn end notices arrive without a sound while you are typing at the terminal, `notifyOnTurnEnd: false` disables them, and `streamDrafts: false` turns off live draft streaming. `pinnedDashboard: true` adds a pinned message that always shows every live session and rewrites itself in place, no more than once every `dashboardSeconds` (default 30) and only when the text actually changed. Edits apply within about fifteen seconds to sessions already running, so no restart is needed. Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops omp's own bell from flagging tmux windows.
 
 ## Answering
 
