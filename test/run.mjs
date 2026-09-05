@@ -120,6 +120,43 @@ const badgeHead = (id, folder) => {
 	const { emoji } = record(id);
 	return `${emoji.length > 0 ? `${emoji} ` : ""}${folder} \u00B7 `;
 };
+/**
+ * What Telegram counts: the text left once its entities are parsed, so tags and escapes are free.
+ * Walked rather than stripped with a regex, which reads as HTML sanitisation and is not one.
+ */
+const wireLength = (html) => {
+	let count = 0;
+	let inTag = false;
+	for (let i = 0; i < html.length; i++) {
+		const ch = html[i];
+		if (inTag) {
+			if (ch === ">") inTag = false;
+			continue;
+		}
+		if (ch === "<") {
+			inTag = true;
+			continue;
+		}
+		if (ch === "&") {
+			const end = html.indexOf(";", i);
+			if (end > i && end - i <= 8) i = end;
+		}
+		count += 1;
+	}
+	return count;
+};
+/** The badge line as the session writes it: emoji, working folder, then its label or its tag. */
+const badgeLineOf = (id) => {
+	const own = record(id);
+	const folder = own.cwd
+		.split("/")
+		.filter((part) => part.length > 0)
+		.pop();
+	const detail = own.label.length > 0 ? own.label : own.name.length > 0 ? own.name : own.tag;
+	return `${own.emoji.length > 0 ? `${own.emoji} ` : ""}${folder} \u00B7 ${detail}`;
+};
+/** notify_status refuses an option with no description; most tests do not care what it says. */
+const opts = (...labels) => labels.map((label) => ({ label, description: `what "${label}" does` }));
 const inboxCount = (id) =>
 	existsSync(inboxOf(id)) ? readdirSync(inboxOf(id)).filter((f) => f.endsWith(".json")).length : 0;
 
@@ -1071,7 +1108,7 @@ check("spoiler renders", mdBody.text.includes("<tg-spoiler>secret</tg-spoiler>")
 check("snake_case is left alone", mdBody.text.includes("snake_case_name"));
 check("bare multiplication is left alone", mdBody.text.includes("2 * 3"));
 
-// An oversized body must still be sent, shrunk to fit.
+// Escaping costs nothing on the wire, so a body dense in angle brackets is not cut early.
 const huge = "<".repeat(3500);
 mdSession.tools
 	.get("ask")
@@ -1083,7 +1120,27 @@ mdSession.tools
 		stubbornCtx(mdSession.ctx, {}),
 	);
 await settle(200);
-check("an oversized message is shrunk below the telegram ceiling", lastCall("sendMessage").body.text.length <= 4096);
+check(
+	"a body dense in escapes is sent whole",
+	!lastCall("sendMessage").body.text.includes("truncated, full text at the terminal"),
+);
+
+// A body over the real ceiling must still be sent, shrunk to fit.
+mdSession.tools
+	.get("ask")
+	.execute(
+		"hg2",
+		{ context: "x".repeat(5000), questions: [{ id: "q", question: "ok?", options: [{ label: "yes" }] }] },
+		undefined,
+		undefined,
+		stubbornCtx(mdSession.ctx, {}),
+	);
+await settle(200);
+check(
+	"an oversized message is shrunk below the telegram ceiling",
+	wireLength(lastCall("sendMessage").body.text) <= 4096 &&
+		lastCall("sendMessage").body.text.includes("truncated, full text at the terminal"),
+);
 
 // Media reaches the agent: photos as images, voice and documents as saved file paths.
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
@@ -1263,8 +1320,10 @@ check(
 );
 check("it says it was cancelled at the terminal", closing.body.text.includes("Cancelled at the terminal"));
 check(
-	"cancelled native question keeps the badge and question",
-	closing.body.text.startsWith(badgeHead(esc.id, "subql")) &&
+	"cancelled native question retains context and question",
+	closing.body.text.startsWith(
+		`${badgeLineOf(esc.id)}\nTask: subql [${record(esc.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) &&
 		closing.body.text.includes("Proceed?") &&
 		closing.body.text.includes("Cancelled at the terminal"),
 );
@@ -1282,7 +1341,7 @@ check("the reply explains the question is closed", lastCall("sendMessage").body.
 check(
 	"a stale question notice begins with session context",
 	lastCall("sendMessage").body.text.startsWith(
-		`\u{1F535} Task: subql [${record(esc.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+		`\u{1F535} ${badgeLineOf(esc.id)}\nTask: subql [${record(esc.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
 	),
 );
 
@@ -1414,8 +1473,10 @@ writeFileSync(join(inboxOf(st.id), "970.json"), JSON.stringify({ kind: "callback
 await st.pump(250);
 const settledStance = lastCall("editMessageText");
 check(
-	"selected native answer retains badge, question, result, and buttons",
-	settledStance.body.text.startsWith(badgeHead(st.id, "diesel")) &&
+	"selected native answer retains context, question, result, and buttons",
+	settledStance.body.text.startsWith(
+		`${badgeLineOf(st.id)}\nTask: diesel [${record(st.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) &&
 		settledStance.body.text.includes("Which approach?") &&
 		settledStance.body.text.includes("Answered:") &&
 		settledStance.body.text.includes("the good one") &&
@@ -1616,16 +1677,19 @@ check(
 		rs.tools.get("notify_status").description.includes("criterion benchmarks") &&
 		rs.tools.get("notify_status").description.includes("maintainer"),
 );
+const blockReason = firstStop.find((r) => r?.decision === "block").reason;
 check(
 	"the block requires self-contained phone choices",
-	firstStop.find((r) => r?.decision === "block").reason.includes("answerable from a phone") &&
-		firstStop.find((r) => r?.decision === "block").reason.includes("what each option does or costs") &&
-		firstStop.find((r) => r?.decision === "block").reason.includes("Never use only a phase number or letter"),
+	blockReason.includes("answerable from a phone") &&
+		blockReason.includes("what choosing it does or costs") &&
+		blockReason.includes("an option with no description is refused") &&
+		blockReason.includes("Never use only a phase number or letter"),
 );
 check(
 	"notify_status requires self-contained phone choices",
 	rs.tools.get("notify_status").description.includes("answerable from a phone") &&
-		rs.tools.get("notify_status").description.includes("what each option does or costs") &&
+		rs.tools.get("notify_status").description.includes("what choosing it does or costs") &&
+		rs.tools.get("notify_status").description.includes("an option with no description is refused") &&
 		rs.tools.get("notify_status").description.includes("Never use only a phase number or letter"),
 );
 check(
@@ -1698,7 +1762,7 @@ await tq.tools.get("notify_status").execute(
 		summary: "Refactor done, diff is large.",
 		urgency: "orange",
 		question: "How should we proceed?",
-		options: ["Continue", "Review the diff", "Stop here"],
+		options: opts("Continue", "Review the diff", "Stop here"),
 	},
 	undefined,
 	undefined,
@@ -1735,7 +1799,9 @@ check(
 );
 check(
 	"selected standing answer retains context and question",
-	retired.body.text.startsWith(badgeHead(tq.id, "sqlitegis")) && retired.body.text.includes("How should we proceed?"),
+	retired.body.text.startsWith(
+		`${badgeLineOf(tq.id)}\nTask: sqlitegis [${record(tq.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) && retired.body.text.includes("How should we proceed?"),
 );
 
 // A second press on the same, now cleared, question is told it is closed.
@@ -1753,7 +1819,7 @@ await tq.tools
 	.get("notify_status")
 	.execute(
 		"q2",
-		{ summary: "First.", urgency: "orange", question: "Use the first choice?", options: ["A", "B"] },
+		{ summary: "First.", urgency: "orange", question: "Use the first choice?", options: opts("A", "B") },
 		undefined,
 		undefined,
 		tq.ctx,
@@ -1765,7 +1831,7 @@ await tq.tools
 	.get("notify_status")
 	.execute(
 		"q3",
-		{ summary: "Second.", urgency: "orange", question: "Use the second choice?", options: ["C", "D"] },
+		{ summary: "Second.", urgency: "orange", question: "Use the second choice?", options: opts("C", "D") },
 		undefined,
 		undefined,
 		tq.ctx,
@@ -1775,7 +1841,9 @@ await settle(200);
 const supersededStanding = lastCall("editMessageText");
 check(
 	"superseded standing question retains context, question, and reason",
-	supersededStanding.body.text.startsWith(badgeHead(tq.id, "sqlitegis")) &&
+	supersededStanding.body.text.startsWith(
+		`${badgeLineOf(tq.id)}\nTask: sqlitegis [${record(tq.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) &&
 		supersededStanding.body.text.includes("Use the first choice?") &&
 		supersededStanding.body.text.includes("Superseded by a newer question"),
 );
@@ -1804,7 +1872,9 @@ check(
 const resumedRetired = lastCall("editMessageText");
 check(
 	"resumed standing answer retains its stored context and question",
-	resumedRetired.body.text.startsWith(badgeHead(tq.id, "sqlitegis")) &&
+	resumedRetired.body.text.startsWith(
+		`${badgeLineOf(tq.id)}\nTask: sqlitegis [${record(tq.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) &&
 		resumedRetired.body.text.includes("Use the second choice?") &&
 		resumedRetired.body.text.includes("Chosen:") &&
 		resumedRetired.body.text.includes("D"),
@@ -1814,7 +1884,13 @@ check(
 await tq.fire("input");
 await tq.tools
 	.get("notify_status")
-	.execute("q5", { summary: "Choose.", urgency: "orange", options: ["Go on", "Halt"] }, undefined, undefined, tq.ctx);
+	.execute(
+		"q5",
+		{ summary: "Choose.", urgency: "orange", options: opts("Go on", "Halt") },
+		undefined,
+		undefined,
+		tq.ctx,
+	);
 await tq.fire("session_stop");
 await settle(150);
 const q5Btn = lastCall("sendMessage").body.reply_markup.inline_keyboard.flat()[0];
@@ -1840,7 +1916,7 @@ await tq.tools
 	.get("notify_status")
 	.execute(
 		"q6",
-		{ summary: "Choose again.", urgency: "orange", options: ["Proceed", "Wait"] },
+		{ summary: "Choose again.", urgency: "orange", options: opts("Proceed", "Wait") },
 		undefined,
 		undefined,
 		tq.ctx,
@@ -1863,7 +1939,7 @@ check("the retired standing question is cleared from the record", record(tq.id).
 // notify_status validation: a bad options list costs the buttons, never the notification.
 const badOpts = await tq.tools
 	.get("notify_status")
-	.execute("q4", { summary: "x", urgency: "green", options: ["only-one"] }, undefined, undefined, tq.ctx);
+	.execute("q4", { summary: "x", urgency: "green", options: opts("only-one") }, undefined, undefined, tq.ctx);
 check("a single option still records the status", badOpts.isError !== true);
 check("a single option is reported as too few", /fewer than 2/.test(badOpts.content[0].text));
 
@@ -2051,7 +2127,13 @@ check("and is acknowledged with a thumbs up", lastCall("setMessageReaction").bod
 await ux.fire("input");
 await ux.tools
 	.get("notify_status")
-	.execute("ux2", { summary: "Pick one.", urgency: "orange", options: ["Go", "Stop"] }, undefined, undefined, ux.ctx);
+	.execute(
+		"ux2",
+		{ summary: "Pick one.", urgency: "orange", options: opts("Go", "Stop") },
+		undefined,
+		undefined,
+		ux.ctx,
+	);
 await ux.fire("session_stop");
 await settle(150);
 const uxStanding = lastCall("sendMessage").body;
@@ -2156,7 +2238,7 @@ await ux.tools
 	.get("notify_status")
 	.execute(
 		"ux3",
-		{ summary: "Choose.", urgency: "orange", question: "Which hidden choice?", options: ["A", "B"] },
+		{ summary: "Choose.", urgency: "orange", question: "Which hidden choice?", options: opts("A", "B") },
 		undefined,
 		undefined,
 		ux.ctx,
@@ -2169,7 +2251,7 @@ const openQuestionStatus = lastCall("sendMessage").body.text;
 check(
 	"status begins with context while a choice is open",
 	openQuestionStatus.startsWith(
-		`\u{1F535} Task: pgvector [${record(ux.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+		`\u{1F535} ${badgeLineOf(ux.id)}\nTask: pgvector [${record(ux.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
 	),
 );
 check("status retains the open-question alert", openQuestionStatus.includes("A choice question stands open."));
@@ -2183,7 +2265,9 @@ check(
 const hiddenStanding = lastCall("editMessageText");
 check(
 	"hidden standing question retains context, question, and reason",
-	hiddenStanding.body.text.startsWith(badgeHead(ux.id, "pgvector")) &&
+	hiddenStanding.body.text.startsWith(
+		`${badgeLineOf(ux.id)}\nTask: pgvector [${record(ux.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+	) &&
 		hiddenStanding.body.text.includes("Which hidden choice?") &&
 		hiddenStanding.body.text.includes("Question hidden"),
 );
@@ -2351,7 +2435,7 @@ const draft = lastCall("sendMessageDraft");
 check("a partial answer streams as a draft", draft?.body.text.includes("Partial answer") === true);
 check("the draft carries no stop control", draft.body.can_stop === undefined);
 check("the draft has a stable non-zero id", typeof draft.body.draft_id === "number" && draft.body.draft_id !== 0);
-const draftContext = `Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
+const draftContext = `${badgeLineOf(fx.id)}\nTask: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
 check("every draft starts with session context", draft.body.text.startsWith(draftContext));
 
 await fx.fire("tool_execution_start", { toolName: "bash", intent: "Running tests" });
@@ -2369,7 +2453,7 @@ const switchedDraft = lastCall("sendMessageDraft").body;
 check(
 	"a later draft reflects the live model and retains its content",
 	switchedDraft.text.startsWith(
-		`Task: quackml [${record(fx.id).tag}] | Model: anthropic/claude-sonnet-4-6 | Tmux: not attached`,
+		`${badgeLineOf(fx.id)}\nTask: quackml [${record(fx.id).tag}] | Model: anthropic/claude-sonnet-4-6 | Tmux: not attached`,
 	) &&
 		switchedDraft.text.includes("Partial answer after fallback") &&
 		switchedDraft.text.includes("bash: Running tests") &&
@@ -2511,11 +2595,12 @@ fx.setTitle("Tune the quack model");
 await fx.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
 await settle(120);
 const compactionMsg = lastCall("sendMessage").body.text;
-const titleContext = compactionMsg.split("\n")[0];
+const titleContext = compactionMsg.split("\n").slice(0, 2).join("\n");
 check("compaction shows a notice", compactionMsg.includes("compacted (overflow)"));
 check(
 	"session title supplies the context task",
-	titleContext === "\u{1F535} Task: Tune the quack model | Model: openai/gpt-5.6-sol | Tmux: work:3.1",
+	titleContext ===
+		`\u{1F535} ${badgeLineOf(fx.id)}\nTask: Tune the quack model | Model: openai/gpt-5.6-sol | Tmux: work:3.1`,
 );
 check(
 	"context is one stable labeled line",
@@ -2632,8 +2717,8 @@ await fx.fire("auto_compaction_start", { reason: "overflow", action: "context-fu
 await settle(120);
 check(
 	"explicit badge label overrides the session title",
-	lastCall("sendMessage").body.text.split("\n")[0] ===
-		"\u{1F535} Task: Pinned task | Model: openai/gpt-5.6-sol | Tmux: work:3.1",
+	lastCall("sendMessage").body.text.split("\n").slice(0, 2).join("\n") ===
+		`\u{1F535} ${badgeLineOf(fx.id)}\nTask: Pinned task | Model: openai/gpt-5.6-sol | Tmux: work:3.1`,
 );
 
 await fx.tools.get("session_badge").execute("identity-clear", { label: "" }, undefined, undefined, fx.ctx);
@@ -2643,8 +2728,8 @@ await fx.fire("auto_compaction_start", { reason: "overflow", action: "context-fu
 await settle(120);
 check(
 	"folder and session tag supply the unnamed task",
-	lastCall("sendMessage").body.text.split("\n")[0] ===
-		`\u{1F535} Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: work:3.1`,
+	lastCall("sendMessage").body.text.split("\n").slice(0, 2).join("\n") ===
+		`\u{1F535} ${badgeLineOf(fx.id)}\nTask: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: work:3.1`,
 );
 
 delete process.env.TMUX;
@@ -2655,14 +2740,14 @@ await fx.fire("auto_compaction_start", { reason: "overflow", action: "context-fu
 await settle(120);
 check(
 	"absent model and tmux have explicit context values",
-	lastCall("sendMessage").body.text.split("\n")[0] ===
-		`\u{1F535} Task: quackml [${record(fx.id).tag}] | Model: unavailable | Tmux: not attached`,
+	lastCall("sendMessage").body.text.split("\n").slice(0, 2).join("\n") ===
+		`\u{1F535} ${badgeLineOf(fx.id)}\nTask: quackml [${record(fx.id).tag}] | Model: unavailable | Tmux: not attached`,
 );
 fx.ctx.model = { provider: "openai", id: "gpt-5.6-sol" };
 process.env.PATH = pathBeforeTmuxTest;
 await fx.fire("agent_end");
 
-const fxSessionContext = `\u{1F535} Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
+const fxSessionContext = `\u{1F535} ${badgeLineOf(fx.id)}\nTask: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
 // /status answers from the extension without touching the agent.
 writeFileSync(join(inboxOf(fx.id), "701.json"), JSON.stringify({ kind: "command", value: "status" }));
 await fx.pump(250);
@@ -2722,7 +2807,7 @@ check(
 	"an uploaded photo carries the standard name",
 	/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__photo__[a-z0-9]{5}\S*__artefact\.png$/u.test(photoName),
 );
-const fileContext = `Task: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
+const fileContext = `${badgeLineOf(fx.id)}\nTask: quackml [${record(fx.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
 // Telegram strips a photo's filename, so the caption is the only place it stays searchable.
 check(
 	"a single file caption carries context first and the name last",
@@ -2961,7 +3046,7 @@ const activeStatus = lastCall("sendMessage").body.text;
 check(
 	"active status begins with session context",
 	activeStatus.startsWith(
-		`\u{1F535} Task: htmlq [${record(rv.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
+		`\u{1F535} ${badgeLineOf(rv.id)}\nTask: htmlq [${record(rv.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
 	),
 );
 check(
@@ -2985,7 +3070,7 @@ const albumFiles = lastCall("sendMediaGroup").files;
 check(
 	"the album context sits only on the first item, each carrying its own name",
 	albumMedia[0].caption ===
-		`Task: htmlq [${record(rv.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached\n\nthe chart\n\n${albumFiles.f0}` &&
+		`${badgeLineOf(rv.id)}\nTask: htmlq [${record(rv.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached\n\nthe chart\n\n${albumFiles.f0}` &&
 		albumMedia[1].caption === albumFiles.f1,
 );
 const outside = await rv.tools
@@ -3273,7 +3358,7 @@ await orphanSess.fire("session_start");
 		.get("notify_status")
 		.execute(
 			"bye1",
-			{ summary: "Round done.", urgency: "orange", options: ["Continue", "Stop"] },
+			{ summary: "Round done.", urgency: "orange", options: opts("Continue", "Stop") },
 			undefined,
 			undefined,
 			bye.ctx,
@@ -3390,7 +3475,10 @@ await orphanSess.fire("session_start");
 		"a streaming ask previews the partial question under an input-needed line",
 		partial?.body.text.includes("Input needed") === true && partial.body.text.includes('Ship the "big" relea'),
 	);
-	check("the ask preview leads with the session badge", partial.body.text.indexOf("qdraft") >= 0);
+	check(
+		"the ask preview carries the session badge exactly once, from the draft head",
+		partial.body.text.split(badgeLineOf(qp.id)).length === 2,
+	);
 	await qp.fire("message_update", {
 		message: askMsg,
 		assistantMessageEvent: {
@@ -3461,7 +3549,7 @@ await orphanSess.fire("session_start");
 		.get("notify_status")
 		.execute(
 			"g3",
-			{ summary: "Done, pick.", urgency: "green", options: ["Merge", "Wait"] },
+			{ summary: "Done, pick.", urgency: "green", options: opts("Merge", "Wait") },
 			undefined,
 			undefined,
 			cs.ctx,
@@ -3573,8 +3661,8 @@ heading("oversized message truncation");
 	const tr = spawn("01a06010-0000-0000-0000-000000000000", "/home/dev/work/toolong");
 	await tr.fire("session_start");
 
-	// a. A summary whose rendered form blows past the limit keeps the turn's usage
-	// footer and says out loud that it was cut.
+	// a. Escaping is free on the wire, so a summary at the tool's own cap goes out whole, footer
+	// and every ampersand included.
 	await tr.fire("agent_start");
 	await tr.fire("message_end", {
 		message: { role: "assistant", usage: { input: 12400, output: 900, cost: { total: 0.0512 } } },
@@ -3585,38 +3673,54 @@ heading("oversized message truncation");
 		.execute("t1", { summary: "&".repeat(900), urgency: "green" }, undefined, undefined, tr.ctx);
 	await tr.fire("session_stop");
 	await settle(150);
-	const cut = lastCall("sendMessage").body.text;
-	check("an oversized summary keeps the usage footer", cut.includes("12.4k in / 900 out"));
-	check("an oversized summary says it was truncated", cut.includes("truncated, full text at the terminal"));
-	check("an oversized summary fits the telegram limit", cut.length <= 4096);
+	const whole = lastCall("sendMessage").body.text;
+	check("a summary dense in escapes keeps the usage footer", whole.includes("12.4k in / 900 out"));
+	check("a summary dense in escapes is not cut", !whole.includes("truncated, full text at the terminal"));
+	check("a summary dense in escapes keeps every ampersand", (whole.match(/&amp;/g) ?? []).length === 900);
 
-	// b. Escaping inflates the rendered form up to fivefold, so the fit test has to
-	// be on the rendered text and not on the source.
-	await tr.fire("agent_start");
-	await tr.fire("agent_end");
-	await tr.tools
-		.get("notify_status")
-		.execute("t2", { summary: "<".repeat(200), urgency: "green" }, undefined, undefined, tr.ctx);
-	await tr.fire("session_stop");
-	await settle(150);
-	check("a dense-escape summary fits the telegram limit", lastCall("sendMessage").body.text.length <= 4096);
+	// b. A body past the real ceiling is cut, says so, and fits.
+	const trAsk = { id: "q", question: "ok?", options: [{ label: "yes" }] };
+	tr.tools
+		.get("ask")
+		.execute("t2", { context: "x".repeat(5000), questions: [trAsk] }, undefined, undefined, stubbornCtx(tr.ctx, {}));
+	await settle(200);
+	const cut = lastCall("sendMessage").body.text;
+	check("an oversized body says it was truncated", cut.includes("truncated, full text at the terminal"));
+	check("an oversized body fits the telegram limit", wireLength(cut) <= 4096);
 
 	// c. A cut inside a fenced code block leaves a stray fence that renders as
 	// literal backticks, so the cut has to keep the fences balanced.
-	await tr.fire("agent_start");
-	await tr.fire("agent_end");
-	await tr.tools
-		.get("notify_status")
-		.execute("t3", { summary: `\`\`\`\n${"&".repeat(880)}\n\`\`\``, urgency: "green" }, undefined, undefined, tr.ctx);
-	await tr.fire("session_stop");
-	await settle(150);
+	tr.tools
+		.get("ask")
+		.execute(
+			"t3",
+			{ context: `\`\`\`\n${"x".repeat(5000)}\n\`\`\``, questions: [trAsk] },
+			undefined,
+			undefined,
+			stubbornCtx(tr.ctx, {}),
+		);
+	await settle(200);
 	const fenced = lastCall("sendMessage").body.text;
 	check("a truncated fence leaks no literal backticks", !fenced.includes("```"));
 	check(
 		"a truncated fence stays balanced",
 		(fenced.match(/<pre>/g) ?? []).length === (fenced.match(/<\/pre>/g) ?? []).length,
 	);
-	check("a truncated fenced summary fits the telegram limit", fenced.length <= 4096);
+	check("a truncated fenced body fits the telegram limit", wireLength(fenced) <= 4096);
+	// Both questions stay open otherwise, and a session waiting on one outranks recency in routing.
+	let trEntry = 8800;
+	const answerLast = async () => {
+		const press = (lastCall("sendMessage").body.reply_markup?.inline_keyboard ?? [])
+			.flat()
+			.find((b) => b.callback_data?.startsWith("o:"));
+		trEntry += 1;
+		writeFileSync(
+			join(inboxOf(tr.id), `${trEntry}.json`),
+			JSON.stringify({ kind: "callback", value: press.callback_data }),
+		);
+		await tr.pump(250);
+	};
+	await answerLast();
 	api.failMethods = [];
 }
 
@@ -3878,13 +3982,13 @@ heading("rich status options");
 		typeof richTag === "string" && richId.startsWith(richTag),
 	);
 
-	// Plain strings keep working, with no markers and no descriptions.
+	// An option with a description but no stance renders its section and an unstyled button.
 	await ro.fire("input");
 	await ro.tools
 		.get("notify_status")
 		.execute(
 			"ro2",
-			{ summary: "Simple.", urgency: "orange", options: ["Continue", "Stop"] },
+			{ summary: "Simple.", urgency: "orange", options: opts("Continue", "Stop") },
 			undefined,
 			undefined,
 			ro.ctx,
@@ -3893,30 +3997,35 @@ heading("rich status options");
 	await settle(150);
 	const plain = lastCall("sendMessage").body;
 	const plainButtons = plain.reply_markup.inline_keyboard.flat();
-	check("plain string options still render two buttons", plainButtons.length === 2);
+	check("unmarked options still render two buttons", plainButtons.length === 2);
 	check(
-		"plain string options carry no stance marker",
+		"unmarked options carry no stance marker",
 		plainButtons.every((b) => !b.text.includes("(")),
 	);
 	check(
-		"plain string options carry no style",
+		"unmarked options carry no style",
 		plainButtons.every((b) => b.style === undefined),
 	);
-	check("plain string options add nothing to the body", !plain.text.includes("**Continue**"));
+	check(
+		"an unmarked option still explains itself in the body",
+		plain.text.includes('<b>Continue</b>\nwhat "Continue" does'),
+	);
 
-	// A malformed option loses its button, not the whole notification.
+	// A malformed option costs the whole notification a round trip, not a silent half-list.
 	await ro.fire("input");
 	const bad = await ro.tools
 		.get("notify_status")
 		.execute(
 			"ro3",
-			{ summary: "Bad.", urgency: "orange", options: ["Fine", { note: "no label" }] },
+			{ summary: "Bad.", urgency: "orange", options: [{ label: "Fine", description: "works" }, { note: "no label" }] },
 			undefined,
 			undefined,
 			ro.ctx,
 		);
-	check("an option without a label still records the status", bad.isError !== true);
-	check("an option without a label is named in the result", /1 of 2 options/.test(bad.content[0].text));
+	check("an option without a label is refused", bad.isError === true);
+	check("an option without a label is counted in the refusal", /1 of 2 carry no label/.test(bad.content[0].text));
+	await ro.fire("session_stop");
+	await settle(150);
 }
 
 heading("aggregated status");
@@ -4032,7 +4141,7 @@ heading("aggregated status");
 		.slice(pickerFrom)
 		.find((c) => (c.body.reply_markup?.inline_keyboard ?? []).flat().some((b) => b.callback_data?.startsWith("m:")));
 	check("a which-session picker is still sent for a big fleet", bigPicker !== undefined);
-	check("the which-session picker is cut to the limit", (bigPicker?.body.text.length ?? 0) <= 4096);
+	check("the which-session picker is cut to the limit", wireLength(bigPicker?.body.text ?? "") <= 4096);
 	// A shortened list with every button intact would offer a choice the reader cannot see, so the
 	// buttons and the listed sessions have to be the same set.
 	const pickerButtons = (bigPicker?.body.reply_markup.inline_keyboard ?? []).flat().length;
@@ -4191,7 +4300,7 @@ heading("replies reach an idle session");
 	check("a service message is recorded for reply routing", record(ir.id).recent.includes(statusMessage));
 }
 
-heading("bad options never lose the status");
+heading("a bad options list costs a retry, never the notification");
 {
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const bo = spawn("01a06090-0000-0000-0000-000000000000", "/home/dev/work/badoptions");
@@ -4212,53 +4321,50 @@ heading("bad options never lose the status");
 		};
 	};
 
-	// a. Every option unusable. The summary is the payload, so it must still ship.
+	// a. Nothing usable in the list. The status is refused whole, so the retry can carry buttons.
 	const allBad = await send("bo1", {
 		summary: "The work is done.",
 		urgency: "green",
 		question: "What next?",
 		options: [{ note: "no label" }, 42],
 	});
-	check("an unusable options list still sends the summary", allBad.text.includes("The work is done."));
-	check("an unusable options list still asks the question", allBad.text.includes("What next?"));
-	check("an unusable options list is not an error", !allBad.isError);
-	check("an unusable options list explains itself to the agent", /option/i.test(allBad.note));
-	check("an unusable options list does not block the turn", !allBad.blocked);
-	check("an unusable options list offers no buttons", allBad.buttons.length === 0);
+	check("an unusable options list is refused", allBad.isError);
+	check("an unusable options list records no status", !allBad.text.includes("The work is done."));
+	check("an unusable options list blocks the turn for a retry", allBad.blocked);
+	check("an unusable options list explains itself to the agent", /carry no label/.test(allBad.note));
 
-	// b. A mix keeps the good ones rather than throwing the lot away.
+	// b. Both faults at once, each named, so one retry can fix the whole list.
 	const mixed = await send("bo2", {
 		summary: "Half of these are fine.",
 		urgency: "orange",
 		options: ["Keep going", { label: "Stop here" }, { nope: true }],
 	});
-	check("a mixed options list keeps the valid buttons", mixed.buttons.length === 2);
-	check("a mixed options list still sends the summary", mixed.text.includes("Half of these are fine."));
-	check("a mixed options list reports the dropped one", /option/i.test(mixed.note));
+	check("a half-described list is refused", mixed.isError);
+	check(
+		"a half-described list names the undescribed options",
+		/"Keep going", "Stop here" carry no description/.test(mixed.note),
+	);
+	check("a half-described list also counts the unlabelled one", /1 of 3 carry no label/.test(mixed.note));
 
 	// c. Too many is a trim, not a loss.
 	const tooMany = await send("bo3", {
 		summary: "Seven choices.",
 		urgency: "orange",
-		options: ["a", "b", "c", "d", "e", "f", "g"],
+		options: opts("a", "b", "c", "d", "e", "f", "g"),
 	});
 	check("more than six options still send the summary", tooMany.text.includes("Seven choices."));
 	check("more than six options render six buttons", tooMany.buttons.length === 6);
 	check("more than six options say so", /option/i.test(tooMany.note));
 
-	// d. One survivor is not a choice, so no fake single button, but the summary lives.
-	const lonely = await send("bo4", {
-		summary: "Only one left.",
-		urgency: "orange",
-		options: ["Only this", { bad: 1 }],
-	});
-	check("a single usable option still sends the summary", lonely.text.includes("Only one left."));
-	check("a single usable option offers no buttons", lonely.buttons.length === 0);
+	// d. One option is not a choice, so no fake single button, but the summary lives.
+	const lonely = await send("bo4", { summary: "Only one left.", urgency: "orange", options: opts("Only this") });
+	check("a single option still sends the summary", lonely.text.includes("Only one left."));
+	check("a single option offers no buttons", lonely.buttons.length === 0);
 
 	// e. A clean list is untouched and draws no complaint.
-	const good = await send("bo5", { summary: "All good.", urgency: "orange", options: ["Yes", "No"] });
+	const good = await send("bo5", { summary: "All good.", urgency: "orange", options: opts("Yes", "No") });
 	check("a valid options list still renders", good.buttons.length === 2);
-	check("a valid options list draws no complaint", !/dropped|unusable|ignored/i.test(good.note));
+	check("a valid options list draws no complaint", !/dropped|unusable|ignored|refused/i.test(good.note));
 }
 
 heading("ambiguous plain messages ask which session");
@@ -4888,6 +4994,314 @@ heading("spinner frames match omp exactly");
 	process.env.PATH = spinPath;
 	delete process.env.TMUX;
 	delete process.env.TMUX_PANE;
+}
+
+heading("one standard message head");
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const hd = spawn("01a060e0-0000-0000-0000-000000000000", "/home/dev/work/headline");
+	await hd.fire("session_start");
+	const hdTag = record(hd.id).tag;
+	const head = `${record(hd.id).emoji} headline \u00B7 ${hdTag}\nTask: headline [${hdTag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`;
+
+	// a. A plain turn-end summary.
+	await hd.fire("input");
+	await hd.tools
+		.get("notify_status")
+		.execute("hd1", { summary: "The suite is green.", urgency: "green" }, undefined, undefined, hd.ctx);
+	await hd.fire("session_stop");
+	await settle(150);
+	check(
+		"a turn-end summary opens with the standard head",
+		lastCall("sendMessage").body.text.startsWith(`${head}\n\n<b>\u{1F7E2} Turn finished</b>`),
+	);
+
+	// b. A turn-end choice.
+	await hd.fire("input");
+	await hd.tools.get("notify_status").execute(
+		"hd2",
+		{
+			summary: "Two ways.",
+			urgency: "orange",
+			question: "Which one?",
+			options: [
+				{ label: "First", description: "Takes the fast path." },
+				{ label: "Second", description: "Takes the safe path." },
+			],
+		},
+		undefined,
+		undefined,
+		hd.ctx,
+	);
+	await hd.fire("session_stop");
+	await settle(150);
+	check("a turn-end choice opens with the standard head", lastCall("sendMessage").body.text.startsWith(head));
+
+	// c. An ask question.
+	const hdState = {};
+	const hdAsk = hd.tools
+		.get("ask")
+		.execute(
+			"hd3",
+			{ questions: [{ id: "q", question: "Ready?", options: [{ label: "Yes" }, { label: "No" }] }] },
+			undefined,
+			undefined,
+			stubbornCtx(hd.ctx, hdState),
+		);
+	await settle(150);
+	const hdAskBody = lastCall("sendMessage").body;
+	check("an ask question opens with the standard head", hdAskBody.text.startsWith(head));
+	check("an ask question no longer repeats the location in its title", !hdAskBody.text.includes("(tmux"));
+	const hdAskId = hdAskBody.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
+	writeFileSync(join(inboxOf(hd.id), "5099.json"), JSON.stringify({ kind: "callback", value: `t:${hdAskId}:0` }));
+	await hd.pump(250);
+	check("the free-text prompt opens with the standard head", lastCall("sendMessage").body.text.startsWith(head));
+	writeFileSync(join(inboxOf(hd.id), "5100.json"), JSON.stringify({ kind: "callback", value: `o:${hdAskId}:0:0` }));
+	await hd.pump(250);
+	await hdAsk;
+	check("a settled ask keeps the standard head", lastCall("editMessageText").body.text.startsWith(head) === true);
+
+	// d. An approval notice and its resolution.
+	await hd.fire("tool_approval_requested", { toolCallId: "hdt1", toolName: "bash" });
+	await settle(150);
+	check("an approval notice opens with the standard head", lastCall("sendMessage").body.text.startsWith(head));
+	await hd.fire("tool_approval_resolved", { toolCallId: "hdt1", approved: true });
+	await settle(150);
+	check("an approval resolution opens with the standard head", lastCall("editMessageText").body.text.startsWith(head));
+
+	// e. A service reply this session composed.
+	writeFileSync(join(inboxOf(hd.id), "5101.json"), JSON.stringify({ kind: "command", value: "status" }));
+	await hd.pump(300);
+	check(
+		"a service reply opens with the standard head",
+		lastCall("sendMessage").body.text.startsWith(`\u{1F535} ${head}`),
+	);
+
+	// f. A streamed draft.
+	await hd.fire("agent_start");
+	await hd.fire("message_update", {
+		message: { role: "assistant", content: [{ type: "text", text: "Working on it" }] },
+	});
+	await hd.pump(200);
+	check("a draft opens with the standard head", lastCall("sendMessageDraft").body.text.startsWith(head));
+
+	// g. A file caption.
+	const hdShot = join(root, "headline.png");
+	writeFileSync(hdShot, "png-bytes");
+	await hd.tools
+		.get("notify_file")
+		.execute("hd4", { paths: [hdShot], caption: "the chart" }, undefined, undefined, hd.ctx);
+	const hdName = lastCall("sendPhoto").files.f0;
+	check(
+		"a file caption opens with the standard head",
+		lastCall("sendPhoto").body.caption === `${head}\n\nthe chart\n\n${hdName}`,
+	);
+
+	// h. Attached to tmux, the location is in the head and nowhere else.
+	const headBin = join(root, "head-bin");
+	mkdirSync(headBin, { recursive: true });
+	writeFileSync(join(headBin, "tmux"), "#!/bin/sh\nprintf 'work\\t3\\t1\\n'\n", { mode: 0o755 });
+	const headPath = process.env.PATH;
+	process.env.PATH = `${headBin}:${headPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	process.env.TMUX_PANE = "%1";
+	await hd.fire("input");
+	await hd.tools
+		.get("notify_status")
+		.execute("hd5", { summary: "Attached now.", urgency: "orange" }, undefined, undefined, hd.ctx);
+	await hd.fire("session_stop");
+	await settle(150);
+	const hdAttached = lastCall("sendMessage").body.text;
+	check("the head names the tmux pane", hdAttached.includes("Tmux: work:3.1"));
+	check("the title does not repeat the tmux pane", !hdAttached.includes("(tmux "));
+	process.env.PATH = headPath;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+}
+
+heading("every turn-end option explains itself");
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const od = spawn("01a060f0-0000-0000-0000-000000000000", "/home/dev/work/options");
+	await od.fire("session_start");
+
+	await od.fire("input");
+	const bare = await od.tools
+		.get("notify_status")
+		.execute(
+			"od1",
+			{ summary: "Done.", urgency: "orange", question: "What next?", options: ["Continue", "Stop"] },
+			undefined,
+			undefined,
+			od.ctx,
+		);
+	check("a bare label is refused", bare.isError === true);
+	check(
+		"the refusal names every option missing its description",
+		/Continue/.test(bare.content[0].text) && /Stop/.test(bare.content[0].text),
+	);
+	const odStop = await od.fire("session_stop");
+	check(
+		"a refused status still blocks the turn for a retry",
+		odStop.some((r) => r?.decision === "block"),
+	);
+	await settle(150);
+
+	await od.fire("input");
+	const described = await od.tools.get("notify_status").execute(
+		"od2",
+		{
+			summary: "Done.",
+			urgency: "orange",
+			question: "What next?",
+			options: [
+				{ label: "Continue", description: "Runs the remaining migrations." },
+				{ label: "Stop", description: "Leaves the branch as it is." },
+			],
+		},
+		undefined,
+		undefined,
+		od.ctx,
+	);
+	check("a described list is accepted", described.isError !== true);
+	await od.fire("session_stop");
+	await settle(150);
+	const odBody = lastCall("sendMessage").body;
+	check(
+		"every option gets its own section in the message",
+		odBody.text.includes("<b>Continue</b>\nRuns the remaining migrations.") &&
+			odBody.text.includes("<b>Stop</b>\nLeaves the branch as it is."),
+	);
+	check(
+		"a described list still gets its buttons",
+		(odBody.reply_markup?.inline_keyboard ?? []).flat().filter((b) => b.callback_data?.startsWith("c:")).length === 2,
+	);
+
+	await od.fire("input");
+	const halfBad = await od.tools.get("notify_status").execute(
+		"od3",
+		{
+			summary: "Half described.",
+			urgency: "orange",
+			options: [{ label: "Merge", description: "Lands the branch." }, { label: "Rebase" }],
+		},
+		undefined,
+		undefined,
+		od.ctx,
+	);
+	check("one bare option refuses the whole list", halfBad.isError === true);
+	check(
+		"the refusal names the bare option only",
+		/Rebase/.test(halfBad.content[0].text) && !/Merge/.test(halfBad.content[0].text),
+	);
+	await od.fire("session_stop");
+	await settle(150);
+}
+
+heading("a snippet arrives ready to copy");
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const sn = spawn("01a06100-0000-0000-0000-000000000000", "/home/dev/work/snippet");
+	await sn.fire("session_start");
+	const snHead = `${record(sn.id).emoji} snippet \u00B7 ${record(sn.id).tag}\n`;
+
+	const posted = await sn.tools
+		.get("notify_snippet")
+		.execute("sn1", { purpose: "PR body for #9", text: "First line\n\nSecond line\n" }, undefined, undefined, sn.ctx);
+	const snBody = lastCall("sendMessage").body;
+	check("a snippet reports success", posted.isError !== true);
+	check("a snippet opens with the standard head", snBody.text.startsWith(snHead));
+	check("a snippet says where the text goes", snBody.text.includes("PR body for #9"));
+	check("a snippet payload arrives in one block", snBody.text.includes("<pre>First line\n\nSecond line</pre>"));
+	check("a snippet ends on its copyable block", snBody.text.endsWith("</pre>"));
+	check("a snippet is replyable", record(sn.id).recent.length > 0);
+
+	await sn.tools
+		.get("notify_snippet")
+		.execute("sn2", { purpose: "issue body", text: "Steps:\n\n```sh\nnpm test\n```\n" }, undefined, undefined, sn.ctx);
+	check(
+		"a payload with its own fence is not cut short",
+		lastCall("sendMessage").body.text.includes("<pre>Steps:\n\n```sh\nnpm test\n```</pre>"),
+	);
+
+	// A fence run in the label would otherwise open a block that swallows the payload's own opener.
+	await sn.tools
+		.get("notify_snippet")
+		.execute(
+			"sn2b",
+			{ purpose: "replacement for the ```yaml block", text: "steps:\n  - run: npm test" },
+			undefined,
+			undefined,
+			sn.ctx,
+		);
+	const labelled = lastCall("sendMessage").body.text;
+	check("a fence run in the purpose does not escape the label", labelled.includes("replacement for the yaml block"));
+	check(
+		"a fence run in the purpose leaves the payload copyable",
+		labelled.includes("<pre>steps:\n  - run: npm test</pre>"),
+	);
+
+	await sn.tools
+		.get("notify_snippet")
+		.execute("sn3", { purpose: "the patch", language: "ts", text: "const x = 1;" }, undefined, undefined, sn.ctx);
+	check(
+		"a language tag reaches the block",
+		lastCall("sendMessage").body.text.includes('<pre><code class="language-ts">const x = 1;</code></pre>'),
+	);
+
+	await sn.tools
+		.get("notify_snippet")
+		.execute("sn4", { purpose: "a note", text: "<b>bold</b> & **stars**" }, undefined, undefined, sn.ctx);
+	check(
+		"markup in the payload is shown, not applied",
+		lastCall("sendMessage").body.text.includes("<pre>&lt;b&gt;bold&lt;/b&gt; &amp; **stars**</pre>"),
+	);
+
+	const snSends = called("sendMessage").length;
+	const oversized = await sn.tools
+		.get("notify_snippet")
+		.execute("sn5", { purpose: "far too much", text: "x".repeat(4200) }, undefined, undefined, sn.ctx);
+	check("an oversized snippet is refused", oversized.isError === true);
+	check("an oversized snippet sends nothing", called("sendMessage").length === snSends);
+	check("an oversized snippet names the room it needs", /4\d{3}/.test(oversized.content[0].text));
+	check("an oversized snippet points at the file route", /notify_file/.test(oversized.content[0].text));
+
+	const blank = await sn.tools
+		.get("notify_snippet")
+		.execute("sn6", { purpose: "nothing", text: "   \n" }, undefined, undefined, sn.ctx);
+	check("an empty payload is refused", blank.isError === true);
+	const unnamed = await sn.tools
+		.get("notify_snippet")
+		.execute("sn7", { purpose: " ", text: "something" }, undefined, undefined, sn.ctx);
+	check("a snippet with no purpose is refused", unnamed.isError === true);
+	const badLanguage = await sn.tools
+		.get("notify_snippet")
+		.execute(
+			"sn8",
+			{ purpose: "the patch", language: "ts and bash", text: "const x = 1;" },
+			undefined,
+			undefined,
+			sn.ctx,
+		);
+	check("a snippet with a bogus fence tag is refused", badLanguage.isError === true);
+
+	api.failMethods = ["sendMessage"];
+	const refused = await sn.tools
+		.get("notify_snippet")
+		.execute("sn9", { purpose: "a note", text: "never arrives" }, undefined, undefined, sn.ctx);
+	api.failMethods = [];
+	check("a snippet Telegram refuses is reported as an error", refused.isError === true);
+
+	// A session whose config never parsed has nowhere to send, and must say so.
+	const heldConfig = readFileSync(join(root, "notify-telegram.json"), "utf8");
+	writeFileSync(join(root, "notify-telegram.json"), "");
+	const off = spawn("01a06101-0000-0000-0000-000000000000", "/home/dev/work/snippetoff");
+	await off.fire("session_start");
+	writeFileSync(join(root, "notify-telegram.json"), heldConfig);
+	const unconfigured = await off.tools
+		.get("notify_snippet")
+		.execute("sn10", { purpose: "nowhere", text: "orphaned" }, undefined, undefined, off.ctx);
+	check("a snippet from an unconfigured session is refused", unconfigured.isError === true);
 }
 
 rmSync(root, { recursive: true, force: true });

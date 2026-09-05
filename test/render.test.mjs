@@ -8,7 +8,7 @@ import {
 	clip,
 	duration,
 	extractQuestionPreviews,
-	fitPlainToTelegram,
+	fenceFor,
 	fitToTelegram,
 	isMarkupFailure,
 	packRows,
@@ -59,40 +59,27 @@ heading("fitting a message to the telegram limit");
 	check("text under the limit is untouched", fitToTelegram(short, "") === short);
 	check("the kept tail is appended when nothing is cut", fitToTelegram(short, "\n\nfooter") === `${short}\n\nfooter`);
 
-	// Escaping inflates fivefold, so 900 source characters render to 4500.
+	// Escaping costs nothing on the wire, so 900 ampersands are 900 characters and fit whole.
 	const dense = "&".repeat(900);
-	const cut = fitToTelegram(dense, "\n\n`12 in / 34 out`");
-	check("an oversized body is cut to fit", toTelegramHtml(cut).length <= TELEGRAM_TEXT_MAX);
+	check("escaping does not spend the budget", fitToTelegram(dense, "") === dense);
+
+	const long = "&".repeat(5000);
+	const cut = fitToTelegram(long, "\n\n`12 in / 34 out`");
+	check("an oversized body is cut to fit", cut.length <= TELEGRAM_TEXT_MAX);
 	check("the cut says it happened", cut.includes("truncated, full text at the terminal"));
 	check("the kept tail survives the cut", cut.endsWith("\n\n`12 in / 34 out`"));
-	check("the cut keeps as much as it can", cut.length > 700);
+	check("the cut keeps as much as it can", cut.length > 4000);
 
-	const fenced = `\`\`\`\n${"&".repeat(880)}\n\`\`\``;
+	const fenced = `\`\`\`\n${"&".repeat(5000)}\n\`\`\``;
 	const cutFence = fitToTelegram(fenced, "");
 	check("a cut inside a fence closes it", (cutFence.match(/```/g) ?? []).length % 2 === 0);
 	check("a closed fence renders as one pre block", (toTelegramHtml(cutFence).match(/<pre>/g) ?? []).length === 1);
-	check("a cut fenced body fits", toTelegramHtml(cutFence).length <= TELEGRAM_TEXT_MAX);
+	check("a cut fenced body fits", cutFence.length <= TELEGRAM_TEXT_MAX);
 
 	const emoji = "\u{1F600}".repeat(3000);
 	const cutEmoji = fitToTelegram(emoji, "");
 	const lastUnit = cutEmoji.charCodeAt(cutEmoji.indexOf("\n\n(truncated") - 1);
 	check("a cut between surrogate halves is pulled back", lastUnit < 0xd800 || lastUnit > 0xdbff);
-
-	// A plain-text send is never escaped, so budgeting for escaping cuts it needlessly early: the
-	// HTML-aware fitter keeps about a fifth of what Telegram would actually accept.
-	const plainDense = "&".repeat(5000);
-	const plainCut = fitPlainToTelegram(plainDense);
-	check("a plain oversized body is cut to fit", plainCut.length <= TELEGRAM_TEXT_MAX);
-	check("the plain cut says it happened", plainCut.includes("truncated, full text at the terminal"));
-	check("the plain cut keeps what escaping would have cost", plainCut.length > 4000);
-	check(
-		"the plain fitter keeps far more than the html one",
-		plainCut.length > fitToTelegram(plainDense, "").length * 4,
-	);
-	const plainEmoji = fitPlainToTelegram("\u{1F600}".repeat(5000));
-	const plainLast = plainEmoji.charCodeAt(plainEmoji.indexOf("\n\n(truncated") - 1);
-	check("a plain cut between surrogate halves is pulled back", plainLast < 0xd800 || plainLast > 0xdbff);
-	check("plain text under the limit is untouched", fitPlainToTelegram(short) === short);
 }
 
 heading("classifying a telegram refusal");
@@ -198,6 +185,26 @@ check(
 check(
 	"a badge without an emoji does not open with a space",
 	badgeLine("", "/home/dev/work/subql", "index work", "t1") === "subql \u00B7 index work",
+);
+
+heading("a fence that survives a fence inside it");
+check("plain text takes the shortest fence", fenceFor("no ticks here") === "```");
+check("a three-tick run inside forces four", fenceFor("before\n```rust\nlet x = 1;\n```\nafter") === "````");
+check("a four-tick run inside forces five", fenceFor("x ```` y") === "`````");
+check("an inline pair does not lengthen the fence", fenceFor("call `foo` twice") === "```");
+check(
+	"a longer fence closes only on its own run",
+	toTelegramHtml("````\n```\ninner\n```\n````") === "<pre>```\ninner\n```</pre>",
+);
+check(
+	"a longer fence still keeps its language",
+	toTelegramHtml("````md\n```\nx\n```\n````") === '<pre><code class="language-md">```\nx\n```</code></pre>',
+);
+check("an unclosed fence stays literal", toTelegramHtml("```\nhalf a block").includes("```"));
+check("a four-tick fence closed by three stays literal", toTelegramHtml("````\nbody\n```") === "````\nbody\n```");
+check(
+	"a closing run longer than the opener leaves no stray backtick",
+	toTelegramHtml("```\nx\n````") === "<pre>x</pre>",
 );
 
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);

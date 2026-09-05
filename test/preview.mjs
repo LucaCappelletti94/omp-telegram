@@ -31,6 +31,7 @@ mod.default({
 const ctx = {
 	hasUI: false,
 	cwd: "/home/dev/work/sqlitegis",
+	model: { provider: "anthropic", id: "claude-opus-5" },
 	sessionManager: {
 		getSessionId: () => "01a00000-0000-0000-0000-000000000000",
 		getSessionName: () => "Fix FTS5 rebuild",
@@ -78,13 +79,29 @@ await tools.get("notify_status").execute(
 		summary: "Refactor done, **all tests pass**.",
 		urgency: "orange",
 		question: "How should we proceed?",
-		options: ["Continue", "Review the diff", "Stop here"],
+		options: [
+			{ label: "Continue", description: "Starts the index rebuild work on top of this.", recommended: true },
+			{ label: "Review the diff", description: "Walks the 14 changed files before anything else." },
+			{ label: "Stop here", description: "Leaves the branch unmerged and the session idle.", lukewarm: true },
+		],
 	},
 	undefined,
 	undefined,
 	ctx,
 );
 for (const fn of handlers.get("session_stop")) await fn({}, ctx);
+await new Promise((r) => setTimeout(r, 200));
+
+await tools.get("notify_snippet").execute(
+	"c",
+	{
+		purpose: "PR body for #12",
+		text: "Rebuilds the FTS5 index beside the live one and swaps it in, so a crash mid-run leaves the old index in place.\n\nThe temporary table doubles peak disk use, which the nightly job already tolerates.",
+	},
+	undefined,
+	undefined,
+	ctx,
+);
 await new Promise((r) => setTimeout(r, 200));
 
 for (const message of sent) {
