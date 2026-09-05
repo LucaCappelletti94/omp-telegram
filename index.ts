@@ -46,7 +46,6 @@ const LEGACY_LOCK_DIR = join(STATE_DIR, "poller.lock.d");
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
 const DASHBOARD_FILE = join(STATE_DIR, "dashboard.json");
 const DASHBOARD_LOCK_FILE = join(STATE_DIR, "dashboard.lock");
-const PENDING_TOPICS_DIR = join(STATE_DIR, "pending-topics");
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const MEDIA_DIR = join(STATE_DIR, "media");
 /** Held only across a badge validate-and-persist, which is two file writes long. */
@@ -68,7 +67,6 @@ const HELD_MESSAGE_TTL_MS = 3_600_000;
 const WAITING_ON_QUESTION = "waiting on a question";
 const PREVIEW_MAX = 300;
 const SUMMARY_MAX = 900;
-const TOPIC_NAME_MAX = 128;
 /**
  * The exact frames omp writes into the pane title while a turn runs
  * (`title-generator.ts` `TITLE_SPINNER_FRAMES`). omp-tmux matches the same literal set, so both
@@ -140,8 +138,6 @@ interface SessionRecord {
 	pid: number;
 	tag: string;
 	name: string;
-	topicId: number | null;
-	topicName: string;
 	cwd: string;
 	emoji: string;
 	/** True once an agent picked the emoji for its task; a palette placeholder is not a choice. */
@@ -162,8 +158,6 @@ interface SessionRecord {
 	state: string;
 	/** Provider weather for the current turn: a retry, a fallback, or a recovery. */
 	health: string;
-	/** `"<tmux session>:<window index>"`, so `/fleet` can join a tmux row to this session. */
-	tmuxWindow: string | null;
 	/** First line of the last turn-end summary, and when it landed. */
 	summary: string;
 	summaryAt: number;
@@ -174,7 +168,6 @@ interface TelegramMessage {
 	message_id: number;
 	date: number;
 	chat: { id: number };
-	message_thread_id?: number;
 	reply_to_message?: { message_id: number };
 	text?: string;
 	caption?: string;
@@ -182,10 +175,8 @@ interface TelegramMessage {
 	voice?: { file_id: string; file_size?: number; mime_type?: string };
 	audio?: { file_id: string; file_size?: number; mime_type?: string; file_name?: string };
 	document?: { file_id: string; file_size?: number; mime_type?: string; file_name?: string };
-	/** Telegram's own narration of a chat event, all three of which this extension causes itself. */
+	/** Telegram's own narration of a pin, which this extension causes itself. */
 	pinned_message?: unknown;
-	forum_topic_created?: unknown;
-	forum_topic_edited?: unknown;
 }
 
 interface TelegramCallbackQuery {
@@ -199,7 +190,7 @@ interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
 	callback_query?: TelegramCallbackQuery;
-	stopped_message_generation?: { chat: { id: number }; message_thread_id?: number; draft_id: number };
+	stopped_message_generation?: { chat: { id: number }; draft_id: number };
 }
 
 interface AskResult {
@@ -280,8 +271,6 @@ interface InboxEntry {
 	messageId?: number;
 	/** Message id the sender replied to. */
 	replyTo?: number;
-	/** A command that arrived inside a session's own forum thread answers for that session alone. */
-	scoped?: boolean;
 	caption?: string;
 	mime?: string;
 }
@@ -325,16 +314,12 @@ function pickMedia(message: TelegramMessage): IncomingFile | null {
 }
 
 /**
- * Telegram narrates its own chat events back into the chat as contentless messages: pinning the
- * fleet board or a red status, and creating or renaming a topic. This extension causes all of
- * them, and none is user input, so they must not be mistaken for an unsupported message type.
+ * Telegram narrates its own pins back into the chat as contentless messages: the fleet board and
+ * a red status. This extension causes both, and neither is user input, so they must not be
+ * mistaken for an unsupported message type.
  */
 function isChatEvent(message: TelegramMessage): boolean {
-	return (
-		message.pinned_message !== undefined ||
-		message.forum_topic_created !== undefined ||
-		message.forum_topic_edited !== undefined
-	);
+	return message.pinned_message !== undefined;
 }
 
 /** Temp plus rename: a reader in another omp process must never see a torn file. */
@@ -536,8 +521,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let turnSummary: TurnStatus | null = null;
 	let standingSeq = 0;
 	let standingQuestion: StandingQuestion | null = null;
-	/** Refreshed on the heartbeat, not per write: a tmux query per tool call is not worth the accuracy. */
-	let tmuxWindowKey: string | null = null;
 	let closeOfferMessageId: number | null = null;
 	let statusBlockUsed = false;
 	let lastState = "";
@@ -548,10 +531,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let badgeEmoji = "";
 	let badgeOverride = "";
 	let badgeChosen = false;
-	/** The emoji whose icon the forum topic currently wears, so a rename can spot a stale one. */
-	let topicIconEmoji = "";
-	let topicId: number | null = null;
-	let topicName = "";
 	const recentMessages: number[] = [];
 	let lastNotifiedAt = 0;
 	let turnActive = false;
@@ -562,7 +541,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let approvalWaiting = false;
 	let approvalNotice: ApprovalNotice | null = null;
 	let pinnedMessageId: number | null = null;
-	let topicIcons: Array<{ emoji?: string; custom_emoji_id?: string }> | null = null;
 	/** The live session context, for record writes outside event handlers. */
 	let sessionCtx: ExtensionContext | null = null;
 	let draftId = 0;
@@ -665,8 +643,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pid: process.pid,
 			tag: sessionTag,
 			name: ctx.sessionManager.getSessionName() ?? "",
-			topicId,
-			topicName,
 			cwd: ctx.cwd,
 			emoji: badgeEmoji,
 			emojiChosen: badgeChosen,
@@ -679,7 +655,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			draftId,
 			state: lastState,
 			health: lastHealth,
-			tmuxWindow: tmuxWindowKey,
 			summary: lastSummary,
 			summaryAt: lastSummaryAt,
 			heartbeat: Date.now(),
@@ -722,8 +697,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				pid: count(raw.pid),
 				tag: text(raw.tag),
 				name: text(raw.name),
-				topicId: messageId(raw.topicId),
-				topicName: text(raw.topicName),
 				cwd: text(raw.cwd),
 				emoji: text(raw.emoji),
 				emojiChosen: raw.emojiChosen === true,
@@ -736,7 +709,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				draftId: count(raw.draftId),
 				state: text(raw.state),
 				health: text(raw.health),
-				tmuxWindow: typeof raw.tmuxWindow === "string" ? raw.tmuxWindow : null,
 				summary: text(raw.summary),
 				summaryAt: count(raw.summaryAt),
 				heartbeat: count(raw.heartbeat),
@@ -956,14 +928,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return `${folder} [${sessionTag}]`;
 	}
 
-	function threaded(extra: Record<string, unknown>): Record<string, unknown> {
-		if (config === null) return extra;
-		const base = { chat_id: config.chatId, ...extra };
-		return topicId === null ? base : { ...base, message_thread_id: topicId };
-	}
-
-	/** Re-read per message because tmux windows can move. One query serves both consumers below. */
-	function tmuxWindow(): { session: string; index: string; pane: string } | null {
+	/** The location shown in notifications, as `session:window.pane`. Re-read per message because windows move. */
+	function tmuxLocation(): string | null {
 		const pane = process.env.TMUX_PANE;
 		if (process.env.TMUX === undefined || pane === undefined) return null;
 		try {
@@ -974,23 +940,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			)
 				.toString()
 				.trim();
-			const [session, index, pane_index] = out.split("\t");
+			const [session, index, paneIndex] = out.split("\t");
 			if (session === undefined || index === undefined || index.length === 0) return null;
-			return { session, index, pane: pane_index ?? "0" };
+			return `${session}:${index}.${paneIndex ?? "0"}`;
 		} catch {
 			return null;
 		}
-	}
-
-	function refreshTmuxWindowKey(): void {
-		const where = tmuxWindow();
-		tmuxWindowKey = where === null ? null : `${where.session}:${where.index}`;
-	}
-
-	/** The human-readable location shown in notifications, as `session:window.pane`. */
-	function tmuxLocation(): string | null {
-		const where = tmuxWindow();
-		return where === null ? null : `${where.session}:${where.index}.${where.pane}`;
 	}
 
 	/** Puts this session's window in front for the user's return, but never while they are typing elsewhere. */
@@ -1121,15 +1076,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const glyphs = { working: "\u{1F7E2}", waiting: "\u{1F534}", finished: "\u2705", idle: "\u26AA" };
 		// Whatever wants a human first, then what it can hand over, then what is still busy.
 		const rank = { waiting: 0, finished: 1, working: 2, idle: 3 };
-		const threads = topicLinks();
 		const lines = rows
 			.sort((a, b) => rank[a.state] - rank[b.state])
 			.map((row) => {
 				const mark = row.priority ? "\u2757 " : "";
 				const where = manySessions ? `${row.session}:` : "";
-				const link = threads.get(`${row.session}:${row.index}`);
-				const label = link === undefined ? row.label : `[${row.label}](${link})`;
-				return `${glyphs[row.state]} ${mark}${where}${row.index} ${label}`;
+				return `${glyphs[row.state]} ${mark}${where}${row.index} ${row.label}`;
 			});
 		return `\u{1F39B} ${summary}\n${lines.join("\n")}`;
 	}
@@ -1137,23 +1089,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function sessionContextLine(ctx: ExtensionContext): string {
 		const model = ctx.model === undefined ? "unavailable" : `${ctx.model.provider}/${ctx.model.id}`;
 		return `Task: ${taskName(ctx)} | Model: ${model} | Tmux: ${tmuxLocation() ?? "not attached"}`;
-	}
-
-	/**
-	 * Deep links from a tmux window to the forum thread of the session sitting in it. Only a
-	 * supergroup has threads, and only its `-100`-prefixed id maps onto a `t.me/c/` link.
-	 */
-	function topicLinks(): Map<string, string> {
-		const links = new Map<string, string>();
-		const id = config === null ? "" : String(config.chatId);
-		if (!id.startsWith("-100")) return links;
-		const internal = id.slice(4);
-		for (const { record } of allRecords()) {
-			if (typeof record.tmuxWindow !== "string" || typeof record.topicId !== "number") continue;
-			if (Date.now() - record.heartbeat > LOCK_STALE_MS) continue;
-			links.set(record.tmuxWindow, `https://t.me/c/${internal}/${record.topicId}`);
-		}
-		return links;
 	}
 
 	function lastAssistantTail(ctx: ExtensionContext): string {
@@ -1182,25 +1117,24 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function withHead(ctx: ExtensionContext, title: string, body: string): string {
-		const head = topicId === null ? `${badge(ctx)}\n\n` : "";
-		return `${head}**${title}**\n${body}`;
+		return `${badge(ctx)}\n\n**${title}**\n${body}`;
 	}
 
 	/**
-	 * `thread` overrides the session topic for replies into a foreign thread. A notice the session
-	 * makes about itself is tracked, so replying to it routes back here. A poller-level refusal about
-	 * someone else's message is not: replying to that would mean nothing.
+	 * A notice the session makes about itself is tracked, so replying to it routes back here. A
+	 * poller-level refusal about someone else's message is not: replying to that would mean nothing.
 	 */
-	async function serviceNotice(text: string, thread?: number, routable = true): Promise<void> {
+	async function serviceNotice(text: string, routable = true): Promise<void> {
 		if (config === null) return;
 		// `/status` grows a block per live session, so this is the one notice that can outgrow the
 		// message limit. Unfitted, Telegram refuses it and the command gets no answer at all.
 		const shown = fitPlainToTelegram(`\u{1F535} ${text}`);
-		const body: Record<string, unknown> =
-			thread === undefined
-				? threaded({ text: shown })
-				: { chat_id: config.chatId, message_thread_id: thread, text: shown };
-		const sent = await callTelegram<TelegramMessage>(config, "sendMessage", body, 15_000);
+		const sent = await callTelegram<TelegramMessage>(
+			config,
+			"sendMessage",
+			{ chat_id: config.chatId, text: shown },
+			15_000,
+		);
 		if (!routable) return;
 		trackSent(sent);
 	}
@@ -1240,7 +1174,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		keep = "",
 	): Promise<TelegramMessage | null> {
 		if (config === null) return null;
-		const sent = await sendStructured(config, threaded(extra), withHead(ctx, title, body), keep);
+		const sent = await sendStructured(config, { chat_id: config.chatId, ...extra }, withHead(ctx, title, body), keep);
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
 		return sent;
@@ -1428,13 +1362,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (Date.now() - draftSentAt < 10_000) return;
 		if (Date.now() - typingSentAt < TYPING_MS) return;
 		typingSentAt = Date.now();
-		detach(callTelegram(config, "sendChatAction", threaded({ action: "typing" }), 10_000), "typing action");
+		detach(
+			callTelegram(config, "sendChatAction", { chat_id: config.chatId, action: "typing" }, 10_000),
+			"typing action",
+		);
 	}
 
 	/** Telegram's own upload status, for the seconds a file spends going up. */
 	function showUploading(action: "upload_photo" | "upload_document"): void {
 		if (config === null) return;
-		detach(callTelegram(config, "sendChatAction", threaded({ action }), 10_000), "upload action");
+		detach(callTelegram(config, "sendChatAction", { chat_id: config.chatId, action }, 10_000), "upload action");
 	}
 
 	/** Streams the turn as an ephemeral draft bubble with a native stop control. */
@@ -1467,7 +1404,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		const text = tail.length > 0 ? `${prefix}${tail}${suffix}` : `${context}${suffix}`;
 		const cfg = config;
-		const body = threaded({ draft_id: draftId, can_stop: true });
+		const body = { chat_id: cfg.chatId, draft_id: draftId, can_stop: true };
 		detach(
 			(async () => {
 				// Unclosed constructs degrade to literal text in toTelegramHtml, so a rendered draft is safe
@@ -1561,129 +1498,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	/** The free sticker set, or null while Telegram has not answered with one. */
-	async function iconStickers(): Promise<Array<{ emoji?: string; custom_emoji_id?: string }> | null> {
-		if (config === null) return null;
-		if (topicIcons !== null) return topicIcons;
-		const stickers = await callTelegram<Array<{ emoji?: string; custom_emoji_id?: string }>>(
-			config,
-			"getForumTopicIconStickers",
-			{},
-			15_000,
-		);
-		// A refused call is not an empty set: caching one would strip the icon off every topic.
-		if (!Array.isArray(stickers)) return null;
-		topicIcons = stickers;
-		return topicIcons;
-	}
-
-	async function ensureTopic(ctx: ExtensionContext): Promise<void> {
-		if (config === null) return;
-		const previous = readSessionRecord(sessionId);
-		if (typeof previous?.topicId === "number") {
-			topicId = previous.topicId;
-			topicName = previous.topicName;
-			topicIconEmoji = previous.emoji;
-			return;
-		}
-		const colours = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047];
-		const index = Math.max(0, BADGE_PALETTE.indexOf(badgeEmoji)) % colours.length;
-		const name = clip(badge(ctx), TOPIC_NAME_MAX);
-		// Only the free sticker set can be a topic icon, so most chosen emoji have none.
-		const icon = (await iconStickers())?.find((sticker) => sticker.emoji === badgeEmoji)?.custom_emoji_id;
-		const created = await callTelegram<unknown>(
-			config,
-			"createForumTopic",
-			{
-				chat_id: config.chatId,
-				name,
-				icon_color: colours[index],
-				...(typeof icon === "string" ? { icon_custom_emoji_id: icon } : {}),
-			},
-			15_000,
-		);
-		const thread =
-			created !== null && typeof created === "object" && "message_thread_id" in created
-				? created.message_thread_id
-				: undefined;
-		if (typeof thread !== "number") {
-			pi.logger.debug("notify-telegram: no forum topic, falling back to flat messages");
-			return;
-		}
-		topicId = thread;
-		topicName = name;
-		topicIconEmoji = badgeEmoji;
-	}
-
-	/** The session title lands after the first turn, and the badge emoji changes with the task. */
-	async function renameTopicIfStale(ctx: ExtensionContext): Promise<void> {
-		if (config === null || topicId === null) return;
-		const name = clip(badge(ctx), TOPIC_NAME_MAX);
-		const staleIcon = topicIconEmoji !== badgeEmoji;
-		if (name === topicName && !staleIcon) return;
-		// An empty id removes the icon: a chosen emoji the sticker set lacks must leave the topic its
-		// plain colour rather than the placeholder's icon, which would contradict the name beside it.
-		// An unanswered sticker call leaves the icon alone, so the next rename tries again.
-		const stickers = staleIcon ? await iconStickers() : null;
-		const icon =
-			stickers === null ? undefined : (stickers.find((sticker) => sticker.emoji === badgeEmoji)?.custom_emoji_id ?? "");
-		const edited = await callTelegram(
-			config,
-			"editForumTopic",
-			{
-				chat_id: config.chatId,
-				message_thread_id: topicId,
-				name,
-				...(icon === undefined ? {} : { icon_custom_emoji_id: icon }),
-			},
-			15_000,
-		);
-		// A refused edit left the topic as it was, so nothing here may claim otherwise: the heartbeat
-		// finds the same staleness next tick and retries.
-		if (edited === null) return;
-		topicName = name;
-		if (icon !== undefined) topicIconEmoji = badgeEmoji;
-	}
-
-	/** A discarded entry loses a forum topic that nothing else will ever clean up, so it gets named. */
-	function readPendingTopics(): { path: string; topicId: number }[] {
-		if (!existsSync(PENDING_TOPICS_DIR)) return [];
-		const pending: { path: string; topicId: number }[] = [];
-		for (const entry of readdirSync(PENDING_TOPICS_DIR)) {
-			const path = join(PENDING_TOPICS_DIR, entry);
-			let reason = "";
-			try {
-				const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-				if (typeof parsed === "number") {
-					pending.push({ path, topicId: parsed });
-					continue;
-				}
-				reason = `expected a topic id, found ${parsed === null ? "null" : typeof parsed}`;
-			} catch (error) {
-				reason = error instanceof Error ? error.message : String(error);
-			}
-			// An unreadable entry would otherwise wedge the sweep forever.
-			pi.logger.warn("notify-telegram: discarding a corrupt pending-topic file", { path, reason });
-			try {
-				unlinkSync(path);
-			} catch {}
-		}
-		return pending;
-	}
-
-	/** Shutdown cannot await; the next start sweeps the queue. Unlink first claims the entry across processes. */
-	async function sweepPendingTopics(): Promise<void> {
-		if (config === null) return;
-		for (const { path, topicId } of readPendingTopics()) {
-			try {
-				unlinkSync(path);
-			} catch {
-				continue;
-			}
-			await callTelegram(config, "deleteForumTopic", { chat_id: config.chatId, message_thread_id: topicId }, 15_000);
-		}
-	}
-
 	/** One poller only, or Telegram 409s. Atomic `wx` create; ownership re-read, never cached. */
 	function readLock(file: string = LOCK_FILE): { sessionId: string; pid: number; heartbeat: number } | null {
 		if (!existsSync(file)) return null;
@@ -1733,15 +1547,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {}
 	}
 
-	/** Topic, then replied-to message, then recency. Unresolvable targets are refused, not guessed. */
-	function routeMessage(thread: number | undefined, replyTo: number | undefined): string | null {
+	/** Replied-to message, then recency. Unresolvable targets are refused, not guessed. */
+	function routeMessage(replyTo: number | undefined): string | null {
 		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
-		const byReply =
-			replyTo === undefined ? null : (live.find(({ record }) => record.recent?.includes(replyTo) === true)?.id ?? null);
-		if (thread !== undefined) {
-			return live.find(({ record }) => record.topicId === thread)?.id ?? byReply;
+		if (replyTo !== undefined) {
+			return live.find(({ record }) => record.recent?.includes(replyTo) === true)?.id ?? null;
 		}
-		if (replyTo !== undefined) return byReply;
 		let best: { id: string; lastNotified: number } | null = null;
 		for (const { id, record } of live) {
 			if (best === null || record.lastNotified > best.lastNotified) best = { id, lastNotified: record.lastNotified };
@@ -2025,7 +1836,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 		if (isChatEvent(message)) return;
-		const thread = message.message_thread_id;
 		const replyTo = message.reply_to_message?.message_id;
 		const text = message.text ?? message.caption;
 
@@ -2039,7 +1849,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				"sendMessage",
 				{
 					chat_id: cfg.chatId,
-					...(thread === undefined ? {} : { message_thread_id: thread }),
 					text: toTelegramHtml(report),
 					parse_mode: "HTML",
 					link_preview_options: { is_disabled: true },
@@ -2049,33 +1858,31 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 		if (command !== undefined) {
-			const scoped = thread === undefined ? null : routeMessage(thread, replyTo);
 			// `/status` answers for the whole fleet from the records, so exactly one session composes it.
-			const broadcast =
+			const targets =
 				command === "status"
-					? [routeMessage(undefined, undefined)].filter((id): id is string => id !== null)
+					? [routeMessage(undefined)].filter((id): id is string => id !== null)
 					: allRecords()
 							.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
 							.map(({ id }) => id);
-			const targets = scoped !== null ? [scoped] : broadcast;
 			for (const target of targets) {
-				deliver(target, update.update_id, { kind: "command", value: command, scoped: scoped !== null });
+				deliver(target, update.update_id, { kind: "command", value: command });
 			}
 			return;
 		}
 
 		const media = pickMedia(message);
 		if (media !== null) {
-			const target = routeMessage(thread, replyTo);
+			const target = routeMessage(replyTo);
 			if (target === null) {
-				await serviceNotice("No live omp session owns that message, so it was dropped.", thread, false);
+				await serviceNotice("No live omp session owns that message, so it was dropped.", false);
 				return;
 			}
 			const record = readSessionRecord(target);
 			const owner = record === null ? "unknown" : fileOwner(record.tag, record.emoji);
 			const saved = await downloadMedia(cfg, media, update.update_id, owner);
 			if (saved === null) {
-				await serviceNotice("That file could not be fetched (20 MB is the ceiling), so it was dropped.", thread, false);
+				await serviceNotice("That file could not be fetched (20 MB is the ceiling), so it was dropped.", false);
 				return;
 			}
 			deliver(target, update.update_id, {
@@ -2092,17 +1899,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (text === undefined || text.length === 0) {
 			await serviceNotice(
 				"That message type does not reach the agent. Send text, a photo, a voice note, an audio file, or a document.",
-				thread,
 				false,
 			);
 			return;
 		}
 
-		const target = routeMessage(thread, replyTo);
+		const target = routeMessage(replyTo);
 		if (target === null) {
 			await serviceNotice(
 				"No live omp session owns that message, so it was dropped. Reply to a message from the session you mean.",
-				thread,
 				false,
 			);
 			return;
@@ -2110,7 +1915,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// A plain message with no reply attached is the only one that can be misrouted, and only
 		// when two sessions finished together. Ask instead of guessing.
 		let routed = target;
-		if (thread === undefined && replyTo === undefined) {
+		if (replyTo === undefined) {
 			const rivals = ambiguousTargets();
 			if (rivals.length > 1) {
 				// An open question outranks recency: a bare message plainly answers it.
@@ -2189,7 +1994,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (question === undefined) return;
 		// An option appears in the body only when it adds something beyond its button label.
 		const blocks: string[] = [];
-		if (ask.head.length > 0 && topicId === null) blocks.push(ask.head);
+		if (ask.head.length > 0) blocks.push(ask.head);
 		const where = tmuxLocation();
 		const position = ask.questions.length > 1 ? ` ${ask.index + 1} of ${ask.questions.length}` : "";
 		blocks.push(`\u{1F534} Input needed${position}${where === null ? "" : ` (tmux ${where})`}`);
@@ -2222,7 +2027,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			);
 			return;
 		}
-		const sentMessage = await sendOrEdit(config, "sendMessage", threaded({ reply_markup: markup }), body);
+		const sentMessage = await sendOrEdit(config, "sendMessage", { chat_id: config.chatId, reply_markup: markup }, body);
 		ask.messageId = sentMessage?.message_id ?? null;
 	}
 
@@ -2282,10 +2087,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (recorded.urgency === "green") keyboard.push([closeSessionButton()]);
 		const sent = await sendStructured(
 			config,
-			threaded({
+			{
+				chat_id: config.chatId,
 				reply_markup: { inline_keyboard: keyboard, force_reply: true },
 				...urgencyExtras(recorded.urgency),
-			}),
+			},
 			body,
 			keep,
 		);
@@ -2361,7 +2167,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await sendOrEdit(
 					config,
 					"sendMessage",
-					threaded({ reply_markup: { force_reply: true, input_field_placeholder: "Your answer" } }),
+					{
+						chat_id: config.chatId,
+						reply_markup: { force_reply: true, input_field_placeholder: "Your answer" },
+					},
 					`Type your answer to: ${question.question}`,
 				);
 			}
@@ -2459,10 +2268,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					if (entry.value === "status" && sessionCtx !== null) {
 						// Our own line has to be current before it is read back with everyone else's.
 						writeSessionRecord(sessionCtx);
-						const own = readSessionRecord(sessionId);
-						const report = entry.scoped === true && own !== null ? statusLine(own) : statusReport();
 						// Context-prefixed even for the fleet answer, so the reply says which session composed it.
-						await sessionNotice(sessionCtx, report);
+						await sessionNotice(sessionCtx, statusReport());
 					}
 					continue;
 				}
@@ -2812,7 +2619,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					`${wanted} is already in use by ${badgeOf(claimed.value)}, so the badge is unchanged. In use: ${taken}. Pick another emoji that depicts this work.`,
 				);
 			}
-			detach(renameTopicIfStale(ctx), "topic rename");
 			return {
 				content: [{ type: "text", text: `Badge is now: ${badge(ctx)}` }],
 				details: { badge: badge(ctx), applied: true },
@@ -2965,7 +2771,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const captionOf = (name: string, lead: boolean): string => (lead ? `${head}\n\n${name}` : name);
 
 			const base: Record<string, string | number> = { chat_id: config.chatId };
-			if (topicId !== null) base.message_thread_id = topicId;
 			const sentIds: number[] = [];
 			if (loaded.length > 1 && loaded.every((file) => file.photo)) {
 				const names = loaded.map((file) => nameOf(file.original, "photo"));
@@ -3055,7 +2860,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		sessionTag = claimTag();
 		// Base-36 tag as a number: stable across resumes, unique across live sessions.
 		draftId = Number.parseInt(sessionTag, 36) + 1;
-		refreshTmuxWindowKey();
 		const previous = readSessionRecord(sessionId);
 		badgeOverride = previous?.label ?? "";
 		if (previous?.standing != null && typeof previous.standing.id === "string") {
@@ -3070,13 +2874,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		lastNotifiedAt = typeof previous?.lastNotified === "number" ? previous.lastNotified : 0;
 		pinnedMessageId = typeof previous?.pinned === "number" ? previous.pinned : null;
 		closeOfferMessageId = typeof previous?.closeOffer === "number" ? previous.closeOffer : null;
-		// Topic state must come back before the first record write below, or a
-		// crash-recovered session clobbers it and creates a duplicate forum topic.
-		if (typeof previous?.topicId === "number") {
-			topicId = previous.topicId;
-			topicName = typeof previous.topicName === "string" ? previous.topicName : "";
-			topicIconEmoji = previous.emoji;
-		}
 		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
 			rmSync(LOCK_FILE, { recursive: true, force: true });
 		}
@@ -3133,10 +2930,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		ctx.setInterval(() => {
 			try {
 				reloadConfig();
-				refreshTmuxWindowKey();
 				writeSessionRecord(ctx);
 				if (badgeEmoji.length === 0) detach(claimBadgeIfMissing(ctx), "badge claim");
-				detach(renameTopicIfStale(ctx), "topic rename");
 				reapOldMedia();
 				reapHeldMessages();
 				if (ownsLock()) refreshLock();
@@ -3163,15 +2958,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		}, DRAIN_MS);
 
-		try {
-			await sweepPendingTopics();
-			await ensureTopic(ctx);
-			writeSessionRecord(ctx);
-		} catch (error) {
-			pi.logger.warn("notify-telegram: topic setup failed, continuing without a topic", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
+		writeSessionRecord(ctx);
 	});
 
 	pi.on("input", async (_event, ctx) => {
@@ -3283,7 +3070,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const questions = extractQuestionPreviews(askStream.buffer);
 		const blocks: string[] = [];
 		const head = sessionCtx === null ? "" : badge(sessionCtx);
-		if (head.length > 0 && topicId === null) blocks.push(head);
+		if (head.length > 0) blocks.push(head);
 		blocks.push("\u{1F534} Input needed (the question is still being written)");
 		if (questions.length === 1) blocks.push(questions[0] ?? "");
 		else if (questions.length > 1) blocks.push(questions.map((q, i) => `${i + 1}. ${q}`).join("\n\n"));
@@ -3486,14 +3273,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		unsubscribeInput?.();
 		unsubscribeInput = null;
-		retireCloseOffer(topicId === null);
+		retireCloseOffer(true);
 		const ask = pendingAsk;
 		if (ask !== null) {
 			pendingAsk = null;
 			const messageId = ask.messageId;
 			const head = ask.settlementHeads[ask.index];
 			ask.messageId = null;
-			if (config !== null && topicId === null && head !== undefined) {
+			if (config !== null && head !== undefined) {
 				detach(settleQuestionMessage(messageId, head, "This question is no longer active."), "pending-question close");
 			}
 		}
@@ -3501,24 +3288,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (standing !== null) {
 			standingQuestion = null;
 			if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-			// A topic session's shutdown deletes the whole thread below, question included.
-			if (config !== null && topicId === null) {
+			if (config !== null) {
 				detach(
 					settleQuestionMessage(standing.messageId, standing.head, "**Session closed.**"),
 					"standing-question close",
 				);
 			}
 		}
-		if (topicId === null && sessionCtx !== null) unpinRed(sessionCtx);
-		if (config !== null && topicId !== null) {
-			mkdirSync(PENDING_TOPICS_DIR, { recursive: true, mode: 0o700 });
-			writeFileAtomic(join(PENDING_TOPICS_DIR, `${sessionId}.json`), JSON.stringify(topicId), 0o600);
-			detach(
-				callTelegram(config, "deleteForumTopic", { chat_id: config.chatId, message_thread_id: topicId }, 5_000),
-				"topic delete",
-			);
-			unlinkSync(join(SESSIONS_DIR, `${sessionId}.json`));
-		}
+		if (sessionCtx !== null) unpinRed(sessionCtx);
 		releaseLock();
 		// Handing the board on rather than leaving the next owner to wait out a stale claim.
 		releaseLock(DASHBOARD_LOCK_FILE);

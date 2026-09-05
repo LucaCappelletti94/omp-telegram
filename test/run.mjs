@@ -35,11 +35,7 @@ const api = {
 	calls: [],
 	queued: [],
 	rejectHtml: false,
-	topicsEnabled: true,
-	topicHasThread: true,
-	nextTopic: 900,
 	nextMessage: 7,
-	icons: null,
 	filePath: "documents/file_9.oga",
 	fileDownload: "ok",
 };
@@ -86,9 +82,6 @@ globalThis.fetch = async (url, init) => {
 			}),
 		};
 	}
-	if (method === "createForumTopic" && !api.topicsEnabled) {
-		return { ok: false, status: 400, json: async () => ({ ok: false, description: "TOPICS_DISABLED" }) };
-	}
 	if (api.rejectHtml && body.parse_mode === "HTML") {
 		return { ok: false, status: 400, json: async () => ({ ok: false, description: "can't parse entities" }) };
 	}
@@ -97,17 +90,11 @@ globalThis.fetch = async (url, init) => {
 			? api.queued.splice(0, api.queued.length)
 			: method === "sendMessage"
 				? { message_id: api.nextMessage++ }
-				: method === "createForumTopic"
-					? api.topicHasThread
-						? { message_thread_id: api.nextTopic++ }
-						: {}
-					: method === "getFile"
-						? api.filePath === null
-							? {}
-							: { file_path: api.filePath }
-						: method === "getForumTopicIconStickers"
-							? (api.icons ?? [])
-							: true;
+				: method === "getFile"
+					? api.filePath === null
+						? {}
+						: { file_path: api.filePath }
+					: true;
 	return { ok: true, json: async () => ({ ok: true, result }) };
 };
 
@@ -216,7 +203,6 @@ const singleQuestion = {
 
 // ---------------------------------------------------------------- registration
 heading("registration and startup");
-api.topicsEnabled = false;
 const one = spawn("01a03406-6e80-75e3-8321-3c2a242a59b6", "/home/dev/work/subql");
 await one.fire("session_start");
 check("registers ask and session_badge", one.tools.get("ask")?.strict === true && one.tools.has("session_badge"));
@@ -226,12 +212,7 @@ check(
 	"poller lock acquired",
 	JSON.parse(readFileSync(join(root, "notify-telegram/poller.lock"), "utf8")).sessionId === one.id,
 );
-check("timers registered even though topic creation failed", one.timers.length === 2);
-check(
-	"topic failure is logged rather than swallowed",
-	one.warns.some((w) => JSON.stringify(w.meta ?? {}).includes("TOPICS_DISABLED")),
-);
-check("no topic recorded when topic mode is off", record(one.id).topicId === null);
+check("timers registered", one.timers.length === 2);
 
 // -------------------------------------------------------------- session tokens
 heading("session routing tokens");
@@ -698,8 +679,6 @@ const crowd = [
 			pid: 4000 + index,
 			tag: `c${index}`.padEnd(5, "0"),
 			name: "",
-			topicId: null,
-			topicName: "",
 			cwd: `/home/dev/work/crowd-${index}`,
 			emoji,
 			emojiChosen: false,
@@ -734,8 +713,6 @@ writeFileSync(
 		pid: 999999,
 		tag: "zzzzz",
 		name: "",
-		topicId: null,
-		topicName: "",
 		cwd: "/x",
 		emoji: "\u{1F41D}",
 		label: "",
@@ -748,83 +725,6 @@ await reaper.fire("session_start");
 check("stale record reaped", !existsSync(join(sessionsDir, `${dead}.json`)));
 check("stale inbox reaped", !existsSync(inboxOf(dead)));
 check("live records survive", existsSync(join(sessionsDir, `${one.id}.json`)));
-
-// ---------------------------------------------------------------------- topics
-heading("forum topics");
-api.topicsEnabled = true;
-const alpha = spawn("01a03600-0000-0000-0000-000000000000", "/home/dev/work/sqlitegis");
-await alpha.fire("session_start");
-const beta = spawn("01a03601-0000-0000-0000-000000000000", "/home/dev/work/pg2sqlite");
-await beta.fire("session_start");
-const topicAlpha = record(alpha.id).topicId;
-const topicBeta = record(beta.id).topicId;
-check("each session gets a topic", typeof topicAlpha === "number" && typeof topicBeta === "number");
-check("topics are distinct", topicAlpha !== topicBeta);
-check(
-	"topic name carries badge and folder",
-	/^.+ sqlitegis \u00B7 /u.test(called("createForumTopic").at(-2).body.name),
-);
-await alpha.fire("session_stop");
-await settle();
-check("messages go into the topic", lastCall("sendMessage").body.message_thread_id === topicAlpha);
-check(
-	"badge head is dropped inside a topic",
-	lastCall("sendMessage").body.text.startsWith("<b>\u{1F7E2} Turn finished</b>"),
-);
-
-alpha.setTitle("Port the R-tree index");
-alpha.heartbeat();
-await settle();
-check("topic renamed once omp titles the session", lastCall("editForumTopic")?.body.message_thread_id === topicAlpha);
-check("new name carries the title", lastCall("editForumTopic")?.body.name.includes("Port the R-tree index"));
-
-api.queued = [
-	{
-		update_id: 120,
-		message: { message_id: 30, date: 1, chat: { id: CHAT }, message_thread_id: topicBeta, text: "use duckdb" },
-	},
-];
-await one.pump(250);
-check("a reply in a topic routes to that topic's session", inboxCount(beta.id) === 1);
-check("it ignores which session was notified most recently", inboxCount(alpha.id) === 0);
-
-api.queued = [
-	{
-		update_id: 121,
-		message: { message_id: 31, date: 1, chat: { id: CHAT }, message_thread_id: 424242, text: "orphan" },
-	},
-];
-await one.pump(250);
-check("an unowned thread is refused inside that thread", lastCall("sendMessage").body.message_thread_id === 424242);
-
-await alpha.fire("session_shutdown");
-check(
-	"topic deleted on clean exit",
-	called("deleteForumTopic").some((c) => c.body.message_thread_id === topicAlpha),
-);
-check(
-	"topic queued in case the process dies first",
-	existsSync(join(root, "notify-telegram/pending-topics", `${alpha.id}.json`)) &&
-		JSON.parse(readFileSync(join(root, "notify-telegram/pending-topics", `${alpha.id}.json`), "utf8")) === topicAlpha,
-);
-check("session record removed on exit", !existsSync(join(sessionsDir, `${alpha.id}.json`)));
-const sweeper = spawn("01a03700-0000-0000-0000-000000000000", "/home/dev/work/ds4");
-await sweeper.fire("session_start");
-check(
-	"the next start sweeps the delete queue",
-	!existsSync(join(root, "notify-telegram/pending-topics", `${alpha.id}.json`)),
-);
-
-api.topicsEnabled = false;
-const flatSession = spawn("01a03800-0000-0000-0000-000000000000", "/home/dev/work/rls2fga");
-await flatSession.fire("session_start");
-await flatSession.fire("session_stop");
-await settle();
-check(
-	"falls back to a flat message when topics are unavailable",
-	lastCall("sendMessage").body.message_thread_id === undefined,
-);
-check("badge head returns in flat mode", lastCall("sendMessage").body.text.startsWith(record(flatSession.id).emoji));
 
 // ------------------------------------------------------------- reply routing
 heading("reply routing");
@@ -1336,8 +1236,8 @@ check(
 );
 
 // Pinning the fleet board or a red status makes Telegram post its own "pinned a message" notice
-// back into the chat, and creating a topic does the same. Those are chat events, not something the
-// user typed, so they pass in silence rather than earn a lecture about supported types.
+// back into the chat. That is a chat event, not something the user typed, so it passes in silence
+// rather than earn a lecture about supported types.
 const beforePin = called("sendMessage").length;
 api.queued = [
 	{
@@ -1352,39 +1252,6 @@ api.queued = [
 ];
 await voiceSession.pump(250);
 check("a pin notice draws no reply", called("sendMessage").length === beforePin);
-
-const beforeTopic = called("sendMessage").length;
-api.queued = [
-	{
-		update_id: 507,
-		message: {
-			message_id: 76,
-			date: 1,
-			chat: { id: CHAT },
-			message_thread_id: 901,
-			forum_topic_created: { name: "omp subql" },
-		},
-	},
-];
-await voiceSession.pump(250);
-check("a new-topic notice draws no reply", called("sendMessage").length === beforeTopic);
-
-// A stale topic name gets rewritten with editForumTopic, which narrates itself the same way.
-const beforeRename = called("sendMessage").length;
-api.queued = [
-	{
-		update_id: 508,
-		message: {
-			message_id: 77,
-			date: 1,
-			chat: { id: CHAT },
-			message_thread_id: 901,
-			forum_topic_edited: { name: "omp diesel" },
-		},
-	},
-];
-await voiceSession.pump(250);
-check("a renamed-topic notice draws no reply", called("sendMessage").length === beforeRename);
 
 // ------------------------------------------------------ terminal cancellation and closure
 heading("cancellation and message closure");
@@ -1650,18 +1517,6 @@ await settle(150);
 torn.heartbeat();
 const litter = readdirSync(sessionsDir).filter((f) => f.includes(".tmp"));
 check("no temp files are left behind", litter.length === 0);
-
-// An unparseable pending-topics entry is silently discarded instead of throwing.
-mkdirSync(join(root, "notify-telegram/pending-topics"), { recursive: true });
-writeFileSync(join(root, "notify-telegram/pending-topics/corrupt.json"), "{nope");
-const sweep2 = spawn("01a04103-0000-0000-0000-000000000000", "/home/dev/work/rats");
-let sweepFailed = false;
-try {
-	await sweep2.fire("session_start");
-} catch {
-	sweepFailed = true;
-}
-check("a corrupt pending-topics file does not break startup", sweepFailed === false);
 
 // ------------------------------------------------------------------ status semaphore
 heading("turn-end status semaphore");
@@ -2117,30 +1972,6 @@ await rrBack.pump(250);
 check("a reply to a pre-restart message still routes", inboxCount(rr1.id) === 1);
 for (const f of readdirSync(inboxOf(rr1.id))) unlinkSync(join(inboxOf(rr1.id), f));
 
-// Fix 1: inside a topic, an ask no longer repeats the badge that the topic name already carries.
-api.topicsEnabled = true;
-const ta = spawn("01a04600-0000-0000-0000-000000000000", "/home/dev/work/sqlitegis");
-await ta.fire("session_start");
-const taState = {};
-const taRun = ta.tools
-	.get("ask")
-	.execute(
-		"ta",
-		{ questions: [{ id: "q", question: "ok?", options: [{ label: "yes" }] }] },
-		undefined,
-		undefined,
-		stubbornCtx(ta.ctx, taState),
-	);
-await settle(180);
-const taMsg = lastCall("sendMessage").body;
-check("a topic ask goes into the thread", typeof taMsg.message_thread_id === "number");
-check("a topic ask does not repeat the badge", !taMsg.text.includes(" \u00B7 "));
-const taAsk = taMsg.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
-writeFileSync(join(inboxOf(ta.id), "996.json"), JSON.stringify({ kind: "callback", value: `o:${taAsk}:0:0` }));
-await ta.pump(250);
-await taRun;
-api.topicsEnabled = false;
-
 // Fix 3: routing skips a stale record without deleting it, so its inbox is not orphaned.
 const staleId = "01a04700-dead-0000-0000-000000000000";
 writeFileSync(
@@ -2149,8 +1980,6 @@ writeFileSync(
 		pid: 999999,
 		tag: "qqqqq",
 		name: "",
-		topicId: null,
-		topicName: "",
 		cwd: "/x",
 		emoji: "\u{1F344}",
 		label: "",
@@ -2444,7 +2273,6 @@ check(
 		fleetMsg.text.includes("\u26AA 3 Sleepy"),
 );
 check("fleet skips windows that are not omp", !fleetMsg.text.includes("bash"));
-check("fleet answers the general chat without a thread", fleetMsg.message_thread_id === undefined);
 check("fleet does not touch any session inbox", inboxCount(ux.id) === 0);
 
 // The report is re-read per command: an emptied fleet answers accordingly.
@@ -2490,23 +2318,6 @@ const green = called("sendMessage").findLast(
 );
 check("a green status carries the celebration effect", green?.body.message_effect_id === "5046509860389126442");
 
-// Topic icons match the badge when the free icon set has it.
-api.topicsEnabled = true;
-api.icons = [
-	"\u{1F98A}",
-	"\u{1F419}",
-	"\u{1F335}",
-	"\u{1F3B8}",
-	"\u{1F680}",
-	"\u{1F41D}",
-	"\u{1F344}",
-	"\u{1F9ED}",
-	"\u{1F42C}",
-	"\u{1F3A9}",
-	"\u{1F9F2}",
-	"\u{1F94C}",
-	"\u{1F401}",
-].map((emoji) => ({ emoji, custom_emoji_id: `icon-${emoji}` }));
 // A resume carries the badge the agent chose, so the emoji under test is not the luck of the palette.
 const iconicId = "01a04900-0000-0000-0000-000000000000";
 writeFileSync(
@@ -2515,8 +2326,6 @@ writeFileSync(
 		pid: 4321,
 		tag: "icon1",
 		name: "",
-		topicId: null,
-		topicName: "",
 		cwd: "/home/dev/work/duckpond",
 		emoji: "\u{1F401}",
 		emojiChosen: true,
@@ -2529,72 +2338,7 @@ writeFileSync(
 const iconic = spawn(iconicId, "/home/dev/work/duckpond");
 await iconic.fire("session_start");
 check("the resumed session kept its chosen emoji", record(iconic.id).emoji === "\u{1F401}");
-check(
-	"the topic icon matches the badge emoji",
-	lastCall("createForumTopic").body.icon_custom_emoji_id === "icon-\u{1F401}",
-);
-// The badge is what the topic wears, so a chosen emoji takes the icon with it.
-await iconic.tools.get("session_badge").execute("i1", { emoji: "\u{1F9AB}" }, undefined, undefined, iconic.ctx);
-await settle();
-check(
-	"an emoji outside the icon set clears the stale topic icon",
-	lastCall("editForumTopic").body.icon_custom_emoji_id === "",
-);
-await iconic.tools.get("session_badge").execute("i2", { emoji: "\u{1F401}" }, undefined, undefined, iconic.ctx);
-await settle();
-check(
-	"an emoji inside the icon set becomes the topic icon",
-	lastCall("editForumTopic").body.icon_custom_emoji_id === "icon-\u{1F401}",
-);
 
-// A refused topic edit changed nothing on Telegram, so the next heartbeat has to try again.
-api.failMethods = ["editForumTopic"];
-await iconic.tools.get("session_badge").execute("i3", { emoji: "\u{1F9F0}" }, undefined, undefined, iconic.ctx);
-await settle();
-api.failMethods = [];
-iconic.heartbeat();
-await settle(150);
-check("a refused topic edit is retried", lastCall("editForumTopic").body.name.includes("\u{1F9F0}"));
-
-// A refused sticker lookup is not an empty sticker set, and caching one would strip every icon.
-api.icons = [...api.icons, { emoji: "\u{1F41E}", custom_emoji_id: "icon-\u{1F41E}" }];
-api.failMethods = ["getForumTopicIconStickers"];
-const stickerless = spawn("01a04901-0000-0000-0000-000000000000", "/home/dev/work/stickerless");
-await stickerless.fire("session_start");
-check(
-	"a refused sticker lookup leaves the new topic iconless",
-	lastCall("createForumTopic").body.icon_custom_emoji_id === undefined,
-);
-await stickerless.tools
-	.get("session_badge")
-	.execute("s1", { emoji: "\u{1F41E}" }, undefined, undefined, stickerless.ctx);
-await settle();
-check(
-	"a refused sticker lookup does not strip the icon",
-	lastCall("editForumTopic").body.icon_custom_emoji_id === undefined,
-);
-api.failMethods = [];
-stickerless.heartbeat();
-await settle(150);
-check(
-	"the icon lands once the sticker set answers",
-	lastCall("editForumTopic").body.icon_custom_emoji_id === "icon-\u{1F41E}",
-);
-api.topicsEnabled = false;
-api.icons = null;
-
-// A crash-recovered session must keep its forum topic instead of leaking a new one.
-api.topicsEnabled = true;
-const crashed = spawn("01a04a00-0000-0000-0000-000000000000", "/home/dev/work/lance");
-await crashed.fire("session_start");
-const crashedTopic = record(crashed.id).topicId;
-check("the crashed session had a topic", typeof crashedTopic === "number");
-const topicsBefore = called("createForumTopic").length;
-const revived = spawn(crashed.id, "/home/dev/work/lance");
-await revived.fire("session_start");
-check("a crash resume keeps the same topic", record(crashed.id).topicId === crashedTopic);
-check("no duplicate topic is created", called("createForumTopic").length === topicsBefore);
-api.topicsEnabled = false;
 heading("streaming, cost, and transparency");
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 const fx = spawn("01a04b00-0000-0000-0000-000000000000", "/home/dev/work/quackml");
@@ -3515,41 +3259,8 @@ await orphanSess.fire("session_start");
 	);
 }
 
-// h. Concurrent shutdown: two topic sessions shut down and write separate
-// pending-topics files; the next start sweeps both with two deleteForumTopic calls.
-{
-	api.topicsEnabled = true;
-	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
-	const concA = spawn("01a05010-0000-0000-0000-000000000000", "/home/dev/work/concA");
-	const concB = spawn("01a05011-0000-0000-0000-000000000000", "/home/dev/work/concB");
-	await concA.fire("session_start");
-	await concB.fire("session_start");
-	await concA.fire("session_shutdown");
-	await concB.fire("session_shutdown");
-	const pendingTopicsDir = join(root, "notify-telegram/pending-topics");
-	check(
-		"concurrent shutdown writes a pending-topics file per session",
-		existsSync(join(pendingTopicsDir, `${concA.id}.json`)) && existsSync(join(pendingTopicsDir, `${concB.id}.json`)),
-	);
-	api.topicsEnabled = false;
-	writeConfig();
-	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
-	const sweepTwo = spawn("01a05012-0000-0000-0000-000000000000", "/home/dev/work/sweep2");
-	const deletesBeforeSweep = called("deleteForumTopic").length;
-	await sweepTwo.fire("session_start");
-	check(
-		"concurrent shutdown sweep clears both pending-topics files",
-		!existsSync(join(pendingTopicsDir, `${concA.id}.json`)) && !existsSync(join(pendingTopicsDir, `${concB.id}.json`)),
-	);
-	check(
-		"concurrent shutdown sweep calls deleteForumTopic for each pending topic",
-		called("deleteForumTopic").length === deletesBeforeSweep + 2,
-	);
-}
-
 // A session shutdown turns an open standing question into a closing message.
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const bye = spawn("01a06001-0000-0000-0000-000000000000", "/home/dev/work/bye");
 	await bye.fire("session_start");
@@ -3585,7 +3296,6 @@ await orphanSess.fire("session_start");
 }
 
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const closedAsk = spawn("01a05005-0000-0000-0000-000000000000", "/home/dev/work/closed-ask");
 	await closedAsk.fire("session_start");
@@ -3617,7 +3327,6 @@ await orphanSess.fire("session_start");
 
 // Drafts render the markdown subset, with a plain fallback when the HTML is rejected.
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const md = spawn("01a06002-0000-0000-0000-000000000000", "/home/dev/work/mdraft");
 	await md.fire("session_start");
@@ -3651,7 +3360,6 @@ await orphanSess.fire("session_start");
 
 // A streaming ask tool call previews its questions in the draft, header first.
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const qp = spawn("01a06003-0000-0000-0000-000000000000", "/home/dev/work/qdraft");
 	await qp.fire("session_start");
@@ -3714,7 +3422,6 @@ await orphanSess.fire("session_start");
 
 // A green summary offers a close-session button that shuts the session down from the phone.
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const cs = spawn("01a06004-0000-0000-0000-000000000000", "/home/dev/work/closer");
 	let shutdowns = 0;
@@ -3779,7 +3486,6 @@ await orphanSess.fire("session_start");
 
 // A Telegram reply focuses the session's tmux window, but never while the terminal is busy.
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const binDir = join(root, "fakebin");
 	mkdirSync(binDir, { recursive: true });
@@ -3830,7 +3536,6 @@ await orphanSess.fire("session_start");
 
 // Starting new work retires a stale close-session button.
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const rt = spawn("01a06006-0000-0000-0000-000000000000", "/home/dev/work/retire");
 	await rt.fire("session_start");
@@ -3858,7 +3563,6 @@ await orphanSess.fire("session_start");
 
 heading("oversized message truncation");
 {
-	api.topicsEnabled = false;
 	// A fenced summary would otherwise leave through the native rich path.
 	api.failMethods = ["sendRichMessage"];
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
@@ -3914,7 +3618,6 @@ heading("oversized message truncation");
 
 heading("status tool feedback");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const sf = spawn("01a06011-0000-0000-0000-000000000000", "/home/dev/work/statusfeedback");
 	await sf.fire("session_start");
@@ -3949,21 +3652,12 @@ heading("status tool feedback");
 
 heading("surrogate-safe clipping");
 {
-	// a. A topic name cut at 128 UTF-16 units must not end on half an emoji.
-	api.topicsEnabled = true;
+	// A caption cut at 1024 UTF-16 units must not end on half an emoji. FormData
+	// turns the orphaned half into a replacement character, which is what ships.
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const sg = spawn("01a06012-0000-0000-0000-000000000000", `/home/dev/work/${"\u{1F600}".repeat(100)}`);
 	await sg.fire("session_start");
 	await settle(150);
-	await sg.tools.get("session_badge").execute("sb1", { emoji: "\u{1F9EA}" }, undefined, undefined, sg.ctx);
-	await settle(150);
-	const renamed = lastCall("editForumTopic").body.name;
-	check("the topic name is clipped at the 128-unit boundary", renamed.length === 127 || renamed.length === 128);
-	check("a clipped topic name holds no lone surrogate", renamed.isWellFormed());
-
-	// b. A caption cut at 1024 UTF-16 units must not end on half an emoji. FormData
-	// turns the orphaned half into a replacement character, which is what ships.
-	api.topicsEnabled = false;
 	const shot = join(root, "clip.png");
 	writeFileSync(shot, "png-bytes");
 	await sg.tools
@@ -3972,29 +3666,8 @@ heading("surrogate-safe clipping");
 	check("a clipped caption holds no replacement character", !lastCall("sendPhoto").body.caption.includes("\uFFFD"));
 }
 
-heading("pending-topic hygiene");
-{
-	api.topicsEnabled = false;
-	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
-	const pendingDir = join(root, "notify-telegram/pending-topics");
-	mkdirSync(pendingDir, { recursive: true });
-	writeFileSync(join(pendingDir, "unreadable.json"), "{not json");
-	writeFileSync(join(pendingDir, "wrongtype.json"), '{"topicId":12}');
-	const pt = spawn("01a06013-0000-0000-0000-000000000000", "/home/dev/work/pending");
-	await pt.fire("session_start");
-	await settle(150);
-	const warned = (file) => pt.warns.some((w) => `${w.m} ${JSON.stringify(w.meta)}`.includes(file));
-	check("an unparseable pending-topic file is named in a warning", warned("unreadable.json"));
-	check("a wrong-shaped pending-topic file is named in a warning", warned("wrongtype.json"));
-	check(
-		"the corrupt pending-topic files are still removed",
-		!existsSync(join(pendingDir, "unreadable.json")) && !existsSync(join(pendingDir, "wrongtype.json")),
-	);
-}
-
 heading("a discarded inbox entry is never silent");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const ib = spawn("01a06014-0000-0000-0000-000000000000", "/home/dev/work/inbox-drop");
 	await ib.fire("session_start");
@@ -4019,7 +3692,6 @@ heading("a discarded inbox entry is never silent");
 
 heading("uncovered event handlers");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const ev = spawn("01a06020-0000-0000-0000-000000000000", "/home/dev/work/events");
 	await ev.fire("session_start");
@@ -4068,7 +3740,6 @@ heading("uncovered event handlers");
 
 heading("media fetch failures");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const mf = spawn("01a06021-0000-0000-0000-000000000000", "/home/dev/work/mediafail");
 	await mf.fire("session_start");
@@ -4137,32 +3808,8 @@ heading("media fetch failures");
 	check("a healthy download still reaches the session", good.delivered);
 }
 
-heading("forum topic creation failures");
-{
-	// Telegram answers createForumTopic without a thread id: the session must fall back to flat messages.
-	api.topicsEnabled = true;
-	api.topicHasThread = false;
-	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
-	const nt = spawn("01a06022-0000-0000-0000-000000000000", "/home/dev/work/nothread");
-	await nt.fire("session_start");
-	await settle(150);
-	check("a topic without a thread id is not recorded", record(nt.id).topicId === null);
-	await nt.fire("input");
-	await nt.tools
-		.get("notify_status")
-		.execute("nt1", { summary: "Flat it is.", urgency: "green" }, undefined, undefined, nt.ctx);
-	await nt.fire("session_stop");
-	await settle(150);
-	const flat = lastCall("sendMessage").body;
-	check("a thread-less session sends flat messages", flat.message_thread_id === undefined);
-	check("a thread-less session still leads with its badge", flat.text.includes("nothread"));
-	api.topicHasThread = true;
-	api.topicsEnabled = false;
-}
-
 heading("rich status options");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const ro = spawn("01a06030-0000-0000-0000-000000000000", "/home/dev/work/richopts");
 	await ro.fire("session_start");
@@ -4270,7 +3917,6 @@ heading("rich status options");
 
 heading("aggregated status");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const trio = [];
 	for (const [index, folder] of ["alpha-svc", "beta-svc", "gamma-svc"].entries()) {
@@ -4331,8 +3977,6 @@ heading("aggregated status");
 				pid: 3000 + i,
 				tag: `y${String(i).padStart(4, "0")}`,
 				name: `swollen ${i}`,
-				topicId: null,
-				topicName: "",
 				cwd: `/home/dev/work/project-number-${i}`,
 				emoji: "\u{1F41D}",
 				label: "",
@@ -4343,7 +3987,6 @@ heading("aggregated status");
 				pinned: null,
 				draftId: 700 + i,
 				state: "working (bash: a tool label of a realistic length)",
-				tmuxWindow: null,
 				summary: "S".repeat(160),
 				summaryAt: Date.now(),
 				heartbeat: Date.now(),
@@ -4399,39 +4042,8 @@ heading("aggregated status");
 	await settle(150);
 }
 
-heading("thread-scoped status");
-{
-	api.topicsEnabled = true;
-	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
-	const solo = spawn("01a06050-0000-0000-0000-000000000000", "/home/dev/work/solo-svc");
-	await solo.fire("session_start");
-	await settle(150);
-	const soloTopic = record(solo.id).topicId;
-	check("the scoped session has a topic", typeof soloTopic === "number");
-	const before = called("sendMessage").length;
-	api.queued = [
-		{
-			update_id: 920,
-			message: { message_id: 920, date: 1, chat: { id: CHAT }, text: "/status", message_thread_id: soloTopic },
-		},
-	];
-	await solo.pump(250);
-	await solo.pump(250);
-	const scoped =
-		called("sendMessage")
-			.slice(before)
-			.find((c) => c.body.text?.includes("State:"))?.body.text ?? "";
-	check("a thread-scoped /status answers for its own session", scoped.includes("solo-svc"));
-	check(
-		"a thread-scoped /status names no other session",
-		!scoped.includes("alpha-svc") && !scoped.includes("beta-svc") && !scoped.includes("gamma-svc"),
-	);
-	api.topicsEnabled = false;
-}
-
 heading("attention-first /fleet");
 {
-	const SUPERGROUP = -1001234567890;
 	const fleetBin = join(root, "fleet-bin");
 	mkdirSync(fleetBin, { recursive: true });
 	// Five omp windows in one tmux session plus a plain shell. Column four is @omp_priority.
@@ -4462,19 +4074,13 @@ heading("attention-first /fleet");
 	process.env.TMUX = "/tmp/fake-tmux,1,0";
 	process.env.TMUX_PANE = "%42";
 
-	// Topic links only exist in a supergroup, whose chat id carries the -100 prefix.
-	writeConfig({ chatId: SUPERGROUP });
-	api.topicsEnabled = true;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const fl = spawn("01a06060-0000-0000-0000-000000000000", "/home/dev/work/fleeted");
 	await fl.fire("session_start");
 	await settle(150);
 	fl.heartbeat();
 	await settle(150);
-	const flTopic = record(fl.id).topicId;
-	check("the fleet session claims its tmux window", record(fl.id).tmuxWindow === "main:2");
-
-	api.queued = [{ update_id: 930, message: { message_id: 930, date: 1, chat: { id: SUPERGROUP }, text: "/fleet" } }];
+	api.queued = [{ update_id: 930, message: { message_id: 930, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
 	await fl.pump(250);
 	const report = lastCall("sendMessage").body.text ?? "";
 	const at = (needle) => report.indexOf(needle);
@@ -4484,15 +4090,8 @@ heading("attention-first /fleet");
 	check("a priority window is marked", /\u2757/u.test(report) && at("\u2757") < at("Marked urgent"));
 	check("an unmarked window carries no priority marker", (report.match(/\u2757/gu) ?? []).length === 1);
 	check("non-omp windows stay out", !report.includes("bash"));
-	check(
-		"the row for a session with a topic links to its thread",
-		report.includes(`<a href="https://t.me/c/1234567890/${flTopic}">Needs you</a>`),
-	);
-	check("a row with no matching session is not linked", !/<a [^>]*>Idle one<\/a>/u.test(report));
 	check("the report renders as HTML", lastCall("sendMessage").body.parse_mode === "HTML");
 
-	api.topicsEnabled = false;
-	writeConfig();
 	process.env.PATH = priorPath;
 	delete process.env.TMUX;
 	delete process.env.TMUX_PANE;
@@ -4500,7 +4099,6 @@ heading("attention-first /fleet");
 
 heading("turn duration in the footer");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const td = spawn("01a06070-0000-0000-0000-000000000000", "/home/dev/work/timed");
 	await td.fire("session_start");
@@ -4536,7 +4134,6 @@ heading("turn duration in the footer");
 
 heading("replies reach an idle session");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const ir = spawn("01a06080-0000-0000-0000-000000000000", "/home/dev/work/idlereply");
 	await ir.fire("session_start");
@@ -4592,7 +4189,6 @@ heading("replies reach an idle session");
 
 heading("bad options never lose the status");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const bo = spawn("01a06090-0000-0000-0000-000000000000", "/home/dev/work/badoptions");
 	await bo.fire("session_start");
@@ -4663,7 +4259,6 @@ heading("bad options never lose the status");
 
 heading("ambiguous plain messages ask which session");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	// Every earlier session in this suite counts as recently notified, which would make
 	// everything ambiguous. Reset them to "never notified" so only the pair below competes.
@@ -4820,7 +4415,6 @@ heading("ambiguous plain messages ask which session");
 
 heading("settings apply without a restart");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	writeConfig();
 	const cf = spawn("01a060b0-0000-0000-0000-000000000000", "/home/dev/work/livecfg");
@@ -4893,7 +4487,6 @@ heading("settings apply without a restart");
 
 heading("pinned fleet dashboard");
 {
-	api.topicsEnabled = false;
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
 	rmSync(join(root, "notify-telegram/dashboard.lock"), { force: true });
@@ -5055,8 +4648,6 @@ heading("pinned fleet dashboard");
 				pid: 9000 + i,
 				tag: `z${String(i).padStart(4, "0")}`,
 				name: `filler ${i}`,
-				topicId: null,
-				topicName: "",
 				cwd: `/home/dev/work/project-number-${i}`,
 				emoji: "\u{1F41D}",
 				label: "",
@@ -5067,7 +4658,6 @@ heading("pinned fleet dashboard");
 				pinned: null,
 				draftId: i,
 				state: "working (bash: a tool label of a realistic length)",
-				tmuxWindow: null,
 				summary: "S".repeat(160),
 				summaryAt: Date.now(),
 				heartbeat: Date.now(),
@@ -5111,8 +4701,6 @@ heading("pinned fleet dashboard");
 			pid: process.pid,
 			tag: "old",
 			name: "",
-			topicId: null,
-			topicName: "",
 			cwd: "/home/dev/work/old-code",
 			emoji: "\u{1F535}",
 			label: "old-code",
@@ -5123,7 +4711,6 @@ heading("pinned fleet dashboard");
 			pinned: null,
 			draftId: 0,
 			state: "idle",
-			tmuxWindow: null,
 			summary: "",
 			summaryAt: 0,
 			heartbeat: Date.now(),
@@ -5216,7 +4803,6 @@ heading("spinner frames match omp exactly");
 	process.env.PATH = `${spinBin}:${spinPath}`;
 	process.env.TMUX = "/tmp/fake-tmux,1,0";
 	process.env.TMUX_PANE = "%1";
-	api.topicsEnabled = false;
 	writeConfig();
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	const sp = spawn("01a060d0-0000-0000-0000-000000000000", "/home/dev/work/spinner");
