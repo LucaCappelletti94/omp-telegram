@@ -5195,6 +5195,34 @@ heading("a snippet arrives ready to copy");
 		.get("notify_snippet")
 		.execute("sn7", { purpose: " ", text: "something" }, undefined, undefined, sn.ctx);
 	check("a snippet with no purpose is refused", unnamed.isError === true);
+	const badLanguage = await sn.tools
+		.get("notify_snippet")
+		.execute(
+			"sn8",
+			{ purpose: "the patch", language: "ts and bash", text: "const x = 1;" },
+			undefined,
+			undefined,
+			sn.ctx,
+		);
+	check("a snippet with a bogus fence tag is refused", badLanguage.isError === true);
+
+	api.failMethods = ["sendMessage"];
+	const refused = await sn.tools
+		.get("notify_snippet")
+		.execute("sn9", { purpose: "a note", text: "never arrives" }, undefined, undefined, sn.ctx);
+	api.failMethods = [];
+	check("a snippet Telegram refuses is reported as an error", refused.isError === true);
+
+	// A session whose config never parsed has nowhere to send, and must say so.
+	const heldConfig = readFileSync(join(root, "notify-telegram.json"), "utf8");
+	writeFileSync(join(root, "notify-telegram.json"), "");
+	const off = spawn("01a06101-0000-0000-0000-000000000000", "/home/dev/work/snippetoff");
+	await off.fire("session_start");
+	writeFileSync(join(root, "notify-telegram.json"), heldConfig);
+	const unconfigured = await off.tools
+		.get("notify_snippet")
+		.execute("sn10", { purpose: "nowhere", text: "orphaned" }, undefined, undefined, off.ctx);
+	check("a snippet from an unconfigured session is refused", unconfigured.isError === true);
 }
 
 rmSync(root, { recursive: true, force: true });
