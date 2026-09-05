@@ -2922,7 +2922,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				};
 			}
 			const fence = fenceFor(payload);
-			const plain = `${messageHead(ctx)}\n\n**\u{1F4CB} Copy: ${purpose}**\n${fence}${language}\n${payload}\n${fence}`;
+			// Everything above the block is a plain label, and a backtick run in a session name or in
+			// the purpose would open a fence that swallows the payload's own opener, leaving the text
+			// meant for copying outside the block.
+			const label = `${messageHead(ctx)}\n\n**\u{1F4CB} Copy: ${purpose}**`.replaceAll("`", "");
+			const plain = `${label}\n${fence}${language}\n${payload}\n${fence}`;
 			const rendered = toTelegramHtml(plain).length;
 			if (rendered > TELEGRAM_TEXT_MAX) {
 				const room = Math.max(0, payload.length - (rendered - TELEGRAM_TEXT_MAX));
@@ -3183,10 +3187,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 		const questions = extractQuestionPreviews(askStream.buffer);
-		const blocks: string[] = [];
-		const head = sessionCtx === null ? "" : badge(sessionCtx);
-		if (head.length > 0) blocks.push(head);
-		blocks.push("\u{1F534} Input needed (the question is still being written)");
+		// The draft this rides in already opens with the session head, badge included.
+		const blocks: string[] = ["\u{1F534} Input needed (the question is still being written)"];
 		if (questions.length === 1) blocks.push(questions[0] ?? "");
 		else if (questions.length > 1) blocks.push(questions.map((q, i) => `${i + 1}. ${q}`).join("\n\n"));
 		askPreview = blocks.join("\n\n");

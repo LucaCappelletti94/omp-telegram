@@ -128,12 +128,16 @@ export function toTelegramHtml(source: string): string {
 	// NUL is the stash marker below; hostile input must not be able to forge or collide with it.
 	let work = source
 		.replaceAll("\u0000", "")
-		// The closer matches the opener's length, so a fenced payload can hold a shorter fence.
-		.replace(/(`{3,})([A-Za-z0-9_+-]*)\n?([\s\S]*?)\1/g, (_match, _fence: string, language: string, code: string) => {
-			const opener = language.length > 0 ? `<pre><code class="language-${language}">` : "<pre>";
-			const closer = language.length > 0 ? "</code></pre>" : "</pre>";
-			return stash(`${opener}${escapeHtml(code.replace(/\n$/, ""))}${closer}`);
-		});
+		// The closer is a whole run at least as long as the opener, so a fenced payload can hold a
+		// shorter fence, an opener is never read as part of a longer run, and no backtick is left over.
+		.replace(
+			/(?<!`)(`{3,})(?!`)([A-Za-z0-9_+-]*)\n?([\s\S]*?)\1`*(?!`)/g,
+			(_match, _fence: string, language: string, code: string) => {
+				const opener = language.length > 0 ? `<pre><code class="language-${language}">` : "<pre>";
+				const closer = language.length > 0 ? "</code></pre>" : "</pre>";
+				return stash(`${opener}${escapeHtml(code.replace(/\n$/, ""))}${closer}`);
+			},
+		);
 	work = work.replace(/`([^`\n]+)`/g, (_match, code: string) => stash(`<code>${escapeHtml(code)}</code>`));
 
 	work = escapeHtml(work);

@@ -215,6 +215,11 @@ check(
 	toTelegramHtml("````md\n```\nx\n```\n````") === '<pre><code class="language-md">```\nx\n```</code></pre>',
 );
 check("an unclosed fence stays literal", toTelegramHtml("```\nhalf a block").includes("```"));
+check("a four-tick fence closed by three stays literal", toTelegramHtml("````\nbody\n```") === "````\nbody\n```");
+check(
+	"a closing run longer than the opener leaves no stray backtick",
+	toTelegramHtml("```\nx\n````") === "<pre>x</pre>",
+);
 
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);

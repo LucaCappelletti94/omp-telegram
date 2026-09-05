@@ -3432,7 +3432,10 @@ await orphanSess.fire("session_start");
 		"a streaming ask previews the partial question under an input-needed line",
 		partial?.body.text.includes("Input needed") === true && partial.body.text.includes('Ship the "big" relea'),
 	);
-	check("the ask preview leads with the session badge", partial.body.text.indexOf("qdraft") >= 0);
+	check(
+		"the ask preview carries the session badge exactly once, from the draft head",
+		partial.body.text.split(badgeLineOf(qp.id)).length === 2,
+	);
 	await qp.fire("message_update", {
 		message: askMsg,
 		assistantMessageEvent: {
@@ -5160,6 +5163,23 @@ heading("a snippet arrives ready to copy");
 	check(
 		"a payload with its own fence is not cut short",
 		lastCall("sendMessage").body.text.includes("<pre>Steps:\n\n```sh\nnpm test\n```</pre>"),
+	);
+
+	// A fence run in the label would otherwise open a block that swallows the payload's own opener.
+	await sn.tools
+		.get("notify_snippet")
+		.execute(
+			"sn2b",
+			{ purpose: "replacement for the ```yaml block", text: "steps:\n  - run: npm test" },
+			undefined,
+			undefined,
+			sn.ctx,
+		);
+	const labelled = lastCall("sendMessage").body.text;
+	check("a fence run in the purpose does not escape the label", labelled.includes("replacement for the yaml block"));
+	check(
+		"a fence run in the purpose leaves the payload copyable",
+		labelled.includes("<pre>steps:\n  - run: npm test</pre>"),
 	);
 
 	await sn.tools
