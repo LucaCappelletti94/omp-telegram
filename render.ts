@@ -79,14 +79,6 @@ export function badgeLine(emoji: string, cwd: string, detail: string, fallback: 
 	return `${head}${folder} \u00B7 ${detail.length > 0 ? clip(detail, 60) : fallback}`;
 }
 
-/** Coarse elapsed time; a fleet overview never needs seconds past a minute. */
-export function ago(when: number, now = Date.now()): string {
-	const seconds = Math.max(0, Math.round((now - when) / 1000));
-	if (seconds < 60) return `${seconds}s ago`;
-	if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
-	return `${Math.round(seconds / 3600)}h ago`;
-}
-
 /** Compact elapsed time for the usage footer. */
 export function duration(ms: number): string {
 	const total = Math.max(0, Math.round(ms / 1000));
@@ -96,13 +88,18 @@ export function duration(ms: number): string {
 	return minutes % 60 === 0 ? `${Math.floor(minutes / 60)}h` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
-/**
- * Absolute wall-clock time, deliberately not a relative "4m ago". A pinned board is rewritten
- * only when its text changes, and a relative stamp would change every second and edit forever.
- */
+/** Absolute wall-clock time, the text a client without the date_time entity falls back to. */
 export function clockTime(when: number): string {
 	const at = new Date(when);
 	return `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+}
+
+/**
+ * A stamp the phone renders relative to now ("4 minutes ago") and keeps current itself. The wire
+ * text never changes, so a board compared by text is not rewritten every minute for it.
+ */
+export function relativeTime(when: number): string {
+	return `<tg-time unix="${Math.floor(when / 1000)}" format="r">${clockTime(when)}</tg-time>`;
 }
 
 /**
@@ -115,7 +112,10 @@ export function fenceFor(text: string): string {
 	return "`".repeat(Math.max(3, longest + 1));
 }
 
-/** Markdown subset to Telegram HTML. Code is stashed first so emphasis cannot touch it. */
+/**
+ * Markdown subset to Telegram HTML. Code is stashed first so emphasis cannot touch it, and so is
+ * Telegram's own `tg-time` tag, the one piece of HTML the source may carry.
+ */
 export function toTelegramHtml(source: string): string {
 	const blocks: string[] = [];
 	const stash = (html: string): string => {
@@ -139,6 +139,13 @@ export function toTelegramHtml(source: string): string {
 			},
 		);
 	work = work.replace(/`([^`\n]+)`/g, (_match, code: string) => stash(`<code>${escapeHtml(code)}</code>`));
+	work = work.replace(
+		/<tg-time unix="(\d+)"(?: format="([A-Za-z]*)")?>([^<\n]*)<\/tg-time>/g,
+		(_match, unix: string, format: string | undefined, text: string) =>
+			stash(
+				`<tg-time unix="${unix}"${format === undefined ? "" : ` format="${format}"`}>${escapeHtml(text)}</tg-time>`,
+			),
+	);
 
 	work = escapeHtml(work);
 	// Headings have no Telegram equivalent and otherwise render as literal hash marks.
@@ -193,6 +200,9 @@ export function fitToTelegram(plain: string, keep: string): string {
 		// An odd fence count means the cut landed inside a code block, which would otherwise
 		// degrade to literal backticks for the whole remaining message.
 		if ((head.match(/```/g)?.length ?? 0) % 2 === 1) head += "\n```";
+		// A cut inside a time stamp would ship its tag as literal text.
+		const stamp = head.lastIndexOf("<tg-time");
+		if (stamp >= 0 && !head.includes("</tg-time>", stamp)) head = head.slice(0, stamp).trimEnd();
 		return `${head}${TRUNCATION_NOTE}${keep}`;
 	};
 	let low = 0;

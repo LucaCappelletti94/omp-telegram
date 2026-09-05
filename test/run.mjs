@@ -4127,7 +4127,11 @@ heading("aggregated status");
 		["alpha-svc", "beta-svc", "gamma-svc"].every((f) => roll.includes(f)),
 	);
 	check("the reply carries each session's last summary", roll.includes("beta-svc is done."));
-	check("the reply says how long ago each summary landed", /\d+[smh] ago/.test(roll));
+	check(
+		"the reply stamps each summary with a client-rendered relative time",
+		/<tg-time unix="\d+" format="r">\d\d:\d\d<\/tg-time>/.test(roll),
+	);
+	check("the reply goes out as HTML so the stamp is an entity", lastCall("sendMessage").body.parse_mode === "HTML");
 
 	// A session mid-turn reports as working, not idle.
 	await trio[0].fire("input");
@@ -4183,9 +4187,10 @@ heading("aggregated status");
 		.slice(swollenFrom)
 		.find((c) => typeof c.body.text === "string" && c.body.text.includes("State:"));
 	check("a fleet too big for one message still gets a /status answer", bigStatus !== undefined);
-	check("the /status answer is cut to the limit", (bigStatus?.body.text.length ?? 0) <= 4096);
-	// The answer goes out as plain text, which Telegram never escapes, so budgeting for escaping
-	// would cut a summary dense in ampersands about five times earlier than it has to.
+	check("the /status answer is cut to the limit", wireLength(bigStatus?.body.text ?? "") <= 4096);
+	// The answer goes out as HTML now, so the limit is what Telegram counts once entities are
+	// parsed: an escaped ampersand costs one, and budgeting for the escape would cut a summary
+	// dense in them about five times earlier than it has to.
 	for (const f of readdirSync(join(root, "notify-telegram/sessions"))) {
 		if (!f.startsWith("01a060ee")) continue;
 		const path = join(root, "notify-telegram/sessions", f);
@@ -4197,8 +4202,8 @@ heading("aggregated status");
 	const denseStatus = api.calls
 		.slice(denseFrom)
 		.find((c) => typeof c.body.text === "string" && c.body.text.includes("State:"));
-	check("a /status dense in special characters still fits", (denseStatus?.body.text.length ?? 0) <= 4096);
-	check("a /status dense in special characters is not cut early", (denseStatus?.body.text.length ?? 0) > 3500);
+	check("a /status dense in special characters still fits", wireLength(denseStatus?.body.text ?? "") <= 4096);
+	check("a /status dense in special characters is not cut early", wireLength(denseStatus?.body.text ?? "") > 3500);
 
 	// The picker that asks which session a bare message belongs to carries the same blocks, and in
 	// a fleet this size every session is a rival.
@@ -4762,6 +4767,12 @@ heading("pinned fleet dashboard");
 	check("the dashboard names the live sessions", board?.text.includes("dash-owner") === true);
 	check("the dashboard reports their state", board?.text.includes("idle") === true);
 	check("the dashboard carries the last summary", board?.text.includes("Owner is done.") === true);
+	// The time beside the summary is a date_time entity the phone renders relative to now, so the
+	// text on the wire is fixed and the client keeps "4 minutes ago" current on its own.
+	check(
+		"the dashboard stamps the summary with a client-rendered relative time",
+		/<tg-time unix="\d+" format="r">\d\d:\d\d<\/tg-time>/.test(board?.text ?? "") && board?.parse_mode === "HTML",
+	);
 	check("the dashboard is pinned", called("pinChatMessage").length === pinsBefore + 1);
 	check("the dashboard is pinned silently", called("pinChatMessage").at(-1)?.body.disable_notification === true);
 	check("the dashboard message id is shared on disk", existsSync(join(root, "notify-telegram/dashboard.json")));

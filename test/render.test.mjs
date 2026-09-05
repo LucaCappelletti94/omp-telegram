@@ -1,17 +1,18 @@
 // The pure rendering helpers, called directly. No fake server, no session, no sleeping.
 
 import {
-	ago,
 	BUTTON_TEXT_MAX,
 	badgeLine,
 	buttonText,
 	clip,
+	clockTime,
 	duration,
 	extractQuestionPreviews,
 	fenceFor,
 	fitToTelegram,
 	isMarkupFailure,
 	packRows,
+	relativeTime,
 	stanceOf,
 	TELEGRAM_TEXT_MAX,
 	toTelegramHtml,
@@ -80,6 +81,13 @@ heading("fitting a message to the telegram limit");
 	const cutEmoji = fitToTelegram(emoji, "");
 	const lastUnit = cutEmoji.charCodeAt(cutEmoji.indexOf("\n\n(truncated") - 1);
 	check("a cut between surrogate halves is pulled back", lastUnit < 0xd800 || lastUnit > 0xdbff);
+
+	// A cut that lands inside a time stamp would ship the tag as literal text. The stamp starts
+	// just under the budget so the longest fitting prefix ends inside it.
+	const stamped = `${"x".repeat(4040)} (${relativeTime(0)}) ${"y".repeat(100)}`;
+	const cutStamp = fitToTelegram(stamped, "");
+	check("the probe cut would land inside the stamp", cutStamp.indexOf("(truncated") > 4040);
+	check("a cut never lands inside a time stamp", !cutStamp.includes("<tg-time") || cutStamp.includes("</tg-time>"));
 }
 
 heading("classifying a telegram refusal");
@@ -167,9 +175,27 @@ check("a part minute keeps the seconds", duration(95_000) === "1m 35s");
 check("a whole hour drops the minutes", duration(7_200_000) === "2h");
 check("a part hour keeps the minutes", duration(5_400_000) === "1h 30m");
 check("a negative elapsed clamps to zero", duration(-5_000) === "0s");
-check("fresh reads as seconds ago", ago(1_000_000, 1_000_000) === "0s ago");
-check("minutes round", ago(0, 150_000) === "3m ago");
-check("hours round", ago(0, 7_200_000) === "2h ago");
+// The stamp is a date_time entity: unix seconds carry the instant, the clock time is what a
+// client without the entity shows, and the wire text never changes as time passes.
+const stampedAt = Date.UTC(2026, 8, 5, 9, 55, 30);
+check(
+	"a relative stamp is a tg-time tag with whole seconds and a clock fallback",
+	relativeTime(stampedAt) ===
+		`<tg-time unix="${Math.floor(stampedAt / 1000)}" format="r">${clockTime(stampedAt)}</tg-time>`,
+);
+check("a relative stamp is stable across ticks", relativeTime(stampedAt) === relativeTime(stampedAt + 999));
+check(
+	"a tg-time tag passes through the markdown renderer",
+	toTelegramHtml(`done (${relativeTime(stampedAt)}) & <b>`) === `done (${relativeTime(stampedAt)}) &amp; &lt;b&gt;`,
+);
+check(
+	"a tg-time tag escapes the text it carries",
+	toTelegramHtml('<tg-time unix="1" format="r">a & b</tg-time>') === '<tg-time unix="1" format="r">a &amp; b</tg-time>',
+);
+check(
+	"a tg-time tag wrapping markup is not a tag at all",
+	!toTelegramHtml('<tg-time unix="1" format="r"><b>x</tg-time>').includes("<tg-time"),
+);
 check(
 	"a badge names the folder and the detail",
 	badgeLine("\u{1F98A}", "/home/dev/work/subql", "index work", "t1") === "\u{1F98A} subql \u00B7 index work",
