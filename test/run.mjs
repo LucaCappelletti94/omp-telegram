@@ -742,7 +742,6 @@ check("stale record reaped", !existsSync(join(sessionsDir, `${dead}.json`)));
 check("stale inbox reaped", !existsSync(inboxOf(dead)));
 check("live records survive", existsSync(join(sessionsDir, `${one.id}.json`)));
 
-
 // ------------------------------------------------------------- reply routing
 heading("reply routing");
 const rr1 = spawn("01a03900-0000-0000-0000-000000000000", "/home/dev/work/subql");
@@ -2461,7 +2460,6 @@ check(
 		switchedDraft.can_stop === undefined,
 );
 fx.ctx.model = { provider: "openai", id: "gpt-5.6-sol" };
-
 
 // Usage lands as a footer on the turn-end summary.
 await fx.fire("message_end", {
