@@ -204,7 +204,6 @@ interface PendingAsk {
 	head: string;
 	context: string;
 	questions: AskQuestion[];
-	settlementHeads: string[];
 	index: number;
 	messageId: number | null;
 	selected: Set<string>[];
@@ -2078,6 +2077,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
+	/** The current question's message, under the same badge head the live message carried. Past the last question there is nothing to settle. */
+	async function settleAskMessage(
+		ask: PendingAsk,
+		messageId: number | null,
+		result: string,
+		settled?: InlineButton[][],
+	): Promise<void> {
+		const question = ask.questions[ask.index];
+		if (question === undefined) return;
+		await settleQuestionMessage(messageId, `${ask.head}\n\n${question.question}`, result, settled);
+	}
+
 	/** Blocks nothing: a press starts the next turn. Only the latest stands. */
 	async function sendStandingQuestion(
 		ctx: ExtensionContext,
@@ -2090,7 +2101,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		standingSeq += 1;
 		const id = `${sessionTag}-n${standingSeq.toString(36)}`;
 		const prompt = recorded.question?.trim() || recorded.text;
-		const settlementHead = `${sessionContextLine(ctx)}\n\n${prompt}`;
+		// The settled message keeps the same head as the live one, so the chat stays scannable by badge.
+		const settlementHead = `${badge(ctx)}\n\n${prompt}`;
 		// An option earns a body block only when it says more than its button already does.
 		const blocks = [`${recorded.text}${recorded.question === undefined ? "" : `\n\n${recorded.question}`}`];
 		for (const option of recorded.options) {
@@ -2153,16 +2165,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const chosen = [...(ask.selected[ask.index] ?? new Set<string>())];
 		const shown = ask.custom[ask.index] ?? (chosen.length === 0 ? "no selection" : chosen.join(", "));
 		if (answered !== undefined) {
-			const head = ask.settlementHeads[ask.index];
-			if (head !== undefined) {
-				const labels = answered.options.map((option) => option.label);
-				await settleQuestionMessage(
-					ask.messageId,
-					head,
-					`**Answered:** ${shown}`,
-					settledKeyboard(labels, new Set(chosen)),
-				);
-			}
+			const labels = answered.options.map((option) => option.label);
+			await settleAskMessage(ask, ask.messageId, `**Answered:** ${shown}`, settledKeyboard(labels, new Set(chosen)));
 		}
 		if (pendingAsk !== ask) return; // Settled at the terminal while the closing edit was in flight.
 		ask.messageId = null;
@@ -2174,10 +2178,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await presentQuestion(ask, false);
 		if (pendingAsk !== ask) {
 			// The terminal settled this ask while the next question was in flight; close the orphan keyboard.
-			const head = ask.settlementHeads[ask.index];
-			if (head !== undefined) {
-				await settleQuestionMessage(ask.messageId, head, "This question is no longer active.");
-			}
+			await settleAskMessage(ask, ask.messageId, "This question is no longer active.");
 			ask.messageId = null;
 		}
 	}
@@ -2259,10 +2260,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (entry.kind === "command") {
 					if (entry.value === "hidequestions") {
 						if (ask !== null && ask.messageId !== null) {
-							const head = ask.settlementHeads[ask.index];
-							if (head !== undefined) {
-								await settleQuestionMessage(ask.messageId, head, "Question hidden. It stays open at the terminal.");
-							}
+							await settleAskMessage(ask, ask.messageId, "Question hidden. It stays open at the terminal.");
 							ask.messageId = null;
 						}
 						const standing = standingQuestion;
@@ -2432,14 +2430,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (config === null) return await invoke(nativeParams, { signal, onUpdate });
 
 			askSequence += 1;
-			const settlementContext = sessionContextLine(ctx);
+			const head = badge(ctx);
 			const remote = Promise.withResolvers<AskResult[]>();
 			const ask: PendingAsk = {
 				askId: `${sessionTag}-${askSequence.toString(36)}`,
-				head: badge(ctx),
+				head,
 				context,
 				questions,
-				settlementHeads: questions.map((question) => `${settlementContext}\n\n${question.question}`),
 				index: 0,
 				messageId: null,
 				selected: questions.map(() => new Set<string>()),
@@ -2463,10 +2460,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			try {
 				const winner = await Promise.race([local, answered]);
 				if (winner.kind === "local") {
-					const head = ask.settlementHeads[ask.index];
-					if (head !== undefined) {
-						detach(settleQuestionMessage(ask.messageId, head, "Answered at the terminal."), "terminal-answer edit");
-					}
+					detach(settleAskMessage(ask, ask.messageId, "Answered at the terminal."), "terminal-answer edit");
 					return winner.value;
 				}
 
@@ -2485,14 +2479,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				};
 			} catch (error) {
 				const aborted = error instanceof Error && /cancel|abort/iu.test(error.message);
-				const head = ask.settlementHeads[ask.index];
-				if (head !== undefined) {
-					await settleQuestionMessage(
-						ask.messageId,
-						head,
-						aborted ? "Cancelled at the terminal." : "This question is no longer active.",
-					);
-				}
+				await settleAskMessage(
+					ask,
+					ask.messageId,
+					aborted ? "Cancelled at the terminal." : "This question is no longer active.",
+				);
 				throw error;
 			} finally {
 				pendingAsk = null;
@@ -3294,10 +3285,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (ask !== null) {
 			pendingAsk = null;
 			const messageId = ask.messageId;
-			const head = ask.settlementHeads[ask.index];
 			ask.messageId = null;
-			if (config !== null && head !== undefined) {
-				detach(settleQuestionMessage(messageId, head, "This question is no longer active."), "pending-question close");
+			if (config !== null) {
+				detach(settleAskMessage(ask, messageId, "This question is no longer active."), "pending-question close");
 			}
 		}
 		const standing = standingQuestion;
