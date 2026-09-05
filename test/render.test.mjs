@@ -186,6 +186,10 @@ check(
 	"a badge without an emoji does not open with a space",
 	badgeLine("", "/home/dev/work/subql", "index work", "t1") === "subql \u00B7 index work",
 );
+check(
+	"a badge detail cut at 60 never ends on half an emoji",
+	badgeLine("x", "/d", `${"a".repeat(59)}\u{1F600}`, "t").isWellFormed(),
+);
 
 heading("a fence that survives a fence inside it");
 check("plain text takes the shortest fence", fenceFor("no ticks here") === "```");

@@ -3772,6 +3772,74 @@ heading("surrogate-safe clipping");
 		.get("notify_file")
 		.execute("sb2", { paths: [shot], caption: `${"a".repeat(1023)}\u{1F600}` }, undefined, undefined, sg.ctx);
 	check("a clipped caption holds no replacement character", !lastCall("sendPhoto").body.caption.includes("\uFFFD"));
+
+	// Every other cut this extension makes has the same failure mode: a UTF-16 cap that lands on the
+	// high half of an emoji ships a lone surrogate, which Telegram refuses. Each cap is probed with
+	// text whose last allowed unit is exactly that half.
+	const half = (units) => `${"a".repeat(units - 1)}\u{1F600}`;
+
+	// The turn summary, cut at 900. A question follows it so the cut is mid-message, where the
+	// send-time guard against a trailing lone surrogate cannot catch it.
+	await sg.fire("input");
+	await sg.tools
+		.get("notify_status")
+		.execute("sc1", { summary: half(900), urgency: "green", question: "Ok?" }, undefined, undefined, sg.ctx);
+	await sg.fire("session_stop");
+	await settle(150);
+	check("a clipped summary holds no lone surrogate", lastCall("sendMessage").body.text.isWellFormed());
+
+	// The badge label, cut at 60, reaches the record and every head built from it.
+	await sg.tools.get("session_badge").execute("sc2", { label: half(60) }, undefined, undefined, sg.ctx);
+	check("a clipped badge label holds no lone surrogate", record(sg.id).label.isWellFormed());
+
+	// The session title, cut at 60 for the context line.
+	const titled = spawn("01a06015-0000-0000-0000-000000000000", "/home/dev/work/titled", half(60));
+	await titled.fire("session_start");
+	await titled.fire("credential_disabled", { provider: "anthropic" });
+	await settle(150);
+	check("a clipped session title holds no lone surrogate", lastCall("sendMessage").body.text.isWellFormed());
+
+	// The running tool's intent, cut at 80 for the state line.
+	await titled.fire("agent_start");
+	await titled.fire("tool_execution_start", { toolName: "bash", intent: half(80 - "bash: ".length) });
+	check("a clipped tool label holds no lone surrogate", record(titled.id).state.isWellFormed());
+	await titled.fire("agent_end");
+
+	// A compaction failure message, cut at 300.
+	await titled.fire("agent_start");
+	await titled.fire("auto_compaction_start", { reason: "overflow", action: "context-full" });
+	await settle(150);
+	await titled.fire("auto_compaction_end", { errorMessage: half(300), action: "context-full" });
+	await settle(150);
+	check("a clipped compaction error holds no lone surrogate", lastCall("sendMessage").body.text.isWellFormed());
+	await titled.fire("agent_end");
+
+	// An option preview, cut at 300 inside its fence.
+	const pvState = {};
+	const pvRun = titled.tools
+		.get("ask")
+		.execute(
+			"sc3",
+			{ questions: [{ id: "p", question: "Which?", options: [{ label: "a", preview: half(300) }, { label: "b" }] }] },
+			undefined,
+			undefined,
+			stubbornCtx(titled.ctx, pvState),
+		);
+	await settle(150);
+	check("a clipped option preview holds no lone surrogate", lastCall("sendMessage").body.text.isWellFormed());
+	const pvAsk = lastCall("sendMessage").body.reply_markup.inline_keyboard.flat()[0].callback_data.split(":")[1];
+	writeFileSync(join(inboxOf(titled.id), "997.json"), JSON.stringify({ kind: "callback", value: `o:${pvAsk}:0:0` }));
+	await titled.pump(200);
+	await pvRun;
+
+	// The agent's last words, cut at 600 when no status was recorded.
+	titled.ctx.sessionManager.getBranch = () => [
+		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: half(600) }] } },
+	];
+	await titled.fire("input");
+	await titled.fire("session_stop");
+	await settle(150);
+	check("a clipped last paragraph holds no lone surrogate", lastCall("sendMessage").body.text.isWellFormed());
 }
 
 heading("a discarded inbox entry is never silent");
