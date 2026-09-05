@@ -105,6 +105,16 @@ export function clockTime(when: number): string {
 	return `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
 }
 
+/**
+ * A fence long enough to carry `text` verbatim. A fence closes on a run at least as long as the
+ * one that opened it, so a payload holding its own fence needs a longer one around it.
+ */
+export function fenceFor(text: string): string {
+	let longest = 0;
+	for (const [run] of text.matchAll(/`+/g)) longest = Math.max(longest, run.length);
+	return "`".repeat(Math.max(3, longest + 1));
+}
+
 /** Markdown subset to Telegram HTML. Code is stashed first so emphasis cannot touch it. */
 export function toTelegramHtml(source: string): string {
 	const blocks: string[] = [];
@@ -118,7 +128,8 @@ export function toTelegramHtml(source: string): string {
 	// NUL is the stash marker below; hostile input must not be able to forge or collide with it.
 	let work = source
 		.replaceAll("\u0000", "")
-		.replace(/```([A-Za-z0-9_+-]*)\n?([\s\S]*?)```/g, (_match, language: string, code: string) => {
+		// The closer matches the opener's length, so a fenced payload can hold a shorter fence.
+		.replace(/(`{3,})([A-Za-z0-9_+-]*)\n?([\s\S]*?)\1/g, (_match, _fence: string, language: string, code: string) => {
 			const opener = language.length > 0 ? `<pre><code class="language-${language}">` : "<pre>";
 			const closer = language.length > 0 ? "</code></pre>" : "</pre>";
 			return stash(`${opener}${escapeHtml(code.replace(/\n$/, ""))}${closer}`);

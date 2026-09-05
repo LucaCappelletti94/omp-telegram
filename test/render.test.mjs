@@ -8,6 +8,7 @@ import {
 	clip,
 	duration,
 	extractQuestionPreviews,
+	fenceFor,
 	fitPlainToTelegram,
 	fitToTelegram,
 	isMarkupFailure,
@@ -199,6 +200,21 @@ check(
 	"a badge without an emoji does not open with a space",
 	badgeLine("", "/home/dev/work/subql", "index work", "t1") === "subql \u00B7 index work",
 );
+
+heading("a fence that survives a fence inside it");
+check("plain text takes the shortest fence", fenceFor("no ticks here") === "```");
+check("a three-tick run inside forces four", fenceFor("before\n```rust\nlet x = 1;\n```\nafter") === "````");
+check("a four-tick run inside forces five", fenceFor("x ```` y") === "`````");
+check("an inline pair does not lengthen the fence", fenceFor("call `foo` twice") === "```");
+check(
+	"a longer fence closes only on its own run",
+	toTelegramHtml("````\n```\ninner\n```\n````") === "<pre>```\ninner\n```</pre>",
+);
+check(
+	"a longer fence still keeps its language",
+	toTelegramHtml("````md\n```\nx\n```\n````") === '<pre><code class="language-md">```\nx\n```</code></pre>',
+);
+check("an unclosed fence stays literal", toTelegramHtml("```\nhalf a block").includes("```"));
 
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);

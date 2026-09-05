@@ -24,6 +24,7 @@ import {
 	clockTime,
 	duration,
 	extractQuestionPreviews,
+	fenceFor,
 	fitPlainToTelegram,
 	fitToTelegram,
 	type InlineButton,
@@ -86,6 +87,8 @@ const SPINNER_FRAMES = new Set([
 ]);
 const STATUS_SUMMARY_MAX = 160;
 const CAPTION_MAX = 1024;
+/** A snippet's purpose is one line above the block, not a second summary. */
+const SNIPPET_PURPOSE_MAX = 120;
 const RECENT_MESSAGE_CAP = 60;
 
 const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
@@ -201,7 +204,8 @@ interface AskResult {
 
 interface PendingAsk {
 	askId: string;
-	head: string;
+	/** Kept so every re-render of the question opens with the head this session shows everywhere. */
+	ctx: ExtensionContext;
 	context: string;
 	questions: AskQuestion[];
 	index: number;
@@ -225,7 +229,10 @@ interface TurnStatus {
 	options?: StatusOption[];
 }
 
-/** A bare string is the label. Anything else must be an object carrying one. `null` means malformed. */
+/**
+ * A bare string is the label, which the caller then refuses for carrying no description. Anything
+ * else must be an object holding one. `null` means malformed.
+ */
 function parseStatusOption(raw: unknown): StatusOption | null {
 	if (typeof raw === "string") {
 		const label = raw.trim();
@@ -1079,6 +1086,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return `\u{1F39B} ${summary}\n${lines.join("\n")}`;
 	}
 
+	/**
+	 * The two lines every message from this session opens with: which session is speaking, then
+	 * what it is working on, with which model, and where its terminal is. One shape everywhere, so
+	 * a notification read on a phone never needs the terminal to be identified.
+	 */
+	function messageHead(ctx: ExtensionContext): string {
+		return `${badge(ctx)}\n${sessionContextLine(ctx)}`;
+	}
+
 	function sessionContextLine(ctx: ExtensionContext): string {
 		const model = ctx.model === undefined ? "unavailable" : `${ctx.model.provider}/${ctx.model.id}`;
 		return `Task: ${taskName(ctx)} | Model: ${model} | Tmux: ${tmuxLocation() ?? "not attached"}`;
@@ -1110,7 +1126,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function withHead(ctx: ExtensionContext, title: string, body: string): string {
-		return `${badge(ctx)}\n\n**${title}**\n${body}`;
+		return `${messageHead(ctx)}\n\n**${title}**\n${body}`;
 	}
 
 	/**
@@ -1133,7 +1149,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	async function sessionNotice(ctx: ExtensionContext, text: string): Promise<void> {
-		await serviceNotice(`${sessionContextLine(ctx)}\n\n${text}`);
+		await serviceNotice(`${messageHead(ctx)}\n\n${text}`);
 	}
 
 	/** Structured markdown (tables, fences) goes out as a native rich message; anything else keeps the HTML subset path. */
@@ -1375,7 +1391,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!draftDirty || Date.now() - draftSentAt < DRAFT_MS) return;
 		draftDirty = false;
 		draftSentAt = Date.now();
-		const context = sessionContextLine(sessionCtx);
+		const context = messageHead(sessionCtx);
 		const tool = currentTool.length > 0 ? `\u25B8 ${currentTool}` : "";
 		const prefix = `${context}\n\n`;
 		const suffix = tool.length > 0 ? `\n\n${tool}` : "";
@@ -2022,15 +2038,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (config === null) return;
 		const question = ask.questions[ask.index];
 		if (question === undefined) return;
-		// An option appears in the body only when it adds something beyond its button label.
-		const blocks: string[] = [];
-		if (ask.head.length > 0) blocks.push(ask.head);
-		const where = tmuxLocation();
+		const blocks: string[] = [messageHead(ask.ctx)];
 		const position = ask.questions.length > 1 ? ` ${ask.index + 1} of ${ask.questions.length}` : "";
-		blocks.push(`\u{1F534} Input needed${position}${where === null ? "" : ` (tmux ${where})`}`);
+		blocks.push(`\u{1F534} Input needed${position}`);
 		const header = question.header?.trim() ?? "";
 		blocks.push(header.length > 0 ? `**${header}**\n${question.question}` : question.question);
 		if (ask.context.length > 0) blocks.push(ask.context);
+		// An option appears in the body only when it adds something beyond its button label.
 		for (const [index, option] of question.options.entries()) {
 			const description = option.description?.trim() ?? "";
 			const preview = option.preview?.trim() ?? "";
@@ -2081,7 +2095,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	/** The current question's message, under the same badge head the live message carried. Past the last question there is nothing to settle. */
+	/** The current question's message, under the same head the live message carried. Past the last question there is nothing to settle. */
 	async function settleAskMessage(
 		ask: PendingAsk,
 		messageId: number | null,
@@ -2090,7 +2104,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	): Promise<void> {
 		const question = ask.questions[ask.index];
 		if (question === undefined) return;
-		await settleQuestionMessage(messageId, `${ask.head}\n\n${question.question}`, result, settled);
+		await settleQuestionMessage(messageId, `${messageHead(ask.ctx)}\n\n${question.question}`, result, settled);
 	}
 
 	/** Blocks nothing: a press starts the next turn. Only the latest stands. */
@@ -2107,12 +2121,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const id = `${sessionTag}-n${standingSeq.toString(36)}`;
 		const prompt = recorded.question?.trim() || recorded.text;
 		// The settled message keeps the same head as the live one, so the chat stays scannable by badge.
-		const settlementHead = `${badge(ctx)}\n\n${prompt}`;
-		// An option earns a body block only when it says more than its button already does.
+		const settlementHead = `${messageHead(ctx)}\n\n${prompt}`;
+		// Every option gets its own section: a bare button is a choice the phone cannot judge.
 		const blocks = [`${recorded.text}${recorded.question === undefined ? "" : `\n\n${recorded.question}`}`];
 		for (const option of recorded.options) {
 			const stance = stanceFor(option.recommended === true, option);
-			if (option.description === undefined && stance === null) continue;
 			const head = stance === null ? `**${option.label}**` : `**${option.label}** ${stance.marker}`;
 			blocks.push(option.description === undefined ? head : `${head}\n${option.description}`);
 		}
@@ -2435,11 +2448,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (config === null) return await invoke(nativeParams, { signal, onUpdate });
 
 			askSequence += 1;
-			const head = badge(ctx);
 			const remote = Promise.withResolvers<AskResult[]>();
 			const ask: PendingAsk = {
 				askId: `${sessionTag}-${askSequence.toString(36)}`,
-				head,
+				ctx,
 				context,
 				questions,
 				index: 0,
@@ -2503,7 +2515,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "notify_status",
 		label: "Notify Status",
 		description:
-			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two plain sentences when no choice is attached, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 short `options` drawn from those real next steps. The notification must be answerable from a phone without terminal context. Options are bare labels, so the `summary` must name the decision, explain why it is needed now, and state what each option does or costs. Each option must name the action. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices. An option may instead be an object with `label` plus an optional one-line `description` shown under the summary, and at most one of `recommended`, `lukewarm` or `discouraged` to colour the button. Describe an option only when its label cannot carry the tradeoff on its own.",
+			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two plain sentences when no choice is attached, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 `options` drawn from those real next steps. Every option is an object with a short `label` naming the action and a one-line `description` of what choosing it does or costs, and at most one of `recommended`, `lukewarm` or `discouraged` to colour the button. The description is not optional: the button is the whole of what a phone shows, so an option with no description is refused and no status is recorded. Never use only a phase number or letter, such as `Start Phase 7`. Each description becomes its own section under the summary, and the buttons start the next turn with the most likely choice first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices. The notification must be answerable from a phone without terminal context, so the `summary` names the decision and says why it is needed now. Text the user is meant to copy, an issue body, a PR post, a patch, goes out through `notify_snippet` instead of riding in the summary.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -2539,22 +2551,40 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (summary.length === 0) {
 				return { content: [{ type: "text", text: "Error: summary must not be empty" }], isError: true };
 			}
-			// Buttons ride on top of the summary. A bad list costs the buttons, never the notification.
+			// A button is the whole of what a phone shows, so an option nobody explained is refused
+			// outright: nothing is recorded, and the turn-end block asks for the list again. A list
+			// that is merely degenerate, too short to be a choice or too long, still ships: the
+			// summary and its question are answerable in plain words.
 			const requested = Array.isArray(p.options) ? p.options : [];
 			const parsed = requested.map(parseStatusOption);
+			const unlabelled = parsed.filter((option) => option === null).length;
+			const bare = parsed
+				.filter((option): option is StatusOption => option !== null && option.description === undefined)
+				.map((option) => `"${option.label}"`);
+			if (unlabelled > 0 || bare.length > 0) {
+				const faults: string[] = [];
+				if (unlabelled > 0) faults.push(`${unlabelled} of ${requested.length} carry no label`);
+				if (bare.length > 0) faults.push(`${bare.join(", ")} carry no description`);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: nothing was recorded because ${faults.join(" and ")}. Every option is an object with a short label naming the action and a one-line description of what choosing it does or costs. Call notify_status again with the whole list.`,
+						},
+					],
+					isError: true,
+				};
+			}
 			const usable = parsed.filter((option): option is StatusOption => option !== null);
 			const offered = usable.length >= STATUS_OPTIONS_MIN ? usable.slice(0, STATUS_OPTIONS_MAX) : [];
 			const notes: string[] = [];
-			if (usable.length < parsed.length) {
-				notes.push(
-					`${parsed.length - usable.length} of ${parsed.length} options were neither a short label nor an object carrying one`,
-				);
-			}
 			if (offered.length > 0 && usable.length > offered.length) {
 				notes.push(`only the first ${STATUS_OPTIONS_MAX} options were kept`);
 			}
 			if (requested.length > 0 && offered.length === 0) {
-				notes.push(`fewer than ${STATUS_OPTIONS_MIN} usable options remained, so the summary went out without buttons`);
+				notes.push(
+					`fewer than ${STATUS_OPTIONS_MIN} options are not a choice, so the summary went out without buttons`,
+				);
 			}
 			const clipped = summary.length > SUMMARY_MAX;
 			turnSummary = {
@@ -2719,7 +2749,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				};
 			}
 			const requestedCaption = typeof p.caption === "string" ? p.caption.trim() : "";
-			const context = sessionContextLine(ctx);
+			const context = messageHead(ctx);
 			const separator = requestedCaption.length > 0 ? "\n\n" : "";
 			const at = Date.now();
 			const owner = fileOwner(sessionTag, badgeEmoji);
@@ -2842,6 +2872,79 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return {
 				content: [{ type: "text", text: `Sent ${loaded.length} file${loaded.length === 1 ? "" : "s"} to Telegram.` }],
 				details: { messageIds: sentIds },
+			};
+		},
+	});
+
+	/**
+	 * Text the user has to paste somewhere else. The message ends on a single fenced block holding
+	 * the payload verbatim, so the copy control Telegram draws on that block yields exactly the
+	 * payload and nothing of ours. It deliberately skips `sendStructured`: a payload must not be
+	 * handed to a markdown renderer whose fence rules are not the ones measured here, and it is
+	 * never truncated, because half an issue body is worse than none.
+	 */
+	pi.registerTool({
+		name: "notify_snippet",
+		label: "Notify Snippet",
+		description:
+			"Send the user text they are meant to copy: an issue body, a PR post, a review reply, a patch, a command, a config block. It arrives as one Telegram message whose last element is a single fenced block holding the text verbatim, so the block's copy control yields exactly the payload with nothing of yours around it. `purpose`: a short line naming what the text is and where it goes, such as `PR body for #9` or `reply to the review comment`. `text`: the payload itself, unprefixed and unquoted, with no leading `>` or `!` markers. `language`: an optional bare fence tag such as `ts`, `md` or `bash` for colouring, and left off for prose. Markdown inside the payload is shown, never rendered, and a payload carrying its own fence still arrives as one block. One block per call, so send several by calling several times. Nothing is ever truncated: a payload too large for one message is refused, with the room that is left, and anything bigger belongs in a file sent through `notify_file`.",
+		approval: "read",
+		strict: true,
+		parameters: z.object({
+			purpose: z.string(),
+			text: z.string(),
+			language: z.string().optional(),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const p = params as { purpose?: unknown; text?: unknown; language?: unknown };
+			if (config === null) {
+				return { content: [{ type: "text", text: "Error: Telegram is not configured" }], isError: true };
+			}
+			const purpose = typeof p.purpose === "string" ? p.purpose.trim().slice(0, SNIPPET_PURPOSE_MAX) : "";
+			// Trailing newlines are invisible in a code block and only cost room, never meaning.
+			const payload = typeof p.text === "string" ? p.text.replace(/\n+$/, "") : "";
+			const language = typeof p.language === "string" ? p.language.trim() : "";
+			if (purpose.length === 0) {
+				return {
+					content: [{ type: "text", text: 'Error: purpose must say where the text goes, such as "PR body for #9"' }],
+					isError: true,
+				};
+			}
+			if (payload.trim().length === 0) {
+				return { content: [{ type: "text", text: "Error: text must not be empty" }], isError: true };
+			}
+			if (!/^[A-Za-z0-9_+-]*$/u.test(language)) {
+				return {
+					content: [
+						{ type: "text", text: `Error: language must be a bare fence tag such as ts or bash, not "${language}"` },
+					],
+					isError: true,
+				};
+			}
+			const fence = fenceFor(payload);
+			const plain = `${messageHead(ctx)}\n\n**\u{1F4CB} Copy: ${purpose}**\n${fence}${language}\n${payload}\n${fence}`;
+			const rendered = toTelegramHtml(plain).length;
+			if (rendered > TELEGRAM_TEXT_MAX) {
+				const room = Math.max(0, payload.length - (rendered - TELEGRAM_TEXT_MAX));
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: nothing was sent, because the message would render to ${rendered} characters against Telegram's ${TELEGRAM_TEXT_MAX} and text meant for pasting must never be cut. Send about ${room} characters or fewer, split it over several calls, or write it to a file and send that with notify_file.`,
+						},
+					],
+					isError: true,
+				};
+			}
+			const sent = await sendOrEdit(config, "sendMessage", { chat_id: config.chatId }, plain);
+			if (sent === null) {
+				return { content: [{ type: "text", text: "Error: Telegram rejected the snippet" }], isError: true };
+			}
+			lastNotifiedAt = Date.now();
+			writeSessionRecord(ctx);
+			return {
+				content: [{ type: "text", text: `Sent ${payload.length} characters as a copyable block.` }],
+				details: { messageId: sent.message_id, characters: payload.length },
 			};
 		},
 	});
@@ -3184,8 +3287,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		approvalWaiting = false;
 		if (config === null || !config.notifyOnTurnEnd) return;
 		const quiet = Date.now() - lastLocalInput < config.quietSeconds * 1000;
-		const where = tmuxLocation();
-		const suffix = where === null ? "" : ` (tmux ${where})`;
 
 		if (turnSummary !== null) {
 			const heads = {
@@ -3203,7 +3304,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
 				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
-				const work = notify(ctx, `${heads[recorded.urgency]}${suffix}`, body, extra, usageFooter()).then((sent) => {
+				const work = notify(ctx, heads[recorded.urgency], body, extra, usageFooter()).then((sent) => {
 					if (recorded.urgency === "red") return pinRed(ctx, sent);
 					if (recorded.urgency === "green" && typeof sent?.message_id === "number") {
 						closeOfferMessageId = sent.message_id;
@@ -3214,10 +3315,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				detach(work, "turn-end notice");
 				return;
 			}
-			detach(
-				sendStandingQuestion(ctx, heads[recorded.urgency] + suffix, recorded, quiet, usageFooter()),
-				"turn-end question",
-			);
+			detach(sendStandingQuestion(ctx, heads[recorded.urgency], recorded, quiet, usageFooter()), "turn-end question");
 			return;
 		}
 
@@ -3226,13 +3324,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return {
 				decision: "block" as const,
 				reason:
-					"Before finishing, call notify_status with a one-or-two-sentence summary when no choice is attached and an urgency (green done, orange reply wanted, red blocked). Be proactive about next steps: name the concrete ones when they exist, and say plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. If any user action is wanted, also set question and 2 to 6 short options drawn from those real next steps. The notification must be answerable from a phone without terminal context. Options are bare labels, so the summary must name the decision, explain why it is needed now, and state what each option does or costs. Each option must name the action. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit them when there is genuinely nothing to ask.",
+					"Before finishing, call notify_status with a one-or-two-sentence summary when no choice is attached and an urgency (green done, orange reply wanted, red blocked). Be proactive about next steps: name the concrete ones when they exist, and say plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. If any user action is wanted, also set question and 2 to 6 options drawn from those real next steps. Every option is an object with a short label naming the action and a one-line description saying what choosing it does or costs: a button is all a phone shows, so an option with no description is refused and nothing is recorded. The notification must be answerable from a phone without terminal context. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit them when there is genuinely nothing to ask.",
 			};
 		}
 
 		const tail = lastAssistantTail(ctx);
 		const wantsReply = /\?\s*$/m.test(tail);
-		const title = `${wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished"}${suffix}`;
+		const title = wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished";
 		detach(
 			notify(
 				ctx,
@@ -3257,12 +3355,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			resolution: null,
 		};
 		approvalNotice = notice;
-		const where = tmuxLocation();
-		const work = notify(
-			ctx,
-			`\u{1F534} Approval needed${where === null ? "" : ` (tmux ${where})`}`,
-			`${tool} is waiting for approval.`,
-		).then((sent) => {
+		const work = notify(ctx, "\u{1F534} Approval needed", `${tool} is waiting for approval.`).then((sent) => {
 			notice.messageId = typeof sent?.message_id === "number" ? sent.message_id : null;
 			if (notice.messageId === null && notice.resolution !== null && approvalNotice === notice) {
 				approvalNotice = null;
