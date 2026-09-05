@@ -3128,7 +3128,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("tool_execution_start", async (event) => {
 		turnTools += 1;
 		const intent = typeof event.intent === "string" && event.intent.length > 0 ? `: ${event.intent}` : "";
-		currentTool = clip(`${typeof event.toolName === "string" ? event.toolName : "tool"}${intent}`, 80);
+		currentTool = clip(`${event.toolName}${intent}`, 80);
 		draftDirty = true;
 		noteState();
 	});
