@@ -25,7 +25,6 @@ import {
 	duration,
 	extractQuestionPreviews,
 	fenceFor,
-	fitPlainToTelegram,
 	fitToTelegram,
 	type InlineButton,
 	isMarkupFailure,
@@ -1137,7 +1136,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (config === null) return;
 		// `/status` grows a block per live session, so this is the one notice that can outgrow the
 		// message limit. Unfitted, Telegram refuses it and the command gets no answer at all.
-		const shown = fitPlainToTelegram(`\u{1F535} ${text}`);
+		const shown = fitToTelegram(`\u{1F535} ${text}`, "");
 		const sent = await callTelegram<TelegramMessage>(
 			config,
 			"sendMessage",
@@ -1697,13 +1696,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		let body = whole;
 		// Room for the note is reserved only once something must actually be omitted. Reserving it
 		// unconditionally costs the last session its place, and its button, to a note nobody needs.
-		if (toTelegramHtml(whole).length > TELEGRAM_TEXT_MAX) {
+		if (whole.length > TELEGRAM_TEXT_MAX) {
 			const worst = note(rivals.length);
 			listed = [];
 			body = header;
 			for (const rival of rivals) {
 				const grown = `${body}\n\n${statusLine(rival.record)}`;
-				if (toTelegramHtml(grown + worst).length > TELEGRAM_TEXT_MAX) break;
+				if ((grown + worst).length > TELEGRAM_TEXT_MAX) break;
 				body = grown;
 				listed.push(rival);
 			}
@@ -2927,14 +2926,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			// meant for copying outside the block.
 			const label = `${messageHead(ctx)}\n\n**\u{1F4CB} Copy: ${purpose}**`.replaceAll("`", "");
 			const plain = `${label}\n${fence}${language}\n${payload}\n${fence}`;
-			const rendered = toTelegramHtml(plain).length;
-			if (rendered > TELEGRAM_TEXT_MAX) {
-				const room = Math.max(0, payload.length - (rendered - TELEGRAM_TEXT_MAX));
+			// The same budget `fitToTelegram` fits against, checked here so an oversized payload is
+			// refused whole rather than arriving cut in half.
+			const size = plain.length;
+			if (size > TELEGRAM_TEXT_MAX) {
+				const room = Math.max(0, payload.length - (size - TELEGRAM_TEXT_MAX));
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Error: nothing was sent, because the message would render to ${rendered} characters against Telegram's ${TELEGRAM_TEXT_MAX} and text meant for pasting must never be cut. Send about ${room} characters or fewer, split it over several calls, or write it to a file and send that with notify_file.`,
+							text: `Error: nothing was sent, because the message would be ${size} characters against Telegram's ${TELEGRAM_TEXT_MAX} and text meant for pasting must never be cut. Send about ${room} characters or fewer, split it over several calls, or write it to a file and send that with notify_file.`,
 						},
 					],
 					isError: true,

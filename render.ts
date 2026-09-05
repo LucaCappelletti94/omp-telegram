@@ -178,10 +178,16 @@ export function buttonText(label: string, marker = ""): string {
 	return `${clip(label, Math.max(0, BUTTON_TEXT_MAX - marker.length))}${marker}`;
 }
 
-/** The longest fitting prefix under `measure`, searched because escaping is not a fixed cost. */
-function fitBy(plain: string, keep: string, measure: (text: string) => number): string {
+/**
+ * Telegram's 4096 applies to the text after its entities are parsed, verified against the live
+ * API: HTML tags and escapes such as `&lt;` cost nothing, and the limit counts code points, so a
+ * message of 4096 emoji goes through. The markdown source is therefore the budget, and measuring
+ * it in UTF-16 units leaves the fit a little conservative in both directions rather than wrong.
+ * `keep` is a short tail, today the usage footer, that survives the cut.
+ */
+export function fitToTelegram(plain: string, keep: string): string {
 	const whole = plain + keep;
-	if (measure(whole) <= TELEGRAM_TEXT_MAX) return dropLoneHighSurrogate(whole);
+	if (whole.length <= TELEGRAM_TEXT_MAX) return dropLoneHighSurrogate(whole);
 	const build = (n: number): string => {
 		let head = dropLoneHighSurrogate(plain.slice(0, n).trimEnd());
 		// An odd fence count means the cut landed inside a code block, which would otherwise
@@ -193,26 +199,10 @@ function fitBy(plain: string, keep: string, measure: (text: string) => number): 
 	let high = plain.length;
 	while (low < high) {
 		const mid = Math.ceil((low + high) / 2);
-		if (measure(build(mid)) <= TELEGRAM_TEXT_MAX) low = mid;
+		if (build(mid).length <= TELEGRAM_TEXT_MAX) low = mid;
 		else high = mid - 1;
 	}
 	return build(low);
-}
-
-/**
- * For a send that carries `parse_mode`, where Telegram measures the rendered form and escaping
- * inflates it up to fivefold. `keep` is a short tail, today the usage footer, that survives the cut.
- */
-export function fitToTelegram(plain: string, keep: string): string {
-	return fitBy(plain, keep, (text) => toTelegramHtml(text).length);
-}
-
-/**
- * For a send with no `parse_mode`, where nothing is escaped. Measuring the escaped form here would
- * cut a notice dense in ampersands or angle brackets around five times earlier than Telegram needs.
- */
-export function fitPlainToTelegram(plain: string): string {
-	return fitBy(plain, "", (text) => text.length);
 }
 
 /**

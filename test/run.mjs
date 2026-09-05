@@ -120,6 +120,13 @@ const badgeHead = (id, folder) => {
 	const { emoji } = record(id);
 	return `${emoji.length > 0 ? `${emoji} ` : ""}${folder} \u00B7 `;
 };
+/** What Telegram counts: the text after its entities are parsed, so tags and escapes are free. */
+const wireLength = (html) =>
+	html
+		.replace(/<[^>]*>/g, "")
+		.replaceAll("&lt;", "<")
+		.replaceAll("&gt;", ">")
+		.replaceAll("&amp;", "&").length;
 /** The badge line as the session writes it: emoji, working folder, then its label or its tag. */
 const badgeLineOf = (id) => {
 	const own = record(id);
@@ -1084,7 +1091,7 @@ check("spoiler renders", mdBody.text.includes("<tg-spoiler>secret</tg-spoiler>")
 check("snake_case is left alone", mdBody.text.includes("snake_case_name"));
 check("bare multiplication is left alone", mdBody.text.includes("2 * 3"));
 
-// An oversized body must still be sent, shrunk to fit.
+// Escaping costs nothing on the wire, so a body dense in angle brackets is not cut early.
 const huge = "<".repeat(3500);
 mdSession.tools
 	.get("ask")
@@ -1096,7 +1103,27 @@ mdSession.tools
 		stubbornCtx(mdSession.ctx, {}),
 	);
 await settle(200);
-check("an oversized message is shrunk below the telegram ceiling", lastCall("sendMessage").body.text.length <= 4096);
+check(
+	"a body dense in escapes is sent whole",
+	!lastCall("sendMessage").body.text.includes("truncated, full text at the terminal"),
+);
+
+// A body over the real ceiling must still be sent, shrunk to fit.
+mdSession.tools
+	.get("ask")
+	.execute(
+		"hg2",
+		{ context: "x".repeat(5000), questions: [{ id: "q", question: "ok?", options: [{ label: "yes" }] }] },
+		undefined,
+		undefined,
+		stubbornCtx(mdSession.ctx, {}),
+	);
+await settle(200);
+check(
+	"an oversized message is shrunk below the telegram ceiling",
+	wireLength(lastCall("sendMessage").body.text) <= 4096 &&
+		lastCall("sendMessage").body.text.includes("truncated, full text at the terminal"),
+);
 
 // Media reaches the agent: photos as images, voice and documents as saved file paths.
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
@@ -3618,8 +3645,8 @@ heading("oversized message truncation");
 	const tr = spawn("01a06010-0000-0000-0000-000000000000", "/home/dev/work/toolong");
 	await tr.fire("session_start");
 
-	// a. A summary whose rendered form blows past the limit keeps the turn's usage
-	// footer and says out loud that it was cut.
+	// a. Escaping is free on the wire, so a summary at the tool's own cap goes out whole, footer
+	// and every ampersand included.
 	await tr.fire("agent_start");
 	await tr.fire("message_end", {
 		message: { role: "assistant", usage: { input: 12400, output: 900, cost: { total: 0.0512 } } },
@@ -3630,38 +3657,54 @@ heading("oversized message truncation");
 		.execute("t1", { summary: "&".repeat(900), urgency: "green" }, undefined, undefined, tr.ctx);
 	await tr.fire("session_stop");
 	await settle(150);
-	const cut = lastCall("sendMessage").body.text;
-	check("an oversized summary keeps the usage footer", cut.includes("12.4k in / 900 out"));
-	check("an oversized summary says it was truncated", cut.includes("truncated, full text at the terminal"));
-	check("an oversized summary fits the telegram limit", cut.length <= 4096);
+	const whole = lastCall("sendMessage").body.text;
+	check("a summary dense in escapes keeps the usage footer", whole.includes("12.4k in / 900 out"));
+	check("a summary dense in escapes is not cut", !whole.includes("truncated, full text at the terminal"));
+	check("a summary dense in escapes keeps every ampersand", (whole.match(/&amp;/g) ?? []).length === 900);
 
-	// b. Escaping inflates the rendered form up to fivefold, so the fit test has to
-	// be on the rendered text and not on the source.
-	await tr.fire("agent_start");
-	await tr.fire("agent_end");
-	await tr.tools
-		.get("notify_status")
-		.execute("t2", { summary: "<".repeat(200), urgency: "green" }, undefined, undefined, tr.ctx);
-	await tr.fire("session_stop");
-	await settle(150);
-	check("a dense-escape summary fits the telegram limit", lastCall("sendMessage").body.text.length <= 4096);
+	// b. A body past the real ceiling is cut, says so, and fits.
+	const trAsk = { id: "q", question: "ok?", options: [{ label: "yes" }] };
+	tr.tools
+		.get("ask")
+		.execute("t2", { context: "x".repeat(5000), questions: [trAsk] }, undefined, undefined, stubbornCtx(tr.ctx, {}));
+	await settle(200);
+	const cut = lastCall("sendMessage").body.text;
+	check("an oversized body says it was truncated", cut.includes("truncated, full text at the terminal"));
+	check("an oversized body fits the telegram limit", wireLength(cut) <= 4096);
 
 	// c. A cut inside a fenced code block leaves a stray fence that renders as
 	// literal backticks, so the cut has to keep the fences balanced.
-	await tr.fire("agent_start");
-	await tr.fire("agent_end");
-	await tr.tools
-		.get("notify_status")
-		.execute("t3", { summary: `\`\`\`\n${"&".repeat(880)}\n\`\`\``, urgency: "green" }, undefined, undefined, tr.ctx);
-	await tr.fire("session_stop");
-	await settle(150);
+	tr.tools
+		.get("ask")
+		.execute(
+			"t3",
+			{ context: `\`\`\`\n${"x".repeat(5000)}\n\`\`\``, questions: [trAsk] },
+			undefined,
+			undefined,
+			stubbornCtx(tr.ctx, {}),
+		);
+	await settle(200);
 	const fenced = lastCall("sendMessage").body.text;
 	check("a truncated fence leaks no literal backticks", !fenced.includes("```"));
 	check(
 		"a truncated fence stays balanced",
 		(fenced.match(/<pre>/g) ?? []).length === (fenced.match(/<\/pre>/g) ?? []).length,
 	);
-	check("a truncated fenced summary fits the telegram limit", fenced.length <= 4096);
+	check("a truncated fenced body fits the telegram limit", wireLength(fenced) <= 4096);
+	// Both questions stay open otherwise, and a session waiting on one outranks recency in routing.
+	let trEntry = 8800;
+	const answerLast = async () => {
+		const press = (lastCall("sendMessage").body.reply_markup?.inline_keyboard ?? [])
+			.flat()
+			.find((b) => b.callback_data?.startsWith("o:"));
+		trEntry += 1;
+		writeFileSync(
+			join(inboxOf(tr.id), `${trEntry}.json`),
+			JSON.stringify({ kind: "callback", value: press.callback_data }),
+		);
+		await tr.pump(250);
+	};
+	await answerLast();
 	api.failMethods = [];
 }
 
@@ -4082,7 +4125,7 @@ heading("aggregated status");
 		.slice(pickerFrom)
 		.find((c) => (c.body.reply_markup?.inline_keyboard ?? []).flat().some((b) => b.callback_data?.startsWith("m:")));
 	check("a which-session picker is still sent for a big fleet", bigPicker !== undefined);
-	check("the which-session picker is cut to the limit", (bigPicker?.body.text.length ?? 0) <= 4096);
+	check("the which-session picker is cut to the limit", wireLength(bigPicker?.body.text ?? "") <= 4096);
 	// A shortened list with every button intact would offer a choice the reader cannot see, so the
 	// buttons and the listed sessions have to be the same set.
 	const pickerButtons = (bigPicker?.body.reply_markup.inline_keyboard ?? []).flat().length;
