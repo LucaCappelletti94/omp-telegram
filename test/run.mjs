@@ -120,13 +120,31 @@ const badgeHead = (id, folder) => {
 	const { emoji } = record(id);
 	return `${emoji.length > 0 ? `${emoji} ` : ""}${folder} \u00B7 `;
 };
-/** What Telegram counts: the text after its entities are parsed, so tags and escapes are free. */
-const wireLength = (html) =>
-	html
-		.replace(/<[^>]*>/g, "")
-		.replaceAll("&lt;", "<")
-		.replaceAll("&gt;", ">")
-		.replaceAll("&amp;", "&").length;
+/**
+ * What Telegram counts: the text left once its entities are parsed, so tags and escapes are free.
+ * Walked rather than stripped with a regex, which reads as HTML sanitisation and is not one.
+ */
+const wireLength = (html) => {
+	let count = 0;
+	let inTag = false;
+	for (let i = 0; i < html.length; i++) {
+		const ch = html[i];
+		if (inTag) {
+			if (ch === ">") inTag = false;
+			continue;
+		}
+		if (ch === "<") {
+			inTag = true;
+			continue;
+		}
+		if (ch === "&") {
+			const end = html.indexOf(";", i);
+			if (end > i && end - i <= 8) i = end;
+		}
+		count += 1;
+	}
+	return count;
+};
 /** The badge line as the session writes it: emoji, working folder, then its label or its tag. */
 const badgeLineOf = (id) => {
 	const own = record(id);
