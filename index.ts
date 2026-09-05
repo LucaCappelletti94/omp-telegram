@@ -912,7 +912,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 	function taskName(ctx: ExtensionContext): string {
 		const named = badgeOverride.length > 0 ? badgeOverride : (ctx.sessionManager.getSessionName() ?? "");
-		if (named.length > 0) return named.slice(0, 60);
+		if (named.length > 0) return clip(named, 60);
 		const folder =
 			ctx.cwd
 				.split("/")
@@ -1101,7 +1101,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								.trim()
 								.split(/\n{2,}/)
 								.at(-1) ?? "";
-						return tail.length > 600 ? `${tail.slice(0, 600)}...` : tail;
+						return tail.length > 600 ? `${clip(tail, 600)}...` : tail;
 					}
 				}
 			}
@@ -2039,7 +2039,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const lines = [stance === null ? `**${option.label}**` : `**${option.label}** ${stance.marker}`];
 			if (description.length > 0) lines.push(description);
 			if (preview.length > 0) {
-				const clipped = preview.slice(0, PREVIEW_MAX);
+				const clipped = clip(preview, PREVIEW_MAX);
 				lines.push(`\`\`\`\n${clipped}\n\`\`\``);
 				if (preview.length > PREVIEW_MAX) lines.push("(preview truncated)");
 			}
@@ -2558,7 +2558,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			const clipped = summary.length > SUMMARY_MAX;
 			turnSummary = {
-				text: summary.slice(0, SUMMARY_MAX),
+				text: clip(summary, SUMMARY_MAX),
 				urgency,
 				question: typeof p.question === "string" && p.question.trim().length > 0 ? p.question.trim() : undefined,
 				options: offered.length > 0 ? offered : undefined,
@@ -2591,7 +2591,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const p = params as { emoji?: unknown; label?: unknown };
 			const wanted = typeof p.emoji === "string" ? p.emoji.trim() : "";
-			const label = typeof p.label === "string" ? p.label.trim().slice(0, 60) : null;
+			const label = typeof p.label === "string" ? clip(p.label.trim(), 60) : null;
 			const refuse = (text: string) => ({
 				content: [{ type: "text" as const, text }],
 				details: { badge: badge(ctx), applied: false },
@@ -3128,7 +3128,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("tool_execution_start", async (event) => {
 		turnTools += 1;
 		const intent = typeof event.intent === "string" && event.intent.length > 0 ? `: ${event.intent}` : "";
-		currentTool = `${typeof event.toolName === "string" ? event.toolName : "tool"}${intent}`.slice(0, 80);
+		currentTool = clip(`${typeof event.toolName === "string" ? event.toolName : "tool"}${intent}`, 80);
 		draftDirty = true;
 		noteState();
 	});
@@ -3168,7 +3168,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		let failure = "aborted";
 		if (event.aborted !== true) {
 			if (typeof event.errorMessage !== "string") return;
-			failure = event.errorMessage.slice(0, PREVIEW_MAX);
+			failure = clip(event.errorMessage, PREVIEW_MAX);
 		}
 		const action = typeof event.action === "string" ? event.action : compaction.action;
 		transparencyNotice(
