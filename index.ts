@@ -17,11 +17,9 @@ import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
 	type AskQuestion,
-	ago,
 	badgeLine,
 	buttonText,
 	clip,
-	clockTime,
 	duration,
 	extractQuestionPreviews,
 	fenceFor,
@@ -29,6 +27,8 @@ import {
 	type InlineButton,
 	isMarkupFailure,
 	packRows,
+	plainStamps,
+	relativeTime,
 	STANCE,
 	type StatusOption,
 	stanceFor,
@@ -605,6 +605,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		body: Record<string, unknown>,
 		plain: string,
 		keep = "",
+		track = true,
 	): Promise<TelegramMessage | null> {
 		const quiet = { link_preview_options: { is_disabled: true } };
 		const source = fitToTelegram(plain, keep);
@@ -621,11 +622,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (sent === null && isMarkupFailure(refusal)) {
 			pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method, description: refusal });
 			const { message_effect_id: _effect, ...safe } = body;
-			sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: source }, 15_000);
+			sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: plainStamps(source) }, 15_000);
 		} else if (sent === null) {
 			pi.logger.warn("telegram: send refused", { method, description: refusal });
 		}
-		if (method === "sendMessage") trackSent(sent);
+		if (method === "sendMessage" && track) trackSent(sent);
 		return sent;
 	}
 
@@ -1134,17 +1135,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 */
 	async function serviceNotice(text: string, routable = true): Promise<void> {
 		if (config === null) return;
-		// `/status` grows a block per live session, so this is the one notice that can outgrow the
-		// message limit. Unfitted, Telegram refuses it and the command gets no answer at all.
-		const shown = fitToTelegram(`\u{1F535} ${text}`, "");
-		const sent = await callTelegram<TelegramMessage>(
-			config,
-			"sendMessage",
-			{ chat_id: config.chatId, text: shown },
-			15_000,
-		);
-		if (!routable) return;
-		trackSent(sent);
+		await sendOrEdit(config, "sendMessage", { chat_id: config.chatId }, `\u{1F535} ${text}`, "", routable);
 	}
 
 	async function sessionNotice(ctx: ExtensionContext, text: string): Promise<void> {
@@ -1209,7 +1200,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function statusLine(record: SessionRecord): string {
 		const lines = [badgeOf(record), `State: ${record.state.length > 0 ? record.state : "unknown"}.`];
 		if (record.health.length > 0) lines.push(`Provider: ${record.health}.`);
-		if (record.summary.length > 0) lines.push(`Last: ${record.summary} (${ago(record.summaryAt)})`);
+		if (record.summary.length > 0) lines.push(`Last: ${record.summary} (${relativeTime(record.summaryAt)})`);
 		if (record.standing !== null) lines.push("A choice question stands open.");
 		if (record.pinned !== null) lines.push("A red status is pinned.");
 		return lines.join("\n");
@@ -1225,8 +1216,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * One compact line per session for the pinned board. Deliberately no relative time: the board
-	 * is rewritten only when its text differs, and "4m ago" would differ every single second.
+	 * One compact line per session for the pinned board. The board is rewritten only when its text
+	 * differs, so the stamp beside a summary is a client-rendered relative time rather than "4m ago"
+	 * in the text, which would differ every minute and edit forever.
 	 */
 	function dashboardReport(): string {
 		const live = allRecords()
@@ -1241,7 +1233,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				record.pinned !== null ? "red pinned" : "",
 			].filter((flag) => flag.length > 0);
 			const tail = flags.length > 0 ? ` [${flags.join(", ")}]` : "";
-			const said = record.summary.length > 0 ? `\n    ${record.summary} (${clockTime(record.summaryAt)})` : "";
+			const said = record.summary.length > 0 ? `\n    ${record.summary} (${relativeTime(record.summaryAt)})` : "";
 			return `${badgeOf(record)} \u00B7 ${state}${tail}${said}`;
 		});
 		// Fitted here rather than at the send, so the text compared, recorded and sent are one
