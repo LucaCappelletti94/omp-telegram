@@ -115,6 +115,11 @@ const lastCall = (method) => called(method).at(-1);
 const sessionsDir = join(root, "notify-telegram/sessions");
 const inboxOf = (id) => join(root, "notify-telegram/inbox", id);
 const record = (id) => JSON.parse(readFileSync(join(sessionsDir, `${id}.json`), "utf8"));
+/** The head every live and settled session message opens with; a session past the palette has no emoji. */
+const badgeHead = (id, folder) => {
+	const { emoji } = record(id);
+	return `${emoji.length > 0 ? `${emoji} ` : ""}${folder} \u00B7 `;
+};
 const inboxCount = (id) =>
 	existsSync(inboxOf(id)) ? readdirSync(inboxOf(id)).filter((f) => f.endsWith(".json")).length : 0;
 
@@ -1234,10 +1239,8 @@ check(
 );
 check("it says it was cancelled at the terminal", closing.body.text.includes("Cancelled at the terminal"));
 check(
-	"cancelled native question retains context and question",
-	closing.body.text.startsWith(
-		`Task: subql [${record(esc.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
-	) &&
+	"cancelled native question keeps the badge and question",
+	closing.body.text.startsWith(badgeHead(esc.id, "subql")) &&
 		closing.body.text.includes("Proceed?") &&
 		closing.body.text.includes("Cancelled at the terminal"),
 );
@@ -1387,10 +1390,8 @@ writeFileSync(join(inboxOf(st.id), "970.json"), JSON.stringify({ kind: "callback
 await st.pump(250);
 const settledStance = lastCall("editMessageText");
 check(
-	"selected native answer retains context, question, result, and buttons",
-	settledStance.body.text.startsWith(
-		`Task: diesel [${record(st.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
-	) &&
+	"selected native answer retains badge, question, result, and buttons",
+	settledStance.body.text.startsWith(badgeHead(st.id, "diesel")) &&
 		settledStance.body.text.includes("Which approach?") &&
 		settledStance.body.text.includes("Answered:") &&
 		settledStance.body.text.includes("the good one") &&
@@ -1710,9 +1711,7 @@ check(
 );
 check(
 	"selected standing answer retains context and question",
-	retired.body.text.startsWith(
-		`Task: sqlitegis [${record(tq.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
-	) && retired.body.text.includes("How should we proceed?"),
+	retired.body.text.startsWith(badgeHead(tq.id, "sqlitegis")) && retired.body.text.includes("How should we proceed?"),
 );
 
 // A second press on the same, now cleared, question is told it is closed.
@@ -1752,9 +1751,7 @@ await settle(200);
 const supersededStanding = lastCall("editMessageText");
 check(
 	"superseded standing question retains context, question, and reason",
-	supersededStanding.body.text.startsWith(
-		`Task: sqlitegis [${record(tq.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
-	) &&
+	supersededStanding.body.text.startsWith(badgeHead(tq.id, "sqlitegis")) &&
 		supersededStanding.body.text.includes("Use the first choice?") &&
 		supersededStanding.body.text.includes("Superseded by a newer question"),
 );
@@ -1783,9 +1780,7 @@ check(
 const resumedRetired = lastCall("editMessageText");
 check(
 	"resumed standing answer retains its stored context and question",
-	resumedRetired.body.text.startsWith(
-		`Task: sqlitegis [${record(tq.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
-	) &&
+	resumedRetired.body.text.startsWith(badgeHead(tq.id, "sqlitegis")) &&
 		resumedRetired.body.text.includes("Use the second choice?") &&
 		resumedRetired.body.text.includes("Chosen:") &&
 		resumedRetired.body.text.includes("D"),
@@ -2164,9 +2159,7 @@ check(
 const hiddenStanding = lastCall("editMessageText");
 check(
 	"hidden standing question retains context, question, and reason",
-	hiddenStanding.body.text.startsWith(
-		`Task: pgvector [${record(ux.id).tag}] | Model: openai/gpt-5.6-sol | Tmux: not attached`,
-	) &&
+	hiddenStanding.body.text.startsWith(badgeHead(ux.id, "pgvector")) &&
 		hiddenStanding.body.text.includes("Which hidden choice?") &&
 		hiddenStanding.body.text.includes("Question hidden"),
 );
