@@ -157,6 +157,9 @@ const badgeLineOf = (id) => {
 };
 /** notify_status refuses an option with no description; most tests do not care what it says. */
 const opts = (...labels) => labels.map((label) => ({ label, description: `what "${label}" does` }));
+/** ask refuses an option with no description either; most tests do not care what it says. */
+const askOpt = (label) => ({ label, description: `what "${label}" does` });
+const askOpts = (...labels) => labels.map(askOpt);
 const inboxCount = (id) =>
 	existsSync(inboxOf(id)) ? readdirSync(inboxOf(id)).filter((f) => f.endsWith(".json")).length : 0;
 
@@ -237,7 +240,7 @@ const singleQuestion = {
 		{
 			id: "backend",
 			question: "Which backend?",
-			options: [{ label: "SQLite" }, { label: "Postgres" }],
+			options: askOpts("SQLite", "Postgres"),
 			recommended: 0,
 		},
 	],
@@ -358,7 +361,7 @@ const multi = {
 			id: "t",
 			question: "Targets?",
 			multi: true,
-			options: [{ label: "linux" }, { label: "macos" }, { label: "windows" }],
+			options: askOpts("linux", "macos", "windows"),
 		},
 	],
 };
@@ -381,8 +384,8 @@ check("tag is stable across asks", askId.startsWith(tag2));
 
 const pair = {
 	questions: [
-		{ id: "q1", question: "First?", options: [{ label: "yes" }, { label: "no" }] },
-		{ id: "q2", question: "Second?", options: [{ label: "alpha" }, { label: "beta" }] },
+		{ id: "q1", question: "First?", options: askOpts("yes", "no") },
+		{ id: "q2", question: "Second?", options: askOpts("alpha", "beta") },
 	],
 };
 const stateD = {};
@@ -816,8 +819,8 @@ const withCapture = {
 const ctxAsk = {
 	context: "The rebuild takes 40 minutes on this corpus.",
 	questions: [
-		{ id: "a", question: "Rebuild now?", options: [{ label: "yes" }, { label: "no" }] },
-		{ id: "b", question: "Notify on completion?", options: [{ label: "yes" }, { label: "no" }] },
+		{ id: "a", question: "Rebuild now?", options: askOpts("yes", "no") },
+		{ id: "b", question: "Notify on completion?", options: askOpts("yes", "no") },
 	],
 };
 const ctxRun = ctxSession.tools.get("ask").execute("cx", ctxAsk, undefined, undefined, withCapture);
@@ -852,6 +855,85 @@ check(
 	"tool description no longer claims telegram-only context",
 	!ctxSession.tools.get("ask").description.includes("only on Telegram"),
 );
+const askDoc = ctxSession.tools.get("ask").description;
+check(
+	"tool description demands the option that is best once the work is finished",
+	askDoc.includes("best once the work is finished"),
+);
+check(
+	"tool description forbids effort as a reason to prefer or demote an option",
+	askDoc.includes("Effort, edit count and churn are never grounds") && askDoc.includes("many call sites"),
+);
+check(
+	"tool description confines a partial option to a named blocker and states its cost",
+	askDoc.includes("named concrete blocker") && askDoc.includes("what the deferral costs"),
+);
+check(
+	"tool description says to act rather than ask when one path is plainly better",
+	askDoc.includes("matter of the user's taste"),
+);
+check(
+	"tool description states that an undescribed option is refused",
+	askDoc.includes("an option without one is refused"),
+);
+
+// --------------------------------------------------- an option nobody explained
+heading("an undescribed ask option");
+const nakedAsk = await ctxSession.tools.get("ask").execute(
+	"bare1",
+	{
+		questions: [
+			{
+				id: "split",
+				question: "Split the enum?",
+				options: [
+					{ label: "Split it now", description: "Two disjoint types, 700 call sites touched once." },
+					{ label: "Keep one enum" },
+				],
+			},
+		],
+	},
+	undefined,
+	undefined,
+	ctxSession.ctx,
+);
+check("an option with no description is refused", nakedAsk.isError === true);
+const nakedText = nakedAsk.content[0].text;
+check(
+	"the refusal names the question and the option",
+	nakedText.includes("split") && nakedText.includes("Keep one enum"),
+);
+check(
+	"the refusal explains why a description is mandatory",
+	nakedText.includes("the label alone is what arrives") && nakedText.includes("cannot judge"),
+);
+check(
+	"the refusal says exactly what to send instead",
+	nakedText.includes("what choosing it does or costs") && nakedText.includes("call ask again"),
+);
+check("the refusal reaches no chat", lastCall("sendMessage").body.text.includes("Split the enum?") === false);
+// An id and a label are both allowed to be empty by the schema, and the refusal still has to point somewhere.
+const namelessAsk = await ctxSession.tools.get("ask").execute(
+	"bare2",
+	{
+		questions: [
+			{
+				id: "  ",
+				question: "Which one?",
+				options: [askOpt("Keep it"), { label: "  " }],
+			},
+			{ id: "second", question: "And then?", options: [askOpt("Stop")] },
+		],
+	},
+	undefined,
+	undefined,
+	ctxSession.ctx,
+);
+check(
+	"a nameless question and a nameless option are still located",
+	namelessAsk.content[0].text.includes("the question offers option 2 with no description"),
+);
+check("a described question alongside it is not blamed", namelessAsk.content[0].text.includes("second") === false);
 
 // ------------------------------------------------------------- poller mutual exclusion
 heading("poller mutual exclusion");
@@ -921,9 +1003,9 @@ check(
 );
 const three = {
 	questions: [
-		{ id: "one", question: "Q1?", options: [{ label: "a1" }, { label: "b1" }] },
-		{ id: "two", question: "Q2?", options: [{ label: "a2" }, { label: "b2" }] },
-		{ id: "three", question: "Q3?", options: [{ label: "a3" }, { label: "b3" }] },
+		{ id: "one", question: "Q1?", options: askOpts("a1", "b1") },
+		{ id: "two", question: "Q2?", options: askOpts("a2", "b2") },
+		{ id: "three", question: "Q3?", options: askOpts("a3", "b3") },
 	],
 };
 const mqState = {};
@@ -971,9 +1053,9 @@ if (mqResult !== "timeout") {
 // Mixed shapes in one ask: plain, multi-select, then a typed answer, all in the middle positions.
 const mixed = {
 	questions: [
-		{ id: "first", question: "Pick one?", options: [{ label: "x" }, { label: "y" }] },
-		{ id: "middle", question: "Pick many?", multi: true, options: [{ label: "p" }, { label: "q" }, { label: "r" }] },
-		{ id: "last", question: "Free form?", options: [{ label: "preset" }] },
+		{ id: "first", question: "Pick one?", options: askOpts("x", "y") },
+		{ id: "middle", question: "Pick many?", multi: true, options: askOpts("p", "q", "r") },
+		{ id: "last", question: "Free form?", options: askOpts("preset") },
 	],
 };
 const mixState = {};
@@ -1088,7 +1170,7 @@ mdSession.tools
 	.get("ask")
 	.execute(
 		"md",
-		{ context: md, questions: [{ id: "q", question: "ok?", options: [{ label: "yes" }] }] },
+		{ context: md, questions: [{ id: "q", question: "ok?", options: askOpts("yes") }] },
 		undefined,
 		undefined,
 		stubbornCtx(mdSession.ctx, {}),
@@ -1114,7 +1196,7 @@ mdSession.tools
 	.get("ask")
 	.execute(
 		"hg",
-		{ context: huge, questions: [{ id: "q", question: "ok?", options: [{ label: "yes" }] }] },
+		{ context: huge, questions: [{ id: "q", question: "ok?", options: askOpts("yes") }] },
 		undefined,
 		undefined,
 		stubbornCtx(mdSession.ctx, {}),
@@ -1130,7 +1212,7 @@ mdSession.tools
 	.get("ask")
 	.execute(
 		"hg2",
-		{ context: "x".repeat(5000), questions: [{ id: "q", question: "ok?", options: [{ label: "yes" }] }] },
+		{ context: "x".repeat(5000), questions: [{ id: "q", question: "ok?", options: askOpts("yes") }] },
 		undefined,
 		undefined,
 		stubbornCtx(mdSession.ctx, {}),
@@ -1290,7 +1372,7 @@ heading("cancellation and message closure");
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 const esc = spawn("01a03f00-0000-0000-0000-000000000000", "/home/dev/work/subql");
 await esc.fire("session_start");
-const escAsk = { questions: [{ id: "q", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] };
+const escAsk = { questions: [{ id: "q", question: "Proceed?", options: askOpts("yes", "no") }] };
 
 // Esc at the terminal: the native dialog throws, and the telegram message must be retired.
 let rejectLocal = null;
@@ -1362,8 +1444,8 @@ const walkRun = esc.tools.get("ask").execute(
 	"e3",
 	{
 		questions: [
-			{ id: "a", question: "First?", options: [{ label: "x" }, { label: "y" }] },
-			{ id: "b", question: "Second?", options: [{ label: "p" }] },
+			{ id: "a", question: "First?", options: askOpts("x", "y") },
+			{ id: "b", question: "Second?", options: askOpts("p") },
 		],
 	},
 	undefined,
@@ -1404,7 +1486,7 @@ const stanceAsk = {
 				{ label: "neutral one", description: "no strong view", preview: "preview should disappear" },
 				{ label: "the good one", description: "cheapest to maintain" },
 				{ label: "the bad one", description: "here for contrast", discouraged: true },
-				{ label: "bare option" },
+				{ label: "another neutral", description: "also no strong view" },
 				{ label: "the meh one", description: "works, but slow", lukewarm: true },
 				{
 					label: "Add a code marker to the record and have a health-aware session take the board over",
@@ -1435,7 +1517,10 @@ check(
 	stRows[5][0].text.endsWith("\u{1F7E0} (lukewarm)"),
 );
 check("a cut button label still fits the button", stRows[5][0].text.length <= 60);
-check("a neutral option with nothing to add is omitted from the body", !stBody.text.includes("bare option"));
+check(
+	"every option gets its own section in the body",
+	stBody.text.includes("<b>another neutral</b>\nalso no strong view"),
+);
 check(
 	"the terminal sees the discouraged marker too",
 	stanceParams.params.questions[0].options[2].description.startsWith("(discouraged)"),
@@ -1445,8 +1530,8 @@ check(
 	stanceParams.params.questions[0].options[4].description.startsWith("\u{1F7E0} (lukewarm)"),
 );
 check(
-	"the marker is not lost when there was no description",
-	stanceParams.params.questions[0].options[3].description === undefined,
+	"an unmarked option reaches the native tool with its description untouched",
+	stanceParams.params.questions[0].options[3].description === "also no strong view",
 );
 check(
 	"discouraged never reaches the strict native tool",
@@ -1502,7 +1587,7 @@ const bareRun = st.tools.get("ask").execute(
 				id: "b",
 				question: "Which?",
 				recommended: 0,
-				options: [{ label: "take this" }, { label: "avoid this", discouraged: true }],
+				options: [askOpt("take this"), { ...askOpt("avoid this"), discouraged: true }],
 			},
 		],
 	},
@@ -1616,7 +1701,7 @@ const semRun = sem.tools
 	.get("ask")
 	.execute(
 		"sm",
-		{ questions: [{ id: "q", question: "ok?", options: [{ label: "yes" }] }] },
+		{ questions: [{ id: "q", question: "ok?", options: askOpts("yes") }] },
 		undefined,
 		undefined,
 		stubbornCtx(sem.ctx, semState),
@@ -1691,6 +1776,18 @@ check(
 		rs.tools.get("notify_status").description.includes("what choosing it does or costs") &&
 		rs.tools.get("notify_status").description.includes("an option with no description is refused") &&
 		rs.tools.get("notify_status").description.includes("Never use only a phase number or letter"),
+);
+check(
+	"the block holds next steps to the long-term standard",
+	blockReason.includes("finishes the work properly") &&
+		blockReason.includes("effort is never a reason") &&
+		blockReason.includes("leaves a known defect"),
+);
+check(
+	"notify_status carries the same long-term standard",
+	rs.tools.get("notify_status").description.includes("finishes the work properly") &&
+		rs.tools.get("notify_status").description.includes("effort is never a reason") &&
+		rs.tools.get("notify_status").description.includes("leaves a known defect"),
 );
 check(
 	"after the block the fallback message still goes out",
@@ -1955,14 +2052,14 @@ const bpRun = bp.tools.get("ask").execute(
 			{
 				id: "p",
 				question: "Pick",
-				options: [
-					{ label: "Yes" },
-					{ label: "No" },
-					{ label: "Skip" },
-					{ label: "Continue" },
-					{ label: "Review the diff" },
-					{ label: "A very long deliberate label that needs its own row" },
-				],
+				options: askOpts(
+					"Yes",
+					"No",
+					"Skip",
+					"Continue",
+					"Review the diff",
+					"A very long deliberate label that needs its own row",
+				),
 			},
 		],
 	},
@@ -2093,7 +2190,7 @@ const uxRun = ux.tools
 	.get("ask")
 	.execute(
 		"ux1",
-		{ questions: [{ id: "q", question: "Deploy how?", options: [{ label: "Canary" }, { label: "Full" }] }] },
+		{ questions: [{ id: "q", question: "Deploy how?", options: askOpts("Canary", "Full") }] },
 		undefined,
 		undefined,
 		stubbornCtx(ux.ctx, uxState),
@@ -2181,8 +2278,8 @@ await ux.fire("input");
 const dtState = {};
 const dtPair = {
 	questions: [
-		{ id: "d1", question: "First?", options: [{ label: "yes" }, { label: "no" }] },
-		{ id: "d2", question: "Second?", options: [{ label: "alpha" }, { label: "beta" }] },
+		{ id: "d1", question: "First?", options: askOpts("yes", "no") },
+		{ id: "d2", question: "Second?", options: askOpts("alpha", "beta") },
 	],
 };
 const runDouble = ux.tools.get("ask").execute("dt1", dtPair, undefined, undefined, stubbornCtx(ux.ctx, dtState));
@@ -2298,7 +2395,7 @@ const hideRun = ux.tools
 	.get("ask")
 	.execute(
 		"ux-hide-ask",
-		{ questions: [{ id: "h", question: "Hide me?", options: [{ label: "yes" }, { label: "no" }] }] },
+		{ questions: [{ id: "h", question: "Hide me?", options: askOpts("yes", "no") }] },
 		undefined,
 		undefined,
 		stubbornCtx(ux.ctx, hideState),
@@ -2995,7 +3092,7 @@ const rvAsk = rv.tools
 	.get("ask")
 	.execute(
 		"r4",
-		{ questions: [{ id: "q", question: "Q?", options: [{ label: "a" }, { label: "b" }] }] },
+		{ questions: [{ id: "q", question: "Q?", options: askOpts("a", "b") }] },
 		undefined,
 		undefined,
 		stubbornCtx(rv.ctx, rvState),
@@ -3299,8 +3396,8 @@ await orphanSess.fire("session_start");
 		"ork",
 		{
 			questions: [
-				{ id: "a", question: "First?", options: [{ label: "x" }] },
-				{ id: "b", question: "Second?", options: [{ label: "y" }] },
+				{ id: "a", question: "First?", options: askOpts("x") },
+				{ id: "b", question: "Second?", options: askOpts("y") },
 			],
 		},
 		undefined,
@@ -3679,7 +3776,7 @@ heading("oversized message truncation");
 	check("a summary dense in escapes keeps every ampersand", (whole.match(/&amp;/g) ?? []).length === 900);
 
 	// b. A body past the real ceiling is cut, says so, and fits.
-	const trAsk = { id: "q", question: "ok?", options: [{ label: "yes" }] };
+	const trAsk = { id: "q", question: "ok?", options: askOpts("yes") };
 	tr.tools
 		.get("ask")
 		.execute("t2", { context: "x".repeat(5000), questions: [trAsk] }, undefined, undefined, stubbornCtx(tr.ctx, {}));
@@ -3820,7 +3917,7 @@ heading("surrogate-safe clipping");
 		.get("ask")
 		.execute(
 			"sc3",
-			{ questions: [{ id: "p", question: "Which?", options: [{ label: "a", preview: half(300) }, { label: "b" }] }] },
+			{ questions: [{ id: "p", question: "Which?", options: [{ ...askOpt("a"), preview: half(300) }, askOpt("b")] }] },
 			undefined,
 			undefined,
 			stubbornCtx(titled.ctx, pvState),
@@ -5122,7 +5219,7 @@ heading("one standard message head");
 		.get("ask")
 		.execute(
 			"hd3",
-			{ questions: [{ id: "q", question: "Ready?", options: [{ label: "Yes" }, { label: "No" }] }] },
+			{ questions: [{ id: "q", question: "Ready?", options: askOpts("Yes", "No") }] },
 			undefined,
 			undefined,
 			stubbornCtx(hd.ctx, hdState),
