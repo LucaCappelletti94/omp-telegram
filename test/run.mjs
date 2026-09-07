@@ -5763,6 +5763,322 @@ check(
 	called("editMessageReplyMarkup").filter((c) => c.body.message_id === 46).length === 1,
 );
 
+// ------------------------------------------------------------ upstream_launch
+heading("upstream_launch");
+{
+	const savedPath = process.env.PATH;
+	const savedHome = process.env.HOME;
+	const upBin = join(root, "up-bin");
+	mkdirSync(upBin, { recursive: true });
+	writeFileSync(
+		join(upBin, "gh"),
+		`#!/bin/sh
+args="$*"
+case "$args" in
+  "api user "*) if [ "$GH_NOLOGIN" = "1" ]; then exit 1; else echo "LucaCappelletti94"; fi ;;
+  *defaultBranchRef*) if [ "$GH_NODEFAULT" = "1" ]; then exit 1; else echo "main"; fi ;;
+  *"repo view"*isFork*)
+    case "$GH_FORK" in
+      missing) echo "not found" 1>&2; exit 1 ;;
+      collision) printf 'false\\t\\n' ;;
+      *) printf 'true\\t%s\\n' "$GH_UPSTREAM" ;;
+    esac ;;
+  "repo fork"*) if [ "$GH_FORKFAIL" = "1" ]; then echo "fork failed" 1>&2; exit 1; else echo forked; fi ;;
+  *) echo "unhandled gh $args" 1>&2; exit 1 ;;
+esac
+`,
+		{ mode: 0o755 },
+	);
+	writeFileSync(
+		join(upBin, "git"),
+		`#!/bin/sh
+args="$*"
+case "$args" in
+  *"remote get-url origin"*) echo "$GIT_ORIGIN" ;;
+  *"remote get-url upstream"*) [ "$GIT_UPSTREAM" = "1" ] && echo up || exit 1 ;;
+  *"rev-parse"*) exit 1 ;;
+  *clone*) if [ "$GIT_CLONEFAIL" = "1" ]; then echo "clone failed" 1>&2; exit 1; elif [ -n "$GIT_CLONE_FLAKY" ]; then if [ -f "$GIT_CLONE_FLAKY" ]; then exit 0; else : > "$GIT_CLONE_FLAKY"; echo "not ready" 1>&2; exit 1; fi; else exit 0; fi ;;
+  *fetch*) if [ "$GIT_FETCHFAIL" = "1" ]; then echo "fetch failed" 1>&2; exit 1; else exit 0; fi ;;
+  *"worktree add"*) if [ "$GIT_WTFAIL" = "1" ]; then echo "wt failed" 1>&2; exit 1; else exit 0; fi ;;
+  *) exit 0 ;;
+esac
+`,
+		{ mode: 0o755 },
+	);
+	writeFileSync(
+		join(upBin, "tmux"),
+		`#!/bin/sh
+case "$1" in
+  new-window) if [ "$TMUX_NEWWIN_FAIL" = "1" ]; then echo "nw failed" 1>&2; exit 1; else echo "@42"; fi ;;
+  display-message) printf 'work\\t3\\t1\\n' ;;
+  *) exit 0 ;;
+esac
+`,
+		{ mode: 0o755 },
+	);
+	process.env.PATH = `${upBin}:${savedPath}`;
+	process.env.HOME = root;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	process.env.TMUX_PANE = "%1";
+	writeConfig();
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+
+	const workK = join(root, "work-K");
+	mkdirSync(workK, { recursive: true });
+	writeFileSync(join(workK, "req.md"), "# Problem\nThe parser rejects valid X.\n\n## Failure\nx\n\n## Corrected\ny\n");
+
+	const up = spawn("01a07000-0000-0000-0000-000000000000", workK);
+	await up.fire("session_start");
+
+	const answerLaunch = async (session, choice) => {
+		await settle(90);
+		const button = lastCall("sendMessage")
+			.body.reply_markup.inline_keyboard.flat()
+			.find((b) => b.callback_data?.startsWith("o:"));
+		const askId = button.callback_data.split(":")[1];
+		mkdirSync(inboxOf(session.id), { recursive: true });
+		writeFileSync(
+			join(inboxOf(session.id), `${Date.now()}.json`),
+			JSON.stringify({ kind: "callback", value: `o:${askId}:0:${choice}` }),
+		);
+		await session.pump(160);
+	};
+
+	// a. The user's own repository: reuse an existing clone, fork nothing.
+	mkdirSync(join(root, "github", "dep", ".git", "info"), { recursive: true });
+	process.env.GIT_ORIGIN = "git@github.com:LucaCappelletti94/dep.git";
+	const ownRun = up.tools
+		.get("upstream_launch")
+		.execute(
+			"u-own",
+			{ repo: "LucaCappelletti94/dep", document: "req.md", problem: "It rejects valid X." },
+			undefined,
+			undefined,
+			up.ctx,
+		);
+	await answerLaunch(up, 0);
+	const ownResult = await ownRun;
+	check("own-repo launch succeeds", ownResult.details?.launched === true);
+	check(
+		"own-repo launch uses the user's own repository",
+		ownResult.details.mode === "own" && ownResult.details.created === false,
+	);
+	check("launch cuts an upstream/ branch from the problem", ownResult.details.branch === "upstream/it-rejects-valid-x");
+	check(
+		"launch carries the request into the worktree",
+		existsSync(join(root, "github", "dep.upstreams", "it-rejects-valid-x", "upstream", "request.md")),
+	);
+	check(
+		"launch excludes upstream/ through the private exclude",
+		readFileSync(join(root, "github", "dep", ".git", "info", "exclude"), "utf8").includes("upstream/"),
+	);
+	check("launch reports the new tmux window", ownResult.details.windowId === "@42");
+	check("launch notifies Telegram it opened", lastCall("sendMessage").body.text.includes("Upstream launched"));
+
+	// b. A third-party repository with no fork yet: the fork is created.
+	process.env.GH_FORK = "missing";
+	delete process.env.GIT_UPSTREAM;
+	const forkRun = up.tools
+		.get("upstream_launch")
+		.execute(
+			"u-fork",
+			{ repo: "someorg/widget", document: "req.md", problem: "Widget mis-encodes Y." },
+			undefined,
+			undefined,
+			up.ctx,
+		);
+	await answerLaunch(up, 0);
+	const forkResult = await forkRun;
+	check(
+		"third-party launch creates a fork",
+		forkResult.details?.launched === true && forkResult.details.mode === "fork" && forkResult.details.created === true,
+	);
+	check(
+		"the created fork's worktree holds the request",
+		existsSync(join(root, "github", "widget.upstreams", "widget-mis-encodes-y", "upstream", "request.md")),
+	);
+
+	// c. A third-party repository already forked: reuse it, fork nothing.
+	process.env.GH_FORK = "reuse";
+	process.env.GH_UPSTREAM = "someorg/gadget";
+	mkdirSync(join(root, "github", "gadget", ".git", "info"), { recursive: true });
+	process.env.GIT_ORIGIN = "git@github.com:LucaCappelletti94/gadget.git";
+	process.env.GIT_UPSTREAM = "1";
+	const reuseRun = up.tools
+		.get("upstream_launch")
+		.execute(
+			"u-reuse",
+			{ repo: "someorg/gadget", document: "req.md", problem: "Gadget drops Z." },
+			undefined,
+			undefined,
+			up.ctx,
+		);
+	await answerLaunch(up, 0);
+	const reuseResult = await reuseRun;
+	check(
+		"an existing fork is reused without a new fork",
+		reuseResult.details?.launched === true &&
+			reuseResult.details.mode === "fork" &&
+			reuseResult.details.created === false,
+	);
+
+	// d. Cancel forks, clones, and opens nothing.
+	const cancelRun = up.tools
+		.get("upstream_launch")
+		.execute(
+			"u-cancel",
+			{ repo: "someorg/thing", document: "req.md", problem: "Thing breaks." },
+			undefined,
+			undefined,
+			up.ctx,
+		);
+	await answerLaunch(up, 1);
+	const cancelResult = await cancelRun;
+	check("Cancel launches nothing", cancelResult.details?.launched === false);
+
+	// e. Validation refuses before any confirmation is even shown.
+	const badRepo = await up.tools
+		.get("upstream_launch")
+		.execute("u-bad", { repo: "not-a-repo", document: "req.md", problem: "x" }, undefined, undefined, up.ctx);
+	check("a malformed repo is refused", badRepo.isError === true);
+	const noDoc = await up.tools
+		.get("upstream_launch")
+		.execute("u-nodoc", { repo: "a/b", document: "missing.md", problem: "x" }, undefined, undefined, up.ctx);
+	check("a missing request document is refused", noDoc.isError === true);
+	delete process.env.TMUX;
+	const noTmux = await up.tools
+		.get("upstream_launch")
+		.execute("u-notmux", { repo: "a/b", document: "req.md", problem: "x" }, undefined, undefined, up.ctx);
+	check("a launch without tmux is refused", noTmux.isError === true);
+
+	// f. Every failure path returns an error and opens nothing.
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	const errLaunch = async (tag, repo, problem, extra) => {
+		const prev = {};
+		for (const key of Object.keys(extra)) {
+			prev[key] = process.env[key];
+			process.env[key] = extra[key];
+		}
+		const runp = up.tools
+			.get("upstream_launch")
+			.execute(tag, { repo, document: "req.md", problem }, undefined, undefined, up.ctx);
+		await answerLaunch(up, 0);
+		const res = await runp;
+		for (const key of Object.keys(extra)) {
+			if (prev[key] === undefined) delete process.env[key];
+			else process.env[key] = prev[key];
+		}
+		return res;
+	};
+
+	const noLogin = await errLaunch("e-login", "LucaCappelletti94/dep", "P.", { GH_NOLOGIN: "1" });
+	check("an unreadable gh login is refused", noLogin.isError === true);
+
+	const collision = await errLaunch("e-collision", "someorg/coll", "P.", { GH_FORK: "collision" });
+	check("a name collision that is not a fork is refused", collision.isError === true);
+
+	mkdirSync(join(root, "github", "diffrepo", ".git", "info"), { recursive: true });
+	const wrongRepo = await errLaunch("e-wrong", "LucaCappelletti94/diffrepo", "P.", {
+		GIT_ORIGIN: "git@github.com:someoneelse/other.git",
+	});
+	check("a clone holding a different repository is refused", wrongRepo.isError === true);
+
+	const forkFail = await errLaunch("e-forkfail", "someorg/ff", "P.", { GH_FORK: "missing", GH_FORKFAIL: "1" });
+	check("a failed fork is reported", forkFail.isError === true);
+
+	const cloneFail = await errLaunch("e-clonefail", "LucaCappelletti94/clonefail", "P.", { GIT_CLONEFAIL: "1" });
+	check("a failed clone is reported", cloneFail.isError === true);
+
+	mkdirSync(join(root, "github", "fetchfail", ".git", "info"), { recursive: true });
+	const fetchFail = await errLaunch("e-fetchfail", "LucaCappelletti94/fetchfail", "P.", {
+		GIT_ORIGIN: "git@github.com:LucaCappelletti94/fetchfail.git",
+		GIT_FETCHFAIL: "1",
+	});
+	check("a failed fetch is reported", fetchFail.isError === true);
+
+	mkdirSync(join(root, "github", "deffail", ".git", "info"), { recursive: true });
+	const defFail = await errLaunch("e-deffail", "LucaCappelletti94/deffail", "P.", {
+		GIT_ORIGIN: "git@github.com:LucaCappelletti94/deffail.git",
+		GH_NODEFAULT: "1",
+	});
+	check("an unreadable default branch is reported", defFail.isError === true);
+
+	mkdirSync(join(root, "github", "wtfail", ".git", "info"), { recursive: true });
+	const wtFail = await errLaunch("e-wtfail", "LucaCappelletti94/wtfail", "P.", {
+		GIT_ORIGIN: "git@github.com:LucaCappelletti94/wtfail.git",
+		GIT_WTFAIL: "1",
+	});
+	check("a failed worktree add is reported", wtFail.isError === true);
+
+	mkdirSync(join(root, "github", "wtexists", ".git", "info"), { recursive: true });
+	mkdirSync(join(root, "github", "wtexists.upstreams", "edge-case"), { recursive: true });
+	const wtExists = await errLaunch("e-wtexists", "LucaCappelletti94/wtexists", "Edge case.", {
+		GIT_ORIGIN: "git@github.com:LucaCappelletti94/wtexists.git",
+	});
+	check("an existing worktree is refused", wtExists.isError === true);
+
+	// g. Document that exists but cannot be read as text (a directory), and an empty one.
+	const dirDoc = await up.tools
+		.get("upstream_launch")
+		.execute("e-dirdoc", { repo: "a/b", document: ".", problem: "P." }, undefined, undefined, up.ctx);
+	check("a document that is a directory is refused", dirDoc.isError === true);
+	writeFileSync(join(workK, "empty.md"), "   \n");
+	const emptyDoc = await up.tools
+		.get("upstream_launch")
+		.execute("e-empty", { repo: "a/b", document: "empty.md", problem: "P." }, undefined, undefined, up.ctx);
+	check("an empty request document is refused", emptyDoc.isError === true);
+
+	// h. A session with no Telegram config refuses before anything else.
+	const cfgBackup = readFileSync(join(root, "notify-telegram.json"), "utf8");
+	writeFileSync(join(root, "notify-telegram.json"), "");
+	const noCfg = spawn("01a07001-0000-0000-0000-000000000000", workK);
+	await noCfg.fire("session_start");
+	const noCfgResult = await noCfg.tools
+		.get("upstream_launch")
+		.execute("e-nocfg", { repo: "a/b", document: "req.md", problem: "P." }, undefined, undefined, noCfg.ctx);
+	check("a session without Telegram config is refused", noCfgResult.isError === true);
+	writeFileSync(join(root, "notify-telegram.json"), cfgBackup);
+
+	// i. A confirmation card that cannot be sent refuses instead of hanging.
+	api.failMethods = ["sendMessage"];
+	const undelivered = await up.tools
+		.get("upstream_launch")
+		.execute("e-undelivered", { repo: "a/b", document: "req.md", problem: "P." }, undefined, undefined, up.ctx);
+	api.failMethods = [];
+	check("an undelivered confirmation card is refused, not hung", undelivered.isError === true);
+
+	// j. A signal already aborted before the wait cancels instead of hanging forever.
+	const preAborted = new AbortController();
+	preAborted.abort();
+	const aborted = await up.tools
+		.get("upstream_launch")
+		.execute("e-aborted", { repo: "a/b", document: "req.md", problem: "P." }, preAborted.signal, undefined, up.ctx);
+	check("a pre-aborted signal cancels without hanging", aborted.details?.launched === false);
+
+	// k. A fresh fork whose first clone is not ready yet is retried to success.
+	const flakyMarker = join(root, "flaky-clone-marker");
+	rmSync(flakyMarker, { force: true });
+	const flaky = await errLaunch("e-flaky", "someorg/flaky", "P.", { GH_FORK: "missing", GIT_CLONE_FLAKY: flakyMarker });
+	check("a fork whose first clone is not ready is retried to success", flaky.details?.launched === true);
+
+	// l. A launch that cannot open its tmux window rolls the worktree back and reports it.
+	mkdirSync(join(root, "github", "rollback", ".git", "info"), { recursive: true });
+	const rolledBack = await errLaunch("e-rollback", "LucaCappelletti94/rollback", "P.", {
+		GIT_ORIGIN: "git@github.com:LucaCappelletti94/rollback.git",
+		TMUX_NEWWIN_FAIL: "1",
+	});
+	check("a failed tmux window rolls the launch back and reports it", rolledBack.isError === true);
+
+	process.env.PATH = savedPath;
+	process.env.HOME = savedHome;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+	delete process.env.GH_FORK;
+	delete process.env.GH_UPSTREAM;
+	delete process.env.GIT_ORIGIN;
+	delete process.env.GIT_UPSTREAM;
+}
+
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);
