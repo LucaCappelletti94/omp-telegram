@@ -1662,6 +1662,79 @@ const askMsg = lastCall("sendMessage").body.text;
 check("a trailing question gets the orange light", askMsg.includes("\u{1F7E0}") && askMsg.includes("Reply wanted"));
 check("the question itself is the body", askMsg.includes("legacy shim"));
 
+// A turn that ends on a question the user can only see in the terminal is blocked once, and the
+// block names the two channels that reach Telegram instead of letting the question slip past.
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const qs = spawn("01a04250-0000-0000-0000-000000000000", "/home/dev/work/sqlitegis");
+qs.ctx.sessionManager.getBranch = () => [
+	{
+		type: "message",
+		message: { role: "assistant", content: [{ type: "text", text: "So, should I rename the column or keep it?" }] },
+	},
+];
+await qs.fire("session_start");
+const qsStop = await qs.fire("session_stop");
+await settle(150);
+const qsBlock = qsStop.find((r) => r?.decision === "block");
+check("a turn ending on a bare terminal question is blocked", qsBlock !== undefined);
+check(
+	"the block points at the ask tool and notify_status",
+	qsBlock?.reason.includes("ask tool") && qsBlock?.reason.includes("notify_status"),
+);
+check("the block forbids answering your own question", qsBlock?.reason.includes("Do not answer your own question"));
+check(
+	"after the block the question still reaches Telegram as a reply-wanted notice",
+	lastCall("sendMessage").body.text.includes("\u{1F7E0}") &&
+		lastCall("sendMessage").body.text.includes("rename the column"),
+);
+
+// A question the agent already answered itself in the same paragraph does not end on a question, so
+// it must not trip the gate and prompt the agent to re-ask a settled decision.
+const qa = spawn("01a04260-0000-0000-0000-000000000000", "/home/dev/work/sqlitegis");
+qa.ctx.sessionManager.getBranch = () => [
+	{
+		type: "message",
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text: "Should I rename the column?\nOn reflection I kept it and moved on." }],
+		},
+	},
+];
+await qa.fire("session_start");
+const qaStop = await qa.fire("session_stop");
+await settle(150);
+const qaBlock = qaStop.find((r) => r?.decision === "block");
+check(
+	"a self-answered question does not trip the question gate",
+	qaBlock !== undefined && !qaBlock.reason.includes("Do not answer your own question"),
+);
+check(
+	"a self-answered question gets the ordinary green finish",
+	lastCall("sendMessage").body.text.includes("\u{1F7E2}") && lastCall("sendMessage").body.text.includes("moved on"),
+);
+
+// A long final paragraph is truncated for display, but the question that ends it must still trip the
+// gate: detection runs on the raw tail, truncation only shapes the message body.
+const lq = spawn("01a04270-0000-0000-0000-000000000000", "/home/dev/work/sqlitegis");
+const longQuestion = `${"context ".repeat(120)}so, should I proceed?`;
+lq.ctx.sessionManager.getBranch = () => [
+	{ type: "message", message: { role: "assistant", content: [{ type: "text", text: longQuestion }] } },
+];
+await lq.fire("session_start");
+const lqStop = await lq.fire("session_stop");
+await settle(150);
+const lqBlock = lqStop.find((r) => r?.decision === "block");
+check(
+	"a long question past the display cap still trips the gate",
+	lqBlock?.reason.includes("Do not answer your own question"),
+);
+check(
+	"the truncated reply-wanted body keeps the light and retains the trailing question",
+	lastCall("sendMessage").body.text.includes("\u{1F7E0}") &&
+		lastCall("sendMessage").body.text.includes("...") &&
+		lastCall("sendMessage").body.text.includes("proceed?"),
+);
+
 const grantedNoticeId = api.nextMessage;
 await sem.fire("tool_approval_requested", { toolCallId: "approve-1", toolName: "bash" });
 await settle(150);

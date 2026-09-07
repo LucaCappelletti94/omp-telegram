@@ -21,6 +21,7 @@ import {
 	badgeLine,
 	buttonText,
 	clip,
+	clipEnd,
 	duration,
 	extractQuestionPreviews,
 	fenceFor,
@@ -95,6 +96,12 @@ const CAPTION_MAX = 1024;
 /** A snippet's purpose is one line above the block, not a second summary. */
 const SNIPPET_PURPOSE_MAX = 120;
 const RECENT_MESSAGE_CAP = 60;
+/**
+ * A turn that ends on a question the user can only read in the terminal never reaches the phone, so
+ * the agent gets blocked once and pointed at the two channels that do reach it.
+ */
+const QUESTION_STOP_REASON =
+	"Your turn is ending on a question to the user, but it is written only as terminal prose, which the user does not see on Telegram when away from the desktop. Do not answer your own question and carry on as though it were settled. If you need the answer before proceeding, call the ask tool, which stops the turn and is answerable from the terminal or the phone. If the question itself is what ends the turn, call notify_status with an orange urgency, the question set, and two to six options, each an object with a short label naming a choice and a one-line description of what choosing it does or costs, so the user can answer from a phone.";
 
 const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;
@@ -1132,7 +1139,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								.trim()
 								.split(/\n{2,}/)
 								.at(-1) ?? "";
-						return tail.length > 600 ? `${clip(tail, 600)}...` : tail;
+						return tail;
 					}
 				}
 			}
@@ -3410,6 +3417,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 		if (!statusBlockUsed) {
 			statusBlockUsed = true;
+			if (pendingAsk === null && /\?\s*$/.test(lastAssistantTail(ctx))) {
+				return { decision: "block" as const, reason: QUESTION_STOP_REASON };
+			}
 			return {
 				decision: "block" as const,
 				reason:
@@ -3418,18 +3428,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 
 		const tail = lastAssistantTail(ctx);
-		const wantsReply = /\?\s*$/m.test(tail);
+		const wantsReply = /\?\s*$/.test(tail);
 		const title = wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished";
-		detach(
-			notify(
-				ctx,
-				title,
-				tail.length > 0 ? tail : "Awaiting your next instruction.",
-				quiet ? { disable_notification: true } : {},
-				usageFooter(),
-			),
-			"turn-end notice",
-		);
+		const body =
+			tail.length === 0
+				? "Awaiting your next instruction."
+				: tail.length <= 600
+					? tail
+					: wantsReply
+						? `...${clipEnd(tail, 600)}`
+						: `${clip(tail, 600)}...`;
+		detach(notify(ctx, title, body, quiet ? { disable_notification: true } : {}, usageFooter()), "turn-end notice");
 	});
 
 	pi.on("tool_approval_requested", async (event, ctx) => {
