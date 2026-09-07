@@ -5633,6 +5633,63 @@ check(
 	!called("answerCallbackQuery").some((c) => c.body.callback_query_id === "ext-cb-3"),
 );
 
+// A choice may legitimately contain colons; the parser keeps everything after the second one.
+const colonKey = "c0c0c0c0c0c0c0c0";
+api.queued = [
+	{
+		update_id: 903,
+		callback_query: {
+			id: "ext-cb-4",
+			data: `e:${colonKey}:2026-09-07T10:30`,
+			from: { id: CHAT },
+			message: {
+				message_id: 45,
+				chat: { id: CHAT },
+				reply_markup: { inline_keyboard: [[{ text: "At", callback_data: `e:${colonKey}:2026-09-07T10:30` }]] },
+			},
+		},
+	},
+];
+await extSess.pump(200);
+check(
+	"a choice containing colons is recorded whole",
+	JSON.parse(readFileSync(join(answersDir, `${colonKey}.json`), "utf8")).choice === "2026-09-07T10:30",
+);
+
+// The first press on a key wins: a later press in the same batch neither overwrites nor re-settles.
+const raceKey = "d0d0d0d0d0d0d0d0";
+const raceButtons = [
+	[
+		{ text: "Delete tree", callback_data: `e:${raceKey}:delete` },
+		{ text: "Keep", callback_data: `e:${raceKey}:keep` },
+	],
+];
+const raceMessage = { message_id: 46, chat: { id: CHAT }, reply_markup: { inline_keyboard: raceButtons } };
+api.queued = [
+	{
+		update_id: 904,
+		callback_query: { id: "ext-cb-5a", data: `e:${raceKey}:delete`, from: { id: CHAT }, message: raceMessage },
+	},
+	{
+		update_id: 905,
+		callback_query: { id: "ext-cb-5b", data: `e:${raceKey}:keep`, from: { id: CHAT }, message: raceMessage },
+	},
+];
+await extSess.pump(250);
+check(
+	"the first press on a key wins",
+	JSON.parse(readFileSync(join(answersDir, `${raceKey}.json`), "utf8")).choice === "delete",
+);
+check(
+	"a later press is acknowledged as already recorded",
+	called("answerCallbackQuery").find((c) => c.body.callback_query_id === "ext-cb-5b")?.body.text ===
+		"Already recorded.",
+);
+check(
+	"only the first press settles the keyboard",
+	called("editMessageReplyMarkup").filter((c) => c.body.message_id === 46).length === 1,
+);
+
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);

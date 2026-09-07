@@ -530,6 +530,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastLocalInput = Date.now();
 	let pollInFlight = false;
 	let drainInFlight = false;
+	/** External question keys already answered this session, so the first press on one wins. */
+	const externalAnswered = new Set<string>();
 	let askSequence = 0;
 	let pendingAsk: PendingAsk | null = null;
 	let unsubscribeInput: (() => void) | null = null;
@@ -1790,25 +1792,36 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * is not a scarce operation and stays with the asker, which is why this channel has no send half.
 	 */
 	async function answerExternalQuestion(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
-		const [, key = "", choice = ""] = (callback.data ?? "").split(":");
+		const data = callback.data ?? "";
+		// The key holds no colon, so the choice keeps everything after the second one intact.
+		const keyEnd = data.indexOf(":", 2);
+		const key = keyEnd === -1 ? "" : data.slice(2, keyEnd);
+		const choice = keyEnd === -1 ? "" : data.slice(keyEnd + 1);
 		const valid = EXTERNAL_KEY.test(key) && choice.length > 0;
-		if (valid) {
+		// A destructive asker must act on a single answer, so the first valid press for a key wins:
+		// later presses in the same batch only re-acknowledge, never overwrite or re-settle.
+		const fresh = valid && !externalAnswered.has(key);
+		if (fresh) {
+			externalAnswered.add(key);
 			// The asker created this directory to receive the answer. Recorded before the toast,
 			// which then reports a delivery this write has already made.
 			writeFileAtomic(join(EXTERNAL_ANSWERS_DIR, `${key}.json`), JSON.stringify({ choice, at: Date.now() }), 0o600);
-		} else {
+		} else if (!valid) {
 			pi.logger.warn("telegram: rejected an external answer with a malformed key or choice", {
-				data: clip(callback.data ?? "", 80),
+				data: clip(data, 80),
 			});
 		}
 		await callTelegram(
 			cfg,
 			"answerCallbackQuery",
-			{ callback_query_id: callback.id, text: valid ? "Recorded." : "That button is malformed." },
+			{
+				callback_query_id: callback.id,
+				text: valid ? (fresh ? "Recorded." : "Already recorded.") : "That button is malformed.",
+			},
 			10_000,
 		);
 		const message = callback.message;
-		if (!valid || message === undefined) return;
+		if (!fresh || message === undefined) return;
 		// Only the keyboard is edited, so the question's own text and formatting survive untouched.
 		const settled = (message.reply_markup?.inline_keyboard ?? []).map((row) =>
 			row.map((button) => ({
