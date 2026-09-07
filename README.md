@@ -3,6 +3,7 @@
 [![CI](https://github.com/LucaCappelletti94/omp-telegram/actions/workflows/ci.yml/badge.svg)](https://github.com/LucaCappelletti94/omp-telegram/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/LucaCappelletti94/omp-telegram/graph/badge.svg)](https://codecov.io/gh/LucaCappelletti94/omp-telegram)
 [![Quality gate](https://sonarcloud.io/api/project_badges/measure?project=LucaCappelletti94_omp-telegram&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=LucaCappelletti94_omp-telegram)
+[![Codacy](https://app.codacy.com/project/badge/Grade/31d0370cc25441c682e437e4712e97aa)](https://app.codacy.com/gh/LucaCappelletti94/omp-telegram/dashboard)
 [![License](https://img.shields.io/github/license/LucaCappelletti94/omp-telegram)](https://github.com/LucaCappelletti94/omp-telegram/blob/main/LICENSE)
 
 Telegram notifications and remote control for [Oh My Pi](https://github.com/can1357/oh-my-pi) sessions. Turn ends arrive as a short agent-written summary of a sentence or two with an urgency light and optional tappable choices whose label starts the next turn. Every choice carries a line saying what it does, so a button never has to be guessed at, and `ask` questions appear at the terminal and on Telegram at once, where the first answer wins.
