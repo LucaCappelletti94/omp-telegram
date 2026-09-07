@@ -3347,7 +3347,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 		if (!statusBlockUsed) {
 			statusBlockUsed = true;
-			if (pendingAsk === null && /\?\s*$/m.test(lastAssistantTail(ctx))) {
+			if (pendingAsk === null && /\?\s*$/.test(lastAssistantTail(ctx))) {
 				return { decision: "block" as const, reason: QUESTION_STOP_REASON };
 			}
 			return {
@@ -3358,7 +3358,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 
 		const tail = lastAssistantTail(ctx);
-		const wantsReply = /\?\s*$/m.test(tail);
+		const wantsReply = /\?\s*$/.test(tail);
 		const title = wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished";
 		detach(
 			notify(

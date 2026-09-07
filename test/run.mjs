@@ -1688,6 +1688,31 @@ check(
 		lastCall("sendMessage").body.text.includes("rename the column"),
 );
 
+// A question the agent already answered itself in the same paragraph does not end on a question, so
+// it must not trip the gate and prompt the agent to re-ask a settled decision.
+const qa = spawn("01a04260-0000-0000-0000-000000000000", "/home/dev/work/sqlitegis");
+qa.ctx.sessionManager.getBranch = () => [
+	{
+		type: "message",
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text: "Should I rename the column?\nOn reflection I kept it and moved on." }],
+		},
+	},
+];
+await qa.fire("session_start");
+const qaStop = await qa.fire("session_stop");
+await settle(150);
+const qaBlock = qaStop.find((r) => r?.decision === "block");
+check(
+	"a self-answered question does not trip the question gate",
+	!qaBlock.reason.includes("Do not answer your own question"),
+);
+check(
+	"a self-answered question gets the ordinary green finish",
+	lastCall("sendMessage").body.text.includes("\u{1F7E2}") && lastCall("sendMessage").body.text.includes("moved on"),
+);
+
 const grantedNoticeId = api.nextMessage;
 await sem.fire("tool_approval_requested", { toolCallId: "approve-1", toolName: "bash" });
 await settle(150);
