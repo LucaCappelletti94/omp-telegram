@@ -5533,6 +5533,163 @@ heading("caller text kept whole inside its own quote");
 	await cut.fire("agent_end");
 }
 
+heading("an external process asks and reads the answer");
+// The channel a job outside omp uses: it sends its own question with `e:<key>:<choice>` buttons,
+// and the poller, the only thing that can see the press, records the choice to a file the job polls.
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const extSess = spawn("01a06000-0000-0000-0000-000000000000", "/home/dev/work/cleanup");
+await extSess.fire("session_start");
+const answersDir = join(root, "notify-telegram/external/answers");
+// The asker owns the channel directory, so the test creates it exactly as the asker would.
+mkdirSync(answersDir, { recursive: true });
+check("the asker's channel directory is honoured", existsSync(answersDir));
+const extKey = "a1b2c3d4e5f60718";
+const extButtons = [
+	[{ text: "Delete tree", callback_data: `e:${extKey}:delete` }],
+	[{ text: "Keep", callback_data: `e:${extKey}:keep` }],
+];
+api.queued = [
+	{
+		update_id: 900,
+		callback_query: {
+			id: "ext-cb-1",
+			data: `e:${extKey}:delete`,
+			from: { id: CHAT },
+			message: {
+				message_id: 42,
+				chat: { id: CHAT },
+				text: "PR merged, delete tree?",
+				reply_markup: { inline_keyboard: extButtons },
+			},
+		},
+	},
+];
+await extSess.pump(250);
+const extAnswerPath = join(answersDir, `${extKey}.json`);
+const extAnswer = JSON.parse(readFileSync(extAnswerPath, "utf8"));
+check("the external answer is recorded to a file the asker polls", extAnswer.choice === "delete");
+check("the recorded answer is timestamped", typeof extAnswer.at === "number" && extAnswer.at > 0);
+check("the answer file is private", (statSync(extAnswerPath).mode & 0o777) === 0o600);
+const extAck = called("answerCallbackQuery").find((c) => c.body.callback_query_id === "ext-cb-1");
+check("the press is acknowledged", extAck?.body.text === "Recorded.");
+const extSettle = called("editMessageReplyMarkup").at(-1);
+check("only the keyboard is edited, leaving the question text intact", extSettle?.body.message_id === 42);
+const settledRows = extSettle.body.reply_markup.inline_keyboard;
+check(
+	"every settled button is dead",
+	settledRows.flat().every((b) => b.disabled !== undefined),
+);
+check(
+	"the chosen option is ticked",
+	settledRows.flat().some((b) => b.text.startsWith("\u2713 Delete tree")),
+);
+check(
+	"an unchosen option is not ticked",
+	settledRows.flat().some((b) => b.text === "Keep"),
+);
+
+// A key that tries to escape its directory writes nothing and says so.
+const answersBefore = readdirSync(answersDir).length;
+api.queued = [
+	{
+		update_id: 901,
+		callback_query: {
+			id: "ext-cb-2",
+			data: "e:../escape:delete",
+			from: { id: CHAT },
+			message: { message_id: 43, chat: { id: CHAT } },
+		},
+	},
+];
+await extSess.pump(200);
+check("a path-escaping key writes no answer file", readdirSync(answersDir).length === answersBefore);
+check(
+	"a malformed external key is refused with a toast",
+	called("answerCallbackQuery").find((c) => c.body.callback_query_id === "ext-cb-2")?.body.text ===
+		"That button is malformed.",
+);
+check(
+	"the malformed key is logged",
+	extSess.warns.some((w) => w.m.includes("malformed key")),
+);
+
+// A foreign sender's external press is dropped by the same origin gate every button passes.
+const foreignBefore = readdirSync(answersDir).length;
+api.queued = [
+	{
+		update_id: 902,
+		callback_query: {
+			id: "ext-cb-3",
+			data: `e:${"f".repeat(16)}:delete`,
+			from: { id: STRANGER },
+			message: { message_id: 44, chat: { id: CHAT } },
+		},
+	},
+];
+await extSess.pump(200);
+check("a foreign external press writes no answer", readdirSync(answersDir).length === foreignBefore);
+check(
+	"a foreign external press is not acknowledged",
+	!called("answerCallbackQuery").some((c) => c.body.callback_query_id === "ext-cb-3"),
+);
+
+// A choice may legitimately contain colons; the parser keeps everything after the second one.
+const colonKey = "c0c0c0c0c0c0c0c0";
+api.queued = [
+	{
+		update_id: 903,
+		callback_query: {
+			id: "ext-cb-4",
+			data: `e:${colonKey}:2026-09-07T10:30`,
+			from: { id: CHAT },
+			message: {
+				message_id: 45,
+				chat: { id: CHAT },
+				reply_markup: { inline_keyboard: [[{ text: "At", callback_data: `e:${colonKey}:2026-09-07T10:30` }]] },
+			},
+		},
+	},
+];
+await extSess.pump(200);
+check(
+	"a choice containing colons is recorded whole",
+	JSON.parse(readFileSync(join(answersDir, `${colonKey}.json`), "utf8")).choice === "2026-09-07T10:30",
+);
+
+// The first press on a key wins: a later press in the same batch neither overwrites nor re-settles.
+const raceKey = "d0d0d0d0d0d0d0d0";
+const raceButtons = [
+	[
+		{ text: "Delete tree", callback_data: `e:${raceKey}:delete` },
+		{ text: "Keep", callback_data: `e:${raceKey}:keep` },
+	],
+];
+const raceMessage = { message_id: 46, chat: { id: CHAT }, reply_markup: { inline_keyboard: raceButtons } };
+api.queued = [
+	{
+		update_id: 904,
+		callback_query: { id: "ext-cb-5a", data: `e:${raceKey}:delete`, from: { id: CHAT }, message: raceMessage },
+	},
+	{
+		update_id: 905,
+		callback_query: { id: "ext-cb-5b", data: `e:${raceKey}:keep`, from: { id: CHAT }, message: raceMessage },
+	},
+];
+await extSess.pump(250);
+check(
+	"the first press on a key wins",
+	JSON.parse(readFileSync(join(answersDir, `${raceKey}.json`), "utf8")).choice === "delete",
+);
+check(
+	"a later press is acknowledged as already recorded",
+	called("answerCallbackQuery").find((c) => c.body.callback_query_id === "ext-cb-5b")?.body.text ===
+		"Already recorded.",
+);
+check(
+	"only the first press settles the keyboard",
+	called("editMessageReplyMarkup").filter((c) => c.body.message_id === 46).length === 1,
+);
+
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);
