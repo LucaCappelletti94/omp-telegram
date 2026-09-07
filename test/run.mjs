@@ -1662,6 +1662,32 @@ const askMsg = lastCall("sendMessage").body.text;
 check("a trailing question gets the orange light", askMsg.includes("\u{1F7E0}") && askMsg.includes("Reply wanted"));
 check("the question itself is the body", askMsg.includes("legacy shim"));
 
+// A turn that ends on a question the user can only see in the terminal is blocked once, and the
+// block names the two channels that reach Telegram instead of letting the question slip past.
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const qs = spawn("01a04250-0000-0000-0000-000000000000", "/home/dev/work/sqlitegis");
+qs.ctx.sessionManager.getBranch = () => [
+	{
+		type: "message",
+		message: { role: "assistant", content: [{ type: "text", text: "So, should I rename the column or keep it?" }] },
+	},
+];
+await qs.fire("session_start");
+const qsStop = await qs.fire("session_stop");
+await settle(150);
+const qsBlock = qsStop.find((r) => r?.decision === "block");
+check("a turn ending on a bare terminal question is blocked", qsBlock !== undefined);
+check(
+	"the block points at the ask tool and notify_status",
+	qsBlock.reason.includes("ask tool") && qsBlock.reason.includes("notify_status"),
+);
+check("the block forbids answering your own question", qsBlock.reason.includes("Do not answer your own question"));
+check(
+	"after the block the question still reaches Telegram as a reply-wanted notice",
+	lastCall("sendMessage").body.text.includes("\u{1F7E0}") &&
+		lastCall("sendMessage").body.text.includes("rename the column"),
+);
+
 const grantedNoticeId = api.nextMessage;
 await sem.fire("tool_approval_requested", { toolCallId: "approve-1", toolName: "bash" });
 await settle(150);

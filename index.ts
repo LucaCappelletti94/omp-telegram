@@ -90,6 +90,12 @@ const CAPTION_MAX = 1024;
 /** A snippet's purpose is one line above the block, not a second summary. */
 const SNIPPET_PURPOSE_MAX = 120;
 const RECENT_MESSAGE_CAP = 60;
+/**
+ * A turn that ends on a question the user can only read in the terminal never reaches the phone, so
+ * the agent gets blocked once and pointed at the two channels that do reach it.
+ */
+const QUESTION_STOP_REASON =
+	"Your turn is ending on a question to the user, but it is written only as terminal prose, which the user does not see on Telegram when away from the desktop. Do not answer your own question and carry on as though it were settled. If you need the answer before proceeding, call the ask tool, which stops the turn and is answerable from the terminal or the phone. If the question itself is what ends the turn, call notify_status with an orange urgency, the question set, and two to six options, each an object with a short label naming a choice and a one-line description of what choosing it does or costs, so the user can answer from a phone.";
 
 const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;
@@ -3341,6 +3347,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 		if (!statusBlockUsed) {
 			statusBlockUsed = true;
+			if (pendingAsk === null && /\?\s*$/m.test(lastAssistantTail(ctx))) {
+				return { decision: "block" as const, reason: QUESTION_STOP_REASON };
+			}
 			return {
 				decision: "block" as const,
 				reason:
