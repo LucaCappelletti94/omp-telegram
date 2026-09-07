@@ -49,6 +49,11 @@ const DASHBOARD_FILE = join(STATE_DIR, "dashboard.json");
 const DASHBOARD_LOCK_FILE = join(STATE_DIR, "dashboard.lock");
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const MEDIA_DIR = join(STATE_DIR, "media");
+/** The channel a process outside omp uses to ask one question and read its answer back. */
+const EXTERNAL_DIR = join(STATE_DIR, "external");
+const EXTERNAL_ANSWERS_DIR = join(EXTERNAL_DIR, "answers");
+/** An external question's key becomes a filename, so it stays a plain token no path can escape. */
+const EXTERNAL_KEY = /^[A-Za-z0-9._-]{1,64}$/u;
 /** Held only across a badge validate-and-persist, which is two file writes long. */
 const BADGE_LOCK_FILE = join(STATE_DIR, "badge.lock");
 
@@ -184,7 +189,12 @@ interface TelegramCallbackQuery {
 	id: string;
 	data?: string;
 	from?: { id: number };
-	message?: { message_id: number; chat: { id: number } };
+	message?: {
+		message_id: number;
+		chat: { id: number };
+		text?: string;
+		reply_markup?: { inline_keyboard: { text: string; callback_data?: string }[][] };
+	};
 }
 
 interface TelegramUpdate {
@@ -1773,6 +1783,49 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
+	/**
+	 * A question asked by something that is not an omp session, its buttons carrying `e:<key>:<choice>`.
+	 * The poller holds the only getUpdates consumer, so it is the only thing that can observe the press;
+	 * it records the choice to a file the asker polls, then greys the buttons. Sending such a question
+	 * is not a scarce operation and stays with the asker, which is why this channel has no send half.
+	 */
+	async function answerExternalQuestion(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
+		const [, key = "", choice = ""] = (callback.data ?? "").split(":");
+		const valid = EXTERNAL_KEY.test(key) && choice.length > 0;
+		if (valid) {
+			// Recorded before the toast: the toast reports a delivery this write has already made.
+			mkdirSync(EXTERNAL_ANSWERS_DIR, { recursive: true, mode: 0o700 });
+			writeFileAtomic(join(EXTERNAL_ANSWERS_DIR, `${key}.json`), JSON.stringify({ choice, at: Date.now() }), 0o600);
+		} else {
+			pi.logger.warn("telegram: rejected an external answer with a malformed key or choice", {
+				data: clip(callback.data ?? "", 80),
+			});
+		}
+		await callTelegram(
+			cfg,
+			"answerCallbackQuery",
+			{ callback_query_id: callback.id, text: valid ? "Recorded." : "That button is malformed." },
+			10_000,
+		);
+		const message = callback.message;
+		if (!valid || message === undefined) return;
+		// Only the keyboard is edited, so the question's own text and formatting survive untouched.
+		const settled = (message.reply_markup?.inline_keyboard ?? []).map((row) =>
+			row.map((button) => ({
+				text: buttonText(`${button.callback_data === callback.data ? "\u2713 " : ""}${button.text}`),
+				callback_data: SETTLED_CALLBACK,
+				disabled: {},
+			})),
+		);
+		if (settled.length === 0) return;
+		await callTelegram(
+			cfg,
+			"editMessageReplyMarkup",
+			{ chat_id: cfg.chatId, message_id: message.message_id, reply_markup: { inline_keyboard: settled } },
+			10_000,
+		);
+	}
+
 	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<void> {
 		const callback = update.callback_query;
 		if (callback !== undefined && callback.data !== undefined) {
@@ -1785,6 +1838,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			if (callback.data.startsWith("m:")) {
 				await deliverHeldMessage(cfg, callback);
+				return;
+			}
+			if (callback.data.startsWith("e:")) {
+				await answerExternalQuestion(cfg, callback);
 				return;
 			}
 			// A press on a settled question's dead buttons is not a routing failure, and saying the
@@ -2991,6 +3048,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {}
 		mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
 		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true, mode: 0o700 });
+		mkdirSync(EXTERNAL_ANSWERS_DIR, { recursive: true, mode: 0o700 });
 		reapDeadSessions();
 		reapOldMedia();
 		sessionTag = claimTag();
