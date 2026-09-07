@@ -1713,6 +1713,26 @@ check(
 	lastCall("sendMessage").body.text.includes("\u{1F7E2}") && lastCall("sendMessage").body.text.includes("moved on"),
 );
 
+// A long final paragraph is truncated for display, but the question that ends it must still trip the
+// gate: detection runs on the raw tail, truncation only shapes the message body.
+const lq = spawn("01a04270-0000-0000-0000-000000000000", "/home/dev/work/sqlitegis");
+const longQuestion = `${"context ".repeat(120)}so, should I proceed?`;
+lq.ctx.sessionManager.getBranch = () => [
+	{ type: "message", message: { role: "assistant", content: [{ type: "text", text: longQuestion }] } },
+];
+await lq.fire("session_start");
+const lqStop = await lq.fire("session_stop");
+await settle(150);
+const lqBlock = lqStop.find((r) => r?.decision === "block");
+check(
+	"a long question past the display cap still trips the gate",
+	lqBlock.reason.includes("Do not answer your own question"),
+);
+check(
+	"the truncated fallback body keeps the reply-wanted light and is cut at the display cap",
+	lastCall("sendMessage").body.text.includes("\u{1F7E0}") && lastCall("sendMessage").body.text.includes("..."),
+);
+
 const grantedNoticeId = api.nextMessage;
 await sem.fire("tool_approval_requested", { toolCallId: "approve-1", toolName: "bash" });
 await settle(150);

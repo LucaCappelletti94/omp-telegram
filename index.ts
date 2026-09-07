@@ -1127,7 +1127,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								.trim()
 								.split(/\n{2,}/)
 								.at(-1) ?? "";
-						return tail.length > 600 ? `${clip(tail, 600)}...` : tail;
+						return tail;
 					}
 				}
 			}
@@ -3360,16 +3360,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const tail = lastAssistantTail(ctx);
 		const wantsReply = /\?\s*$/.test(tail);
 		const title = wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished";
-		detach(
-			notify(
-				ctx,
-				title,
-				tail.length > 0 ? tail : "Awaiting your next instruction.",
-				quiet ? { disable_notification: true } : {},
-				usageFooter(),
-			),
-			"turn-end notice",
-		);
+		const body =
+			tail.length === 0 ? "Awaiting your next instruction." : tail.length > 600 ? `${clip(tail, 600)}...` : tail;
+		detach(notify(ctx, title, body, quiet ? { disable_notification: true } : {}, usageFooter()), "turn-end notice");
 	});
 
 	pi.on("tool_approval_requested", async (event, ctx) => {
