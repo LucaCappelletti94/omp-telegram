@@ -1793,8 +1793,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const [, key = "", choice = ""] = (callback.data ?? "").split(":");
 		const valid = EXTERNAL_KEY.test(key) && choice.length > 0;
 		if (valid) {
-			// Recorded before the toast: the toast reports a delivery this write has already made.
-			mkdirSync(EXTERNAL_ANSWERS_DIR, { recursive: true, mode: 0o700 });
+			// The asker created this directory to receive the answer. Recorded before the toast,
+			// which then reports a delivery this write has already made.
 			writeFileAtomic(join(EXTERNAL_ANSWERS_DIR, `${key}.json`), JSON.stringify({ choice, at: Date.now() }), 0o600);
 		} else {
 			pi.logger.warn("telegram: rejected an external answer with a malformed key or choice", {
@@ -3048,7 +3048,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {}
 		mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
 		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true, mode: 0o700 });
-		mkdirSync(EXTERNAL_ANSWERS_DIR, { recursive: true, mode: 0o700 });
 		reapDeadSessions();
 		reapOldMedia();
 		sessionTag = claimTag();

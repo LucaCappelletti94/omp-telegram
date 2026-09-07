@@ -5540,7 +5540,9 @@ rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 const extSess = spawn("01a06000-0000-0000-0000-000000000000", "/home/dev/work/cleanup");
 await extSess.fire("session_start");
 const answersDir = join(root, "notify-telegram/external/answers");
-check("the channel answers directory exists once a session runs", existsSync(answersDir));
+// The asker owns the channel directory, so the test creates it exactly as the asker would.
+mkdirSync(answersDir, { recursive: true });
+check("the asker's channel directory is honoured", existsSync(answersDir));
 const extKey = "a1b2c3d4e5f60718";
 const extButtons = [
 	[{ text: "Delete tree", callback_data: `e:${extKey}:delete` }],
