@@ -192,7 +192,6 @@ interface TelegramCallbackQuery {
 	message?: {
 		message_id: number;
 		chat: { id: number };
-		text?: string;
 		reply_markup?: { inline_keyboard: { text: string; callback_data?: string }[][] };
 	};
 }
