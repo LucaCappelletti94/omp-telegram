@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	chmodSync,
@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
 	type AskOption,
@@ -525,6 +526,322 @@ function settledKeyboard(labels: string[], chosen: Set<string>): InlineButton[][
 			callback_data: SETTLED_CALLBACK,
 		})),
 	);
+}
+
+/** One subprocess, captured. `ok` is the exit status; stderr carries the reason a step can report. */
+interface RunResult {
+	ok: boolean;
+	stdout: string;
+	stderr: string;
+}
+
+const execFileAsync = promisify(execFile);
+
+async function run(command: string, args: string[]): Promise<RunResult> {
+	try {
+		const { stdout } = await execFileAsync(command, args, {
+			encoding: "utf8",
+			timeout: 300_000,
+			maxBuffer: 64 * 1024 * 1024,
+		});
+		return { ok: true, stdout: stdout.toString().trim(), stderr: "" };
+	} catch (error) {
+		const e = error as { stdout?: unknown; stderr?: unknown; message?: string };
+		const text = (value: unknown): string => (value === undefined || value === null ? "" : value.toString().trim());
+		return { ok: false, stdout: text(e.stdout), stderr: text(e.stderr) || e.message || "command failed" };
+	}
+}
+
+/** A pause between subprocess retries that yields the thread, so the Telegram poller keeps running. */
+async function sleepMs(ms: number): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A remote url and an `owner/name` name the same repository whether it is ssh or https, with or without `.git`. */
+function sameRepo(url: string, owner: string, name: string): boolean {
+	const normalised = url
+		.trim()
+		.replace(/\.git$/u, "")
+		.toLowerCase();
+	const target = `${owner}/${name}`.toLowerCase();
+	return normalised.endsWith(`:${target}`) || normalised.endsWith(`/${target}`);
+}
+
+/** Excludes a path through the checkout's private exclude, shared across worktrees, never through tracked `.gitignore`. */
+function excludePath(clonePath: string, entry: string): void {
+	const file = join(clonePath, ".git", "info", "exclude");
+	let current = "";
+	try {
+		current = readFileSync(file, "utf8");
+	} catch {}
+	if (current.split("\n").some((line) => line.trim() === entry.trim())) return;
+	try {
+		mkdirSync(join(clonePath, ".git", "info"), { recursive: true });
+		writeFileSync(file, `${current}${current.length === 0 || current.endsWith("\n") ? "" : "\n"}${entry}\n`);
+	} catch {}
+}
+
+/** A short kebab identifier for the branch and worktree, derived from the problem when the caller gives none. */
+function upstreamSlug(text: string, name: string): string {
+	const base = text
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/gu, "-")
+		.replace(/^-+|-+$/gu, "")
+		.slice(0, 40)
+		.replace(/-+$/u, "");
+	return base.length > 0 ? base : `${name.toLowerCase().replace(/[^a-z0-9]+/gu, "-")}-fix`;
+}
+
+interface LaunchArgs {
+	owner: string;
+	name: string;
+	slug: string;
+	doc: string;
+	problem: string;
+}
+
+type LaunchOutcome =
+	| {
+			ok: true;
+			owner: string;
+			name: string;
+			login: string;
+			mode: "own" | "fork";
+			created: boolean;
+			clonePath: string;
+			worktreePath: string;
+			branch: string;
+			windowId: string;
+	  }
+	| { ok: false; error: string };
+
+/** Validates the tool's parameters into launch arguments, or an error string a caller reports verbatim. */
+function validateLaunchParams(
+	p: { repo?: unknown; document?: unknown; problem?: unknown; slug?: unknown },
+	cwd: string,
+): { ok: true; args: LaunchArgs; docPath: string } | { ok: false; error: string } {
+	const repo = typeof p.repo === "string" ? p.repo.trim() : "";
+	const match = /^([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9][\w.-]*)$/u.exec(repo);
+	if (match === null) return { ok: false, error: `repo must be the uphill repository as "owner/name", not "${repo}"` };
+	const owner = match[1] ?? "";
+	const name = match[2] ?? "";
+	const document = typeof p.document === "string" ? p.document.trim() : "";
+	const docPath = document.length > 0 ? resolve(cwd, document) : "";
+	if (docPath.length === 0 || !existsSync(docPath)) {
+		return {
+			ok: false,
+			error: `no request document at ${docPath || "(empty path)"}; write the upstream request document first, then pass its path`,
+		};
+	}
+	let doc = "";
+	try {
+		doc = readFileSync(docPath, "utf8");
+	} catch {
+		return { ok: false, error: `could not read the request document at ${docPath}` };
+	}
+	if (doc.trim().length === 0) {
+		return {
+			ok: false,
+			error:
+				"the request document is empty; it must state the problem, examples of the failure, and examples of the corrected behaviour",
+		};
+	}
+	const problem = typeof p.problem === "string" ? p.problem.trim() : "";
+	if (problem.length === 0)
+		return { ok: false, error: "problem must be one sentence naming what the dependency does wrong" };
+	const slug = upstreamSlug(typeof p.slug === "string" && p.slug.trim().length > 0 ? p.slug : problem, name);
+	return { ok: true, args: { owner, name, slug, doc, problem }, docPath };
+}
+
+interface LaunchTarget {
+	login: string;
+	isOwn: boolean;
+	cloneOwner: string;
+	created: boolean;
+}
+
+/** A gh failure that means the repository is genuinely absent, the only case that justifies forking. */
+const GH_ABSENT = /not found|could not resolve|no such|404/iu;
+
+/** Resolves the target on the user's account: their own repository, an existing fork, or a fork it creates. */
+async function resolveTarget(
+	a: LaunchArgs,
+): Promise<{ ok: true; target: LaunchTarget } | { ok: false; error: string }> {
+	const who = await run("gh", ["api", "user", "-q", ".login"]);
+	if (!who.ok || who.stdout.length === 0) {
+		return {
+			ok: false,
+			error: `could not read your GitHub login from gh (${who.stderr || "no output"}); check that gh is authenticated`,
+		};
+	}
+	const login = who.stdout;
+	if (a.owner.toLowerCase() === login.toLowerCase()) {
+		return { ok: true, target: { login, isOwn: true, cloneOwner: a.owner, created: false } };
+	}
+	const view = await run("gh", [
+		"repo",
+		"view",
+		`${login}/${a.name}`,
+		"--json",
+		"isFork,parent",
+		"-q",
+		'[(.isFork | tostring), (if .parent then .parent.owner.login + "/" + .parent.name else "" end)] | @tsv',
+	]);
+	if (view.ok) {
+		const [isFork, parent] = view.stdout.split("\t");
+		if (isFork !== "true" || (parent ?? "").toLowerCase() !== `${a.owner}/${a.name}`.toLowerCase()) {
+			return {
+				ok: false,
+				error: `${login}/${a.name} already exists but is not a fork of ${a.owner}/${a.name}; move or rename it, then retry`,
+			};
+		}
+		return { ok: true, target: { login, isOwn: false, cloneOwner: login, created: false } };
+	}
+	// A non-OK view is only "fork does not exist" when gh says so; a network or auth failure must not fork.
+	if (!GH_ABSENT.test(view.stderr)) {
+		return {
+			ok: false,
+			error: `could not check whether ${login}/${a.name} exists (${view.stderr || "no output"}); resolve the gh error and retry`,
+		};
+	}
+	const fork = await run("gh", ["repo", "fork", `${a.owner}/${a.name}`, "--clone=false"]);
+	if (!fork.ok) return { ok: false, error: `gh repo fork ${a.owner}/${a.name} failed: ${fork.stderr}` };
+	return { ok: true, target: { login, isOwn: false, cloneOwner: login, created: true } };
+}
+
+/** Ensures the clone exists with the right remotes, fetches, and returns the base ref to branch from. */
+async function prepareClone(
+	a: LaunchArgs,
+	target: LaunchTarget,
+): Promise<{ ok: true; clonePath: string; base: string } | { ok: false; error: string }> {
+	const clonePath = join(homedir(), "github", a.name);
+	const originUrl = `git@github.com:${target.cloneOwner}/${a.name}.git`;
+	const upstreamUrl = `git@github.com:${a.owner}/${a.name}.git`;
+	if (existsSync(clonePath)) {
+		const remote = await run("git", ["-C", clonePath, "remote", "get-url", "origin"]);
+		if (!remote.ok) return { ok: false, error: `${clonePath} exists but is not a git checkout` };
+		if (!sameRepo(remote.stdout, target.cloneOwner, a.name)) {
+			return {
+				ok: false,
+				error: `${clonePath} holds ${remote.stdout}, not ${target.cloneOwner}/${a.name}; move it aside first`,
+			};
+		}
+	} else {
+		const attempts = target.created ? 6 : 1;
+		let cloned = await run("git", ["clone", originUrl, clonePath]);
+		// A freshly created fork can lag behind its own API object, so a first clone may 404.
+		for (let attempt = 1; attempt < attempts && !cloned.ok; attempt++) {
+			await sleepMs(2000);
+			cloned = await run("git", ["clone", originUrl, clonePath]);
+		}
+		if (!cloned.ok) return { ok: false, error: `git clone ${originUrl} failed: ${cloned.stderr}` };
+	}
+	if (!target.isOwn) {
+		const current = await run("git", ["-C", clonePath, "remote", "get-url", "upstream"]);
+		if (!current.ok) await run("git", ["-C", clonePath, "remote", "add", "upstream", upstreamUrl]);
+		else if (!sameRepo(current.stdout, a.owner, a.name)) {
+			await run("git", ["-C", clonePath, "remote", "set-url", "upstream", upstreamUrl]);
+		}
+	}
+	const remoteName = target.isOwn ? "origin" : "upstream";
+	const fetched = await run("git", ["-C", clonePath, "fetch", remoteName]);
+	if (!fetched.ok) return { ok: false, error: `git fetch ${remoteName} failed: ${fetched.stderr}` };
+	const def = await run("gh", [
+		"repo",
+		"view",
+		`${a.owner}/${a.name}`,
+		"--json",
+		"defaultBranchRef",
+		"-q",
+		".defaultBranchRef.name",
+	]);
+	if (!def.ok || def.stdout.length === 0) {
+		return {
+			ok: false,
+			error: `could not read the default branch of ${a.owner}/${a.name}: ${def.stderr || "no output"}`,
+		};
+	}
+	return { ok: true, clonePath, base: `${remoteName}/${def.stdout}` };
+}
+
+/** Cuts the worktree off the base, carries the request in, and opens the tmux tab, rolling back on failure. */
+async function openWorktree(
+	a: LaunchArgs,
+	clonePath: string,
+	base: string,
+): Promise<{ ok: true; worktreePath: string; branch: string; windowId: string } | { ok: false; error: string }> {
+	const branch = `upstream/${a.slug}`;
+	const worktreeParent = join(homedir(), "github", `${a.name}.upstreams`);
+	const worktreePath = join(worktreeParent, a.slug);
+	if (existsSync(worktreePath)) {
+		return { ok: false, error: `a worktree already exists at ${worktreePath}; remove it or choose another slug` };
+	}
+	mkdirSync(worktreeParent, { recursive: true });
+	const rollback = async (): Promise<void> => {
+		await run("git", ["-C", clonePath, "worktree", "remove", "--force", worktreePath]);
+		await run("git", ["-C", clonePath, "branch", "-D", branch]);
+	};
+	// -B recreates the branch from the freshly fetched base, so a stale branch a prior aborted launch
+	// left behind never checks out at its old tip.
+	const added = await run("git", ["-C", clonePath, "worktree", "add", "-B", branch, worktreePath, base]);
+	if (!added.ok) return { ok: false, error: `git worktree add failed: ${added.stderr}` };
+	try {
+		mkdirSync(join(worktreePath, "upstream"), { recursive: true });
+		writeFileSync(join(worktreePath, "upstream", "request.md"), a.doc);
+	} catch (error) {
+		await rollback();
+		return { ok: false, error: `could not write the request into the worktree: ${(error as Error).message}` };
+	}
+	excludePath(clonePath, "upstream/");
+	const kickoff = [
+		`You are the upstream agent for ${a.owner}/${a.name}.`,
+		"Read upstream/request.md in this worktree and the skill skill://upstream-agent, then carry out the upstream procedure.",
+		`In one sentence, the request is: ${a.problem}`,
+	].join(" ");
+	const window = await run("tmux", [
+		"new-window",
+		"-c",
+		worktreePath,
+		"-n",
+		`${a.name}\u2191`,
+		"-P",
+		"-F",
+		"#{window_id}",
+		"omp",
+		"@upstream/request.md",
+		kickoff,
+	]);
+	if (!window.ok) {
+		await rollback();
+		return { ok: false, error: `tmux new-window failed: ${window.stderr}` };
+	}
+	return { ok: true, worktreePath, branch, windowId: window.stdout };
+}
+
+/**
+ * The mechanical half of the procedure, run on the extension thread but off the synchronous path: resolve or
+ * create the fork, ensure the clone, cut a worktree off the latest default branch, carry the request in, and
+ * open a new omp session in a tmux tab. It writes only under the user's own account and `~/github`.
+ */
+async function performUpstreamLaunch(a: LaunchArgs): Promise<LaunchOutcome> {
+	const resolved = await resolveTarget(a);
+	if (!resolved.ok) return { ok: false, error: resolved.error };
+	const prepared = await prepareClone(a, resolved.target);
+	if (!prepared.ok) return { ok: false, error: prepared.error };
+	const opened = await openWorktree(a, prepared.clonePath, prepared.base);
+	if (!opened.ok) return { ok: false, error: opened.error };
+	return {
+		ok: true,
+		owner: a.owner,
+		name: a.name,
+		login: resolved.target.login,
+		mode: resolved.target.isOwn ? "own" : "fork",
+		created: resolved.target.created,
+		clonePath: prepared.clonePath,
+		worktreePath: opened.worktreePath,
+		branch: opened.branch,
+		windowId: opened.windowId,
+	};
 }
 
 export default function notifyTelegram(pi: ExtensionAPI): void {
@@ -3043,6 +3360,161 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return {
 				content: [{ type: "text", text: `Sent ${payload.length} characters as a copyable block.` }],
 				details: { messageId: sent.message_id, characters: payload.length },
+			};
+		},
+	});
+
+	/**
+	 * The hard gate before anything is forked or opened. Reuses the same `pendingAsk` path the ask tool
+	 * uses, so the Launch/Cancel card is answerable from the phone and an abort or a Cancel leaves nothing
+	 * behind. Returns true only for an explicit Launch.
+	 */
+	async function confirmUpstreamLaunch(
+		ctx: ExtensionContext,
+		question: string,
+		context: string,
+		signal: AbortSignal | undefined,
+	): Promise<{ confirmed: boolean; delivered: boolean }> {
+		if (config === null) return { confirmed: false, delivered: false };
+		askSequence += 1;
+		const remote = Promise.withResolvers<AskResult[]>();
+		const ask: PendingAsk = {
+			askId: `${sessionTag}-${askSequence.toString(36)}`,
+			ctx,
+			context,
+			questions: [
+				{
+					id: "upstream-launch",
+					question,
+					options: [
+						{
+							label: "Launch",
+							description:
+								"Fork or reuse the repository, open a new omp session in a tmux tab, and start the upstream work.",
+						},
+						{ label: "Cancel", description: "Do nothing. Stay in this session and drop the upstream launch." },
+					],
+					recommended: 0,
+				},
+			],
+			index: 0,
+			messageId: null,
+			selected: [new Set<string>()],
+			custom: [undefined],
+			finish: remote.resolve,
+		};
+		const previous = pendingAsk;
+		pendingAsk = ask;
+		try {
+			await presentQuestion(ask, false);
+		} catch (error) {
+			// A network throw from the send must not leave pendingAsk bound to a card that never showed.
+			if (pendingAsk === ask) pendingAsk = previous;
+			noteState();
+			pi.logger.warn("upstream: the launch confirmation card failed to send", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return { confirmed: false, delivered: false };
+		}
+		if (ask.messageId === null) {
+			// The card never reached Telegram, so there is nothing for the user to answer; do not block.
+			if (pendingAsk === ask) pendingAsk = previous;
+			noteState();
+			return { confirmed: false, delivered: false };
+		}
+		lastNotifiedAt = Date.now();
+		writeSessionRecord(ctx);
+		const onAbort = (): void => remote.resolve([]);
+		signal?.addEventListener("abort", onAbort);
+		// An AbortSignal fires "abort" once; if it is already aborted the listener never runs, so settle now.
+		if (signal?.aborted) onAbort();
+		try {
+			const results = await remote.promise;
+			const answer = (results[0]?.selectedOptions[0] ?? results[0]?.customInput ?? "").trim().toLowerCase();
+			return { confirmed: answer === "launch", delivered: true };
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+			if (pendingAsk === ask) {
+				pendingAsk = previous;
+				if (ask.messageId !== null)
+					detach(settleAskMessage(ask, ask.messageId, "Launch cancelled."), "upstream-confirm close");
+			}
+			noteState();
+		}
+	}
+
+	pi.registerTool({
+		name: "upstream_launch",
+		label: "Upstream Launch",
+		description:
+			"Start the upstream procedure for a fix that belongs in a repository this one depends on. Call it only after you have written the upstream request document (per the upstream-finding-as-document rule) and the user has agreed an upstream fix is wanted. It opens a Telegram Launch/Cancel card and does nothing until Launch is tapped. On Launch it resolves the target on the user's GitHub account (their own repository when they own it, otherwise a fork it reuses or creates), ensures a clone under `~/github`, cuts a worktree on a new `upstream/<slug>` branch off the latest default branch so it never disturbs work already open there, carries the request document into that worktree, and opens a new omp session in a fresh tmux tab to carry out the fix. It writes only on the user's account and under `~/github`, never in this repository, and the spawned session does the upstream work from there. `repo`: the uphill repository as `owner/name`. `document`: path to the request document you wrote, resolved against this session's working directory. `problem`: one sentence naming what the dependency does wrong, shown on the card and given to the new session. `slug`: optional short kebab identifier for the branch and worktree, derived from `problem` when omitted.",
+		approval: "read",
+		strict: true,
+		parameters: z.object({
+			repo: z.string(),
+			document: z.string(),
+			problem: z.string(),
+			slug: z.string().optional(),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const p = params as { repo?: unknown; document?: unknown; problem?: unknown; slug?: unknown };
+			const fail = (text: string): { content: { type: "text"; text: string }[]; isError: true } => ({
+				content: [{ type: "text", text: `Error: ${text}` }],
+				isError: true,
+			});
+			if (config === null) {
+				return fail(
+					"Telegram is not configured, and this procedure runs through the bot; start it from a session paired with the Telegram bot.",
+				);
+			}
+			if (process.env.TMUX === undefined) {
+				return fail("no tmux session is attached, so a new tab cannot be opened; run omp inside tmux");
+			}
+			const validated = validateLaunchParams(p, ctx.cwd);
+			if (!validated.ok) return fail(validated.error);
+			const { args, docPath } = validated;
+
+			const context = `Upstream target: ${args.owner}/${args.name}\nProblem: ${args.problem}\nRequest document: ${docPath}`;
+			const decision = await confirmUpstreamLaunch(
+				ctx,
+				`Launch the upstream procedure for \`${args.owner}/${args.name}\`?`,
+				context,
+				signal,
+			);
+			if (!decision.delivered) {
+				return fail(
+					"could not send the Launch confirmation to Telegram, so nothing was launched; check the bot connection and retry",
+				);
+			}
+			if (!decision.confirmed) {
+				return {
+					content: [{ type: "text", text: "Upstream launch cancelled; nothing was forked, cloned, or opened." }],
+					details: { launched: false },
+				};
+			}
+
+			const outcome = await performUpstreamLaunch(args);
+			if (!outcome.ok) return fail(outcome.error);
+			const where =
+				outcome.mode === "own" ? "your own repository" : outcome.created ? "a new fork" : "your existing fork";
+			detach(
+				notify(
+					ctx,
+					"\u2B06\uFE0F Upstream launched",
+					`${outcome.owner}/${outcome.name} \u2014 ${args.problem}\nBranch \`${outcome.branch}\` in ${where}. It runs in its own tmux tab now.`,
+				),
+				"upstream launch notice",
+			);
+			lastNotifiedAt = Date.now();
+			writeSessionRecord(ctx);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Launched the upstream session for ${outcome.owner}/${outcome.name} in ${where}. Worktree ${outcome.worktreePath} on branch ${outcome.branch}, tmux window ${outcome.windowId}. Your work here is done: the new session carries the fix from here.`,
+					},
+				],
+				details: { launched: true, ...outcome },
 			};
 		},
 	});
