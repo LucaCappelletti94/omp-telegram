@@ -1729,8 +1729,10 @@ check(
 	lqBlock.reason.includes("Do not answer your own question"),
 );
 check(
-	"the truncated fallback body keeps the reply-wanted light and is cut at the display cap",
-	lastCall("sendMessage").body.text.includes("\u{1F7E0}") && lastCall("sendMessage").body.text.includes("..."),
+	"the truncated reply-wanted body keeps the light and retains the trailing question",
+	lastCall("sendMessage").body.text.includes("\u{1F7E0}") &&
+		lastCall("sendMessage").body.text.includes("...") &&
+		lastCall("sendMessage").body.text.includes("proceed?"),
 );
 
 const grantedNoticeId = api.nextMessage;

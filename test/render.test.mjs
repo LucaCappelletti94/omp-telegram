@@ -5,6 +5,7 @@ import {
 	badgeLine,
 	buttonText,
 	clip,
+	clipEnd,
 	clockTime,
 	duration,
 	extractQuestionPreviews,
@@ -136,6 +137,13 @@ check("text under the cap is untouched", clip("abc", 10) === "abc");
 check("text at the cap is untouched", clip("abcde", 5) === "abcde");
 check("a clip between surrogate halves drops the orphan", clip(`ab${"\u{1F600}"}`, 3) === "ab");
 check("a clip on a whole pair keeps it", clip(`ab${"\u{1F600}"}cd`, 4) === `ab${"\u{1F600}"}`);
+
+heading("clipping to a length cap from the end");
+check("text under the cap is untouched", clipEnd("abc", 10) === "abc");
+check("text at the cap is untouched", clipEnd("abcde", 5) === "abcde");
+check("the end is what survives", clipEnd("abcdef", 3) === "def");
+check("a clip between surrogate halves drops the orphan", clipEnd(`${"\u{1F600}"}ab`, 3) === "ab");
+check("a clip on a whole pair keeps it", clipEnd(`ab${"\u{1F600}"}cd`, 4) === `${"\u{1F600}"}cd`);
 
 heading("budgeting a button label against its marker");
 check("a label that fits keeps its marker", buttonText("ok", " (preferable)") === "ok (preferable)");

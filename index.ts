@@ -21,6 +21,7 @@ import {
 	badgeLine,
 	buttonText,
 	clip,
+	clipEnd,
 	duration,
 	extractQuestionPreviews,
 	fenceFor,
@@ -3361,7 +3362,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const wantsReply = /\?\s*$/.test(tail);
 		const title = wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished";
 		const body =
-			tail.length === 0 ? "Awaiting your next instruction." : tail.length > 600 ? `${clip(tail, 600)}...` : tail;
+			tail.length === 0
+				? "Awaiting your next instruction."
+				: tail.length <= 600
+					? tail
+					: wantsReply
+						? `...${clipEnd(tail, 600)}`
+						: `${clip(tail, 600)}...`;
 		detach(notify(ctx, title, body, quiet ? { disable_notification: true } : {}, usageFooter()), "turn-end notice");
 	});
 

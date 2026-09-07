@@ -186,6 +186,15 @@ export function clip(text: string, max: number): string {
 	return text.length <= max ? text : dropLoneHighSurrogate(text.slice(0, max));
 }
 
+/** A UTF-16 length cap that keeps the end of the text and never cuts an emoji in half. */
+export function clipEnd(text: string, max: number): string {
+	if (text.length <= max) return text;
+	const slice = text.slice(text.length - max);
+	// A slice can begin on the low half of a surrogate pair, which Telegram rejects.
+	const first = slice.charCodeAt(0);
+	return first >= 0xdc00 && first <= 0xdfff ? slice.slice(1) : slice;
+}
+
 /**
  * A lukewarm button has no colour of its own, so the marker outranks the tail of a long label.
  */
