@@ -5774,6 +5774,7 @@ heading("upstream_launch");
 		join(upBin, "gh"),
 		`#!/bin/sh
 args="$*"
+[ -n "$GH_LOG" ] && echo "$args" >> "$GH_LOG"
 case "$args" in
   "api user "*) if [ "$GH_NOLOGIN" = "1" ]; then exit 1; else echo "LucaCappelletti94"; fi ;;
   *defaultBranchRef*) if [ "$GH_NODEFAULT" = "1" ]; then exit 1; else echo "main"; fi ;;
@@ -5800,6 +5801,7 @@ case "$args" in
   *clone*) if [ "$GIT_CLONEFAIL" = "1" ]; then echo "clone failed" 1>&2; exit 1; elif [ -n "$GIT_CLONE_FLAKY" ]; then if [ -f "$GIT_CLONE_FLAKY" ]; then exit 0; else : > "$GIT_CLONE_FLAKY"; echo "not ready" 1>&2; exit 1; fi; else exit 0; fi ;;
   *fetch*) if [ "$GIT_FETCHFAIL" = "1" ]; then echo "fetch failed" 1>&2; exit 1; else exit 0; fi ;;
   *"worktree add"*) if [ "$GIT_WTFAIL" = "1" ]; then echo "wt failed" 1>&2; exit 1; else exit 0; fi ;;
+  *"worktree remove"*) last=""; for a in $args; do last="$a"; done; rm -rf "$last" ;;
   *) exit 0 ;;
 esac
 `,
@@ -5817,6 +5819,9 @@ esac
 		{ mode: 0o755 },
 	);
 	process.env.PATH = `${upBin}:${savedPath}`;
+	const ghLog = join(root, "gh-invocations.log");
+	process.env.GH_LOG = ghLog;
+	writeFileSync(ghLog, "");
 	process.env.HOME = root;
 	process.env.TMUX = "/tmp/fake-tmux,1,0";
 	process.env.TMUX_PANE = "%1";
@@ -5874,6 +5879,7 @@ esac
 	);
 	check("launch reports the new tmux window", ownResult.details.windowId === "@42");
 	check("launch notifies Telegram it opened", lastCall("sendMessage").body.text.includes("Upstream launched"));
+	check("case a forks nothing", !readFileSync(ghLog, "utf8").includes("repo fork"));
 
 	// b. A third-party repository with no fork yet: the fork is created.
 	process.env.GH_FORK = "missing";
@@ -5904,6 +5910,7 @@ esac
 	mkdirSync(join(root, "github", "gadget", ".git", "info"), { recursive: true });
 	process.env.GIT_ORIGIN = "git@github.com:LucaCappelletti94/gadget.git";
 	process.env.GIT_UPSTREAM = "1";
+	writeFileSync(ghLog, "");
 	const reuseRun = up.tools
 		.get("upstream_launch")
 		.execute(
@@ -5921,6 +5928,7 @@ esac
 			reuseResult.details.mode === "fork" &&
 			reuseResult.details.created === false,
 	);
+	check("case c reuses without forking", !readFileSync(ghLog, "utf8").includes("repo fork"));
 
 	// d. Cancel forks, clones, and opens nothing.
 	const cancelRun = up.tools
@@ -6068,6 +6076,7 @@ esac
 		TMUX_NEWWIN_FAIL: "1",
 	});
 	check("a failed tmux window rolls the launch back and reports it", rolledBack.isError === true);
+	check("the rolled-back worktree is gone", !existsSync(join(root, "github", "rollback.upstreams", "p")));
 
 	process.env.PATH = savedPath;
 	process.env.HOME = savedHome;
