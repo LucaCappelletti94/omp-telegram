@@ -1679,9 +1679,9 @@ const qsBlock = qsStop.find((r) => r?.decision === "block");
 check("a turn ending on a bare terminal question is blocked", qsBlock !== undefined);
 check(
 	"the block points at the ask tool and notify_status",
-	qsBlock.reason.includes("ask tool") && qsBlock.reason.includes("notify_status"),
+	qsBlock?.reason.includes("ask tool") && qsBlock?.reason.includes("notify_status"),
 );
-check("the block forbids answering your own question", qsBlock.reason.includes("Do not answer your own question"));
+check("the block forbids answering your own question", qsBlock?.reason.includes("Do not answer your own question"));
 check(
 	"after the block the question still reaches Telegram as a reply-wanted notice",
 	lastCall("sendMessage").body.text.includes("\u{1F7E0}") &&
@@ -1706,7 +1706,7 @@ await settle(150);
 const qaBlock = qaStop.find((r) => r?.decision === "block");
 check(
 	"a self-answered question does not trip the question gate",
-	!qaBlock.reason.includes("Do not answer your own question"),
+	qaBlock !== undefined && !qaBlock.reason.includes("Do not answer your own question"),
 );
 check(
 	"a self-answered question gets the ordinary green finish",
@@ -1726,7 +1726,7 @@ await settle(150);
 const lqBlock = lqStop.find((r) => r?.decision === "block");
 check(
 	"a long question past the display cap still trips the gate",
-	lqBlock.reason.includes("Do not answer your own question"),
+	lqBlock?.reason.includes("Do not answer your own question"),
 );
 check(
 	"the truncated reply-wanted body keeps the light and retains the trailing question",
