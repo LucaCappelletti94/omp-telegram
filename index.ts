@@ -2737,6 +2737,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			{ context: ask.context, question },
 		);
 		ask.messageId = sentMessage?.message_id ?? null;
+		if (pendingAsk === ask) writeSessionRecord(ask.ctx);
 	}
 
 	/** Settled options survive as dead grey buttons. `settled`, not `keep`, which now means an untruncatable tail. */

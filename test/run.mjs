@@ -5928,6 +5928,15 @@ const react = (updateId, messageId, emoji, previous = [], from = CHAT) => ({
 		new_reaction: emoji.map((e) => ({ type: "emoji", emoji: e })),
 	},
 });
+const answerButton = (updateId, messageId, data) => ({
+	update_id: updateId,
+	callback_query: {
+		id: `fb-${updateId}`,
+		data,
+		from: { id: CHAT },
+		message: { message_id: messageId, chat: { id: CHAT } },
+	},
+});
 
 await fb.fire("input");
 await fb.tools
@@ -6173,15 +6182,7 @@ const racedButton = lastCall("sendMessage")
 	.find((button) => button.callback_data?.startsWith("o:"));
 const steersBeforeRace = fb.steers.length;
 api.queued = [
-	{
-		update_id: 9015,
-		callback_query: {
-			id: "fb-race",
-			data: racedButton.callback_data,
-			from: { id: CHAT },
-			message: { message_id: racedMessageId, chat: { id: CHAT } },
-		},
-	},
+	answerButton(9015, racedMessageId, racedButton.callback_data),
 	react(9016, racedMessageId, ["\u{1F44E}"]),
 ];
 await fb.pump(250);
@@ -6189,6 +6190,49 @@ await fb.pump(250);
 const racedAnswer = await racedAsk;
 check("the earlier callback still answers the question", racedAnswer.details.selectedOptions.join() === "SQLite");
 check("the later queued redo cannot reopen it", fb.steers.length === steersBeforeRace);
+
+// Advancing a multi-question ask must publish the new message id before a prompt reaction arrives.
+const advancedState = {};
+const advancedAsk = fb.tools.get("ask").execute(
+	"fb-advanced",
+	{
+		questions: [
+			{ id: "first", question: "First choice?", options: askOpts("A", "B") },
+			{ id: "second", question: "Second choice?", options: askOpts("C", "D") },
+		],
+	},
+	undefined,
+	undefined,
+	stubbornCtx(fb.ctx, advancedState),
+);
+await settle(150);
+const firstAdvancedMessage = api.nextMessage - 1;
+const firstAdvancedButton = lastCall("sendMessage")
+	.body.reply_markup.inline_keyboard.flat()
+	.find((button) => button.callback_data?.startsWith("o:"));
+api.queued = [answerButton(9017, firstAdvancedMessage, firstAdvancedButton.callback_data)];
+await fb.pump(250);
+await fb.pump(250);
+const secondAdvancedMessage = api.nextMessage - 1;
+const secondAdvancedButton = lastCall("sendMessage")
+	.body.reply_markup.inline_keyboard.flat()
+	.find((button) => button.callback_data?.startsWith("o:"));
+check(
+	"the session record names an advanced open question immediately",
+	record(fb.id).question === secondAdvancedMessage,
+);
+api.queued = [react(9018, secondAdvancedMessage, ["\u{1F44E}"])];
+await fb.pump(250);
+await fb.pump(250);
+const advancedGrade = feedbackLines().at(-1);
+api.queued = [answerButton(9019, secondAdvancedMessage, secondAdvancedButton.callback_data)];
+await fb.pump(250);
+await fb.pump(250);
+const advancedAnswer = await advancedAsk;
+check(
+	"a prompt negative reaction redoes an advanced question",
+	advancedGrade.redo === true && /restate/i.test(advancedAnswer.details.results[1].customInput ?? ""),
+);
 
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");
