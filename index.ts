@@ -1287,37 +1287,32 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** Puts this session's window in front for the user's return, but never while they are typing elsewhere. */
+	/** Puts this session's pane in front for the user's return, but never while they are typing elsewhere.
+	 * Selecting the window alone lands on whichever pane was last active there, so a co-located session would
+	 * shadow this one; select-pane makes this session's own pane current inside that window. */
 	function focusTmuxWindow(): void {
 		if (config === null || Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
 		const pane = process.env.TMUX_PANE;
 		if (process.env.TMUX === undefined || pane === undefined) return;
 		try {
-			execFileSync("tmux", ["select-window", "-t", pane], { timeout: 2000 });
+			execFileSync("tmux", ["select-window", "-t", pane, ";", "select-pane", "-t", pane], { timeout: 2000 });
 		} catch {}
 	}
 
 	/** Offered on green summaries: everything is done, so the session may be shut down from the phone. */
 	function closeSessionButton(): InlineButton {
-		const label = process.env.TMUX === undefined ? "Close this session" : "Close this session and its tmux tab";
+		const label = process.env.TMUX === undefined ? "Close this session" : "Close this session and its tmux pane";
 		return { text: label, callback_data: `k:${sessionTag}`, style: "danger" };
 	}
 
-	/** A detached shell outlives omp, so the window dies only after the process has exited. */
-	function scheduleTmuxWindowKill(): void {
+	/** A detached shell outlives omp, so the pane dies only after the process has exited. Killing the pane, not
+	 * the window, leaves any sibling sessions sharing that window untouched; a lone pane still takes its tab down. */
+	function scheduleTmuxPaneKill(): void {
 		const pane = process.env.TMUX_PANE;
 		if (process.env.TMUX === undefined || pane === undefined) return;
-		let windowId = "";
+		if (!/^%\d+$/u.test(pane)) return;
 		try {
-			windowId = execFileSync("tmux", ["display-message", "-p", "-t", pane, "#{window_id}"], { timeout: 2000 })
-				.toString()
-				.trim();
-		} catch {
-			return;
-		}
-		if (!/^@\d+$/u.test(windowId)) return;
-		try {
-			spawn("sh", ["-c", `sleep 2; exec tmux kill-window -t '${windowId}'`], {
+			spawn("sh", ["-c", `sleep 2; exec tmux kill-pane -t '${pane}'`], {
 				detached: true,
 				stdio: "ignore",
 			}).unref();
@@ -1342,7 +1337,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			// A standing question is rewritten by session_shutdown; a plain summary only loses its button.
 			await stripKeyboard(messageId);
 		}
-		scheduleTmuxWindowKill();
+		scheduleTmuxPaneKill();
 		sessionCtx?.shutdown();
 	}
 
@@ -1356,7 +1351,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		detach(stripKeyboard(messageId), "close-offer retire");
 	}
 
-	/** One line per omp window, read from the same pane titles that drive the tmux tabs. */
+	/** One line per omp pane, read from the same pane titles that drive the tmux tabs. Listing panes, not windows,
+	 * keeps sessions that share a window from collapsing into the window's single active-pane title. */
 	function fleetReport(): string | null {
 		if (process.env.TMUX === undefined) return null;
 		let out: string;
@@ -1364,7 +1360,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			out = execFileSync(
 				"tmux",
 				[
-					"list-windows",
+					"list-panes",
 					"-a",
 					"-F",
 					"#{session_name}\t#{window_index}\t#{window_bell_flag}\t#{@omp_priority}\t#{pane_title}",
@@ -1374,6 +1370,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {
 			return null;
 		}
+		const parsed: { session: string; index: string; sep: string; bell: boolean; label: string; priority: boolean }[] =
+			[];
+		const ompPanesPerWindow = new Map<string, number>();
+		for (const raw of out.split("\n")) {
+			const parts = raw.split("\t");
+			if (parts.length < 5) continue;
+			const title = parts.slice(4).join("\t");
+			if (!title.startsWith("\u03C0 ")) continue;
+			const key = `${parts[0]}\t${parts[1]}`;
+			ompPanesPerWindow.set(key, (ompPanesPerWindow.get(key) ?? 0) + 1);
+			parsed.push({
+				session: parts[0] ?? "",
+				index: parts[1] ?? "",
+				sep: title.slice(2, 3),
+				bell: parts[2] === "1",
+				label: title.slice(4),
+				priority: parts[3] === "high",
+			});
+		}
 		const rows: {
 			session: string;
 			index: string;
@@ -1382,22 +1397,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			priority: boolean;
 		}[] = [];
 		const counts = { working: 0, waiting: 0, finished: 0, idle: 0 };
-		for (const raw of out.split("\n")) {
-			const parts = raw.split("\t");
-			if (parts.length < 5) continue;
-			const title = parts.slice(4).join("\t");
-			if (!title.startsWith("\u03C0 ")) continue;
-			const sep = title.slice(2, 3);
+		for (const pane of parsed) {
+			// window_bell_flag is a window property, so list-panes repeats it on every pane in the window.
+			// Trust it as finished only where the window holds one omp pane, else the bell cannot name its session.
+			const finished = pane.bell && ompPanesPerWindow.get(`${pane.session}\t${pane.index}`) === 1;
 			const state =
-				sep === "!" ? "waiting" : SPINNER_FRAMES.has(sep) ? "working" : parts[2] === "1" ? "finished" : "idle";
+				pane.sep === "!" ? "waiting" : SPINNER_FRAMES.has(pane.sep) ? "working" : finished ? "finished" : "idle";
 			counts[state] += 1;
-			rows.push({
-				session: parts[0] ?? "",
-				index: parts[1] ?? "",
-				state,
-				label: title.slice(4),
-				priority: parts[3] === "high",
-			});
+			rows.push({ session: pane.session, index: pane.index, state, label: pane.label, priority: pane.priority });
 		}
 		if (rows.length === 0) return "\u{1F535} No omp windows in tmux right now.";
 		const manySessions = new Set(rows.map((row) => row.session)).size > 1;
