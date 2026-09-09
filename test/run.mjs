@@ -10,6 +10,7 @@ import {
 	rmSync,
 	statSync,
 	unlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -465,8 +466,8 @@ check(
 	one.warns.some((w) => w.m.includes("unexpected origin")),
 );
 check(
-	"allowed_updates asks for messages and button presses",
-	lastCall("getUpdates").body.allowed_updates.join(",") === "message,callback_query",
+	"allowed_updates asks for messages, button presses and reactions",
+	lastCall("getUpdates").body.allowed_updates.join(",") === "message,callback_query,message_reaction",
 );
 check(
 	"offset advances past rejected updates",
@@ -5893,6 +5894,240 @@ check(
 	"only the first press settles the keyboard",
 	called("editMessageReplyMarkup").filter((c) => c.body.message_id === 46).length === 1,
 );
+
+// ------------------------------------------------------------ reactions
+heading("reactions grade what the agent sent");
+// A reaction carries only a message id, so its grade stores the sent-message record with it.
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const fb = spawn("01a07000-0000-0000-0000-000000000000", "/home/dev/work/lexer");
+await fb.fire("session_start");
+const sentDir = join(root, "notify-telegram/sent");
+const feedbackFile = join(root, "notify-telegram/feedback.jsonl");
+const feedbackLines = () =>
+	existsSync(feedbackFile)
+		? readFileSync(feedbackFile, "utf8")
+				.split("\n")
+				.filter((line) => line.length > 0)
+				.map((line) => JSON.parse(line))
+		: [];
+const onRecord = (messageId) => JSON.parse(readFileSync(join(sentDir, `${messageId}.json`), "utf8"));
+const react = (updateId, messageId, emoji, previous = [], from = CHAT) => ({
+	update_id: updateId,
+	message_reaction: {
+		chat: { id: CHAT },
+		message_id: messageId,
+		user: { id: from },
+		date: 1,
+		old_reaction: previous.map((e) => ({ type: "emoji", emoji: e })),
+		new_reaction: emoji.map((e) => ({ type: "emoji", emoji: e })),
+	},
+});
+
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute("fb1", { summary: "Lexer rewritten; tests green.", urgency: "green" }, undefined, undefined, fb.ctx);
+await fb.fire("session_stop");
+await settle(150);
+const statusId = record(fb.id).recent.at(-1);
+const statusRecord = onRecord(statusId);
+check(
+	"a sent status is on record with its kind, text and session",
+	statusRecord.version === 1 &&
+		statusRecord.kind === "status" &&
+		statusRecord.text.includes("Lexer rewritten") &&
+		statusRecord.session.tag === record(fb.id).tag &&
+		statusRecord.session.id === fb.id &&
+		statusRecord.session.cwd === "/home/dev/work/lexer",
+);
+check("the record keeps the structured call behind the message", statusRecord.payload.urgency === "green");
+check("the record is private", (statSync(join(sentDir, `${statusId}.json`)).mode & 0o777) === 0o600);
+
+// A thumbs up is a grade and nothing else.
+const sendsBeforePraise = called("sendMessage").length;
+api.queued = [react(9001, statusId, ["\u{1F44D}"])];
+await fb.pump(200);
+let lines = feedbackLines();
+check(
+	"a thumbs up is recorded with its grade and the message it graded",
+	lines.length === 1 &&
+		lines[0].version === 1 &&
+		lines[0].at === 1000 &&
+		lines[0].updateId === 9001 &&
+		lines[0].grade === 2 &&
+		lines[0].emoji.join() === "\u{1F44D}" &&
+		lines[0].messageId === statusId &&
+		lines[0].message.kind === "status" &&
+		lines[0].redo === false,
+);
+check("a positive grade wakes nobody", inboxCount(fb.id) === 0 && called("sendMessage").length === sendsBeforePraise);
+check("the feedback log is private", (statSync(feedbackFile).mode & 0o777) === 0o600);
+
+// A thumbs down on a status makes the agent write it again.
+api.queued = [react(9002, statusId, ["\u{1F44E}"], ["\u{1F44D}"])];
+await fb.pump(200);
+lines = feedbackLines();
+check(
+	"a changed reaction is recorded with what it replaced",
+	lines.at(-1).grade === -2 && lines.at(-1).previous.join() === "\u{1F44D}" && lines.at(-1).redo === true,
+);
+check("a redo reaches the owning session", inboxCount(fb.id) === 1);
+await fb.pump(150);
+check(
+	"the redo tells the agent which message to rewrite and through which tool",
+	fb.steers.length === 1 && fb.steers[0].text.includes("\u{1F44E}") && fb.steers[0].text.includes("notify_status"),
+);
+
+// A turn-end question without buttons gets the same phone-context correction as an ask.
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-question",
+		{ summary: "Need one detail.", urgency: "orange", question: "Should the frobnicator stay enabled?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+const statusQuestionId = record(fb.id).recent.at(-1);
+api.queued = [react(9003, statusQuestionId, ["\u{1F44E}"])];
+await fb.pump(200);
+await fb.pump(150);
+check(
+	"a negative status question asks for a contextual restatement",
+	fb.steers.at(-1).text.includes("restate") &&
+		fb.steers.at(-1).text.includes("definitions") &&
+		fb.steers.at(-1).text.includes("notify_status"),
+);
+
+// A strongly negative reaction on an open question answers it: restate, then ask again.
+const fbState = {};
+const fbAsk = fb.tools.get("ask").execute("fb2", singleQuestion, undefined, undefined, stubbornCtx(fb.ctx, fbState));
+await settle(150);
+const askMessageId = api.nextMessage - 1;
+check(
+	"a question is on record as one, with its options",
+	onRecord(askMessageId).kind === "question" && onRecord(askMessageId).payload.question.options.length === 2,
+);
+api.queued = [react(9004, askMessageId, ["\u{1F4A9}"])];
+await fb.pump(200);
+await fb.pump(150);
+const redone = await fbAsk;
+check(
+	"a strongly negative reaction on an open question answers it with a request to restate",
+	/restate/i.test(redone.details.customInput ?? "") && redone.details.selectedOptions.length === 0,
+);
+check("the terminal dialog is aborted", fbState.aborted === true);
+check(
+	"the question's grade is on file",
+	feedbackLines().at(-1).grade === -3 && feedbackLines().at(-1).message.kind === "question",
+);
+
+// An emoji outside the scale is recorded without a grade and the scale is shown.
+api.queued = [react(9005, statusId, ["\u{1F34C}"])];
+await fb.pump(200);
+check(
+	"an ungraded emoji records without a grade",
+	feedbackLines().at(-1).grade === null && feedbackLines().at(-1).emoji.join() === "\u{1F34C}",
+);
+const scaleNotice = lastCall("sendMessage").body.text;
+check(
+	"and the chat returns an error with the graded set",
+	scaleNotice.includes("Reaction error") &&
+		scaleNotice.includes("\u{1F34C}") &&
+		scaleNotice.includes("\u{1F44E}") &&
+		scaleNotice.includes("\u{1F3C6}"),
+);
+
+// A mixed set is ungraded rather than partly interpreted.
+const steersBeforeMixed = fb.steers.length;
+api.queued = [react(9006, statusId, ["\u{1F44E}", "\u{1F34C}"])];
+await fb.pump(200);
+check("a set containing an unknown emoji has no grade", feedbackLines().at(-1).grade === null);
+check("an ungraded set cannot trigger a redo", inboxCount(fb.id) === 0 && fb.steers.length === steersBeforeMixed);
+
+// Taking a reaction back is recorded, silently.
+const sendsBeforeRemoval = called("sendMessage").length;
+api.queued = [react(9007, statusId, [], ["\u{1F44E}", "\u{1F34C}"])];
+await fb.pump(200);
+check(
+	"removing a reaction records an empty set",
+	feedbackLines().at(-1).emoji.length === 0 && feedbackLines().at(-1).grade === null,
+);
+check("silently", called("sendMessage").length === sendsBeforeRemoval && inboxCount(fb.id) === 0);
+
+// A message not on record cannot be graded, and the chat says so.
+const linesBeforeUnknown = feedbackLines().length;
+api.queued = [react(9008, 424242, ["\u{1F44D}"])];
+await fb.pump(200);
+check("a reaction to a message not on record is not recorded", feedbackLines().length === linesBeforeUnknown);
+check("and the chat is told why", /not on record/.test(lastCall("sendMessage").body.text));
+
+// A stranger's reaction passes the same origin gate every button passes.
+api.queued = [react(9009, statusId, ["\u{1F44E}"], [], STRANGER)];
+await fb.pump(200);
+check("a stranger's reaction is dropped", feedbackLines().length === linesBeforeUnknown && inboxCount(fb.id) === 0);
+check(
+	"and logged",
+	fb.warns.some((w) => w.m.includes("unexpected origin")),
+);
+
+// The bot's own words can be graded, but there is no agent message to redo.
+writeFileSync(join(inboxOf(fb.id), "9100.json"), JSON.stringify({ kind: "command", value: "stop" }));
+await fb.pump(200);
+const noticeId = record(fb.id).recent.at(-1);
+check("a session notice is on record as the bot's own", onRecord(noticeId).kind === "notice");
+const steersBeforeNotice = fb.steers.length;
+api.queued = [react(9010, noticeId, ["\u{1F44E}"])];
+await fb.pump(200);
+await fb.pump(150);
+check(
+	"a thumbs down on the bot's own words is recorded",
+	feedbackLines().at(-1).message.kind === "notice" && feedbackLines().at(-1).redo === false,
+);
+check(
+	"and redoes nothing",
+	fb.steers.length === steersBeforeNotice && /nothing to redo/i.test(lastCall("sendMessage").body.text),
+);
+
+// A session that is gone cannot redo anything; the grade is still kept.
+const gone = spawn("01a07001-0000-0000-0000-000000000000", "/home/dev/work/parser");
+await gone.fire("session_start");
+await gone.fire("input");
+await gone.tools
+	.get("notify_status")
+	.execute("fb3", { summary: "Parser done.", urgency: "green" }, undefined, undefined, gone.ctx);
+await gone.fire("session_stop");
+await settle(150);
+const goneId = record(gone.id).recent.at(-1);
+unlinkSync(join(sessionsDir, `${gone.id}.json`));
+api.queued = [react(9011, goneId, ["\u{1F44E}"])];
+await fb.pump(200);
+check("a redo for a session that is gone is recorded as not done", feedbackLines().at(-1).redo === false);
+check("and the chat is told", /session is gone/.test(lastCall("sendMessage").body.text));
+
+// An unreadable record is refused instead of consuming a reaction without an explanation.
+const malformedRecordId = 424243;
+writeFileSync(join(sentDir, `${malformedRecordId}.json`), "{}");
+const linesBeforeMalformed = feedbackLines().length;
+api.queued = [react(9012, malformedRecordId, ["\u{1F44E}"])];
+await fb.pump(200);
+check("a malformed sent record produces no feedback", feedbackLines().length === linesBeforeMalformed);
+check("and returns a reaction error", lastCall("sendMessage").body.text.includes("Reaction error"));
+
+// Sent-message records have a longer retention period than downloaded media.
+const staleRecord = join(sentDir, "1.json");
+const freshRecord = join(sentDir, "2.json");
+writeFileSync(staleRecord, "{}");
+writeFileSync(freshRecord, "{}");
+const ninetyOneDaysAgo = (Date.now() - 91 * 24 * 3600 * 1000) / 1000;
+utimesSync(staleRecord, ninetyOneDaysAgo, ninetyOneDaysAgo);
+const sweeper = spawn("01a07002-0000-0000-0000-000000000000", "/home/dev/work/sweeper");
+await sweeper.fire("session_start");
+check("a record older than ninety days is swept", !existsSync(staleRecord));
+check("a younger record stays", existsSync(freshRecord));
 
 // ------------------------------------------------------------ upstream_launch
 heading("upstream_launch");

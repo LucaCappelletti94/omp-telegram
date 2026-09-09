@@ -1,6 +1,7 @@
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
+	appendFileSync,
 	chmodSync,
 	existsSync,
 	mkdirSync,
@@ -51,6 +52,10 @@ const DASHBOARD_FILE = join(STATE_DIR, "dashboard.json");
 const DASHBOARD_LOCK_FILE = join(STATE_DIR, "dashboard.lock");
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const MEDIA_DIR = join(STATE_DIR, "media");
+/** Every session message as sent, keyed by message id: a reaction names only the id. */
+const SENT_DIR = join(STATE_DIR, "sent");
+/** One line per reaction change, holding the grade and the message it graded. */
+const FEEDBACK_FILE = join(STATE_DIR, "feedback.jsonl");
 /** The channel a process outside omp uses to ask one question and read its answer back. */
 const EXTERNAL_DIR = join(STATE_DIR, "external");
 const EXTERNAL_ANSWERS_DIR = join(EXTERNAL_DIR, "answers");
@@ -106,6 +111,64 @@ const QUESTION_STOP_REASON =
 
 const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;
+const SENT_KEEP_MS = 90 * 24 * 3600 * 1000;
+/** User-approved Telegram reactions, normalised without the optional U+FE0F selector. */
+const REACTION_SCALE: ReadonlyArray<readonly [number, readonly string[]]> = [
+	[3, ["\u{1F3C6}", "\u{1F4AF}", "\u{1F929}", "\u2764\u200D\u{1F525}", "\u{1F389}", "\u{1F525}"]],
+	[
+		2,
+		["\u{1F44D}", "\u2764", "\u{1F44F}", "\u{1F60D}", "\u{1F970}", "\u{1F44C}", "\u{1F64F}", "\u{1F601}", "\u{1F923}"],
+	],
+	[1, ["\u{1F60E}", "\u{1F91D}", "\u{1FAE1}", "\u{1F192}", "\u{1F440}", "\u{1F913}"]],
+	[0, ["\u{1F914}", "\u{1F928}", "\u{1F610}", "\u{1F937}", "\u{1F937}\u200D\u2642", "\u{1F937}\u200D\u2640"]],
+	[-1, ["\u{1F971}", "\u{1F634}", "\u{1F648}", "\u{1F622}", "\u{1F494}"]],
+	[-2, ["\u{1F44E}", "\u{1F628}", "\u{1F631}", "\u{1F62D}", "\u{1F92F}"]],
+	[-3, ["\u{1F4A9}", "\u{1F92E}", "\u{1F921}", "\u{1F92C}", "\u{1F621}", "\u{1F595}"]],
+];
+const REACTION_GRADES: Readonly<Record<string, number>> = Object.fromEntries(
+	REACTION_SCALE.flatMap(([grade, emoji]) => emoji.map((e) => [e, grade])),
+);
+/** A grade this low on an agent message sends the agent back to write it again. */
+const REDO_GRADE = -2;
+
+/** What a message was, so a grade on it can be read later and a redo can name the tool. */
+type SentKind = "status" | "question" | "standing" | "snippet" | "file" | "approval" | "notice";
+const SENT_KINDS: Readonly<Record<SentKind, true>> = {
+	status: true,
+	question: true,
+	standing: true,
+	snippet: true,
+	file: true,
+	approval: true,
+	notice: true,
+};
+
+interface SentRecord {
+	version: 1;
+	id: number;
+	at: number;
+	kind: SentKind;
+	/** The plain source as sent, head and footer included: what the reader graded. */
+	text: string;
+	session: { id: string; tag: string; emoji: string; name: string; cwd: string };
+	/** The structured call behind the message, where there was one. */
+	payload?: unknown;
+}
+
+interface TelegramReaction {
+	chat: { id: number };
+	message_id: number;
+	user?: { id: number };
+	date: number;
+	old_reaction: TelegramReactionType[];
+	new_reaction: TelegramReactionType[];
+}
+
+type TelegramReactionType =
+	| { type: "emoji"; emoji: string }
+	| { type: "custom_emoji"; custom_emoji_id: string }
+	| { type: "paid" };
+
 const TYPING_MS = 5_000;
 const DRAFT_MS = 1_500;
 /** The party-popper send effect, verified against the live API; effects exist in private chats only. */
@@ -208,6 +271,7 @@ interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
 	callback_query?: TelegramCallbackQuery;
+	message_reaction?: TelegramReaction;
 }
 
 interface AskResult {
@@ -286,10 +350,10 @@ interface ModelUsage {
 }
 
 interface InboxEntry {
-	kind: "text" | "callback" | "file" | "command";
-	/** Text, callback payload, downloaded file path, or command name. */
+	kind: "text" | "callback" | "file" | "command" | "redo";
+	/** Text, callback payload, downloaded file path, command name, or the redo note. */
 	value: string;
-	/** Incoming Telegram message id, for delivery receipts. */
+	/** Incoming Telegram message id, for delivery receipts; for a redo, the graded message. */
 	messageId?: number;
 	/** Message id the sender replied to. */
 	replyTo?: number;
@@ -919,32 +983,42 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	/**
-	 * The record is the only thing the poller can match a reply against, so an id kept in memory is
-	 * a reply that gets refused until the next heartbeat rewrites the file. Persisting here rather
-	 * than at each send site is what keeps a newly added message replyable from the moment it exists.
-	 */
-	function trackSent(sent: TelegramMessage | null): void {
+	/** Persists what one Telegram message currently says so a later reaction can recover it. */
+	function recordSent(id: number, kind: SentKind, text: string, payload?: unknown): void {
+		const name = badgeOverride.length > 0 ? badgeOverride : (sessionCtx?.sessionManager.getSessionName() ?? "");
+		const record: SentRecord = {
+			version: 1,
+			id,
+			at: Date.now(),
+			kind,
+			text,
+			session: { id: sessionId, tag: sessionTag, emoji: badgeEmoji, name, cwd: sessionCtx?.cwd ?? "" },
+		};
+		if (payload !== undefined) record.payload = payload;
+		mkdirSync(SENT_DIR, { recursive: true, mode: 0o700 });
+		writeFileAtomic(join(SENT_DIR, `${id}.json`), JSON.stringify(record), 0o600);
+	}
+
+	/** New messages become reply targets and reaction records atomically with the successful send. */
+	function trackSent(sent: TelegramMessage | null, kind: SentKind, text: string, payload?: unknown): void {
 		if (typeof sent?.message_id !== "number") return;
 		recentMessages.push(sent.message_id);
 		if (recentMessages.length > RECENT_MESSAGE_CAP) {
 			recentMessages.splice(0, recentMessages.length - RECENT_MESSAGE_CAP);
 		}
+		recordSent(sent.message_id, kind, text, payload);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 	}
 
-	/**
-	 * A send rejected over its markup retries as plain text, and the size limit is on the rendered
-	 * form. Nothing else retries: re-sending into a refusal adds a request to whatever is refusing
-	 * them, and drops formatting that was never at fault.
-	 */
+	/** Retries markup failures as plain text and records only messages with a non-null `kind`. */
 	async function sendOrEdit(
 		cfg: Config,
 		method: "sendMessage" | "editMessageText",
 		body: Record<string, unknown>,
 		plain: string,
 		keep = "",
-		track = true,
+		kind: SentKind | null = null,
+		payload?: unknown,
 	): Promise<TelegramMessage | null> {
 		const quiet = { link_preview_options: { is_disabled: true } };
 		const source = fitToTelegram(plain, keep);
@@ -965,7 +1039,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} else if (sent === null) {
 			pi.logger.warn("telegram: send refused", { method, description: refusal });
 		}
-		if (method === "sendMessage" && track) trackSent(sent);
+		if (kind !== null && sent !== null) {
+			if (method === "sendMessage") trackSent(sent, kind, source, payload);
+			else if (typeof body.message_id === "number") recordSent(body.message_id, kind, source, payload);
+		}
 		return sent;
 	}
 
@@ -1232,18 +1309,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	let lastMediaReap = 0;
+	let lastReap = 0;
 
-	/** Downloaded Telegram files are working input, not an archive. */
-	function reapOldMedia(): void {
-		if (Date.now() - lastMediaReap < 3_600_000) return;
-		lastMediaReap = Date.now();
-		if (!existsSync(MEDIA_DIR)) return;
-		for (const entry of readdirSync(MEDIA_DIR)) {
-			const path = join(MEDIA_DIR, entry);
-			try {
-				if (Date.now() - statSync(path).mtimeMs > MEDIA_KEEP_MS) unlinkSync(path);
-			} catch {}
+	/** Downloaded files are working input and sent messages a record for grading; neither is an archive. */
+	function reapOldFiles(): void {
+		if (Date.now() - lastReap < 3_600_000) return;
+		lastReap = Date.now();
+		for (const [dir, keepMs] of [
+			[MEDIA_DIR, MEDIA_KEEP_MS],
+			[SENT_DIR, SENT_KEEP_MS],
+		] as const) {
+			if (!existsSync(dir)) continue;
+			for (const entry of readdirSync(dir)) {
+				const path = join(dir, entry);
+				try {
+					if (Date.now() - statSync(path).mtimeMs > keepMs) unlinkSync(path);
+				} catch {}
+			}
 		}
 	}
 
@@ -1481,7 +1563,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 */
 	async function serviceNotice(text: string, routable = true): Promise<void> {
 		if (config === null) return;
-		await sendOrEdit(config, "sendMessage", { chat_id: config.chatId }, `\u{1F535} ${text}`, "", routable);
+		await sendOrEdit(
+			config,
+			"sendMessage",
+			{ chat_id: config.chatId },
+			`\u{1F535} ${text}`,
+			"",
+			routable ? "notice" : null,
+		);
 	}
 
 	async function sessionNotice(ctx: ExtensionContext, text: string): Promise<void> {
@@ -1493,7 +1582,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		cfg: Config,
 		body: Record<string, unknown>,
 		plain: string,
-		keep = "",
+		keep: string,
+		kind: SentKind,
+		payload?: unknown,
 	): Promise<TelegramMessage | null> {
 		if (/```|(^|\n)\|.+\|/.test(plain)) {
 			const sent = await callTelegram<TelegramMessage>(
@@ -1503,23 +1594,32 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				15_000,
 			);
 			if (sent !== null) {
-				trackSent(sent);
+				trackSent(sent, kind, plain + keep, payload);
 				return sent;
 			}
 		}
-		return await sendOrEdit(cfg, "sendMessage", body, plain, keep);
+		return await sendOrEdit(cfg, "sendMessage", body, plain, keep, kind, payload);
 	}
 
 	/** `keep` is a short tail exempt from truncation, so an oversized body cannot swallow the usage footer. */
 	async function notify(
 		ctx: ExtensionContext,
+		kind: SentKind,
 		title: string,
 		body: string,
 		extra: Record<string, unknown> = {},
 		keep = "",
+		payload?: unknown,
 	): Promise<TelegramMessage | null> {
 		if (config === null) return null;
-		const sent = await sendStructured(config, { chat_id: config.chatId, ...extra }, withHead(ctx, title, body), keep);
+		const sent = await sendStructured(
+			config,
+			{ chat_id: config.chatId, ...extra },
+			withHead(ctx, title, body),
+			keep,
+			kind,
+			payload,
+		);
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
 		return sent;
@@ -2169,8 +2269,124 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
+	/** Builds the correction prompt used as either an ask answer or a steer. */
+	function redoNote(record: SentRecord, emoji: string[]): string {
+		const opening = `The user reacted ${emoji.join(" ")} on Telegram to`;
+		const body = record.text.split("\n\n").slice(1).join("\n\n") || record.text;
+		const quoted = `\n\n> ${clip(body, PREVIEW_MAX).replaceAll("\n", "\n> ")}`;
+		const statusQuestion =
+			record.kind === "status" &&
+			record.payload !== null &&
+			typeof record.payload === "object" &&
+			typeof (record.payload as Partial<TurnStatus>).question === "string";
+		if (record.kind === "question" || record.kind === "standing" || statusQuestion) {
+			const viaStatus = record.kind === "question" ? "" : " through notify_status";
+			return `${opening} your question, which did not make sense on the phone: restate it with the context and definitions a reader who cannot see the terminal needs, spelling out every term this session introduced, then ask again${viaStatus}.${quoted}`;
+		}
+		switch (record.kind) {
+			case "snippet":
+				return `${opening} the snippet you sent, which did not make sense on the phone: send it again with notify_snippet, with a purpose line that says what the text is for and where it goes.${quoted}`;
+			case "file":
+				return `${opening} the file you sent, which did not make sense on the phone: send it again with notify_file, with a caption that says what it shows and why it matters.${quoted}`;
+			default:
+				return `${opening} your turn-end status, which did not stand on its own: write it again with notify_status, stating what changed, what is open, and what you need while assuming this message is all the reader sees.${quoted}`;
+		}
+	}
+
+	/** Records each reaction change and requests a rewrite for strongly negative grades on agent messages. */
+	async function handleReaction(cfg: Config, updateId: number, reaction: TelegramReaction): Promise<void> {
+		if (reaction.chat.id !== cfg.chatId || reaction.user?.id !== cfg.chatId) {
+			pi.logger.warn("telegram: rejected a reaction from an unexpected origin", {
+				chat: reaction.chat.id,
+				from: reaction.user?.id,
+			});
+			return;
+		}
+		let record: SentRecord | null = null;
+		try {
+			const parsed = JSON.parse(readFileSync(join(SENT_DIR, `${reaction.message_id}.json`), "utf8")) as unknown;
+			if (parsed !== null && typeof parsed === "object") {
+				const candidate = parsed as Partial<SentRecord>;
+				const session = candidate.session as Partial<SentRecord["session"]> | undefined;
+				if (
+					candidate.version === 1 &&
+					candidate.id === reaction.message_id &&
+					typeof candidate.at === "number" &&
+					typeof candidate.kind === "string" &&
+					Object.hasOwn(SENT_KINDS, candidate.kind) &&
+					typeof candidate.text === "string" &&
+					session !== undefined &&
+					typeof session.id === "string" &&
+					typeof session.tag === "string" &&
+					typeof session.emoji === "string" &&
+					typeof session.name === "string" &&
+					typeof session.cwd === "string"
+				) {
+					record = candidate as SentRecord;
+				}
+			}
+		} catch {}
+		if (record === null) {
+			await serviceNotice(
+				`Reaction error: that message is not on record, so the reaction was not kept; session messages stay gradable for ${SENT_KEEP_MS / 86_400_000} days.`,
+				false,
+			);
+			return;
+		}
+		const emoji = reaction.new_reaction.map((item) =>
+			item.type === "emoji" ? item.emoji : item.type === "paid" ? "paid" : `custom:${item.custom_emoji_id}`,
+		);
+		let grade: number | null = null;
+		const ungraded: string[] = [];
+		for (const token of emoji) {
+			const value = REACTION_GRADES[token.replaceAll("\uFE0F", "")];
+			if (value === undefined) ungraded.push(token);
+			else grade = grade === null ? value : Math.min(grade, value);
+		}
+		if (ungraded.length > 0) grade = null;
+		const agentWrote = record.kind !== "notice" && record.kind !== "approval";
+		const wantsRedo = grade !== null && grade <= REDO_GRADE;
+		const owner = wantsRedo && agentWrote ? readSessionRecord(record.session.id) : null;
+		const redo = owner !== null && Date.now() - owner.heartbeat <= LOCK_STALE_MS;
+		const line = {
+			version: 1,
+			updateId,
+			at: reaction.date * 1000,
+			messageId: reaction.message_id,
+			emoji,
+			previous: reaction.old_reaction.map((item) =>
+				item.type === "emoji" ? item.emoji : item.type === "paid" ? "paid" : `custom:${item.custom_emoji_id}`,
+			),
+			grade,
+			redo,
+			message: record,
+		};
+		appendFileSync(FEEDBACK_FILE, `${JSON.stringify(line)}\n`, { mode: 0o600 });
+		if (redo)
+			deliver(record.session.id, updateId, { kind: "redo", value: redoNote(record, emoji), messageId: record.id });
+		if (ungraded.length > 0) {
+			const scale = REACTION_SCALE.map(([g, set]) => `${g > 0 ? "+" : ""}${g} ${set.join("")}`).join(" \u00B7 ");
+			await serviceNotice(
+				`Reaction error: ${ungraded.join(" ")} is outside the grading scale, so it was kept without a grade; graded reactions: ${scale}.`,
+				false,
+			);
+		}
+		if (wantsRedo && !redo) {
+			await serviceNotice(
+				agentWrote
+					? "Grade kept, but that session is gone, so nothing was redone."
+					: "Grade kept, but those were this bot's own words, so there is nothing to redo.",
+				false,
+			);
+		}
+	}
+
 	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<void> {
 		const callback = update.callback_query;
+		if (update.message_reaction !== undefined) {
+			await handleReaction(cfg, update.update_id, update.message_reaction);
+			return;
+		}
 		if (callback !== undefined && callback.data !== undefined) {
 			if (callback.message?.chat.id !== cfg.chatId || callback.from?.id !== cfg.chatId) {
 				pi.logger.warn("telegram: rejected a button press from an unexpected origin", {
@@ -2400,7 +2616,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				{
 					offset: config.offset,
 					timeout: LONG_POLL_S,
-					allowed_updates: ["message", "callback_query"],
+					allowed_updates: ["message", "callback_query", "message_reaction"],
 				},
 				(LONG_POLL_S + 10) * 1000,
 			);
@@ -2463,10 +2679,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				"editMessageText",
 				{ chat_id: config.chatId, message_id: ask.messageId, reply_markup: markup },
 				body,
+				"",
+				"question",
+				{ context: ask.context, question },
 			);
 			return;
 		}
-		const sentMessage = await sendOrEdit(config, "sendMessage", { chat_id: config.chatId, reply_markup: markup }, body);
+		const sentMessage = await sendOrEdit(
+			config,
+			"sendMessage",
+			{ chat_id: config.chatId, reply_markup: markup },
+			body,
+			"",
+			"question",
+			{ context: ask.context, question },
+		);
 		ask.messageId = sentMessage?.message_id ?? null;
 	}
 
@@ -2546,6 +2773,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			},
 			body,
 			keep,
+			"standing",
+			recorded,
 		);
 		standingQuestion = {
 			id,
@@ -2663,7 +2892,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					continue;
 				}
 				// A reply or an answer means attention is on this session: put its window in front for the return.
-				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
+				if (
+					entry.kind === "text" ||
+					entry.kind === "redo" ||
+					(entry.kind === "callback" && !entry.value.startsWith("k:"))
+				) {
 					focusTmuxWindow();
 				}
 				// `replyOwed` is set where the entry reaches the agent, never before: an entry answered
@@ -2766,6 +2999,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					}
 					replyOwed = true;
 					ackDelivered(entry.messageId);
+					continue;
+				}
+				// A grade on the open question answers it with the request to restate; a grade on any
+				// other message is a steer, which omp queues behind a running turn or starts one with.
+				if (entry.kind === "redo") {
+					if (ask !== null && ask.messageId === entry.messageId) {
+						ask.custom[ask.index] = entry.value;
+						ask.selected[ask.index] = new Set<string>();
+						replyOwed = true;
+						await advance(ask);
+						continue;
+					}
+					pi.sendUserMessage(entry.value);
+					replyOwed = true;
 					continue;
 				}
 				// The ask blocks the turn, so text arriving now can only be its answer: the question opens
@@ -3246,8 +3493,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (sent === null) {
 					return { content: [{ type: "text", text: "Error: Telegram rejected the album upload" }], isError: true };
 				}
-				for (const message of sent) {
-					trackSent(message);
+				for (const [index, message] of sent.entries()) {
+					trackSent(message, "file", media[index]?.caption ?? "");
 					sentIds.push(message.message_id);
 				}
 			} else {
@@ -3279,7 +3526,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							isError: true,
 						};
 					}
-					trackSent(sent);
+					trackSent(sent, "file", String(fields.caption));
 					sentIds.push(sent.message_id);
 				}
 			}
@@ -3358,7 +3605,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
-			const sent = await sendOrEdit(config, "sendMessage", { chat_id: config.chatId }, plain);
+			const sent = await sendOrEdit(config, "sendMessage", { chat_id: config.chatId }, plain, "", "snippet");
 			if (sent === null) {
 				return { content: [{ type: "text", text: "Error: Telegram rejected the snippet" }], isError: true };
 			}
@@ -3507,6 +3754,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			detach(
 				notify(
 					ctx,
+					"notice",
 					"\u2B06\uFE0F Upstream launched",
 					`${outcome.owner}/${outcome.name} \u2014 ${args.problem}\nBranch \`${outcome.branch}\` in ${where}. It runs in its own tmux tab now.`,
 				),
@@ -3547,7 +3795,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
 		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true, mode: 0o700 });
 		reapDeadSessions();
-		reapOldMedia();
+		reapOldFiles();
 		sessionTag = claimTag();
 		// Base-36 tag as a number: stable across resumes, unique across live sessions.
 		draftId = Number.parseInt(sessionTag, 36) + 1;
@@ -3624,7 +3872,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				reloadConfig();
 				writeSessionRecord(ctx);
 				if (badgeEmoji.length === 0) detach(claimBadgeIfMissing(ctx), "badge claim");
-				reapOldMedia();
+				reapOldFiles();
 				reapHeldMessages();
 				if (ownsLock()) refreshLock();
 				else acquireLock();
@@ -3879,14 +4127,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
 				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
-				const work = notify(ctx, heads[recorded.urgency], body, extra, usageFooter()).then((sent) => {
-					if (recorded.urgency === "red") return pinRed(ctx, sent);
-					if (recorded.urgency === "green" && typeof sent?.message_id === "number") {
-						closeOfferMessageId = sent.message_id;
-						writeSessionRecord(ctx);
-					}
-					return undefined;
-				});
+				const work = notify(ctx, "status", heads[recorded.urgency], body, extra, usageFooter(), recorded).then(
+					(sent) => {
+						if (recorded.urgency === "red") return pinRed(ctx, sent);
+						if (recorded.urgency === "green" && typeof sent?.message_id === "number") {
+							closeOfferMessageId = sent.message_id;
+							writeSessionRecord(ctx);
+						}
+						return undefined;
+					},
+				);
 				detach(work, "turn-end notice");
 				return;
 			}
@@ -3917,7 +4167,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					: wantsReply
 						? `...${clipEnd(tail, 600)}`
 						: `${clip(tail, 600)}...`;
-		detach(notify(ctx, title, body, quiet ? { disable_notification: true } : {}, usageFooter()), "turn-end notice");
+		detach(
+			notify(ctx, "status", title, body, quiet ? { disable_notification: true } : {}, usageFooter()),
+			"turn-end notice",
+		);
 	});
 
 	pi.on("tool_approval_requested", async (event, ctx) => {
@@ -3932,14 +4185,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			resolution: null,
 		};
 		approvalNotice = notice;
-		const work = notify(ctx, "\u{1F534} Approval needed", `${tool} is waiting for approval.`).then((sent) => {
-			notice.messageId = typeof sent?.message_id === "number" ? sent.message_id : null;
-			if (notice.messageId === null && notice.resolution !== null && approvalNotice === notice) {
-				approvalNotice = null;
-				return;
-			}
-			finishApprovalNotice(ctx, notice);
-		});
+		const work = notify(ctx, "approval", "\u{1F534} Approval needed", `${tool} is waiting for approval.`).then(
+			(sent) => {
+				notice.messageId = typeof sent?.message_id === "number" ? sent.message_id : null;
+				if (notice.messageId === null && notice.resolution !== null && approvalNotice === notice) {
+					approvalNotice = null;
+					return;
+				}
+				finishApprovalNotice(ctx, notice);
+			},
+		);
 		detach(work, "approval notice");
 	});
 
