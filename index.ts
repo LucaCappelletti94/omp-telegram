@@ -1370,6 +1370,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {
 			return null;
 		}
+		const parsed: { session: string; index: string; sep: string; bell: boolean; label: string; priority: boolean }[] =
+			[];
+		const ompPanesPerWindow = new Map<string, number>();
+		for (const raw of out.split("\n")) {
+			const parts = raw.split("\t");
+			if (parts.length < 5) continue;
+			const title = parts.slice(4).join("\t");
+			if (!title.startsWith("\u03C0 ")) continue;
+			const key = `${parts[0]}\t${parts[1]}`;
+			ompPanesPerWindow.set(key, (ompPanesPerWindow.get(key) ?? 0) + 1);
+			parsed.push({
+				session: parts[0] ?? "",
+				index: parts[1] ?? "",
+				sep: title.slice(2, 3),
+				bell: parts[2] === "1",
+				label: title.slice(4),
+				priority: parts[3] === "high",
+			});
+		}
 		const rows: {
 			session: string;
 			index: string;
@@ -1378,22 +1397,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			priority: boolean;
 		}[] = [];
 		const counts = { working: 0, waiting: 0, finished: 0, idle: 0 };
-		for (const raw of out.split("\n")) {
-			const parts = raw.split("\t");
-			if (parts.length < 5) continue;
-			const title = parts.slice(4).join("\t");
-			if (!title.startsWith("\u03C0 ")) continue;
-			const sep = title.slice(2, 3);
+		for (const pane of parsed) {
+			// window_bell_flag is a window property, so list-panes repeats it on every pane in the window.
+			// Trust it as finished only where the window holds one omp pane, else the bell cannot name its session.
+			const finished = pane.bell && ompPanesPerWindow.get(`${pane.session}\t${pane.index}`) === 1;
 			const state =
-				sep === "!" ? "waiting" : SPINNER_FRAMES.has(sep) ? "working" : parts[2] === "1" ? "finished" : "idle";
+				pane.sep === "!" ? "waiting" : SPINNER_FRAMES.has(pane.sep) ? "working" : finished ? "finished" : "idle";
 			counts[state] += 1;
-			rows.push({
-				session: parts[0] ?? "",
-				index: parts[1] ?? "",
-				state,
-				label: title.slice(4),
-				priority: parts[3] === "high",
-			});
+			rows.push({ session: pane.session, index: pane.index, state, label: pane.label, priority: pane.priority });
 		}
 		if (rows.length === 0) return "\u{1F535} No omp windows in tmux right now.";
 		const manySessions = new Set(rows.map((row) => row.session)).size > 1;

@@ -2554,6 +2554,26 @@ check("fleet without tmux explains itself", lastCall("sendMessage").body.text.in
 	delete process.env.TMUX;
 	process.env.PATH = realPath;
 }
+
+// A window-level bell must not mark every co-located pane finished; only a lone pane in a belled window is finished.
+{
+	writeFileSync(
+		fakeTmux,
+		`#!/bin/sh\nif [ "$1" = list-panes ]; then\n\tprintf 'work\\t3\\t1\\t\\t\u03C0 > Session C\\n'\n\tprintf 'work\\t3\\t1\\t\\t\u03C0 > Session D\\n'\n\tprintf 'work\\t4\\t1\\t\\t\u03C0 > Session E\\n'\nfi\n`,
+		{ mode: 0o755 },
+	);
+	process.env.PATH = `${fakeBin}:${realPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	api.queued = [{ update_id: 616, message: { message_id: 87, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
+	await ux.pump(250);
+	const belled = lastCall("sendMessage").body;
+	check(
+		"a shared window's bell finishes only its lone pane, leaving co-located panes idle",
+		typeof belled.text === "string" && belled.text.includes("1 finished, 2 idle") && !belled.text.includes("3 finished"),
+	);
+	delete process.env.TMUX;
+	process.env.PATH = realPath;
+}
 process.env.PATH = realPath;
 
 // Red statuses pin until the next turn.
