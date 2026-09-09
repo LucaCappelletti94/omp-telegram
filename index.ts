@@ -946,6 +946,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	const recentMessages: number[] = [];
 	let lastNotifiedAt = 0;
 	let turnActive = false;
+	let sessionAlive = true;
 	let typingSentAt = 0;
 	/** Cleared when the turn carrying the answer ends: typing is chat-wide, so no session may hold it idly. */
 	let replyOwed = false;
@@ -1120,7 +1121,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			health: lastHealth,
 			summary: lastSummary,
 			summaryAt: lastSummaryAt,
-			heartbeat: Date.now(),
+			heartbeat: sessionAlive ? Date.now() : 0,
 		};
 		writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(record), 0o600);
 	}
@@ -3832,6 +3833,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		sessionCtx = ctx;
 		sessionId = ctx.sessionManager.getSessionId();
+		sessionAlive = true;
 		mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
 		try {
 			// mkdir applies the mode only at creation; a dir inherited from an older version stays loose otherwise.
@@ -4286,6 +4288,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		}
 		if (sessionCtx !== null) unpinRed(sessionCtx);
+		sessionAlive = false;
+		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		releaseLock();
 		// Handing the board on rather than leaving the next owner to wait out a stale claim.
 		releaseLock(DASHBOARD_LOCK_FILE);

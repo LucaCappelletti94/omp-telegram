@@ -6123,10 +6123,12 @@ await gone.tools
 await gone.fire("session_stop");
 await settle(150);
 const goneId = record(gone.id).recent.at(-1);
-unlinkSync(join(sessionsDir, `${gone.id}.json`));
+await gone.fire("session_shutdown");
+check("shutdown marks the session record dead immediately", record(gone.id).heartbeat === 0);
 api.queued = [react(9011, goneId, ["\u{1F44E}"])];
 await fb.pump(200);
 check("a redo for a session that is gone is recorded as not done", feedbackLines().at(-1).redo === false);
+check("the dead session receives no redo entry", inboxCount(gone.id) === 0);
 check("and the chat is told", /session is gone/.test(lastCall("sendMessage").body.text));
 
 // An unreadable record is refused instead of consuming a reaction without an explanation.
