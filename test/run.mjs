@@ -6017,6 +6017,7 @@ check(
 	"a question is on record as one, with its options",
 	onRecord(askMessageId).kind === "question" && onRecord(askMessageId).payload.question.options.length === 2,
 );
+check("the live session record names its open question", record(fb.id).question === askMessageId);
 api.queued = [react(9004, askMessageId, ["\u{1F4A9}"])];
 await fb.pump(200);
 await fb.pump(150);
@@ -6034,6 +6035,7 @@ check(
 	"settling a question records the text now visible in Telegram",
 	onRecord(askMessageId).text.includes(redone.details.customInput),
 );
+check("the session record clears its settled question", record(fb.id).question === null);
 
 // An emoji outside the scale is recorded without a grade and the scale is shown.
 api.queued = [react(9005, statusId, ["\u{1F34C}"])];
@@ -6146,6 +6148,18 @@ api.queued = [react(9013, traversalId, ["\u{1F44D}"])];
 await fb.pump(200);
 check("a traversal-shaped message id cannot escape the sent ledger", feedbackLines().length === linesBeforeTraversal);
 unlinkSync(traversalRecord);
+
+// Negative feedback remains recorded after settlement but cannot reopen the closed question.
+const steersBeforeClosedQuestion = fb.steers.length;
+api.queued = [react(9014, askMessageId, ["\u{1F44E}"])];
+await fb.pump(200);
+check(
+	"a settled question keeps its negative grade without a redo",
+	feedbackLines().at(-1).grade === -2 &&
+		feedbackLines().at(-1).redo === false &&
+		fb.steers.length === steersBeforeClosedQuestion,
+);
+check("the chat says the settled question stayed closed", /already closed/i.test(lastCall("sendMessage").body.text));
 
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");

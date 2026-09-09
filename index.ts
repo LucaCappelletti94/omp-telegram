@@ -229,6 +229,8 @@ interface SessionRecord {
 	lastNotified: number;
 	/** Replying to one of these routes back here. */
 	recent: number[];
+	/** Message id of the native ask currently waiting for an answer. */
+	question: number | null;
 	/** Standing turn-end question; survives a resume. */
 	standing: StandingQuestion | null;
 	/** Message carrying a live close-session button on a plain green summary. */
@@ -1108,6 +1110,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			label: badgeOverride,
 			lastNotified: lastNotifiedAt,
 			recent: [...recentMessages],
+			question: pendingAsk?.messageId ?? null,
 			standing: standingQuestion,
 			closeOffer: closeOfferMessageId,
 			pinned: pinnedMessageId,
@@ -1161,6 +1164,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				label: text(raw.label),
 				lastNotified: count(raw.lastNotified),
 				recent: Array.isArray(raw.recent) ? raw.recent.filter((m) => typeof m === "number") : [],
+				question: messageId(raw.question),
 				standing: typeof raw.standing === "object" && raw.standing !== null ? raw.standing : null,
 				closeOffer: messageId(raw.closeOffer),
 				pinned: messageId(raw.pinned),
@@ -2369,7 +2373,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const agentWrote = record.kind !== "notice" && record.kind !== "approval";
 		const wantsRedo = grade !== null && grade <= REDO_GRADE;
 		const owner = wantsRedo && agentWrote ? readSessionRecord(record.session.id) : null;
-		const redo = owner !== null && Date.now() - owner.heartbeat <= LOCK_STALE_MS;
+		const liveOwner = owner !== null && Date.now() - owner.heartbeat <= LOCK_STALE_MS;
+		const targetOpen =
+			record.kind === "question"
+				? owner?.question === record.id
+				: record.kind === "standing"
+					? owner?.standing?.messageId === record.id
+					: true;
+		const redo = liveOwner && targetOpen;
 		const line = {
 			version: 1,
 			updateId,
@@ -2394,12 +2405,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			);
 		}
 		if (wantsRedo && !redo) {
-			await serviceNotice(
-				agentWrote
-					? "Grade kept, but that session is gone, so nothing was redone."
-					: "Grade kept, but those were this bot's own words, so there is nothing to redo.",
-				false,
-			);
+			const reason =
+				agentWrote && liveOwner && !targetOpen
+					? "Grade kept, but that question is already closed, so it was not reopened."
+					: agentWrote
+						? "Grade kept, but that session is gone, so nothing was redone."
+						: "Grade kept, but those were this bot's own words, so there is nothing to redo.";
+			await serviceNotice(reason, false);
 		}
 	}
 
