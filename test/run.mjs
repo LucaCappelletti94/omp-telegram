@@ -2569,7 +2569,9 @@ check("fleet without tmux explains itself", lastCall("sendMessage").body.text.in
 	const belled = lastCall("sendMessage").body;
 	check(
 		"a shared window's bell finishes only its lone pane, leaving co-located panes idle",
-		typeof belled.text === "string" && belled.text.includes("1 finished, 2 idle") && !belled.text.includes("3 finished"),
+		typeof belled.text === "string" &&
+			belled.text.includes("1 finished, 2 idle") &&
+			!belled.text.includes("3 finished"),
 	);
 	delete process.env.TMUX;
 	process.env.PATH = realPath;
