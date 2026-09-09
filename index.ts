@@ -164,6 +164,10 @@ interface TelegramReaction {
 	new_reaction: TelegramReactionType[];
 }
 
+function isTelegramMessageId(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
 type TelegramReactionType =
 	| { type: "emoji"; emoji: string }
 	| { type: "custom_emoji"; custom_emoji_id: string }
@@ -353,7 +357,7 @@ interface InboxEntry {
 	kind: "text" | "callback" | "file" | "command" | "redo";
 	/** Text, callback payload, downloaded file path, command name, or the redo note. */
 	value: string;
-	/** Incoming Telegram message id, for delivery receipts; for a redo, the graded message. */
+	/** Incoming Telegram message id for delivery receipts. For a redo, the graded message. */
 	messageId?: number;
 	/** Message id the sender replied to. */
 	replyTo?: number;
@@ -983,8 +987,38 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
+	function readSentRecord(id: number): SentRecord | null {
+		if (!isTelegramMessageId(id)) return null;
+		try {
+			const parsed = JSON.parse(readFileSync(join(SENT_DIR, `${id}.json`), "utf8")) as unknown;
+			if (parsed === null || typeof parsed !== "object") return null;
+			const candidate = parsed as Partial<SentRecord>;
+			const session = candidate.session as Partial<SentRecord["session"]> | undefined;
+			if (
+				candidate.version !== 1 ||
+				candidate.id !== id ||
+				typeof candidate.at !== "number" ||
+				typeof candidate.kind !== "string" ||
+				!Object.hasOwn(SENT_KINDS, candidate.kind) ||
+				typeof candidate.text !== "string" ||
+				session === undefined ||
+				typeof session.id !== "string" ||
+				typeof session.tag !== "string" ||
+				typeof session.emoji !== "string" ||
+				typeof session.name !== "string" ||
+				typeof session.cwd !== "string"
+			) {
+				return null;
+			}
+			return candidate as SentRecord;
+		} catch {
+			return null;
+		}
+	}
+
 	/** Persists what one Telegram message currently says so a later reaction can recover it. */
 	function recordSent(id: number, kind: SentKind, text: string, payload?: unknown): void {
+		if (!isTelegramMessageId(id)) return;
 		const name = badgeOverride.length > 0 ? badgeOverride : (sessionCtx?.sessionManager.getSessionName() ?? "");
 		const record: SentRecord = {
 			version: 1,
@@ -1001,7 +1035,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** New messages become reply targets and reaction records atomically with the successful send. */
 	function trackSent(sent: TelegramMessage | null, kind: SentKind, text: string, payload?: unknown): void {
-		if (typeof sent?.message_id !== "number") return;
+		if (!isTelegramMessageId(sent?.message_id)) return;
 		recentMessages.push(sent.message_id);
 		if (recentMessages.length > RECENT_MESSAGE_CAP) {
 			recentMessages.splice(0, recentMessages.length - RECENT_MESSAGE_CAP);
@@ -1039,9 +1073,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} else if (sent === null) {
 			pi.logger.warn("telegram: send refused", { method, description: refusal });
 		}
-		if (kind !== null && sent !== null) {
-			if (method === "sendMessage") trackSent(sent, kind, source, payload);
-			else if (typeof body.message_id === "number") recordSent(body.message_id, kind, source, payload);
+		if (sent !== null) {
+			if (method === "sendMessage" && kind !== null) {
+				trackSent(sent, kind, source, payload);
+			} else if (method === "editMessageText" && isTelegramMessageId(body.message_id)) {
+				const previous = readSentRecord(body.message_id);
+				const editedKind = kind ?? previous?.kind;
+				if (editedKind !== undefined) {
+					recordSent(body.message_id, editedKind, source, payload ?? previous?.payload);
+				}
+			}
 		}
 		return sent;
 	}
@@ -1311,7 +1352,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	let lastReap = 0;
 
-	/** Downloaded files are working input and sent messages a record for grading; neither is an archive. */
+	/** Downloaded files are working input, and sent messages are grading records. Neither is an archive. */
 	function reapOldFiles(): void {
 		if (Date.now() - lastReap < 3_600_000) return;
 		lastReap = Date.now();
@@ -2302,30 +2343,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			});
 			return;
 		}
-		let record: SentRecord | null = null;
-		try {
-			const parsed = JSON.parse(readFileSync(join(SENT_DIR, `${reaction.message_id}.json`), "utf8")) as unknown;
-			if (parsed !== null && typeof parsed === "object") {
-				const candidate = parsed as Partial<SentRecord>;
-				const session = candidate.session as Partial<SentRecord["session"]> | undefined;
-				if (
-					candidate.version === 1 &&
-					candidate.id === reaction.message_id &&
-					typeof candidate.at === "number" &&
-					typeof candidate.kind === "string" &&
-					Object.hasOwn(SENT_KINDS, candidate.kind) &&
-					typeof candidate.text === "string" &&
-					session !== undefined &&
-					typeof session.id === "string" &&
-					typeof session.tag === "string" &&
-					typeof session.emoji === "string" &&
-					typeof session.name === "string" &&
-					typeof session.cwd === "string"
-				) {
-					record = candidate as SentRecord;
-				}
-			}
-		} catch {}
+		if (!isTelegramMessageId(reaction.message_id)) {
+			pi.logger.warn("telegram: rejected a reaction with an invalid message id", { id: reaction.message_id });
+			return;
+		}
+		const record = readSentRecord(reaction.message_id);
 		if (record === null) {
 			await serviceNotice(
 				`Reaction error: that message is not on record, so the reaction was not kept; session messages stay gradable for ${SENT_KEEP_MS / 86_400_000} days.`,
@@ -3001,7 +3023,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					ackDelivered(entry.messageId);
 					continue;
 				}
-				// A grade on the open question answers it with the request to restate; a grade on any
+				// A grade on the open question answers it with the request to restate. A grade on any
 				// other message is a steer, which omp queues behind a running turn or starts one with.
 				if (entry.kind === "redo") {
 					if (ask !== null && ask.messageId === entry.messageId) {
@@ -3503,6 +3525,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					const name = nameOf(file.original, kind);
 					const fields: Record<string, string | number> = { ...base, caption: captionOf(name, index === 0) };
 					fields[kind] = "attach://f0";
+					let visibleCaption = String(fields.caption);
 					showUploading(file.photo ? "upload_photo" : "upload_document");
 					let sent = await uploadTelegram<TelegramMessage>(config, file.photo ? "sendPhoto" : "sendDocument", fields, [
 						{ field: "f0", name, data: file.data },
@@ -3519,6 +3542,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						sent = await uploadTelegram<TelegramMessage>(config, "sendDocument", retry, [
 							{ field: "f0", name: fallback, data: file.data },
 						]);
+						visibleCaption = String(retry.caption);
 					}
 					if (sent === null) {
 						return {
@@ -3526,7 +3550,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							isError: true,
 						};
 					}
-					trackSent(sent, "file", String(fields.caption));
+					trackSent(sent, "file", visibleCaption);
 					sentIds.push(sent.message_id);
 				}
 			}

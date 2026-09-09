@@ -3072,6 +3072,12 @@ check(
 	"a photo that falls back is named a document",
 	/__document__\S+__artefact\.png$/u.test(lastCall("sendDocument").files.f0),
 );
+const fallbackRecordId = record(fx.id).recent.at(-1);
+const fallbackRecord = JSON.parse(readFileSync(join(root, "notify-telegram/sent", `${fallbackRecordId}.json`), "utf8"));
+check(
+	"photo fallback records the caption Telegram accepted",
+	fallbackRecord.text === lastCall("sendDocument").body.caption,
+);
 
 // An uncompressed image needs no disguise: the caller asks for document delivery and the
 // original bytes go out under the standard name, extension intact.
@@ -6024,6 +6030,10 @@ check(
 	"the question's grade is on file",
 	feedbackLines().at(-1).grade === -3 && feedbackLines().at(-1).message.kind === "question",
 );
+check(
+	"settling a question records the text now visible in Telegram",
+	onRecord(askMessageId).text.includes(redone.details.customInput),
+);
 
 // An emoji outside the scale is recorded without a grade and the scale is shown.
 api.queued = [react(9005, statusId, ["\u{1F34C}"])];
@@ -6092,7 +6102,7 @@ check(
 	fb.steers.length === steersBeforeNotice && /nothing to redo/i.test(lastCall("sendMessage").body.text),
 );
 
-// A session that is gone cannot redo anything; the grade is still kept.
+// A session that is gone cannot redo anything. The grade is still kept.
 const gone = spawn("01a07001-0000-0000-0000-000000000000", "/home/dev/work/parser");
 await gone.fire("session_start");
 await gone.fire("input");
@@ -6117,6 +6127,26 @@ await fb.pump(200);
 check("a malformed sent record produces no feedback", feedbackLines().length === linesBeforeMalformed);
 check("and returns a reaction error", lastCall("sendMessage").body.text.includes("Reaction error"));
 
+// Runtime Telegram JSON must not turn a string-shaped message id into a ledger path.
+const traversalId = "../traversal";
+const traversalRecord = join(root, "notify-telegram/traversal.json");
+writeFileSync(
+	traversalRecord,
+	JSON.stringify({
+		version: 1,
+		id: traversalId,
+		at: 1,
+		kind: "status",
+		text: "outside the sent ledger",
+		session: { id: fb.id, tag: record(fb.id).tag, emoji: "", name: "", cwd: "" },
+	}),
+);
+const linesBeforeTraversal = feedbackLines().length;
+api.queued = [react(9013, traversalId, ["\u{1F44D}"])];
+await fb.pump(200);
+check("a traversal-shaped message id cannot escape the sent ledger", feedbackLines().length === linesBeforeTraversal);
+unlinkSync(traversalRecord);
+
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");
 const freshRecord = join(sentDir, "2.json");
@@ -6124,10 +6154,18 @@ writeFileSync(staleRecord, "{}");
 writeFileSync(freshRecord, "{}");
 const ninetyOneDaysAgo = (Date.now() - 91 * 24 * 3600 * 1000) / 1000;
 utimesSync(staleRecord, ninetyOneDaysAgo, ninetyOneDaysAgo);
+const staleMedia = join(mediaDir, "stale-retention.bin");
+const freshMedia = join(mediaDir, "fresh-retention.bin");
+writeFileSync(staleMedia, "");
+writeFileSync(freshMedia, "");
+const eightDaysAgo = (Date.now() - 8 * 24 * 3600 * 1000) / 1000;
+utimesSync(staleMedia, eightDaysAgo, eightDaysAgo);
 const sweeper = spawn("01a07002-0000-0000-0000-000000000000", "/home/dev/work/sweeper");
 await sweeper.fire("session_start");
 check("a record older than ninety days is swept", !existsSync(staleRecord));
 check("a younger record stays", existsSync(freshRecord));
+check("downloaded media older than seven days is swept", !existsSync(staleMedia));
+check("younger downloaded media stays", existsSync(freshMedia));
 
 // ------------------------------------------------------------ upstream_launch
 heading("upstream_launch");
