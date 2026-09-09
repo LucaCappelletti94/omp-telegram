@@ -2531,6 +2531,29 @@ delete process.env.TMUX;
 api.queued = [{ update_id: 614, message: { message_id: 85, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
 await ux.pump(250);
 check("fleet without tmux explains itself", lastCall("sendMessage").body.text.includes("No tmux server is reachable"));
+
+// Several omp sessions split into one window must each appear; a window-centric read hides all but the active pane.
+{
+	writeFileSync(
+		fakeTmux,
+		`#!/bin/sh\nif [ "$1" = list-panes ]; then\n\tprintf 'work\\t3\\t0\\t\\t\u03C0 \u280B Session A\\n'\n\tprintf 'work\\t3\\t0\\t\\t\u03C0 ! Session B\\n'\nelif [ "$1" = list-windows ]; then\n\tprintf 'work\\t3\\t0\\t\\t\u03C0 \u280B Session A\\n'\nfi\n`,
+		{ mode: 0o755 },
+	);
+	process.env.PATH = `${fakeBin}:${realPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	api.queued = [{ update_id: 615, message: { message_id: 86, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
+	await ux.pump(250);
+	const cohab = lastCall("sendMessage").body;
+	check(
+		"fleet lists every co-located omp pane, not just the window's active one",
+		typeof cohab.text === "string" &&
+			cohab.text.includes("Session A") &&
+			cohab.text.includes("Session B") &&
+			cohab.text.includes("1 working, 1 waiting for you"),
+	);
+	delete process.env.TMUX;
+	process.env.PATH = realPath;
+}
 process.env.PATH = realPath;
 
 // Red statuses pin until the next turn.
@@ -3779,6 +3802,10 @@ await orphanSess.fire("session_start");
 		"a telegram reply focuses the session's tmux window",
 		existsSync(tmuxLog) && readFileSync(tmuxLog, "utf8").includes("select-window -t %77"),
 	);
+	check(
+		"the reply also focuses the session's own pane, not just the window",
+		existsSync(tmuxLog) && readFileSync(tmuxLog, "utf8").includes("select-pane -t %77"),
+	);
 	rmSync(tmuxLog, { force: true });
 	typed();
 	writeFileSync(
@@ -3790,6 +3817,88 @@ await orphanSess.fire("session_start");
 		"no focus jump while the terminal is busy",
 		!existsSync(tmuxLog) || !readFileSync(tmuxLog, "utf8").includes("select-window"),
 	);
+	writeConfig();
+	process.env.PATH = oldPath;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+}
+
+// Closing from Telegram kills only this session's pane, never the whole window with its siblings.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const binDir = join(root, "fakebin-kill");
+	mkdirSync(binDir, { recursive: true });
+	const killLog = join(root, "tmux-kill.log");
+	rmSync(killLog, { force: true });
+	writeFileSync(
+		join(binDir, "tmux"),
+		`#!/bin/sh\necho "$@" >> ${killLog}\nif [ "$1" = display-message ]; then echo "@1"; fi\n`,
+		{ mode: 0o755 },
+	);
+	const oldPath = process.env.PATH;
+	process.env.PATH = `${binDir}:${oldPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	process.env.TMUX_PANE = "%77";
+	writeConfig();
+	const kc = spawn("01a06007-0000-0000-0000-000000000000", "/home/dev/work/paneclose");
+	await kc.fire("session_start");
+	await kc.fire("input");
+	await kc.tools
+		.get("notify_status")
+		.execute("k1", { summary: "All done.", urgency: "green" }, undefined, undefined, kc.ctx);
+	await kc.fire("session_stop");
+	await settle(150);
+	const tag = JSON.parse(readFileSync(join(sessionsDir, `${kc.id}.json`), "utf8")).tag;
+	writeFileSync(
+		join(inboxOf(kc.id), "3201.json"),
+		JSON.stringify({ kind: "callback", value: `k:${tag}`, messageId: 5757 }),
+	);
+	await kc.pump(250);
+	await settle(2300);
+	const killed = existsSync(killLog) ? readFileSync(killLog, "utf8") : "";
+	check("closing kills this session's own pane", killed.includes("kill-pane -t %77"));
+	check("closing never kills the shared window", !killed.includes("kill-window"));
+	writeConfig();
+	process.env.PATH = oldPath;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+}
+
+// A close press must shut the session down even when the pane id is unusable, and never issue a kill at a bad target.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const binDir = join(root, "fakebin-badpane");
+	mkdirSync(binDir, { recursive: true });
+	const killLog = join(root, "tmux-badpane.log");
+	rmSync(killLog, { force: true });
+	writeFileSync(join(binDir, "tmux"), `#!/bin/sh\necho "$@" >> ${killLog}\n`, { mode: 0o755 });
+	const oldPath = process.env.PATH;
+	process.env.PATH = `${binDir}:${oldPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	process.env.TMUX_PANE = "not-a-pane";
+	writeConfig();
+	const bp = spawn("01a06008-0000-0000-0000-000000000000", "/home/dev/work/badpane");
+	let shutdowns = 0;
+	bp.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await bp.fire("session_start");
+	await bp.fire("input");
+	await bp.tools
+		.get("notify_status")
+		.execute("b1", { summary: "All done.", urgency: "green" }, undefined, undefined, bp.ctx);
+	await bp.fire("session_stop");
+	await settle(150);
+	const tag = JSON.parse(readFileSync(join(sessionsDir, `${bp.id}.json`), "utf8")).tag;
+	writeFileSync(
+		join(inboxOf(bp.id), "3301.json"),
+		JSON.stringify({ kind: "callback", value: `k:${tag}`, messageId: 5858 }),
+	);
+	await bp.pump(250);
+	await settle(2300);
+	check("a close still shuts the session down when the pane id is unusable", shutdowns === 1);
+	const killed = existsSync(killLog) ? readFileSync(killLog, "utf8") : "";
+	check("an unusable pane id schedules no kill at all", !killed.includes("kill-pane"));
 	writeConfig();
 	process.env.PATH = oldPath;
 	delete process.env.TMUX;
@@ -4417,7 +4526,7 @@ heading("attention-first /fleet");
 			"#!/bin/sh",
 			'case "$1" in',
 			"  display-message) printf 'main\\t2\\n' ;;",
-			"  list-windows)",
+			"  list-panes)",
 			...rows.map((r) => `    printf 'main\\t${r[0]}\\t${r[1]}\\t${r[2]}\\t${r[3]}\\n'`),
 			"    ;;",
 			"esac",
@@ -5218,7 +5327,7 @@ heading("spinner frames match omp exactly");
 			"#!/bin/sh",
 			'case "$1" in',
 			"  display-message) printf 'main\\t0\\n' ;;",
-			"  list-windows)",
+			"  list-panes)",
 			...rows,
 			"    ;;",
 			"esac",
