@@ -6161,6 +6161,35 @@ check(
 );
 check("the chat says the settled question stayed closed", /already closed/i.test(lastCall("sendMessage").body.text));
 
+// A callback and reaction can share one poll batch. The callback settles first, so the queued redo is stale.
+const racedState = {};
+const racedAsk = fb.tools
+	.get("ask")
+	.execute("fb-race", singleQuestion, undefined, undefined, stubbornCtx(fb.ctx, racedState));
+await settle(150);
+const racedMessageId = api.nextMessage - 1;
+const racedButton = lastCall("sendMessage")
+	.body.reply_markup.inline_keyboard.flat()
+	.find((button) => button.callback_data?.startsWith("o:"));
+const steersBeforeRace = fb.steers.length;
+api.queued = [
+	{
+		update_id: 9015,
+		callback_query: {
+			id: "fb-race",
+			data: racedButton.callback_data,
+			from: { id: CHAT },
+			message: { message_id: racedMessageId, chat: { id: CHAT } },
+		},
+	},
+	react(9016, racedMessageId, ["\u{1F44E}"]),
+];
+await fb.pump(250);
+await fb.pump(250);
+const racedAnswer = await racedAsk;
+check("the earlier callback still answers the question", racedAnswer.details.selectedOptions.join() === "SQLite");
+check("the later queued redo cannot reopen it", fb.steers.length === steersBeforeRace);
+
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");
 const freshRecord = join(sentDir, "2.json");

@@ -361,6 +361,8 @@ interface InboxEntry {
 	value: string;
 	/** Incoming Telegram message id for delivery receipts. For a redo, the graded message. */
 	messageId?: number;
+	/** Original sent-message kind, used to reject a question redo that became stale in transit. */
+	targetKind?: SentKind;
 	/** Message id the sender replied to. */
 	replyTo?: number;
 	caption?: string;
@@ -2395,8 +2397,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			message: record,
 		};
 		appendFileSync(FEEDBACK_FILE, `${JSON.stringify(line)}\n`, { mode: 0o600 });
-		if (redo)
-			deliver(record.session.id, updateId, { kind: "redo", value: redoNote(record, emoji), messageId: record.id });
+		if (redo) {
+			deliver(record.session.id, updateId, {
+				kind: "redo",
+				value: redoNote(record, emoji),
+				messageId: record.id,
+				targetKind: record.kind,
+			});
+		}
 		if (ungraded.length > 0) {
 			const scale = REACTION_SCALE.map(([g, set]) => `${g > 0 ? "+" : ""}${g} ${set.join("")}`).join(" \u00B7 ");
 			await serviceNotice(
@@ -2926,11 +2934,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					continue;
 				}
 				// A reply or an answer means attention is on this session: put its window in front for the return.
-				if (
-					entry.kind === "text" ||
-					entry.kind === "redo" ||
-					(entry.kind === "callback" && !entry.value.startsWith("k:"))
-				) {
+				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
 					focusTmuxWindow();
 				}
 				// `replyOwed` is set where the entry reaches the agent, never before: an entry answered
@@ -3038,13 +3042,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				// A grade on the open question answers it with the request to restate. A grade on any
 				// other message is a steer, which omp queues behind a running turn or starts one with.
 				if (entry.kind === "redo") {
+					const standingStillOpen = entry.targetKind !== "standing" || standingQuestion?.messageId === entry.messageId;
 					if (ask !== null && ask.messageId === entry.messageId) {
+						focusTmuxWindow();
 						ask.custom[ask.index] = entry.value;
 						ask.selected[ask.index] = new Set<string>();
 						replyOwed = true;
 						await advance(ask);
 						continue;
 					}
+					if (entry.targetKind === "question" || !standingStillOpen) continue;
+					focusTmuxWindow();
 					pi.sendUserMessage(entry.value);
 					replyOwed = true;
 					continue;
