@@ -183,6 +183,37 @@ type TelegramReactionType =
 	| { type: "custom_emoji"; custom_emoji_id: string }
 	| { type: "paid" };
 
+type RedoTargetKind = Exclude<SentKind, "approval" | "notice">;
+const REDO_TARGET_KINDS: Readonly<Record<RedoTargetKind, true>> = {
+	status: true,
+	question: true,
+	standing: true,
+	snippet: true,
+	file: true,
+};
+
+function isRedoTargetKind(value: unknown): value is RedoTargetKind {
+	return typeof value === "string" && Object.hasOwn(REDO_TARGET_KINDS, value);
+}
+
+function gradeReaction(reaction: TelegramReactionType[]): {
+	emoji: string[];
+	grade: number | null;
+	ungraded: string[];
+} {
+	const emoji = reaction.map((item) =>
+		item.type === "emoji" ? item.emoji : item.type === "paid" ? "paid" : `custom:${item.custom_emoji_id}`,
+	);
+	let grade: number | null = null;
+	const ungraded: string[] = [];
+	for (const token of emoji) {
+		const value = REACTION_GRADES[token.replaceAll("\uFE0F", "")];
+		if (value === undefined) ungraded.push(token);
+		else grade = grade === null ? value : Math.min(grade, value);
+	}
+	return { emoji, grade: ungraded.length > 0 ? null : grade, ungraded };
+}
+
 const TYPING_MS = 5_000;
 const DRAFT_MS = 1_500;
 /** The party-popper send effect, verified against the live API; effects exist in private chats only. */
@@ -2548,8 +2579,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					typeof parsed.value !== "string" ||
 					parsed.value.length === 0 ||
 					!isTelegramMessageId(parsed.messageId) ||
-					typeof parsed.targetKind !== "string" ||
-					!Object.hasOwn(SENT_KINDS, parsed.targetKind) ||
+					!isRedoTargetKind(parsed.targetKind) ||
 					(parsed.targetQuestion !== undefined && typeof parsed.targetQuestion !== "boolean") ||
 					(parsed.targetPreEdit !== undefined && typeof parsed.targetPreEdit !== "boolean") ||
 					!("redo" in parsed.feedback) ||
@@ -2745,19 +2775,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			});
 			return false;
 		}
-		const emoji = reaction.new_reaction.map((item) =>
-			item.type === "emoji" ? item.emoji : item.type === "paid" ? "paid" : `custom:${item.custom_emoji_id}`,
-		);
-		let grade: number | null = null;
-		const ungraded: string[] = [];
-		for (const token of emoji) {
-			const value = REACTION_GRADES[token.replaceAll("\uFE0F", "")];
-			if (value === undefined) ungraded.push(token);
-			else grade = grade === null ? value : Math.min(grade, value);
-		}
-		if (ungraded.length > 0) grade = null;
+		const current = gradeReaction(reaction.new_reaction);
+		const previous = gradeReaction(reaction.old_reaction);
+		const { emoji, grade, ungraded } = current;
 		const agentWrote = record.kind !== "notice" && record.kind !== "approval";
-		const wantsRedo = grade !== null && grade <= REDO_GRADE;
+		const wantsRedo = grade !== null && grade <= REDO_GRADE && (previous.grade === null || grade < previous.grade);
 		const owner = wantsRedo && agentWrote ? readSessionRecord(record.session.id) : null;
 		const liveOwner = owner !== null && Date.now() - owner.heartbeat <= LOCK_STALE_MS;
 		const statusQuestion = isStatusQuestion(record);
@@ -2776,9 +2798,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			at: reaction.date * 1000,
 			messageId: reaction.message_id,
 			emoji,
-			previous: reaction.old_reaction.map((item) =>
-				item.type === "emoji" ? item.emoji : item.type === "paid" ? "paid" : `custom:${item.custom_emoji_id}`,
-			),
+			previous: previous.emoji,
 			grade,
 			redo,
 			message: record,
@@ -3445,6 +3465,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (typeof entry.value !== "string" || entry.value.length === 0) {
 					rmSync(processing, { force: true });
 					pi.logger.warn("notify-telegram: discarded an inbox entry with no value", { name, raw: clip(raw, 200) });
+					continue;
+				}
+				if (
+					entry.kind === "redo" &&
+					(!isTelegramMessageId(entry.messageId) ||
+						!isRedoTargetKind(entry.targetKind) ||
+						(entry.targetQuestion !== undefined && typeof entry.targetQuestion !== "boolean") ||
+						(entry.targetPreEdit !== undefined && typeof entry.targetPreEdit !== "boolean"))
+				) {
+					rmSync(processing, { force: true });
+					pi.logger.warn("notify-telegram: discarded a malformed redo entry", { name, raw: clip(raw, 200) });
 					continue;
 				}
 				if (entry.kind !== "redo") rmSync(processing, { force: true });

@@ -7071,6 +7071,26 @@ check(
 );
 rmSync(malformedStoredFile, { force: true });
 
+const malformedRedoFile = join(inboxOf(fb.id), "9040.json");
+const steersBeforeMalformedRedo = fb.steers.length;
+writeFileSync(
+	malformedRedoFile,
+	JSON.stringify({
+		kind: "redo",
+		value: "legacy ambiguous redo",
+		messageId: statusId,
+		targetQuestion: false,
+		targetPreEdit: false,
+	}),
+);
+await fb.pump(150);
+check(
+	"a redo without a known target kind is discarded",
+	!existsSync(malformedRedoFile) &&
+		fb.steers.length === steersBeforeMalformedRedo &&
+		fb.warns.at(-1).m.includes("malformed redo"),
+);
+
 const sentMarkerDir = join(root, "notify-telegram/sent-in-flight");
 mkdirSync(sentMarkerDir, { recursive: true });
 const staleEditMarker = join(sentMarkerDir, `edit-${statusId}-stale`);
@@ -7145,6 +7165,30 @@ api.queued = [react(9046, reactionFileId, ["\u{1F44E}"])];
 await ownershipPoller.pump(250);
 await fb.pump(150);
 check("negative file feedback requests notify_file", fb.steers.at(-1).text.includes("notify_file"));
+
+const steersBeforeStableNegative = fb.steers.length;
+api.queued = [react(9047, statusId, ["\u{1F44E}", "\u{1F44D}"], ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+await fb.pump(150);
+check(
+	"adding praise to an existing negative grade does not request another redo",
+	feedbackLines().at(-1).updateId === 9047 &&
+		feedbackLines().at(-1).grade === -2 &&
+		feedbackLines().at(-1).redo === false &&
+		fb.steers.length === steersBeforeStableNegative &&
+		inboxCount(fb.id) === 0,
+);
+
+api.queued = [react(9048, statusId, ["\u{1F4A9}"], ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+await fb.pump(150);
+check(
+	"a more-negative grade requests a fresh redo",
+	feedbackLines().at(-1).updateId === 9048 &&
+		feedbackLines().at(-1).grade === -3 &&
+		feedbackLines().at(-1).redo === true &&
+		fb.steers.length === steersBeforeStableNegative + 1,
+);
 
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");
