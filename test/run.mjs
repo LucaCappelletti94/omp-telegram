@@ -1,6 +1,6 @@
 // Full suite against a stubbed Telegram API; sends nothing.
 
-import {
+import fs, {
 	chmodSync,
 	existsSync,
 	mkdirSync,
@@ -13,6 +13,7 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -6367,6 +6368,95 @@ await ownershipPoller.pump(250);
 await fb.pump(250);
 check("another poller sees a newly accepted status question as open", feedbackLines().at(-1).redo === true);
 
+// A ledger observer stands in for another process polling at the exact publication boundary.
+const nativePublishSession = spawn("01a07006-0000-0000-0000-000000000000", "/home/dev/work/native-publish");
+await nativePublishSession.fire("session_start");
+const nativePublishState = {};
+const nativePublishMessageId = api.nextMessage;
+let nativeOwnerAtPublish;
+const realRenameSync = fs.renameSync;
+fs.renameSync = (from, to) => {
+	realRenameSync(from, to);
+	if (String(to) === join(sentDir, `${nativePublishMessageId}.json`)) {
+		nativeOwnerAtPublish = record(nativePublishSession.id).question;
+	}
+};
+syncBuiltinESMExports();
+const nativePublishAsk = nativePublishSession.tools
+	.get("ask")
+	.execute(
+		"fb-native-publish",
+		singleQuestion,
+		undefined,
+		undefined,
+		stubbornCtx(nativePublishSession.ctx, nativePublishState),
+	);
+await settle(150);
+fs.renameSync = realRenameSync;
+syncBuiltinESMExports();
+check(
+	"native question ownership exists when its ledger record becomes visible",
+	nativeOwnerAtPublish === nativePublishMessageId,
+);
+
+const nativePublishButton = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0];
+let nativeStateBeforeMarkerRemoval;
+const realRmSync = fs.rmSync;
+fs.rmSync = (path, options) => {
+	if (String(path).includes(`sent-in-flight/edit-${nativePublishMessageId}-`)) {
+		nativeStateBeforeMarkerRemoval = {
+			question: record(nativePublishSession.id).question,
+			text: onRecord(nativePublishMessageId).text,
+		};
+	}
+	return realRmSync(path, options);
+};
+syncBuiltinESMExports();
+writeFileSync(
+	join(inboxOf(nativePublishSession.id), "90260.json"),
+	JSON.stringify({ kind: "callback", value: nativePublishButton.callback_data }),
+);
+await nativePublishSession.pump(300);
+fs.rmSync = realRmSync;
+syncBuiltinESMExports();
+await nativePublishAsk;
+check(
+	"accepted settlement publishes closure before its edit marker disappears",
+	nativeStateBeforeMarkerRemoval?.question === null && nativeStateBeforeMarkerRemoval.text.includes("Answered"),
+);
+
+const standingPublishSession = spawn("01a07007-0000-0000-0000-000000000000", "/home/dev/work/standing-publish");
+await standingPublishSession.fire("session_start");
+const standingPublishMessageId = api.nextMessage;
+let standingOwnerAtPublish;
+fs.renameSync = (from, to) => {
+	realRenameSync(from, to);
+	if (String(to) === join(sentDir, `${standingPublishMessageId}.json`)) {
+		standingOwnerAtPublish = record(standingPublishSession.id).standing?.messageId;
+	}
+};
+syncBuiltinESMExports();
+await standingPublishSession.fire("input");
+await standingPublishSession.tools
+	.get("notify_status")
+	.execute(
+		"fb-standing-publish",
+		{ summary: "Need a choice.", urgency: "orange", question: "Choose now?", options: opts("Choose", "Wait") },
+		undefined,
+		undefined,
+		standingPublishSession.ctx,
+	);
+await standingPublishSession.fire("session_stop");
+await settle(150);
+fs.renameSync = realRenameSync;
+syncBuiltinESMExports();
+check(
+	"standing question ownership exists when its ledger record becomes visible",
+	standingOwnerAtPublish === standingPublishMessageId,
+);
+await standingPublishSession.fire("input");
+await settle(150);
+
 // The ledger records the fallback Telegram accepted, not rejected entity source.
 api.rejectHtml = true;
 await fb.fire("input");
@@ -6472,6 +6562,7 @@ api.queued = [uploadReaction];
 await ownershipPoller.pump(250);
 check(
 	"a reaction awaiting an upload record does not advance the offset",
+
 	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === offsetBeforeUploadReaction,
 );
 releaseUpload();
@@ -6480,6 +6571,29 @@ await uploadWork;
 api.queued = [uploadReaction];
 await ownershipPoller.pump(250);
 check("feedback grades the accepted upload record", feedbackLines().at(-1).message.kind === "file");
+// A failed settlement edit leaves the visible native question open for another answer.
+const failedEditSession = spawn("01a07005-0000-0000-0000-000000000000", "/home/dev/work/failed-edit");
+await failedEditSession.fire("session_start");
+const failedEditState = {};
+const failedEditAsk = failedEditSession.tools
+	.get("ask")
+	.execute("fb-failed-edit", singleQuestion, undefined, undefined, stubbornCtx(failedEditSession.ctx, failedEditState));
+await settle(150);
+const failedEditQuestionId = api.nextMessage - 1;
+const failedEditButton = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0];
+api.failMethods = ["editMessageText"];
+api.queued = [answerButton(9030, failedEditQuestionId, failedEditButton.callback_data)];
+await ownershipPoller.pump(250);
+await failedEditSession.pump(250);
+check(
+	"a rejected settlement edit keeps question ownership open",
+	record(failedEditSession.id).question === failedEditQuestionId && failedEditState.aborted !== true,
+);
+api.failMethods = [];
+api.queued = [answerButton(9031, failedEditQuestionId, failedEditButton.callback_data)];
+await ownershipPoller.pump(250);
+await failedEditSession.pump(250);
+await failedEditAsk;
 // A new turn can begin while Telegram is still accepting the previous turn's question.
 await fb.fire("input");
 let releaseStatusSend;

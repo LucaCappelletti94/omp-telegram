@@ -1139,6 +1139,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					const previous = readSentRecord(body.message_id);
 					const editedKind = kind ?? previous?.kind;
 					if (editedKind !== undefined) {
+						beforeRecord?.(body.message_id);
+						if (beforeRecord !== undefined && sessionCtx !== null) writeSessionRecord(sessionCtx);
 						recordSent(body.message_id, editedKind, sentText, payload ?? previous?.payload);
 					}
 				}
@@ -2823,9 +2825,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			"",
 			"question",
 			{ context: ask.context, question },
+			(messageId) => {
+				ask.messageId = messageId;
+			},
 		);
-		ask.messageId = sentMessage?.message_id ?? null;
-		if (pendingAsk === ask) writeSessionRecord(ask.ctx);
+		if (sentMessage === null && pendingAsk === ask) {
+			ask.messageId = null;
+			writeSessionRecord(ask.ctx);
+		}
 	}
 
 	/** Settled options survive as dead grey buttons. `settled`, not `keep`, which now means an untruncatable tail. */
@@ -2834,6 +2841,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		head: string,
 		result: string,
 		settled?: InlineButton[][],
+		beforeRecord?: (messageId: number) => void,
 	): Promise<void> {
 		if (config === null || messageId === null) return;
 		const inline_keyboard =
@@ -2845,6 +2853,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			"editMessageText",
 			{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard } },
 			`${head}\n\n${result}`,
+			"",
+			null,
+			undefined,
+			beforeRecord,
 		);
 	}
 
@@ -2854,10 +2866,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		messageId: number | null,
 		result: string,
 		settled?: InlineButton[][],
+		beforeRecord?: (messageId: number) => void,
 	): Promise<void> {
 		const question = ask.questions[ask.index];
 		if (question === undefined) return;
-		await settleQuestionMessage(messageId, `${messageHead(ask.ctx)}\n\n${question.question}`, result, settled);
+		await settleQuestionMessage(
+			messageId,
+			`${messageHead(ask.ctx)}\n\n${question.question}`,
+			result,
+			settled,
+			beforeRecord,
+		);
 	}
 
 	/** Blocks nothing: a press starts the next turn. Only the latest stands. */
@@ -2895,6 +2914,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}),
 		);
 		if (recorded.urgency === "green") keyboard.push([closeSessionButton()]);
+		const labels = recorded.options.map((option) => option.label);
+		const publishStanding = (messageId: number): void => {
+			standingQuestion = { id, messageId, labels, head: settlementHead };
+		};
 		const sent = await sendStructured(
 			config,
 			{
@@ -2906,13 +2929,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			keep,
 			"standing",
 			recorded,
+			publishStanding,
 		);
-		standingQuestion = {
-			id,
-			messageId: sent?.message_id ?? null,
-			labels: recorded.options.map((option) => option.label),
-			head: settlementHead,
-		};
+		if (sent === null) standingQuestion = { id, messageId: null, labels, head: settlementHead };
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
 		if (recorded.urgency === "red") await pinRed(ctx, sent);
@@ -2934,16 +2953,32 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	async function advance(ask: PendingAsk): Promise<void> {
 		if (config === null) return;
+		const messageId = ask.messageId;
 		const answered = ask.questions[ask.index];
 		const chosen = [...(ask.selected[ask.index] ?? new Set<string>())];
 		const shown = ask.custom[ask.index] ?? (chosen.length === 0 ? "no selection" : chosen.join(", "));
+		let advanced = false;
+		const publishAdvance = (settledMessageId: number): void => {
+			if (pendingAsk !== ask || ask.messageId !== settledMessageId) return;
+			ask.messageId = null;
+			ask.index += 1;
+			advanced = true;
+		};
 		if (answered !== undefined) {
 			const labels = answered.options.map((option) => option.label);
-			await settleAskMessage(ask, ask.messageId, `**Answered:** ${shown}`, settledKeyboard(labels, new Set(chosen)));
+			await settleAskMessage(
+				ask,
+				messageId,
+				`**Answered:** ${shown}`,
+				settledKeyboard(labels, new Set(chosen)),
+				publishAdvance,
+			);
 		}
-		if (pendingAsk !== ask) return; // Settled at the terminal while the closing edit was in flight.
-		ask.messageId = null;
-		ask.index += 1;
+		if (!advanced) {
+			if (messageId !== null || pendingAsk !== ask || ask.messageId !== null) return;
+			ask.index += 1;
+			writeSessionRecord(ask.ctx);
+		}
 		if (ask.index >= ask.questions.length) {
 			ask.finish(collectResults(ask));
 			return;
@@ -3033,8 +3068,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (entry.kind === "command") {
 					if (entry.value === "hidequestions") {
 						if (ask !== null && ask.messageId !== null) {
-							await settleAskMessage(ask, ask.messageId, "Question hidden. It stays open at the terminal.");
-							ask.messageId = null;
+							await settleAskMessage(
+								ask,
+								ask.messageId,
+								"Question hidden. It stays open at the terminal.",
+								undefined,
+								(messageId) => {
+									if (pendingAsk === ask && ask.messageId === messageId) ask.messageId = null;
+								},
+							);
 						}
 						const standing = standingQuestion;
 						if (standing !== null) {
@@ -3299,10 +3341,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					ask,
 					ask.messageId,
 					aborted ? "Cancelled at the terminal." : "This question is no longer active.",
+					undefined,
+					(messageId) => {
+						if (pendingAsk === ask && ask.messageId === messageId) pendingAsk = null;
+					},
 				);
 				throw error;
 			} finally {
-				pendingAsk = null;
+				if (pendingAsk === ask) pendingAsk = null;
 				// The record still says "waiting on a question" until this runs, which would send
 				// the next plain message to a session that is no longer asking anything.
 				noteState();
