@@ -3373,7 +3373,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!existsSync(dir)) return 0;
 		let discarded = 0;
 		for (const name of readdirSync(dir)) {
-			if (!name.endsWith(".json")) continue;
+			if (!name.endsWith(".json") && !name.endsWith(".json.processing")) continue;
 			const path = join(dir, name);
 			try {
 				const entry: unknown = JSON.parse(readFileSync(path, "utf8"));
@@ -3407,26 +3407,34 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const dir = join(INBOX_DIR, sessionId);
 			if (!existsSync(dir)) return;
 			const names = readdirSync(dir)
-				.filter((entry) => entry.endsWith(".json"))
+				.filter((entry) => entry.endsWith(".json") || entry.endsWith(".json.processing"))
 				.sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10));
 			for (const name of names) {
-				const path = join(dir, name);
+				const queued = join(dir, name.endsWith(".processing") ? name.slice(0, -".processing".length) : name);
+				const processing = `${queued}.processing`;
+				if (!name.endsWith(".processing")) {
+					try {
+						renameSync(queued, processing);
+					} catch {
+						continue;
+					}
+				}
 				let raw = "";
 				try {
-					raw = readFileSync(path, "utf8");
-				} finally {
-					try {
-						unlinkSync(path);
-					} catch {}
+					raw = readFileSync(processing, "utf8");
+				} catch {
+					continue;
 				}
 				let parsed: unknown = null;
 				try {
 					parsed = JSON.parse(raw);
 				} catch {
+					rmSync(processing, { force: true });
 					pi.logger.warn("notify-telegram: discarded an unparseable inbox entry", { name });
 					continue;
 				}
 				if (parsed === null || typeof parsed !== "object") {
+					rmSync(processing, { force: true });
 					pi.logger.warn("notify-telegram: discarded an inbox entry that is not an object", {
 						name,
 						raw: clip(raw, 200),
@@ -3435,9 +3443,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 				const entry = parsed as Partial<InboxEntry>;
 				if (typeof entry.value !== "string" || entry.value.length === 0) {
+					rmSync(processing, { force: true });
 					pi.logger.warn("notify-telegram: discarded an inbox entry with no value", { name, raw: clip(raw, 200) });
 					continue;
 				}
+				if (entry.kind !== "redo") rmSync(processing, { force: true });
 				// A reply or an answer means attention is on this session: put its window in front for the return.
 				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
 					focusTmuxWindow();
@@ -3563,19 +3573,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						ask.custom[ask.index] = entry.value;
 						ask.selected[ask.index] = new Set<string>();
 						if (await advance(ask)) {
+							rmSync(processing, { force: true });
 							replyOwed = true;
 						} else {
-							const retryUpdateId = Number.parseInt(name, 10);
-							if (isTelegramMessageId(retryUpdateId)) {
-								deliver(sessionId, retryUpdateId, {
-									kind: "redo",
-									value: entry.value,
-									messageId: entry.messageId,
-									targetKind: entry.targetKind,
-									targetQuestion: entry.targetQuestion,
-									targetPreEdit: entry.targetPreEdit,
-								});
-							}
+							try {
+								renameSync(processing, queued);
+							} catch {}
 						}
 						continue;
 					}
@@ -3583,11 +3586,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						(entry.targetKind === "question" || !standingStillOpen || !statusStillOpen) &&
 						entry.targetPreEdit !== true
 					) {
+						rmSync(processing, { force: true });
 						continue;
 					}
 					if (entry.targetQuestion === true) closeReplyQuestion(entry.messageId);
 					focusTmuxWindow();
 					pi.sendUserMessage(entry.value);
+					rmSync(processing, { force: true });
 					replyOwed = true;
 					continue;
 				}

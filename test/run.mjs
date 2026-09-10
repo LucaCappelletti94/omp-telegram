@@ -6883,6 +6883,57 @@ check(
 		lastCall("sendMessage").body.text.includes("session ended"),
 );
 
+// A redo being used to settle a native question remains visible to shutdown until it reaches the agent.
+const settlementRaceSession = spawn("01a0700d-0000-0000-0000-000000000000", "/home/dev/work/settlement-race");
+await settlementRaceSession.fire("session_start");
+const settlementRaceState = {};
+const _settlementRaceAsk = settlementRaceSession.tools
+	.get("ask")
+	.execute(
+		"fb-settlement-race",
+		singleQuestion,
+		undefined,
+		undefined,
+		stubbornCtx(settlementRaceSession.ctx, settlementRaceState),
+	);
+await settle(150);
+const settlementRaceQuestionId = record(settlementRaceSession.id).question;
+const settlementRaceInbox = inboxOf(settlementRaceSession.id);
+const settlementRaceEntry = join(settlementRaceInbox, "90375.json");
+const settlementRaceProcessing = `${settlementRaceEntry}.processing`;
+writeFileSync(
+	settlementRaceEntry,
+	JSON.stringify({
+		kind: "redo",
+		value: "Restate the question after negative feedback.",
+		messageId: settlementRaceQuestionId,
+		targetKind: "question",
+		targetQuestion: false,
+		targetPreEdit: false,
+	}),
+);
+let releaseSettlementEdit;
+api.editMessageGate = new Promise((resolve) => {
+	releaseSettlementEdit = resolve;
+});
+const settlementRaceSteers = settlementRaceSession.steers.length;
+const settlingRaceRedo = settlementRaceSession.pump(250);
+await settle(50);
+check("a settling native redo remains visible in the inbox", existsSync(settlementRaceProcessing));
+await settlementRaceSession.fire("session_shutdown");
+check(
+	"shutdown reclassifies a native redo whose settlement is in flight",
+	record(settlementRaceSession.id).heartbeat === 0 &&
+		!existsSync(settlementRaceEntry) &&
+		!existsSync(settlementRaceProcessing) &&
+		settlementRaceSession.steers.length === settlementRaceSteers &&
+		lastCall("sendMessage").body.text.includes("session ended"),
+);
+releaseSettlementEdit();
+api.editMessageGate = null;
+await settlingRaceRedo;
+await settle(50);
+
 // Commit and shutdown serialize through the same owner lock, then a retry records the now-dead route honestly.
 const routeRaceSession = spawn("01a0700c-0000-0000-0000-000000000000", "/home/dev/work/route-race");
 const routeLockDir = join(root, "notify-telegram/reaction-route-locks");
