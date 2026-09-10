@@ -172,6 +172,9 @@ interface TelegramReaction {
 function isTelegramMessageId(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
+function isStateToken(value: unknown): value is string {
+	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value);
+}
 
 type TelegramReactionType =
 	| { type: "emoji"; emoji: string }
@@ -1023,7 +1026,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				!Object.hasOwn(SENT_KINDS, candidate.kind) ||
 				typeof candidate.text !== "string" ||
 				session === undefined ||
-				typeof session.id !== "string" ||
+				!isStateToken(session.id) ||
 				typeof session.tag !== "string" ||
 				typeof session.emoji !== "string" ||
 				typeof session.name !== "string" ||
@@ -2480,6 +2483,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function commitReactionTransaction(transaction: ReactionTransaction, target: string): void {
+		if (transaction.kind === "redo" && !isStateToken(target)) throw new Error("Unsafe reaction inbox target");
 		if (!feedbackHasUpdate(transaction.updateId)) {
 			appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
 		}

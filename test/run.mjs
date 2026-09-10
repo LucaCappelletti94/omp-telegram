@@ -5995,6 +5995,36 @@ check(
 check("a positive grade wakes nobody", inboxCount(fb.id) === 0 && called("sendMessage").length === sendsBeforePraise);
 check("the feedback log is private", (statSync(feedbackFile).mode & 0o777) === 0o600);
 
+// A private ledger file still cannot turn a session id into a path traversal.
+const unsafeSessionId = "../escape";
+const unsafeMessageId = 777_777;
+const unsafeOwnerFile = join(root, "notify-telegram/escape.json");
+const unsafeSentFile = join(sentDir, `${unsafeMessageId}.json`);
+writeFileSync(
+	unsafeOwnerFile,
+	JSON.stringify({ ...record(fb.id), id: unsafeSessionId, heartbeat: Date.now(), question: null }),
+);
+writeFileSync(
+	unsafeSentFile,
+	JSON.stringify({
+		...statusRecord,
+		id: unsafeMessageId,
+		session: { ...statusRecord.session, id: unsafeSessionId },
+	}),
+);
+const feedbackBeforeUnsafeSession = feedbackLines().length;
+api.queued = [react(8998, unsafeMessageId, ["\u{1F44E}"])];
+await fb.pump(200);
+check(
+	"an unsafe ledger session id is rejected before inbox routing",
+	feedbackLines().length === feedbackBeforeUnsafeSession &&
+		!existsSync(join(root, "notify-telegram/escape/8998.json")) &&
+		lastCall("sendMessage").body.text.includes("Reaction error"),
+);
+rmSync(unsafeOwnerFile, { force: true });
+rmSync(unsafeSentFile, { force: true });
+rmSync(join(root, "notify-telegram/escape"), { recursive: true, force: true });
+
 // A thumbs down on a status makes the agent write it again.
 api.queued = [react(9002, statusId, ["\u{1F44E}"], ["\u{1F44D}"])];
 await fb.pump(200);
