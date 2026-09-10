@@ -54,6 +54,7 @@ const INBOX_DIR = join(STATE_DIR, "inbox");
 const MEDIA_DIR = join(STATE_DIR, "media");
 /** Every session message as sent, keyed by message id: a reaction names only the id. */
 const SENT_DIR = join(STATE_DIR, "sent");
+const SENT_IN_FLIGHT_DIR = join(STATE_DIR, "sent-in-flight");
 /** One line per reaction change, holding the grade and the message it graded. */
 const FEEDBACK_FILE = join(STATE_DIR, "feedback.jsonl");
 /** The channel a process outside omp uses to ask one question and read its answer back. */
@@ -1026,6 +1027,29 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return null;
 		}
 	}
+	async function withSentRecordMarker<T>(work: () => Promise<T>): Promise<T> {
+		mkdirSync(SENT_IN_FLIGHT_DIR, { recursive: true, mode: 0o700 });
+		const marker = join(SENT_IN_FLIGHT_DIR, randomUUID());
+		writeFileSync(marker, "", { mode: 0o600 });
+		try {
+			return await work();
+		} finally {
+			rmSync(marker, { force: true });
+		}
+	}
+
+	function sentRecordInFlight(): boolean {
+		if (!existsSync(SENT_IN_FLIGHT_DIR)) return false;
+		let active = false;
+		for (const entry of readdirSync(SENT_IN_FLIGHT_DIR)) {
+			const marker = join(SENT_IN_FLIGHT_DIR, entry);
+			try {
+				if (Date.now() - statSync(marker).mtimeMs > LOCK_STALE_MS) unlinkSync(marker);
+				else active = true;
+			} catch {}
+		}
+		return active;
+	}
 
 	/** Persists what one Telegram message currently says so a later reaction can recover it. */
 	function recordSent(id: number, kind: SentKind, text: string, payload?: unknown): void {
@@ -1045,14 +1069,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/** New messages become reply targets and reaction records atomically with the successful send. */
-	function trackSent(sent: TelegramMessage | null, kind: SentKind, text: string, payload?: unknown): void {
+	function trackSent(
+		sent: TelegramMessage | null,
+		kind: SentKind,
+		text: string,
+		payload?: unknown,
+		beforeRecord?: (messageId: number) => void,
+	): void {
 		if (!isTelegramMessageId(sent?.message_id)) return;
 		recentMessages.push(sent.message_id);
 		if (recentMessages.length > RECENT_MESSAGE_CAP) {
 			recentMessages.splice(0, recentMessages.length - RECENT_MESSAGE_CAP);
 		}
-		recordSent(sent.message_id, kind, text, payload);
+		beforeRecord?.(sent.message_id);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+		recordSent(sent.message_id, kind, text, payload);
 	}
 
 	/** Retries markup failures as plain text and records only messages with a non-null `kind`. */
@@ -1064,38 +1095,45 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		keep = "",
 		kind: SentKind | null = null,
 		payload?: unknown,
+		beforeRecord?: (messageId: number) => void,
 	): Promise<TelegramMessage | null> {
-		const quiet = { link_preview_options: { is_disabled: true } };
-		const source = fitToTelegram(plain, keep);
-		let refusal = "";
-		let sent = await callTelegramRaw<TelegramMessage>(
-			cfg,
-			method,
-			{ ...quiet, ...body, text: toTelegramHtml(source), parse_mode: "HTML" },
-			15_000,
-			(failure) => {
-				refusal = failure.description;
-			},
-		);
-		if (sent === null && isMarkupFailure(refusal)) {
-			pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method, description: refusal });
-			const { message_effect_id: _effect, ...safe } = body;
-			sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: plainStamps(source) }, 15_000);
-		} else if (sent === null) {
-			pi.logger.warn("telegram: send refused", { method, description: refusal });
-		}
-		if (sent !== null) {
-			if (method === "sendMessage" && kind !== null) {
-				trackSent(sent, kind, source, payload);
-			} else if (method === "editMessageText" && isTelegramMessageId(body.message_id)) {
-				const previous = readSentRecord(body.message_id);
-				const editedKind = kind ?? previous?.kind;
-				if (editedKind !== undefined) {
-					recordSent(body.message_id, editedKind, source, payload ?? previous?.payload);
+		const work = async (): Promise<TelegramMessage | null> => {
+			const quiet = { link_preview_options: { is_disabled: true } };
+			const source = fitToTelegram(plain, keep);
+			let sentText = source;
+			let refusal = "";
+			let sent = await callTelegramRaw<TelegramMessage>(
+				cfg,
+				method,
+				{ ...quiet, ...body, text: toTelegramHtml(source), parse_mode: "HTML" },
+				15_000,
+				(failure) => {
+					refusal = failure.description;
+				},
+			);
+			if (sent === null && isMarkupFailure(refusal)) {
+				pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method, description: refusal });
+				const { message_effect_id: _effect, ...safe } = body;
+				const fallback = plainStamps(source);
+				sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: fallback }, 15_000);
+				sentText = fallback;
+			} else if (sent === null) {
+				pi.logger.warn("telegram: send refused", { method, description: refusal });
+			}
+			if (sent !== null) {
+				if (method === "sendMessage" && kind !== null) {
+					trackSent(sent, kind, sentText, payload, beforeRecord);
+				} else if (method === "editMessageText" && isTelegramMessageId(body.message_id)) {
+					const previous = readSentRecord(body.message_id);
+					const editedKind = kind ?? previous?.kind;
+					if (editedKind !== undefined) {
+						recordSent(body.message_id, editedKind, sentText, payload ?? previous?.payload);
+					}
 				}
 			}
-		}
-		return sent;
+			return sent;
+		};
+		return method === "sendMessage" && kind !== null ? await withSentRecordMarker(work) : await work();
 	}
 
 	/** What this session is doing right now, in the words `/status` uses. */
@@ -1648,20 +1686,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		keep: string,
 		kind: SentKind,
 		payload?: unknown,
+		beforeRecord?: (messageId: number) => void,
 	): Promise<TelegramMessage | null> {
 		if (/```|(^|\n)\|.+\|/.test(plain)) {
-			const sent = await callTelegram<TelegramMessage>(
-				cfg,
-				"sendRichMessage",
-				{ ...body, rich_message: { markdown: plain + keep } },
-				15_000,
-			);
-			if (sent !== null) {
-				trackSent(sent, kind, plain + keep, payload);
-				return sent;
-			}
+			const sent = await withSentRecordMarker(async () => {
+				const accepted = await callTelegram<TelegramMessage>(
+					cfg,
+					"sendRichMessage",
+					{ ...body, rich_message: { markdown: plain + keep } },
+					15_000,
+				);
+				if (accepted !== null) trackSent(accepted, kind, plain + keep, payload, beforeRecord);
+				return accepted;
+			});
+			if (sent !== null) return sent;
 		}
-		return await sendOrEdit(cfg, "sendMessage", body, plain, keep, kind, payload);
+		return await sendOrEdit(cfg, "sendMessage", body, plain, keep, kind, payload, beforeRecord);
 	}
 
 	/** `keep` is a short tail exempt from truncation, so an oversized body cannot swallow the usage footer. */
@@ -1673,6 +1713,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		extra: Record<string, unknown> = {},
 		keep = "",
 		payload?: unknown,
+		beforeRecord?: (messageId: number) => void,
 	): Promise<TelegramMessage | null> {
 		if (config === null) return null;
 		const sent = await sendStructured(
@@ -1682,6 +1723,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			keep,
 			kind,
 			payload,
+			beforeRecord,
 		);
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
@@ -2362,7 +2404,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/** Records each reaction change and requests a rewrite for strongly negative grades on agent messages. */
-	async function handleReaction(cfg: Config, updateId: number, reaction: TelegramReaction): Promise<void> {
+	async function handleReaction(cfg: Config, updateId: number, reaction: TelegramReaction): Promise<false | undefined> {
 		if (reaction.chat.id !== cfg.chatId || reaction.user?.id !== cfg.chatId) {
 			pi.logger.warn("telegram: rejected a reaction from an unexpected origin", {
 				chat: reaction.chat.id,
@@ -2375,6 +2417,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 		const record = readSentRecord(reaction.message_id);
+		if (record === null && sentRecordInFlight()) return false;
 		if (record === null) {
 			await serviceNotice(
 				`Reaction error: that message is not on record, so the reaction was not kept; session messages stay gradable for ${SENT_KEEP_MS / 86_400_000} days.`,
@@ -2448,11 +2491,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<void> {
+	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<false | undefined> {
 		const callback = update.callback_query;
 		if (update.message_reaction !== undefined) {
-			await handleReaction(cfg, update.update_id, update.message_reaction);
-			return;
+			return await handleReaction(cfg, update.update_id, update.message_reaction);
 		}
 		if (callback !== undefined && callback.data !== undefined) {
 			if (callback.message?.chat.id !== cfg.chatId || callback.from?.id !== cfg.chatId) {
@@ -2692,9 +2734,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (!ownsLock()) return;
 			let highest = config.offset - 1;
 			for (const update of updates) {
-				highest = Math.max(highest, update.update_id);
 				try {
-					await handleUpdate(config, update);
+					const handled = await handleUpdate(config, update);
+					if (handled === false) break;
 				} catch (error) {
 					// One malformed or failing update must not wedge the batch: the offset still advances.
 					pi.logger.warn("notify-telegram: skipped a malformed update", {
@@ -2702,6 +2744,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						error: error instanceof Error ? error.message : String(error),
 					});
 				}
+				highest = Math.max(highest, update.update_id);
 			}
 			config.offset = highest + 1;
 			persistOffset(config.offset);
@@ -4207,17 +4250,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
 				const replyQuestionToken = recorded.question === undefined ? null : ++replyQuestionGeneration;
-				const work = notify(ctx, "status", heads[recorded.urgency], body, extra, usageFooter(), recorded).then(
-					(sent) => {
-						const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
-						const currentReplyQuestion = replyQuestionToken !== null && replyQuestionToken === replyQuestionGeneration;
-						if (currentReplyQuestion) replyQuestionMessageId = messageId;
-						if (recorded.urgency === "green") closeOfferMessageId = messageId;
-						if (currentReplyQuestion || recorded.urgency === "green") writeSessionRecord(ctx);
-						if (recorded.urgency === "red") return pinRed(ctx, sent);
-						return undefined;
-					},
-				);
+				const registerReplyQuestion = (messageId: number): void => {
+					if (replyQuestionToken === replyQuestionGeneration) replyQuestionMessageId = messageId;
+				};
+				const work = notify(
+					ctx,
+					"status",
+					heads[recorded.urgency],
+					body,
+					extra,
+					usageFooter(),
+					recorded,
+					replyQuestionToken === null ? undefined : registerReplyQuestion,
+				).then((sent) => {
+					const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
+					if (recorded.urgency === "green") {
+						closeOfferMessageId = messageId;
+						writeSessionRecord(ctx);
+					}
+					if (recorded.urgency === "red") return pinRed(ctx, sent);
+					return undefined;
+				});
 				detach(work, "turn-end notice");
 				return;
 			}

@@ -6093,7 +6093,7 @@ check("silently", called("sendMessage").length === sendsBeforeRemoval && inboxCo
 
 // A message not on record cannot be graded, and the chat says so.
 const linesBeforeUnknown = feedbackLines().length;
-api.queued = [react(9008, 424242, ["\u{1F44D}"])];
+api.queued = [react(9008, 1, ["\u{1F44D}"])];
 await fb.pump(200);
 check("a reaction to a message not on record is not recorded", feedbackLines().length === linesBeforeUnknown);
 check("and the chat is told why", /not on record/.test(lastCall("sendMessage").body.text));
@@ -6325,6 +6325,68 @@ api.queued = [replyTo(9024, statusId, "An unrelated follow-up")];
 await fb.pump(250);
 await fb.pump(250);
 check("a reply to an older message leaves the newer question open", record(fb.id).replyQuestion === newerStatusId);
+// A poller in another process can observe the reaction as soon as Telegram accepts the send.
+const ownershipPoller = spawn("01a07003-0000-0000-0000-000000000000", "/home/dev/work/poller");
+await ownershipPoller.fire("session_start");
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+ownershipPoller.heartbeat();
+await fb.fire("input");
+let releaseOwnedSend;
+api.sendMessageGate = new Promise((resolve) => {
+	releaseOwnedSend = resolve;
+});
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-owned-status",
+		{ summary: "Need an immediate decision.", urgency: "orange", question: "Keep ownership?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+const ownedStatusId = api.nextMessage;
+await fb.fire("session_stop");
+await settle(50);
+const ownedReaction = react(9025, ownedStatusId, ["\u{1F44E}"]);
+const offsetBeforeOwnedReaction = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+api.queued = [ownedReaction];
+await ownershipPoller.pump(250);
+check(
+	"a reaction awaiting its sent record does not advance the offset",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === offsetBeforeOwnedReaction,
+);
+releaseOwnedSend();
+api.sendMessageGate = null;
+await settle(50);
+api.queued = [ownedReaction];
+await ownershipPoller.pump(250);
+await fb.pump(250);
+check("another poller sees a newly accepted status question as open", feedbackLines().at(-1).redo === true);
+
+// The ledger records the fallback Telegram accepted, not rejected entity source.
+api.rejectHtml = true;
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-plain-ledger",
+		{ summary: 'Clock <tg-time unix="1" format="r">then</tg-time>.', urgency: "green" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+api.rejectHtml = false;
+const plainStatusId = record(fb.id).recent.at(-1);
+const acceptedPlainText = lastCall("sendMessage").body.text;
+check(
+	"the ledger keeps the plain fallback Telegram displayed",
+	onRecord(plainStatusId).text === acceptedPlainText && !onRecord(plainStatusId).text.includes("<tg-time"),
+);
+api.queued = [react(9026, plainStatusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check("feedback embeds the displayed plain fallback", feedbackLines().at(-1).message.text === acceptedPlainText);
 // A new turn can begin while Telegram is still accepting the previous turn's question.
 await fb.fire("input");
 let releaseStatusSend;
