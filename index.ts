@@ -68,6 +68,8 @@ const BADGE_LOCK_FILE = join(STATE_DIR, "badge.lock");
 const HEARTBEAT_MS = 15_000;
 const LOCK_STALE_MS = 45_000;
 const DRAIN_MS = 1_000;
+/** Longer than two 120-second upload attempts plus the maximum one-off Telegram retry delay. */
+const SENT_MARKER_STALE_MS = 6 * 60_000;
 const BADGE_CLAIM_STALE_MS = 5_000;
 const LONG_POLL_S = 25;
 const STATUS_OPTIONS_MIN = 2;
@@ -1027,9 +1029,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return null;
 		}
 	}
-	async function withSentRecordMarker<T>(work: () => Promise<T>): Promise<T> {
+	async function withSentRecordMarker<T>(work: () => Promise<T>, messageId?: number): Promise<T> {
 		mkdirSync(SENT_IN_FLIGHT_DIR, { recursive: true, mode: 0o700 });
-		const marker = join(SENT_IN_FLIGHT_DIR, randomUUID());
+		const prefix = messageId === undefined ? "new" : `edit-${messageId}`;
+		const marker = join(SENT_IN_FLIGHT_DIR, `${prefix}-${randomUUID()}`);
 		writeFileSync(marker, "", { mode: 0o600 });
 		try {
 			return await work();
@@ -1038,14 +1041,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	function sentRecordInFlight(): boolean {
+	function sentRecordInFlight(messageId: number, includeNew: boolean): boolean {
 		if (!existsSync(SENT_IN_FLIGHT_DIR)) return false;
 		let active = false;
 		for (const entry of readdirSync(SENT_IN_FLIGHT_DIR)) {
 			const marker = join(SENT_IN_FLIGHT_DIR, entry);
 			try {
-				if (Date.now() - statSync(marker).mtimeMs > LOCK_STALE_MS) unlinkSync(marker);
-				else active = true;
+				if (Date.now() - statSync(marker).mtimeMs > SENT_MARKER_STALE_MS) unlinkSync(marker);
+				else if ((includeNew && entry.startsWith("new-")) || entry.startsWith(`edit-${messageId}-`)) active = true;
 			} catch {}
 		}
 		return active;
@@ -1133,7 +1136,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			return sent;
 		};
-		return method === "sendMessage" && kind !== null ? await withSentRecordMarker(work) : await work();
+		if (method === "sendMessage" && kind !== null) return await withSentRecordMarker(work);
+		const editedMessageId =
+			method === "editMessageText" &&
+			isTelegramMessageId(body.message_id) &&
+			(kind !== null || readSentRecord(body.message_id) !== null)
+				? body.message_id
+				: undefined;
+		return editedMessageId === undefined ? await work() : await withSentRecordMarker(work, editedMessageId);
 	}
 
 	/** What this session is doing right now, in the words `/status` uses. */
@@ -2416,8 +2426,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pi.logger.warn("telegram: rejected a reaction with an invalid message id", { id: reaction.message_id });
 			return;
 		}
-		const record = readSentRecord(reaction.message_id);
-		if (record === null && sentRecordInFlight()) return false;
+		let record = readSentRecord(reaction.message_id);
+		if (sentRecordInFlight(reaction.message_id, record === null)) return false;
+		record = readSentRecord(reaction.message_id) ?? record;
 		if (record === null) {
 			await serviceNotice(
 				`Reaction error: that message is not on record, so the reaction was not kept; session messages stay gradable for ${SENT_KEEP_MS / 86_400_000} days.`,
@@ -3519,6 +3530,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (config === null) {
 				return { content: [{ type: "text", text: "Error: Telegram is not configured" }], isError: true };
 			}
+			const cfg = config;
 			const requestedMode = typeof p.mode === "string" ? p.mode.trim().toLowerCase() : "";
 			const mode = requestedMode.length === 0 ? "auto" : requestedMode;
 			if (mode !== "auto" && mode !== "document") {
@@ -3600,19 +3612,28 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					caption: captionOf(names[index] ?? "", index === 0),
 				}));
 				showUploading("upload_photo");
-				const sent = await uploadTelegram<TelegramMessage[]>(
-					config,
-					"sendMediaGroup",
-					{ ...base, media: JSON.stringify(media) },
-					loaded.map((file, index) => ({ field: `f${index}`, name: names[index] ?? file.original, data: file.data })),
-				);
+				const sent = await withSentRecordMarker(async () => {
+					const accepted = await uploadTelegram<TelegramMessage[]>(
+						cfg,
+						"sendMediaGroup",
+						{ ...base, media: JSON.stringify(media) },
+						loaded.map((file, index) => ({
+							field: `f${index}`,
+							name: names[index] ?? file.original,
+							data: file.data,
+						})),
+					);
+					if (accepted !== null) {
+						for (const [index, message] of accepted.entries()) {
+							trackSent(message, "file", media[index]?.caption ?? "");
+						}
+					}
+					return accepted;
+				});
 				if (sent === null) {
 					return { content: [{ type: "text", text: "Error: Telegram rejected the album upload" }], isError: true };
 				}
-				for (const [index, message] of sent.entries()) {
-					trackSent(message, "file", media[index]?.caption ?? "");
-					sentIds.push(message.message_id);
-				}
+				for (const message of sent) sentIds.push(message.message_id);
 			} else {
 				for (const [index, file] of loaded.entries()) {
 					const kind = file.photo ? "photo" : "document";
@@ -3621,30 +3642,36 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					fields[kind] = "attach://f0";
 					let visibleCaption = String(fields.caption);
 					showUploading(file.photo ? "upload_photo" : "upload_document");
-					let sent = await uploadTelegram<TelegramMessage>(config, file.photo ? "sendPhoto" : "sendDocument", fields, [
-						{ field: "f0", name, data: file.data },
-					]);
-					// Telegram rejects photos over its dimension limits; the same bytes go through as a document.
-					if (sent === null && file.photo) {
-						const fallback = nameOf(file.original, "document");
-						const retry: Record<string, string | number> = {
-							...base,
-							caption: captionOf(fallback, index === 0),
-							document: "attach://f0",
-						};
-						showUploading("upload_document");
-						sent = await uploadTelegram<TelegramMessage>(config, "sendDocument", retry, [
-							{ field: "f0", name: fallback, data: file.data },
-						]);
-						visibleCaption = String(retry.caption);
-					}
+					const sent = await withSentRecordMarker(async () => {
+						let accepted = await uploadTelegram<TelegramMessage>(
+							cfg,
+							file.photo ? "sendPhoto" : "sendDocument",
+							fields,
+							[{ field: "f0", name, data: file.data }],
+						);
+						// Telegram rejects photos over its dimension limits; the same bytes go through as a document.
+						if (accepted === null && file.photo) {
+							const fallback = nameOf(file.original, "document");
+							const retry: Record<string, string | number> = {
+								...base,
+								caption: captionOf(fallback, index === 0),
+								document: "attach://f0",
+							};
+							showUploading("upload_document");
+							accepted = await uploadTelegram<TelegramMessage>(cfg, "sendDocument", retry, [
+								{ field: "f0", name: fallback, data: file.data },
+							]);
+							visibleCaption = String(retry.caption);
+						}
+						if (accepted !== null) trackSent(accepted, "file", visibleCaption);
+						return accepted;
+					});
 					if (sent === null) {
 						return {
 							content: [{ type: "text", text: `Error: Telegram rejected the upload of ${file.path}` }],
 							isError: true,
 						};
 					}
-					trackSent(sent, "file", visibleCaption);
 					sentIds.push(sent.message_id);
 				}
 			}

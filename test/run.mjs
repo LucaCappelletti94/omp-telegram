@@ -40,6 +40,8 @@ const api = {
 	filePath: "documents/file_9.oga",
 	fileDownload: "ok",
 	sendMessageGate: null,
+	editMessageGate: null,
+	uploadGate: null,
 };
 globalThis.fetch = async (url, init) => {
 	if (String(url).includes("/file/bot")) {
@@ -62,6 +64,7 @@ globalThis.fetch = async (url, init) => {
 			}
 		}
 		api.calls.push({ method, body, files, bytes });
+		if (api.uploadGate !== null) await api.uploadGate;
 		if ((api.failMethods ?? []).includes(method)) {
 			return { ok: false, status: 400, json: async () => ({ ok: false, description: "failed by test" }) };
 		}
@@ -88,6 +91,7 @@ globalThis.fetch = async (url, init) => {
 		return { ok: false, status: 400, json: async () => ({ ok: false, description: "can't parse entities" }) };
 	}
 	if (method === "sendMessage" && api.sendMessageGate !== null) await api.sendMessageGate;
+	if (method === "editMessageText" && api.editMessageGate !== null) await api.editMessageGate;
 	const result =
 		method === "getUpdates"
 			? api.queued.splice(0, api.queued.length)
@@ -6387,6 +6391,87 @@ check(
 api.queued = [react(9026, plainStatusId, ["\u{1F44D}"])];
 await ownershipPoller.pump(250);
 check("feedback embeds the displayed plain fallback", feedbackLines().at(-1).message.text === acceptedPlainText);
+// Reactions wait while an existing sent-message record is being replaced by an accepted edit.
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-edited-ledger",
+		{ summary: "Choose one.", urgency: "orange", question: "Keep the edit?", options: opts("Keep", "Drop") },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+const editedStatusId = record(fb.id).recent.at(-1);
+let releaseEdit;
+api.editMessageGate = new Promise((resolve) => {
+	releaseEdit = resolve;
+});
+await fb.fire("input");
+await settle(50);
+const editReaction = react(9027, editedStatusId, ["\u{1F44D}"]);
+const offsetBeforeEditReaction = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+api.queued = [editReaction];
+await ownershipPoller.pump(250);
+check(
+	"a reaction awaiting a message edit does not advance the offset",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === offsetBeforeEditReaction,
+);
+releaseEdit();
+api.editMessageGate = null;
+await settle(50);
+api.queued = [editReaction];
+await ownershipPoller.pump(250);
+check(
+	"feedback grades the accepted edited text",
+	feedbackLines().at(-1).message.text.includes("Answered at the terminal"),
+);
+
+// Media uploads hold the same publication marker until their sent records exist.
+const uploadSession = spawn("01a07004-0000-0000-0000-000000000000", root);
+await uploadSession.fire("session_start");
+const reactionUpload = join(root, "reaction-upload.png");
+writeFileSync(reactionUpload, "png-bytes");
+let releaseUpload;
+api.uploadGate = new Promise((resolve) => {
+	releaseUpload = resolve;
+});
+const uploadedMessageId = api.nextMessage;
+const uploadWork = uploadSession.tools
+	.get("notify_file")
+	.execute(
+		"fb-upload-ledger",
+		{ paths: [reactionUpload], caption: "Reaction upload" },
+		undefined,
+		undefined,
+		uploadSession.ctx,
+	);
+await settle(50);
+const unrelatedUploadReaction = react(9028, statusId, ["\u{1F44D}"]);
+const offsetBeforeUnrelatedReaction = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+api.queued = [unrelatedUploadReaction];
+await ownershipPoller.pump(250);
+check(
+	"an unrelated recorded message is graded during an upload",
+	feedbackLines().at(-1).messageId === statusId &&
+		JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset > offsetBeforeUnrelatedReaction,
+);
+const uploadReaction = react(9029, uploadedMessageId, ["\u{1F44D}"]);
+const offsetBeforeUploadReaction = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+api.queued = [uploadReaction];
+await ownershipPoller.pump(250);
+check(
+	"a reaction awaiting an upload record does not advance the offset",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === offsetBeforeUploadReaction,
+);
+releaseUpload();
+api.uploadGate = null;
+await uploadWork;
+api.queued = [uploadReaction];
+await ownershipPoller.pump(250);
+check("feedback grades the accepted upload record", feedbackLines().at(-1).message.kind === "file");
 // A new turn can begin while Telegram is still accepting the previous turn's question.
 await fb.fire("input");
 let releaseStatusSend;
