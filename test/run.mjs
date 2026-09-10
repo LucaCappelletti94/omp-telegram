@@ -6713,6 +6713,34 @@ check(
 	"a published pending redo stays single on later redelivery",
 	feedbackLines().filter((entry) => entry.updateId === 9033).length === 1 && fb.steers.length === publishSteers + 1,
 );
+
+// A transient settlement failure requeues a redo because the user cannot resend the same update.
+const redoRetrySession = spawn("01a07008-0000-0000-0000-000000000000", "/home/dev/work/redo-retry");
+await redoRetrySession.fire("session_start");
+const redoRetryState = {};
+const redoRetryAsk = redoRetrySession.tools
+	.get("ask")
+	.execute("fb-redo-retry", singleQuestion, undefined, undefined, stubbornCtx(redoRetrySession.ctx, redoRetryState));
+await settle(150);
+const redoRetryMessageId = api.nextMessage - 1;
+api.queued = [react(9034, redoRetryMessageId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+api.failMethods = ["editMessageText"];
+await redoRetrySession.pump(250);
+check(
+	"a redo survives a rejected settlement edit",
+	record(redoRetrySession.id).question === redoRetryMessageId &&
+		inboxCount(redoRetrySession.id) === 1 &&
+		redoRetryState.aborted !== true,
+);
+api.failMethods = [];
+await redoRetrySession.pump(250);
+const redoRetryResult = await redoRetryAsk;
+check(
+	"the requeued redo reaches the blocked ask after settlement recovers",
+	redoRetryResult.details.customInput.includes("reacted") &&
+		feedbackLines().filter((entry) => entry.updateId === 9034).length === 1,
+);
 // A new turn can begin while Telegram is still accepting the previous turn's question.
 await fb.fire("input");
 let releaseStatusSend;
@@ -6735,6 +6763,35 @@ releaseStatusSend();
 api.sendMessageGate = null;
 await settle(150);
 check("a late status send cannot reopen a superseded question", record(fb.id).replyQuestion === null);
+
+// Detached sends retain the metadata that accompanied their outgoing text.
+const metadataSession = spawn("01a07009-0000-0000-0000-000000000000", "/home/dev/work/metadata", "Before send");
+await metadataSession.fire("session_start");
+await metadataSession.fire("input");
+await metadataSession.tools
+	.get("notify_status")
+	.execute(
+		"fb-metadata",
+		{ summary: "Metadata snapshot.", urgency: "green" },
+		undefined,
+		undefined,
+		metadataSession.ctx,
+	);
+let releaseMetadataSend;
+api.sendMessageGate = new Promise((resolve) => {
+	releaseMetadataSend = resolve;
+});
+await metadataSession.fire("session_stop");
+await settle(50);
+metadataSession.setTitle("After send");
+releaseMetadataSend();
+api.sendMessageGate = null;
+await settle(150);
+const metadataMessageId = record(metadataSession.id).recent.at(-1);
+check(
+	"a sent record keeps the session metadata from before its network wait",
+	onRecord(metadataMessageId).session.name === "Before send",
+);
 
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");

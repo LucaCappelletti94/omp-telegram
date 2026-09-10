@@ -1072,17 +1072,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return active;
 	}
 
-	/** Persists what one Telegram message currently says so a later reaction can recover it. */
-	function recordSent(id: number, kind: SentKind, text: string, payload?: unknown): void {
-		if (!isTelegramMessageId(id)) return;
+	function snapshotSentSession(): SentRecord["session"] {
 		const name = badgeOverride.length > 0 ? badgeOverride : (sessionCtx?.sessionManager.getSessionName() ?? "");
+		return { id: sessionId, tag: sessionTag, emoji: badgeEmoji, name, cwd: sessionCtx?.cwd ?? "" };
+	}
+
+	/** Persists what one Telegram message currently says so a later reaction can recover it. */
+	function recordSent(
+		id: number,
+		kind: SentKind,
+		text: string,
+		sentSession: SentRecord["session"],
+		payload?: unknown,
+	): void {
+		if (!isTelegramMessageId(id)) return;
 		const record: SentRecord = {
 			version: 1,
 			id,
 			at: Date.now(),
 			kind,
 			text,
-			session: { id: sessionId, tag: sessionTag, emoji: badgeEmoji, name, cwd: sessionCtx?.cwd ?? "" },
+			session: sentSession,
 		};
 		if (payload !== undefined) record.payload = payload;
 		mkdirSync(SENT_DIR, { recursive: true, mode: 0o700 });
@@ -1094,6 +1104,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		sent: TelegramMessage | null,
 		kind: SentKind,
 		text: string,
+		sentSession: SentRecord["session"],
 		payload?: unknown,
 		beforeRecord?: (messageId: number) => void,
 	): void {
@@ -1104,7 +1115,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		beforeRecord?.(sent.message_id);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-		recordSent(sent.message_id, kind, text, payload);
+		recordSent(sent.message_id, kind, text, sentSession, payload);
 	}
 
 	/** Retries markup failures as plain text and records only messages with a non-null `kind`. */
@@ -1117,6 +1128,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		kind: SentKind | null = null,
 		payload?: unknown,
 		beforeRecord?: (messageId: number) => void,
+		sentSession = snapshotSentSession(),
 	): Promise<TelegramMessage | null> {
 		const work = async (): Promise<TelegramMessage | null> => {
 			const quiet = { link_preview_options: { is_disabled: true } };
@@ -1143,14 +1155,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			if (sent !== null) {
 				if (method === "sendMessage" && kind !== null) {
-					trackSent(sent, kind, sentText, payload, beforeRecord);
+					trackSent(sent, kind, sentText, sentSession, payload, beforeRecord);
 				} else if (method === "editMessageText" && isTelegramMessageId(body.message_id)) {
 					const previous = readSentRecord(body.message_id);
 					const editedKind = kind ?? previous?.kind;
 					if (editedKind !== undefined) {
 						beforeRecord?.(body.message_id);
 						if (beforeRecord !== undefined && sessionCtx !== null) writeSessionRecord(sessionCtx);
-						recordSent(body.message_id, editedKind, sentText, payload ?? previous?.payload);
+						recordSent(body.message_id, editedKind, sentText, sentSession, payload ?? previous?.payload);
 					}
 				}
 			}
@@ -1718,6 +1730,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		payload?: unknown,
 		beforeRecord?: (messageId: number) => void,
 	): Promise<TelegramMessage | null> {
+		const sentSession = snapshotSentSession();
 		if (/```|(^|\n)\|.+\|/.test(plain)) {
 			const sent = await withSentRecordMarker(async () => {
 				const accepted = await callTelegram<TelegramMessage>(
@@ -1726,12 +1739,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					{ ...body, rich_message: { markdown: plain + keep } },
 					15_000,
 				);
-				if (accepted !== null) trackSent(accepted, kind, plain + keep, payload, beforeRecord);
+				if (accepted !== null) trackSent(accepted, kind, plain + keep, sentSession, payload, beforeRecord);
 				return accepted;
 			});
 			if (sent !== null) return sent;
 		}
-		return await sendOrEdit(cfg, "sendMessage", body, plain, keep, kind, payload, beforeRecord);
+		return await sendOrEdit(cfg, "sendMessage", body, plain, keep, kind, payload, beforeRecord, sentSession);
 	}
 
 	/** `keep` is a short tail exempt from truncation, so an oversized body cannot swallow the usage footer. */
@@ -3066,8 +3079,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}));
 	}
 
-	async function advance(ask: PendingAsk): Promise<void> {
-		if (config === null) return;
+	async function advance(ask: PendingAsk): Promise<boolean> {
+		if (config === null) return false;
 		const messageId = ask.messageId;
 		const answered = ask.questions[ask.index];
 		const chosen = [...(ask.selected[ask.index] ?? new Set<string>())];
@@ -3090,13 +3103,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			);
 		}
 		if (!advanced) {
-			if (messageId !== null || pendingAsk !== ask || ask.messageId !== null) return;
+			if (messageId !== null) return pendingAsk !== ask || ask.messageId !== messageId;
+			if (pendingAsk !== ask || ask.messageId !== null) return true;
 			ask.index += 1;
 			writeSessionRecord(ask.ctx);
 		}
 		if (ask.index >= ask.questions.length) {
 			ask.finish(collectResults(ask));
-			return;
+			return true;
 		}
 		await presentQuestion(ask, false);
 		if (pendingAsk !== ask) {
@@ -3104,6 +3118,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			await settleAskMessage(ask, ask.messageId, "This question is no longer active.");
 			ask.messageId = null;
 		}
+		return true;
 	}
 
 	async function applyCallback(ask: PendingAsk, payload: string): Promise<void> {
@@ -3296,8 +3311,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						focusTmuxWindow();
 						ask.custom[ask.index] = entry.value;
 						ask.selected[ask.index] = new Set<string>();
-						replyOwed = true;
-						await advance(ask);
+						if (await advance(ask)) {
+							replyOwed = true;
+						} else {
+							const retryUpdateId = Number.parseInt(name, 10);
+							if (isTelegramMessageId(retryUpdateId)) {
+								deliver(sessionId, retryUpdateId, {
+									kind: "redo",
+									value: entry.value,
+									messageId: entry.messageId,
+									targetKind: entry.targetKind,
+									targetQuestion: entry.targetQuestion,
+								});
+							}
+						}
 						continue;
 					}
 					if (entry.targetKind === "question" || !standingStillOpen || !statusStillOpen) continue;
@@ -3711,6 +3738,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			const requestedCaption = typeof p.caption === "string" ? p.caption.trim() : "";
 			const context = messageHead(ctx);
+			const sentSession = snapshotSentSession();
 			const separator = requestedCaption.length > 0 ? "\n\n" : "";
 			const at = Date.now();
 			const owner = fileOwner(sessionTag, badgeEmoji);
@@ -3795,7 +3823,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					);
 					if (accepted !== null) {
 						for (const [index, message] of accepted.entries()) {
-							trackSent(message, "file", media[index]?.caption ?? "");
+							trackSent(message, "file", media[index]?.caption ?? "", sentSession);
 						}
 					}
 					return accepted;
@@ -3833,7 +3861,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							]);
 							visibleCaption = String(retry.caption);
 						}
-						if (accepted !== null) trackSent(accepted, "file", visibleCaption);
+						if (accepted !== null) trackSent(accepted, "file", visibleCaption, sentSession);
 						return accepted;
 					});
 					if (sent === null) {
