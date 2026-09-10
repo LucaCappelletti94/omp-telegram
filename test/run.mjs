@@ -6967,6 +6967,39 @@ check(
 	fenceFailureThrown && !existsSync(fenceFailureClosing) && record(fenceFailureSession.id).heartbeat > 0,
 );
 await fenceFailureSession.fire("session_shutdown");
+const malformedStoredUpdate = 9039;
+const malformedStoredFile = join(root, `notify-telegram/reaction-pending/${malformedStoredUpdate}.json`);
+writeFileSync(
+	malformedStoredFile,
+	JSON.stringify({
+		transaction: 1,
+		updateId: malformedStoredUpdate,
+		feedback: {
+			updateId: malformedStoredUpdate,
+			redo: true,
+			message: onRecord(statusId),
+		},
+		kind: "redo",
+		value: "forged pre-edit redo",
+		messageId: statusId,
+		targetKind: "status",
+		targetQuestion: false,
+		targetPreEdit: "yes",
+	}),
+);
+const malformedStoredOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const feedbackBeforeMalformedStored = feedbackLines().length;
+api.queued = [react(malformedStoredUpdate, statusId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+check(
+	"a malformed stored redo cannot forge pre-edit eligibility",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === malformedStoredOffset &&
+		feedbackLines().length === feedbackBeforeMalformedStored &&
+		existsSync(malformedStoredFile) &&
+		inboxCount(fb.id) === 0,
+);
+rmSync(malformedStoredFile, { force: true });
+
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");
 const freshRecord = join(sentDir, "2.json");

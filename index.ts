@@ -2536,17 +2536,36 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				parsed.transaction !== 1 ||
 				parsed.updateId !== updateId ||
 				parsed.feedback === null ||
-				typeof parsed.feedback !== "object"
+				typeof parsed.feedback !== "object" ||
+				!("updateId" in parsed.feedback) ||
+				parsed.feedback.updateId !== updateId ||
+				(parsed.kind !== undefined && parsed.kind !== "redo")
 			) {
 				return null;
 			}
-			if (
-				parsed.kind === "redo" &&
-				(typeof parsed.value !== "string" ||
+			if (parsed.kind === "redo") {
+				if (
+					typeof parsed.value !== "string" ||
+					parsed.value.length === 0 ||
 					!isTelegramMessageId(parsed.messageId) ||
-					typeof parsed.targetKind !== "string")
-			) {
-				return null;
+					typeof parsed.targetKind !== "string" ||
+					!Object.hasOwn(SENT_KINDS, parsed.targetKind) ||
+					(parsed.targetQuestion !== undefined && typeof parsed.targetQuestion !== "boolean") ||
+					(parsed.targetPreEdit !== undefined && typeof parsed.targetPreEdit !== "boolean") ||
+					!("redo" in parsed.feedback) ||
+					parsed.feedback.redo !== true ||
+					!("message" in parsed.feedback)
+				) {
+					return null;
+				}
+				const message = parseSentRecord(parsed.feedback.message, parsed.messageId);
+				if (
+					message === null ||
+					message.kind !== parsed.targetKind ||
+					parsed.targetQuestion !== isStatusQuestion(message)
+				) {
+					return null;
+				}
 			}
 			return parsed as ReactionTransaction;
 		} catch {
@@ -2682,6 +2701,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pi.logger.warn("telegram: rejected a reaction with an invalid message id", { id: reaction.message_id });
 			return;
 		}
+		const pendingExists = existsSync(reactionTransactionFile(updateId));
 		const pending = readReactionTransaction(updateId);
 		if (pending !== null) {
 			try {
@@ -2699,6 +2719,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				return false;
 			}
 			return;
+		}
+		if (pendingExists) {
+			pi.logger.warn("telegram: rejected a malformed reaction transaction", { update: updateId });
+			return false;
 		}
 		const beforeEdit = recordBeforePendingEdit(reaction.message_id);
 		if (beforeEdit === null) return false;
