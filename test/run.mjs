@@ -6009,6 +6009,13 @@ check(
 	"the redo tells the agent which message to rewrite and through which tool",
 	fb.steers.length === 1 && fb.steers[0].text.includes("\u{1F44E}") && fb.steers[0].text.includes("notify_status"),
 );
+const feedbackAfterFirstRedo = feedbackLines().length;
+api.queued = [react(9002, statusId, ["\u{1F44E}"], ["\u{1F44D}"])];
+await fb.pump(200);
+check(
+	"a redelivered reaction update is recorded and dispatched only once",
+	feedbackLines().length === feedbackAfterFirstRedo && inboxCount(fb.id) === 0 && fb.steers.length === 1,
+);
 
 // A turn-end question without buttons gets the same phone-context correction as an ask.
 await fb.fire("input");
@@ -6594,6 +6601,88 @@ api.queued = [answerButton(9031, failedEditQuestionId, failedEditButton.callback
 await ownershipPoller.pump(250);
 await failedEditSession.pump(250);
 await failedEditAsk;
+
+// A staged redo survives a feedback append failure, then commits exactly once on redelivery.
+fb.heartbeat();
+const interruptedReaction = react(9032, statusId, ["\u{1F44E}"], ["\u{1F44D}"]);
+const interruptedOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const interruptedSteers = fb.steers.length;
+const realAppendFileSync = fs.appendFileSync;
+let rejectFeedbackAppend = true;
+fs.appendFileSync = (path, data, options) => {
+	if (rejectFeedbackAppend && String(path) === feedbackFile) {
+		rejectFeedbackAppend = false;
+		throw new Error("interrupted feedback append");
+	}
+	return realAppendFileSync(path, data, options);
+};
+syncBuiltinESMExports();
+api.queued = [interruptedReaction];
+await ownershipPoller.pump(250);
+fs.appendFileSync = realAppendFileSync;
+syncBuiltinESMExports();
+check(
+	"an uncommitted reaction leaves its update offset for retry",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === interruptedOffset &&
+		!feedbackLines().some((entry) => entry.updateId === 9032) &&
+		inboxCount(fb.id) === 0,
+);
+api.queued = [interruptedReaction];
+await ownershipPoller.pump(250);
+await fb.pump(250);
+check(
+	"a retried reaction commits its feedback and redo together",
+	feedbackLines().filter((entry) => entry.updateId === 9032).length === 1 && fb.steers.length === interruptedSteers + 1,
+);
+api.queued = [interruptedReaction];
+await ownershipPoller.pump(250);
+await fb.pump(250);
+check(
+	"a committed reaction redelivery produces no duplicate effects",
+	feedbackLines().filter((entry) => entry.updateId === 9032).length === 1 && fb.steers.length === interruptedSteers + 1,
+);
+
+const interruptedPublish = react(9033, statusId, ["\u{1F44E}"], ["\u{1F44D}"]);
+const publishOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const publishSteers = fb.steers.length;
+const realTransactionRename = fs.renameSync;
+let rejectTransactionPublish = true;
+fs.renameSync = (from, to) => {
+	if (
+		rejectTransactionPublish &&
+		String(from).endsWith("/reaction-pending/9033.json") &&
+		String(to).endsWith(`${fb.id}/9033.json`)
+	) {
+		rejectTransactionPublish = false;
+		throw new Error("interrupted redo publication");
+	}
+	return realTransactionRename(from, to);
+};
+syncBuiltinESMExports();
+api.queued = [interruptedPublish];
+await ownershipPoller.pump(250);
+fs.renameSync = realTransactionRename;
+syncBuiltinESMExports();
+check(
+	"a reaction committed before redo publication keeps its offset for retry",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === publishOffset &&
+		feedbackLines().filter((entry) => entry.updateId === 9033).length === 1 &&
+		inboxCount(fb.id) === 0,
+);
+api.queued = [interruptedPublish];
+await ownershipPoller.pump(250);
+await fb.pump(250);
+check(
+	"redelivery publishes a committed pending redo without another feedback row",
+	feedbackLines().filter((entry) => entry.updateId === 9033).length === 1 && fb.steers.length === publishSteers + 1,
+);
+api.queued = [interruptedPublish];
+await ownershipPoller.pump(250);
+await fb.pump(250);
+check(
+	"a published pending redo stays single on later redelivery",
+	feedbackLines().filter((entry) => entry.updateId === 9033).length === 1 && fb.steers.length === publishSteers + 1,
+);
 // A new turn can begin while Telegram is still accepting the previous turn's question.
 await fb.fire("input");
 let releaseStatusSend;

@@ -56,6 +56,7 @@ const MEDIA_DIR = join(STATE_DIR, "media");
 /** Every session message as sent, keyed by message id: a reaction names only the id. */
 const SENT_DIR = join(STATE_DIR, "sent");
 const SENT_IN_FLIGHT_DIR = join(STATE_DIR, "sent-in-flight");
+const REACTION_PENDING_DIR = join(STATE_DIR, "reaction-pending");
 /** One line per reaction change, holding the grade and the message it graded. */
 const FEEDBACK_FILE = join(STATE_DIR, "feedback.jsonl");
 /** The channel a process outside omp uses to ask one question and read its answer back. */
@@ -375,6 +376,11 @@ interface InboxEntry {
 	replyTo?: number;
 	caption?: string;
 	mime?: string;
+}
+interface ReactionTransaction extends Partial<InboxEntry> {
+	transaction: 1;
+	updateId: number;
+	feedback: Record<string, unknown>;
 }
 
 interface IncomingFile {
@@ -2424,6 +2430,69 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	function feedbackHasUpdate(updateId: number): boolean {
+		let raw = "";
+		try {
+			raw = readFileSync(FEEDBACK_FILE, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+		for (const row of raw.split("\n")) {
+			if (row.length === 0) continue;
+			try {
+				const candidate = JSON.parse(row) as { updateId?: unknown };
+				if (candidate.updateId === updateId) return true;
+			} catch {}
+		}
+		return false;
+	}
+
+	function reactionTransactionFile(updateId: number): string {
+		return join(REACTION_PENDING_DIR, `${updateId}.json`);
+	}
+
+	function readReactionTransaction(updateId: number): ReactionTransaction | null {
+		try {
+			const parsed = JSON.parse(
+				readFileSync(reactionTransactionFile(updateId), "utf8"),
+			) as Partial<ReactionTransaction>;
+			if (
+				parsed.transaction !== 1 ||
+				parsed.updateId !== updateId ||
+				parsed.feedback === null ||
+				typeof parsed.feedback !== "object"
+			) {
+				return null;
+			}
+			if (
+				parsed.kind === "redo" &&
+				(typeof parsed.value !== "string" ||
+					!isTelegramMessageId(parsed.messageId) ||
+					typeof parsed.targetKind !== "string")
+			) {
+				return null;
+			}
+			return parsed as ReactionTransaction;
+		} catch {
+			return null;
+		}
+	}
+
+	function commitReactionTransaction(transaction: ReactionTransaction, target: string): void {
+		if (!feedbackHasUpdate(transaction.updateId)) {
+			appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
+		}
+		const pending = reactionTransactionFile(transaction.updateId);
+		if (transaction.kind === "redo") {
+			const dir = join(INBOX_DIR, target);
+			mkdirSync(dir, { recursive: true, mode: 0o700 });
+			renameSync(pending, join(dir, `${transaction.updateId}.json`));
+		} else {
+			rmSync(pending, { force: true });
+		}
+	}
+
 	/** Records each reaction change and requests a rewrite for strongly negative grades on agent messages. */
 	async function handleReaction(cfg: Config, updateId: number, reaction: TelegramReaction): Promise<false | undefined> {
 		if (reaction.chat.id !== cfg.chatId || reaction.user?.id !== cfg.chatId) {
@@ -2431,6 +2500,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				chat: reaction.chat.id,
 				from: reaction.user?.id,
 			});
+			return;
+		}
+		if (!isTelegramMessageId(updateId)) {
+			pi.logger.warn("telegram: rejected a reaction with an invalid update id", { id: updateId });
 			return;
 		}
 		if (!isTelegramMessageId(reaction.message_id)) {
@@ -2446,6 +2519,28 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				false,
 			);
 			return;
+		}
+		const pending = readReactionTransaction(updateId);
+		if (pending !== null) {
+			try {
+				commitReactionTransaction(pending, record.session.id);
+			} catch (error) {
+				pi.logger.warn("telegram: could not finish a reaction transaction", {
+					update: updateId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return false;
+			}
+			return;
+		}
+		try {
+			if (feedbackHasUpdate(updateId)) return;
+		} catch (error) {
+			pi.logger.warn("telegram: could not read reaction history", {
+				update: updateId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
 		}
 		const emoji = reaction.new_reaction.map((item) =>
 			item.type === "emoji" ? item.emoji : item.type === "paid" ? "paid" : `custom:${item.custom_emoji_id}`,
@@ -2485,15 +2580,31 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			redo,
 			message: record,
 		};
-		appendFileSync(FEEDBACK_FILE, `${JSON.stringify(line)}\n`, { mode: 0o600 });
-		if (redo) {
-			deliver(record.session.id, updateId, {
-				kind: "redo",
-				value: redoNote(record, emoji),
-				messageId: record.id,
-				targetKind: record.kind,
-				targetQuestion: statusQuestion,
+		const redoEntry: InboxEntry | undefined = redo
+			? {
+					kind: "redo",
+					value: redoNote(record, emoji),
+					messageId: record.id,
+					targetKind: record.kind,
+					targetQuestion: statusQuestion,
+				}
+			: undefined;
+		const transaction: ReactionTransaction = {
+			transaction: 1,
+			updateId,
+			feedback: line,
+			...redoEntry,
+		};
+		try {
+			mkdirSync(REACTION_PENDING_DIR, { recursive: true, mode: 0o700 });
+			writeFileAtomic(reactionTransactionFile(updateId), JSON.stringify(transaction), 0o600);
+			commitReactionTransaction(transaction, record.session.id);
+		} catch (error) {
+			pi.logger.warn("telegram: could not commit a reaction transaction", {
+				update: updateId,
+				error: error instanceof Error ? error.message : String(error),
 			});
+			return false;
 		}
 		if (ungraded.length > 0) {
 			const scale = REACTION_SCALE.map(([g, set]) => `${g > 0 ? "+" : ""}${g} ${set.join("")}`).join(" \u00B7 ");
