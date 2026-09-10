@@ -5937,6 +5937,16 @@ const answerButton = (updateId, messageId, data) => ({
 		message: { message_id: messageId, chat: { id: CHAT } },
 	},
 });
+const replyTo = (updateId, messageId, text) => ({
+	update_id: updateId,
+	message: {
+		message_id: 800_000 + updateId,
+		date: 1,
+		chat: { id: CHAT },
+		text,
+		reply_to_message: { message_id: messageId },
+	},
+});
 
 await fb.fire("input");
 await fb.tools
@@ -6235,6 +6245,31 @@ check(
 	"a prompt negative reaction redoes an advanced question",
 	advancedGrade.redo === true && /restate/i.test(advancedAnswer.details.results[1].customInput ?? ""),
 );
+// Replying to a buttonless status question closes it before any later reaction can redo it.
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-answered-status",
+		{ summary: "Need a decision.", urgency: "orange", question: "Keep the compatibility path?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+const answeredStatusId = record(fb.id).recent.at(-1);
+check("the session record names its buttonless status question", record(fb.id).replyQuestion === answeredStatusId);
+api.queued = [replyTo(9020, answeredStatusId, "Remove it")];
+await fb.pump(250);
+await fb.pump(250);
+const steersAfterStatusAnswer = fb.steers.length;
+check("a reply closes the buttonless status question", record(fb.id).replyQuestion === null);
+api.queued = [react(9021, answeredStatusId, ["\u{1F44E}"])];
+await fb.pump(250);
+await fb.pump(250);
+check("a reaction cannot reopen the answered status question", feedbackLines().at(-1).redo === false);
+check("the answered status question receives no redo", fb.steers.length === steersAfterStatusAnswer);
 
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");

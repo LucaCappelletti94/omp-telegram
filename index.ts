@@ -231,6 +231,8 @@ interface SessionRecord {
 	recent: number[];
 	/** Message id of the native ask currently waiting for an answer. */
 	question: number | null;
+	/** Buttonless turn-end question still waiting for a Telegram reply. */
+	replyQuestion: number | null;
 	/** Standing turn-end question; survives a resume. */
 	standing: StandingQuestion | null;
 	/** Message carrying a live close-session button on a plain green summary. */
@@ -363,6 +365,8 @@ interface InboxEntry {
 	messageId?: number;
 	/** Original sent-message kind, used to reject a question redo that became stale in transit. */
 	targetKind?: SentKind;
+	/** True when a status message is itself a buttonless question. */
+	targetQuestion?: boolean;
 	/** Message id the sender replied to. */
 	replyTo?: number;
 	caption?: string;
@@ -934,6 +938,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let standingSeq = 0;
 	let standingQuestion: StandingQuestion | null = null;
 	let closeOfferMessageId: number | null = null;
+	let replyQuestionMessageId: number | null = null;
 	let statusBlockUsed = false;
 	let lastState = "";
 	let lastHealth = "";
@@ -1114,6 +1119,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			lastNotified: lastNotifiedAt,
 			recent: [...recentMessages],
 			question: pendingAsk?.messageId ?? null,
+			replyQuestion: replyQuestionMessageId,
 			standing: standingQuestion,
 			closeOffer: closeOfferMessageId,
 			pinned: pinnedMessageId,
@@ -1168,6 +1174,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				lastNotified: count(raw.lastNotified),
 				recent: Array.isArray(raw.recent) ? raw.recent.filter((m) => typeof m === "number") : [],
 				question: messageId(raw.question),
+				replyQuestion: messageId(raw.replyQuestion),
 				standing: typeof raw.standing === "object" && raw.standing !== null ? raw.standing : null,
 				closeOffer: messageId(raw.closeOffer),
 				pinned: messageId(raw.pinned),
@@ -2317,16 +2324,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
+	function isStatusQuestion(record: SentRecord): boolean {
+		return (
+			record.kind === "status" &&
+			record.payload !== null &&
+			typeof record.payload === "object" &&
+			typeof (record.payload as Partial<TurnStatus>).question === "string"
+		);
+	}
+
 	/** Builds the correction prompt used as either an ask answer or a steer. */
 	function redoNote(record: SentRecord, emoji: string[]): string {
 		const opening = `The user reacted ${emoji.join(" ")} on Telegram to`;
 		const body = record.text.split("\n\n").slice(1).join("\n\n") || record.text;
 		const quoted = `\n\n> ${clip(body, PREVIEW_MAX).replaceAll("\n", "\n> ")}`;
-		const statusQuestion =
-			record.kind === "status" &&
-			record.payload !== null &&
-			typeof record.payload === "object" &&
-			typeof (record.payload as Partial<TurnStatus>).question === "string";
+		const statusQuestion = isStatusQuestion(record);
 		if (record.kind === "question" || record.kind === "standing" || statusQuestion) {
 			const viaStatus = record.kind === "question" ? "" : " through notify_status";
 			return `${opening} your question, which did not make sense on the phone: restate it with the context and definitions a reader who cannot see the terminal needs, spelling out every term this session introduced, then ask again${viaStatus}.${quoted}`;
@@ -2377,12 +2389,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const wantsRedo = grade !== null && grade <= REDO_GRADE;
 		const owner = wantsRedo && agentWrote ? readSessionRecord(record.session.id) : null;
 		const liveOwner = owner !== null && Date.now() - owner.heartbeat <= LOCK_STALE_MS;
+		const statusQuestion = isStatusQuestion(record);
 		const targetOpen =
 			record.kind === "question"
 				? owner?.question === record.id
 				: record.kind === "standing"
 					? owner?.standing?.messageId === record.id
-					: true;
+					: statusQuestion
+						? owner?.replyQuestion === record.id
+						: true;
 		const redo = liveOwner && targetOpen;
 		const line = {
 			version: 1,
@@ -2404,6 +2419,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				value: redoNote(record, emoji),
 				messageId: record.id,
 				targetKind: record.kind,
+				targetQuestion: statusQuestion,
 			});
 		}
 		if (ungraded.length > 0) {
@@ -3045,6 +3061,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				// other message is a steer, which omp queues behind a running turn or starts one with.
 				if (entry.kind === "redo") {
 					const standingStillOpen = entry.targetKind !== "standing" || standingQuestion?.messageId === entry.messageId;
+					const statusStillOpen = entry.targetQuestion !== true || replyQuestionMessageId === entry.messageId;
 					if (ask !== null && ask.messageId === entry.messageId) {
 						focusTmuxWindow();
 						ask.custom[ask.index] = entry.value;
@@ -3053,11 +3070,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						await advance(ask);
 						continue;
 					}
-					if (entry.targetKind === "question" || !standingStillOpen) continue;
+					if (entry.targetKind === "question" || !standingStillOpen || !statusStillOpen) continue;
+					if (entry.targetQuestion === true) {
+						replyQuestionMessageId = null;
+						if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+					}
 					focusTmuxWindow();
 					pi.sendUserMessage(entry.value);
 					replyOwed = true;
 					continue;
+				}
+				if (entry.kind === "text" && replyQuestionMessageId !== null) {
+					replyQuestionMessageId = null;
+					if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 				}
 				// The ask blocks the turn, so text arriving now can only be its answer: the question opens
 				// the reply field itself, and a plain message routed here by the open question is the same.
@@ -3860,6 +3885,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		lastNotifiedAt = typeof previous?.lastNotified === "number" ? previous.lastNotified : 0;
 		pinnedMessageId = typeof previous?.pinned === "number" ? previous.pinned : null;
 		closeOfferMessageId = typeof previous?.closeOffer === "number" ? previous.closeOffer : null;
+		replyQuestionMessageId = previous?.replyQuestion ?? null;
 		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
 			rmSync(LOCK_FILE, { recursive: true, force: true });
 		}
@@ -3952,6 +3978,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnSummary = null;
 		statusBlockUsed = false;
 		unpinRed(ctx);
+		const replyQuestionWasOpen = replyQuestionMessageId !== null;
+		replyQuestionMessageId = null;
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
@@ -3961,6 +3989,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				"standing-question close",
 			);
 		}
+		if (standing === null && replyQuestionWasOpen) writeSessionRecord(ctx);
 	});
 
 	// The agent loop is the only truthful "working" signal: `input` also fires for
@@ -3970,6 +3999,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		statusBlockUsed = false;
 		unpinRed(ctx);
 		retireCloseOffer(true);
+		const replyQuestionWasOpen = replyQuestionMessageId !== null;
+		replyQuestionMessageId = null;
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
@@ -3980,6 +4011,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			);
 		}
 		approvalWaiting = false;
+		if (standing === null && replyQuestionWasOpen) writeSessionRecord(ctx);
 		typingSentAt = 0;
 		draftText = "";
 		draftDirty = false;
@@ -4176,11 +4208,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
 				const work = notify(ctx, "status", heads[recorded.urgency], body, extra, usageFooter(), recorded).then(
 					(sent) => {
+						const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
+						if (recorded.question !== undefined) replyQuestionMessageId = messageId;
+						if (recorded.urgency === "green") closeOfferMessageId = messageId;
+						if (recorded.question !== undefined || recorded.urgency === "green") writeSessionRecord(ctx);
 						if (recorded.urgency === "red") return pinRed(ctx, sent);
-						if (recorded.urgency === "green" && typeof sent?.message_id === "number") {
-							closeOfferMessageId = sent.message_id;
-							writeSessionRecord(ctx);
-						}
 						return undefined;
 					},
 				);
@@ -4288,6 +4320,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		}
 		if (sessionCtx !== null) unpinRed(sessionCtx);
+		replyQuestionMessageId = null;
 		sessionAlive = false;
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		releaseLock();
