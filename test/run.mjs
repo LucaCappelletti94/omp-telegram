@@ -6449,6 +6449,14 @@ const uploadWork = uploadSession.tools
 		uploadSession.ctx,
 	);
 await settle(50);
+const uploadMarkerDir = join(root, "notify-telegram/sent-in-flight");
+const uploadMarker = join(
+	uploadMarkerDir,
+	readdirSync(uploadMarkerDir).find((entry) => entry.startsWith("new-")),
+);
+utimesSync(uploadMarker, new Date(0), new Date(0));
+await settle(16_000);
+check("an active upload marker is refreshed", statSync(uploadMarker).mtimeMs > 0);
 const unrelatedUploadReaction = react(9028, statusId, ["\u{1F44D}"]);
 const offsetBeforeUnrelatedReaction = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
 api.queued = [unrelatedUploadReaction];

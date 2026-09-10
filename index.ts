@@ -11,6 +11,7 @@ import {
 	rmSync,
 	statSync,
 	unlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -68,8 +69,8 @@ const BADGE_LOCK_FILE = join(STATE_DIR, "badge.lock");
 const HEARTBEAT_MS = 15_000;
 const LOCK_STALE_MS = 45_000;
 const DRAIN_MS = 1_000;
-/** Longer than two 120-second upload attempts plus the maximum one-off Telegram retry delay. */
-const SENT_MARKER_STALE_MS = 6 * 60_000;
+/** Refreshed every heartbeat while work is active, with enough slack for delayed timer ticks. */
+const SENT_MARKER_STALE_MS = 2 * 60_000;
 const BADGE_CLAIM_STALE_MS = 5_000;
 const LONG_POLL_S = 25;
 const STATUS_OPTIONS_MIN = 2;
@@ -1034,9 +1035,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const prefix = messageId === undefined ? "new" : `edit-${messageId}`;
 		const marker = join(SENT_IN_FLIGHT_DIR, `${prefix}-${randomUUID()}`);
 		writeFileSync(marker, "", { mode: 0o600 });
+		const heartbeat = setInterval(() => {
+			try {
+				const now = new Date();
+				utimesSync(marker, now, now);
+			} catch {}
+		}, HEARTBEAT_MS);
+		heartbeat.unref();
 		try {
 			return await work();
 		} finally {
+			clearInterval(heartbeat);
 			rmSync(marker, { force: true });
 		}
 	}
