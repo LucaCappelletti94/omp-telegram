@@ -6518,42 +6518,48 @@ check(
 api.queued = [react(9026, plainStatusId, ["\u{1F44D}"])];
 await ownershipPoller.pump(250);
 check("feedback embeds the displayed plain fallback", feedbackLines().at(-1).message.text === acceptedPlainText);
-// Reactions wait while an existing sent-message record is being replaced by an accepted edit.
-await fb.fire("input");
-await fb.tools
-	.get("notify_status")
-	.execute(
-		"fb-edited-ledger",
-		{ summary: "Choose one.", urgency: "orange", question: "Keep the edit?", options: opts("Keep", "Drop") },
-		undefined,
-		undefined,
-		fb.ctx,
-	);
-await fb.fire("session_stop");
+// A negative reaction before a native-question edit is accepted grades the visible record and still reaches the agent.
+const preEditSession = spawn("01a0700a-0000-0000-0000-000000000000", "/home/dev/work/pre-edit");
+await preEditSession.fire("session_start");
+const preEditState = {};
+const preEditAsk = preEditSession.tools
+	.get("ask")
+	.execute("fb-pre-edit", singleQuestion, undefined, undefined, stubbornCtx(preEditSession.ctx, preEditState));
 await settle(150);
-const editedStatusId = record(fb.id).recent.at(-1);
+const editedQuestionId = record(preEditSession.id).question;
+const preEditText = onRecord(editedQuestionId).text;
+const preEditButton = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0];
 let releaseEdit;
 api.editMessageGate = new Promise((resolve) => {
 	releaseEdit = resolve;
 });
-await fb.fire("input");
+writeFileSync(
+	join(inboxOf(preEditSession.id), "90270.json"),
+	JSON.stringify({ kind: "callback", value: preEditButton.callback_data }),
+);
+const settlingPreEdit = preEditSession.pump(250);
 await settle(50);
-const editReaction = react(9027, editedStatusId, ["\u{1F44D}"]);
-const offsetBeforeEditReaction = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const editReaction = react(9027, editedQuestionId, ["\u{1F44E}"]);
+const preEditSteers = preEditSession.steers.length;
 api.queued = [editReaction];
 await ownershipPoller.pump(250);
+const preEditFeedback = feedbackLines().at(-1);
 check(
-	"a reaction awaiting a message edit does not advance the offset",
-	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === offsetBeforeEditReaction,
+	"a negative reaction before edit acceptance grades the previous question",
+	preEditFeedback.updateId === 9027 &&
+		preEditFeedback.message.text === preEditText &&
+		preEditFeedback.grade === -2 &&
+		preEditFeedback.redo === true,
 );
 releaseEdit();
 api.editMessageGate = null;
+await settlingPreEdit;
 await settle(50);
-api.queued = [editReaction];
-await ownershipPoller.pump(250);
+await preEditAsk;
+await preEditSession.pump(250);
 check(
-	"feedback grades the accepted edited text",
-	feedbackLines().at(-1).message.text.includes("Answered at the terminal"),
+	"the pre-edit question redo reaches the agent after settlement",
+	preEditSession.steers.length === preEditSteers + 1 && preEditSession.steers.at(-1).text.includes("reacted"),
 );
 
 // Media uploads hold the same publication marker until their sent records exist.
@@ -6791,6 +6797,29 @@ const metadataMessageId = record(metadataSession.id).recent.at(-1);
 check(
 	"a sent record keeps the session metadata from before its network wait",
 	onRecord(metadataMessageId).session.name === "Before send",
+);
+
+// An accepted edit marker covers the interval before its replacement ledger record is published.
+const acceptedEditMarkerDir = join(root, "notify-telegram/sent-in-flight");
+mkdirSync(acceptedEditMarkerDir, { recursive: true });
+const acceptedEditMarker = join(acceptedEditMarkerDir, `edit-${editedQuestionId}-accepted-window`);
+writeFileSync(acceptedEditMarker, "");
+const acceptedEditReaction = react(9035, editedQuestionId, ["\u{1F44D}"]);
+const offsetBeforeAcceptedEdit = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const feedbackBeforeAcceptedEdit = feedbackLines().length;
+api.queued = [acceptedEditReaction];
+await ownershipPoller.pump(250);
+check(
+	"a reaction during accepted edit publication waits for the replacement record",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === offsetBeforeAcceptedEdit &&
+		feedbackLines().length === feedbackBeforeAcceptedEdit,
+);
+rmSync(acceptedEditMarker, { force: true });
+api.queued = [acceptedEditReaction];
+await ownershipPoller.pump(250);
+check(
+	"the deferred reaction grades the published replacement record",
+	feedbackLines().at(-1).updateId === 9035 && feedbackLines().at(-1).message.text === onRecord(editedQuestionId).text,
 );
 
 // Sent-message records have a longer retention period than downloaded media.

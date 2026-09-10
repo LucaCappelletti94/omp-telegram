@@ -375,6 +375,8 @@ interface InboxEntry {
 	targetKind?: SentKind;
 	/** True when a status message is itself a buttonless question. */
 	targetQuestion?: boolean;
+	/** True when eligibility was established from the record visible before an accepted edit. */
+	targetPreEdit?: boolean;
 	/** Message id the sender replied to. */
 	replyTo?: number;
 	caption?: string;
@@ -1011,39 +1013,43 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
+	function parseSentRecord(parsed: unknown, id: number): SentRecord | null {
+		if (parsed === null || typeof parsed !== "object") return null;
+		const candidate = parsed as Partial<SentRecord>;
+		const session = candidate.session as Partial<SentRecord["session"]> | undefined;
+		if (
+			candidate.version !== 1 ||
+			candidate.id !== id ||
+			typeof candidate.at !== "number" ||
+			typeof candidate.kind !== "string" ||
+			!Object.hasOwn(SENT_KINDS, candidate.kind) ||
+			typeof candidate.text !== "string" ||
+			session === undefined ||
+			!isStateToken(session.id) ||
+			typeof session.tag !== "string" ||
+			typeof session.emoji !== "string" ||
+			typeof session.name !== "string" ||
+			typeof session.cwd !== "string"
+		) {
+			return null;
+		}
+		return candidate as SentRecord;
+	}
+
 	function readSentRecord(id: number): SentRecord | null {
 		if (!isTelegramMessageId(id)) return null;
 		try {
-			const parsed = JSON.parse(readFileSync(join(SENT_DIR, `${id}.json`), "utf8")) as unknown;
-			if (parsed === null || typeof parsed !== "object") return null;
-			const candidate = parsed as Partial<SentRecord>;
-			const session = candidate.session as Partial<SentRecord["session"]> | undefined;
-			if (
-				candidate.version !== 1 ||
-				candidate.id !== id ||
-				typeof candidate.at !== "number" ||
-				typeof candidate.kind !== "string" ||
-				!Object.hasOwn(SENT_KINDS, candidate.kind) ||
-				typeof candidate.text !== "string" ||
-				session === undefined ||
-				!isStateToken(session.id) ||
-				typeof session.tag !== "string" ||
-				typeof session.emoji !== "string" ||
-				typeof session.name !== "string" ||
-				typeof session.cwd !== "string"
-			) {
-				return null;
-			}
-			return candidate as SentRecord;
+			return parseSentRecord(JSON.parse(readFileSync(join(SENT_DIR, `${id}.json`), "utf8")), id);
 		} catch {
 			return null;
 		}
 	}
-	async function withSentRecordMarker<T>(work: () => Promise<T>, messageId?: number): Promise<T> {
+	async function withSentRecordMarker<T>(work: (acceptEdit: () => void) => Promise<T>, messageId?: number): Promise<T> {
 		mkdirSync(SENT_IN_FLIGHT_DIR, { recursive: true, mode: 0o700 });
 		const prefix = messageId === undefined ? "new" : `edit-${messageId}`;
 		const marker = join(SENT_IN_FLIGHT_DIR, `${prefix}-${randomUUID()}`);
-		writeFileSync(marker, "", { mode: 0o600 });
+		const previous = messageId === undefined ? null : readSentRecord(messageId);
+		writeFileSync(marker, previous === null ? "" : JSON.stringify(previous), { mode: 0o600 });
 		const heartbeat = setInterval(() => {
 			try {
 				const now = new Date();
@@ -1051,8 +1057,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			} catch {}
 		}, HEARTBEAT_MS);
 		heartbeat.unref();
+		let accepted = false;
+		const acceptEdit = (): void => {
+			if (messageId === undefined || accepted) return;
+			writeFileAtomic(marker, "", 0o600);
+			accepted = true;
+		};
 		try {
-			return await work();
+			return await work(acceptEdit);
 		} finally {
 			clearInterval(heartbeat);
 			rmSync(marker, { force: true });
@@ -1070,6 +1082,31 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			} catch {}
 		}
 		return active;
+	}
+
+	/** `undefined` means no edit, `null` means an accepted edit awaiting publication. */
+	function recordBeforePendingEdit(messageId: number): SentRecord | null | undefined {
+		if (!existsSync(SENT_IN_FLIGHT_DIR)) return;
+		let previous: SentRecord | undefined;
+		for (const entry of readdirSync(SENT_IN_FLIGHT_DIR)) {
+			if (!entry.startsWith(`edit-${messageId}-`)) continue;
+			const marker = join(SENT_IN_FLIGHT_DIR, entry);
+			try {
+				if (Date.now() - statSync(marker).mtimeMs > SENT_MARKER_STALE_MS) {
+					unlinkSync(marker);
+					continue;
+				}
+				const raw = readFileSync(marker, "utf8");
+				if (raw.length === 0) return null;
+				const candidate = parseSentRecord(JSON.parse(raw) as unknown, messageId);
+				if (candidate === null) return null;
+				if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(candidate)) return null;
+				previous = candidate;
+			} catch {
+				return null;
+			}
+		}
+		return previous;
 	}
 
 	function snapshotSentSession(): SentRecord["session"] {
@@ -1130,7 +1167,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		beforeRecord?: (messageId: number) => void,
 		sentSession = snapshotSentSession(),
 	): Promise<TelegramMessage | null> {
-		const work = async (): Promise<TelegramMessage | null> => {
+		const work = async (acceptEdit: () => void): Promise<TelegramMessage | null> => {
 			const quiet = { link_preview_options: { is_disabled: true } };
 			const source = fitToTelegram(plain, keep);
 			let sentText = source;
@@ -1154,6 +1191,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				pi.logger.warn("telegram: send refused", { method, description: refusal });
 			}
 			if (sent !== null) {
+				if (method === "editMessageText") acceptEdit();
 				if (method === "sendMessage" && kind !== null) {
 					trackSent(sent, kind, sentText, sentSession, payload, beforeRecord);
 				} else if (method === "editMessageText" && isTelegramMessageId(body.message_id)) {
@@ -1175,7 +1213,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			(kind !== null || readSentRecord(body.message_id) !== null)
 				? body.message_id
 				: undefined;
-		return editedMessageId === undefined ? await work() : await withSentRecordMarker(work, editedMessageId);
+		return editedMessageId === undefined ? await work(() => {}) : await withSentRecordMarker(work, editedMessageId);
 	}
 
 	/** What this session is doing right now, in the words `/status` uses. */
@@ -2495,19 +2533,32 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	function commitReactionTransaction(transaction: ReactionTransaction, target: string): void {
-		if (transaction.kind === "redo" && !isStateToken(target)) throw new Error("Unsafe reaction inbox target");
-		if (!feedbackHasUpdate(transaction.updateId)) {
-			appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
-		}
-		const pending = reactionTransactionFile(transaction.updateId);
+	function reactionTransactionTarget(transaction: ReactionTransaction): string | null {
+		if (!("message" in transaction.feedback)) return null;
+		const message = transaction.feedback.message;
+		if (message === null || typeof message !== "object" || !("session" in message)) return null;
+		const session = message.session;
+		if (session === null || typeof session !== "object" || !("id" in session)) return null;
+		return isStateToken(session.id) ? session.id : null;
+	}
+
+	function commitReactionTransaction(transaction: ReactionTransaction): void {
 		if (transaction.kind === "redo") {
+			const target = reactionTransactionTarget(transaction);
+			if (target === null) throw new Error("Unsafe reaction inbox target");
+			if (!feedbackHasUpdate(transaction.updateId)) {
+				appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
+			}
+			const pending = reactionTransactionFile(transaction.updateId);
 			const dir = join(INBOX_DIR, target);
 			mkdirSync(dir, { recursive: true, mode: 0o700 });
 			renameSync(pending, join(dir, `${transaction.updateId}.json`));
-		} else {
-			rmSync(pending, { force: true });
+			return;
 		}
+		if (!feedbackHasUpdate(transaction.updateId)) {
+			appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
+		}
+		rmSync(reactionTransactionFile(transaction.updateId), { force: true });
 	}
 
 	/** Records each reaction change and requests a rewrite for strongly negative grades on agent messages. */
@@ -2527,20 +2578,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pi.logger.warn("telegram: rejected a reaction with an invalid message id", { id: reaction.message_id });
 			return;
 		}
-		let record = readSentRecord(reaction.message_id);
-		if (sentRecordInFlight(reaction.message_id, record === null)) return false;
-		record = readSentRecord(reaction.message_id) ?? record;
-		if (record === null) {
-			await serviceNotice(
-				`Reaction error: that message is not on record, so the reaction was not kept; session messages stay gradable for ${SENT_KEEP_MS / 86_400_000} days.`,
-				false,
-			);
-			return;
-		}
 		const pending = readReactionTransaction(updateId);
 		if (pending !== null) {
 			try {
-				commitReactionTransaction(pending, record.session.id);
+				commitReactionTransaction(pending);
 			} catch (error) {
 				pi.logger.warn("telegram: could not finish a reaction transaction", {
 					update: updateId,
@@ -2548,6 +2589,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				});
 				return false;
 			}
+			return;
+		}
+		const beforeEdit = recordBeforePendingEdit(reaction.message_id);
+		if (beforeEdit === null) return false;
+		let record = beforeEdit === undefined ? readSentRecord(reaction.message_id) : beforeEdit;
+		if (beforeEdit === undefined && sentRecordInFlight(reaction.message_id, record === null)) return false;
+		if (beforeEdit === undefined) record = readSentRecord(reaction.message_id) ?? record;
+		if (record === null) {
+			await serviceNotice(
+				`Reaction error: that message is not on record, so the reaction was not kept; session messages stay gradable for ${SENT_KEEP_MS / 86_400_000} days.`,
+				false,
+			);
 			return;
 		}
 		try {
@@ -2604,6 +2657,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					messageId: record.id,
 					targetKind: record.kind,
 					targetQuestion: statusQuestion,
+					targetPreEdit: beforeEdit !== undefined,
 				}
 			: undefined;
 		const transaction: ReactionTransaction = {
@@ -2615,7 +2669,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		try {
 			mkdirSync(REACTION_PENDING_DIR, { recursive: true, mode: 0o700 });
 			writeFileAtomic(reactionTransactionFile(updateId), JSON.stringify(transaction), 0o600);
-			commitReactionTransaction(transaction, record.session.id);
+			commitReactionTransaction(transaction);
 		} catch (error) {
 			pi.logger.warn("telegram: could not commit a reaction transaction", {
 				update: updateId,
@@ -3322,12 +3376,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 									messageId: entry.messageId,
 									targetKind: entry.targetKind,
 									targetQuestion: entry.targetQuestion,
+									targetPreEdit: entry.targetPreEdit,
 								});
 							}
 						}
 						continue;
 					}
-					if (entry.targetKind === "question" || !standingStillOpen || !statusStillOpen) continue;
+					if (
+						(entry.targetKind === "question" || !standingStillOpen || !statusStillOpen) &&
+						entry.targetPreEdit !== true
+					) {
+						continue;
+					}
 					if (entry.targetQuestion === true) closeReplyQuestion(entry.messageId);
 					focusTmuxWindow();
 					pi.sendUserMessage(entry.value);
