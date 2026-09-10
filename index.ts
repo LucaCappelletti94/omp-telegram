@@ -939,6 +939,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let standingQuestion: StandingQuestion | null = null;
 	let closeOfferMessageId: number | null = null;
 	let replyQuestionMessageId: number | null = null;
+	let replyQuestionGeneration = 0;
 	let statusBlockUsed = false;
 	let lastState = "";
 	let lastHealth = "";
@@ -1136,6 +1137,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function noteState(): void {
 		if (sessionCtx === null || (sessionState() === lastState && turnHealth === lastHealth)) return;
 		writeSessionRecord(sessionCtx);
+	}
+	function closeReplyQuestion(target = replyQuestionMessageId): void {
+		if (target !== replyQuestionMessageId) return;
+		replyQuestionGeneration += 1;
+		if (replyQuestionMessageId === null) return;
+		replyQuestionMessageId = null;
+		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 	}
 
 	/**
@@ -3043,12 +3051,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						}
 						// No `deliverAs`: omp steers a running turn and starts one when idle. An explicit
 						// steer only interrupts, so on a finished session it delivered nothing at all.
+						closeReplyQuestion(entry.replyTo);
 						pi.sendUserMessage([
 							{ type: "image", data, mimeType: entry.mime },
 							{ type: "text", text: caption.length > 0 ? caption : "(image sent from Telegram)" },
 						]);
 					} else {
 						const tail = caption.length > 0 ? ` Caption: ${caption}` : "";
+						closeReplyQuestion(entry.replyTo);
 						pi.sendUserMessage(
 							`The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`,
 						);
@@ -3071,19 +3081,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						continue;
 					}
 					if (entry.targetKind === "question" || !standingStillOpen || !statusStillOpen) continue;
-					if (entry.targetQuestion === true) {
-						replyQuestionMessageId = null;
-						if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-					}
+					if (entry.targetQuestion === true) closeReplyQuestion(entry.messageId);
 					focusTmuxWindow();
 					pi.sendUserMessage(entry.value);
 					replyOwed = true;
 					continue;
 				}
-				if (entry.kind === "text" && replyQuestionMessageId !== null) {
-					replyQuestionMessageId = null;
-					if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-				}
+				if (entry.kind === "text") closeReplyQuestion(entry.replyTo);
 				// The ask blocks the turn, so text arriving now can only be its answer: the question opens
 				// the reply field itself, and a plain message routed here by the open question is the same.
 				if (ask !== null) {
@@ -3978,8 +3982,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnSummary = null;
 		statusBlockUsed = false;
 		unpinRed(ctx);
-		const replyQuestionWasOpen = replyQuestionMessageId !== null;
-		replyQuestionMessageId = null;
+		closeReplyQuestion();
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
@@ -3989,7 +3992,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				"standing-question close",
 			);
 		}
-		if (standing === null && replyQuestionWasOpen) writeSessionRecord(ctx);
 	});
 
 	// The agent loop is the only truthful "working" signal: `input` also fires for
@@ -3999,8 +4001,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		statusBlockUsed = false;
 		unpinRed(ctx);
 		retireCloseOffer(true);
-		const replyQuestionWasOpen = replyQuestionMessageId !== null;
-		replyQuestionMessageId = null;
+		closeReplyQuestion();
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
@@ -4011,7 +4012,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			);
 		}
 		approvalWaiting = false;
-		if (standing === null && replyQuestionWasOpen) writeSessionRecord(ctx);
 		typingSentAt = 0;
 		draftText = "";
 		draftDirty = false;
@@ -4206,12 +4206,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
 				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
+				const replyQuestionToken = recorded.question === undefined ? null : ++replyQuestionGeneration;
 				const work = notify(ctx, "status", heads[recorded.urgency], body, extra, usageFooter(), recorded).then(
 					(sent) => {
 						const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
-						if (recorded.question !== undefined) replyQuestionMessageId = messageId;
+						const currentReplyQuestion = replyQuestionToken !== null && replyQuestionToken === replyQuestionGeneration;
+						if (currentReplyQuestion) replyQuestionMessageId = messageId;
 						if (recorded.urgency === "green") closeOfferMessageId = messageId;
-						if (recorded.question !== undefined || recorded.urgency === "green") writeSessionRecord(ctx);
+						if (currentReplyQuestion || recorded.urgency === "green") writeSessionRecord(ctx);
 						if (recorded.urgency === "red") return pinRed(ctx, sent);
 						return undefined;
 					},
@@ -4320,7 +4322,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		}
 		if (sessionCtx !== null) unpinRed(sessionCtx);
-		replyQuestionMessageId = null;
+		closeReplyQuestion();
 		sessionAlive = false;
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		releaseLock();

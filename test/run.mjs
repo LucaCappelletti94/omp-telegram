@@ -39,6 +39,7 @@ const api = {
 	nextMessage: 7,
 	filePath: "documents/file_9.oga",
 	fileDownload: "ok",
+	sendMessageGate: null,
 };
 globalThis.fetch = async (url, init) => {
 	if (String(url).includes("/file/bot")) {
@@ -86,6 +87,7 @@ globalThis.fetch = async (url, init) => {
 	if (api.rejectHtml && body.parse_mode === "HTML") {
 		return { ok: false, status: 400, json: async () => ({ ok: false, description: "can't parse entities" }) };
 	}
+	if (method === "sendMessage" && api.sendMessageGate !== null) await api.sendMessageGate;
 	const result =
 		method === "getUpdates"
 			? api.queued.splice(0, api.queued.length)
@@ -6270,6 +6272,81 @@ await fb.pump(250);
 await fb.pump(250);
 check("a reaction cannot reopen the answered status question", feedbackLines().at(-1).redo === false);
 check("the answered status question receives no redo", fb.steers.length === steersAfterStatusAnswer);
+// A media reply answers the same buttonless question just as text does.
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-media-status",
+		{ summary: "Need a file decision.", urgency: "orange", question: "Use the attached recording?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+const mediaStatusId = record(fb.id).recent.at(-1);
+api.queued = [
+	{
+		update_id: 9022,
+		message: {
+			message_id: 809_022,
+			date: 1,
+			chat: { id: CHAT },
+			voice: { file_id: "status-answer" },
+			reply_to_message: { message_id: mediaStatusId },
+		},
+	},
+];
+await fb.pump(250);
+await fb.pump(250);
+const steersAfterMediaAnswer = fb.steers.length;
+check("a media reply closes the buttonless status question", record(fb.id).replyQuestion === null);
+api.queued = [react(9023, mediaStatusId, ["\u{1F44E}"])];
+await fb.pump(250);
+await fb.pump(250);
+check("a reaction cannot reopen the media-answered question", feedbackLines().at(-1).redo === false);
+check("the media-answered question receives no redo", fb.steers.length === steersAfterMediaAnswer);
+// A reply to an older message must not answer the newer status question merely because it routes here.
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-other-reply",
+		{ summary: "Still need a decision.", urgency: "orange", question: "Keep the newer path?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+const newerStatusId = record(fb.id).recent.at(-1);
+api.queued = [replyTo(9024, statusId, "An unrelated follow-up")];
+await fb.pump(250);
+await fb.pump(250);
+check("a reply to an older message leaves the newer question open", record(fb.id).replyQuestion === newerStatusId);
+// A new turn can begin while Telegram is still accepting the previous turn's question.
+await fb.fire("input");
+let releaseStatusSend;
+api.sendMessageGate = new Promise((resolve) => {
+	releaseStatusSend = resolve;
+});
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-stale-status",
+		{ summary: "Need a delayed decision.", urgency: "orange", question: "Keep waiting?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(50);
+await fb.fire("input");
+releaseStatusSend();
+api.sendMessageGate = null;
+await settle(150);
+check("a late status send cannot reopen a superseded question", record(fb.id).replyQuestion === null);
 
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");
