@@ -57,6 +57,7 @@ const MEDIA_DIR = join(STATE_DIR, "media");
 const SENT_DIR = join(STATE_DIR, "sent");
 const SENT_IN_FLIGHT_DIR = join(STATE_DIR, "sent-in-flight");
 const REACTION_PENDING_DIR = join(STATE_DIR, "reaction-pending");
+const REACTION_ROUTE_LOCK_DIR = join(STATE_DIR, "reaction-route-locks");
 /** One line per reaction change, holding the grade and the message it graded. */
 const FEEDBACK_FILE = join(STATE_DIR, "feedback.jsonl");
 /** The channel a process outside omp uses to ask one question and read its answer back. */
@@ -67,6 +68,7 @@ const EXTERNAL_KEY = /^[A-Za-z0-9._-]{1,64}$/u;
 /** Held only across a badge validate-and-persist, which is two file writes long. */
 const BADGE_LOCK_FILE = join(STATE_DIR, "badge.lock");
 
+const REACTION_ROUTE_WAIT_MS = 5_000;
 const HEARTBEAT_MS = 15_000;
 const LOCK_STALE_MS = 45_000;
 const DRAIN_MS = 1_000;
@@ -1481,12 +1483,31 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		for (const entry of readdirSync(SESSIONS_DIR)) {
 			if (!entry.endsWith(".json")) continue;
 			const id = entry.slice(0, -5);
-			if (id === sessionId) continue;
+			if (!isStateToken(id) || id === sessionId) continue;
 			const record = readSessionRecord(id);
 			// A live session refreshes its heartbeat every 15 seconds, so a stale one is gone.
 			if (record !== null && Date.now() - record.heartbeat <= LOCK_STALE_MS) continue;
-			unlinkSync(join(SESSIONS_DIR, entry));
-			rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
+			mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+			const closing = reactionRouteClosingFile(id);
+			try {
+				writeFileSync(closing, randomUUID(), { flag: "wx", mode: 0o600 });
+			} catch {
+				continue;
+			}
+			try {
+				const queuedRedos = discardQueuedRedos(id);
+				if (queuedRedos > 0) {
+					detach(
+						serviceNotice("Grade kept, but its session ended before the queued redo could reach the agent.", false),
+						"dead-session redo notice",
+					);
+				}
+				unlinkSync(join(SESSIONS_DIR, entry));
+				rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
+				rmSync(reactionRouteLockFile(id), { force: true });
+			} finally {
+				rmSync(closing, { force: true });
+			}
 		}
 	}
 
@@ -2542,23 +2563,106 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return isStateToken(session.id) ? session.id : null;
 	}
 
-	function commitReactionTransaction(transaction: ReactionTransaction): void {
+	function reactionRouteLockFile(target: string): string {
+		return join(REACTION_ROUTE_LOCK_DIR, `${target}.lock`);
+	}
+
+	function reactionRouteClosingFile(target: string): string {
+		return join(REACTION_ROUTE_LOCK_DIR, `${target}.closing`);
+	}
+
+	function releaseReactionRouteLock(target: string, token: string): void {
+		const path = reactionRouteLockFile(target);
+		try {
+			if (readFileSync(path, "utf8") === token) unlinkSync(path);
+		} catch {}
+	}
+
+	function takeReactionRouteLock(target: string, duringShutdown = false): string | null {
+		mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+		const closing = reactionRouteClosingFile(target);
+		if (!duringShutdown && existsSync(closing)) return null;
+		const path = reactionRouteLockFile(target);
+		const token = randomUUID();
+		try {
+			writeFileSync(path, token, { flag: "wx", mode: 0o600 });
+		} catch {
+			return null;
+		}
+		if (!duringShutdown && existsSync(closing)) {
+			releaseReactionRouteLock(target, token);
+			return null;
+		}
+		return token;
+	}
+
+	function resetReactionRouteForStartup(target: string): void {
+		mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+		const closing = reactionRouteClosingFile(target);
+		rmSync(closing, { force: true });
+		writeFileSync(closing, randomUUID(), { flag: "wx", mode: 0o600 });
+		try {
+			rmSync(reactionRouteLockFile(target), { force: true });
+		} finally {
+			rmSync(closing, { force: true });
+		}
+	}
+
+	function ownsOpenReactionRoute(target: string, token: string): boolean {
+		if (existsSync(reactionRouteClosingFile(target))) return false;
+		try {
+			return readFileSync(reactionRouteLockFile(target), "utf8") === token;
+		} catch {
+			return false;
+		}
+	}
+
+	function commitReactionTransaction(transaction: ReactionTransaction): boolean {
 		if (transaction.kind === "redo") {
 			const target = reactionTransactionTarget(transaction);
 			if (target === null) throw new Error("Unsafe reaction inbox target");
-			if (!feedbackHasUpdate(transaction.updateId)) {
-				appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
+			const token = takeReactionRouteLock(target);
+			if (token === null) throw new Error("Reaction inbox route is busy");
+			try {
+				const owner = readSessionRecord(target);
+				const liveOwner = owner !== null && Date.now() - owner.heartbeat <= LOCK_STALE_MS;
+				if (!ownsOpenReactionRoute(target, token)) throw new Error("Reaction inbox route is closing");
+				const alreadyRecorded = feedbackHasUpdate(transaction.updateId);
+				if (!liveOwner) {
+					if (!alreadyRecorded) {
+						transaction.feedback.redo = false;
+						appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
+					}
+					rmSync(reactionTransactionFile(transaction.updateId), { force: true });
+					return false;
+				}
+				if (!alreadyRecorded) {
+					if (!ownsOpenReactionRoute(target, token)) throw new Error("Reaction inbox route is closing");
+					appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
+					if (!ownsOpenReactionRoute(target, token)) throw new Error("Reaction inbox route closed during commit");
+				}
+				const pending = reactionTransactionFile(transaction.updateId);
+				const dir = join(INBOX_DIR, target);
+				const inbox = join(dir, `${transaction.updateId}.json`);
+				mkdirSync(dir, { recursive: true, mode: 0o700 });
+				if (!ownsOpenReactionRoute(target, token)) throw new Error("Reaction inbox route is closing");
+				renameSync(pending, inbox);
+				if (!ownsOpenReactionRoute(target, token)) {
+					try {
+						renameSync(inbox, pending);
+					} catch {}
+					throw new Error("Reaction inbox route closed during publication");
+				}
+				return true;
+			} finally {
+				releaseReactionRouteLock(target, token);
 			}
-			const pending = reactionTransactionFile(transaction.updateId);
-			const dir = join(INBOX_DIR, target);
-			mkdirSync(dir, { recursive: true, mode: 0o700 });
-			renameSync(pending, join(dir, `${transaction.updateId}.json`));
-			return;
 		}
 		if (!feedbackHasUpdate(transaction.updateId)) {
 			appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
 		}
 		rmSync(reactionTransactionFile(transaction.updateId), { force: true });
+		return true;
 	}
 
 	/** Records each reaction change and requests a rewrite for strongly negative grades on agent messages. */
@@ -2581,7 +2685,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const pending = readReactionTransaction(updateId);
 		if (pending !== null) {
 			try {
-				commitReactionTransaction(pending);
+				if (!commitReactionTransaction(pending)) {
+					await serviceNotice(
+						"Grade kept, but that session ended before its queued redo could reach the agent.",
+						false,
+					);
+				}
 			} catch (error) {
 				pi.logger.warn("telegram: could not finish a reaction transaction", {
 					update: updateId,
@@ -2666,10 +2775,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			feedback: line,
 			...redoEntry,
 		};
+		let redoRouted = true;
 		try {
 			mkdirSync(REACTION_PENDING_DIR, { recursive: true, mode: 0o700 });
 			writeFileAtomic(reactionTransactionFile(updateId), JSON.stringify(transaction), 0o600);
-			commitReactionTransaction(transaction);
+			redoRouted = commitReactionTransaction(transaction);
 		} catch (error) {
 			pi.logger.warn("telegram: could not commit a reaction transaction", {
 				update: updateId,
@@ -2683,6 +2793,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				`Reaction error: ${ungraded.join(" ")} is outside the grading scale, so it was kept without a grade; graded reactions: ${scale}.`,
 				false,
 			);
+		}
+		if (redo && !redoRouted) {
+			await serviceNotice("Grade kept, but that session ended before its queued redo could reach the agent.", false);
 		}
 		if (wantsRedo && !redo) {
 			const reason =
@@ -3200,6 +3313,66 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		ask.selected[ask.index] = new Set([label]);
 		await advance(ask);
+	}
+
+	async function closeReactionRouteForShutdown(): Promise<number> {
+		mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+		const closing = reactionRouteClosingFile(sessionId);
+		writeFileSync(closing, randomUUID(), { flag: "wx", mode: 0o600 });
+		try {
+			const deadline = Date.now() + REACTION_ROUTE_WAIT_MS;
+			let token: string | null = null;
+			while (token === null && Date.now() < deadline) {
+				token = takeReactionRouteLock(sessionId, true);
+				if (token === null) await sleepMs(20);
+			}
+			if (token === null) {
+				rmSync(reactionRouteLockFile(sessionId), { force: true });
+				token = takeReactionRouteLock(sessionId, true);
+				if (token === null) throw new Error("Could not fence the reaction inbox route");
+			}
+			try {
+				const queuedRedos = discardQueuedRedos(sessionId);
+				sessionAlive = false;
+				if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+				return queuedRedos;
+			} finally {
+				releaseReactionRouteLock(sessionId, token);
+			}
+		} finally {
+			rmSync(closing, { force: true });
+		}
+	}
+
+	function discardQueuedRedos(target: string): number {
+		const dir = join(INBOX_DIR, target);
+		if (!existsSync(dir)) return 0;
+		let discarded = 0;
+		for (const name of readdirSync(dir)) {
+			if (!name.endsWith(".json")) continue;
+			const path = join(dir, name);
+			try {
+				const entry: unknown = JSON.parse(readFileSync(path, "utf8"));
+				if (
+					entry === null ||
+					typeof entry !== "object" ||
+					!("kind" in entry) ||
+					entry.kind !== "redo" ||
+					!("value" in entry) ||
+					typeof entry.value !== "string"
+				) {
+					continue;
+				}
+				rmSync(path, { force: true });
+				discarded += 1;
+			} catch (error) {
+				pi.logger.warn("notify-telegram: could not reclassify a queued shutdown redo", {
+					name,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return discarded;
 	}
 
 	/** Sequential: two taps in one poll batch must see each other's state. */
@@ -4190,13 +4363,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		sessionCtx = ctx;
 		sessionId = ctx.sessionManager.getSessionId();
-		sessionAlive = true;
 		mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
 		try {
 			// mkdir applies the mode only at creation; a dir inherited from an older version stays loose otherwise.
 			chmodSync(STATE_DIR, 0o700);
 		} catch {}
 		mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
+		resetReactionRouteForStartup(sessionId);
+		sessionAlive = true;
 		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true, mode: 0o700 });
 		reapDeadSessions();
 		reapOldFiles();
@@ -4635,7 +4809,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		detach(sessionNotice(ctx, `Credential disabled for ${provider}.`), "credential notice");
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
+		const queuedRedos = await closeReactionRouteForShutdown();
+		if (queuedRedos > 0) {
+			await serviceNotice("Grade kept, but this session ended before its queued redo could reach the agent.", false);
+		}
 		unsubscribeInput?.();
 		unsubscribeInput = null;
 		retireCloseOffer(true);

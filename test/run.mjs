@@ -6822,6 +6822,151 @@ check(
 	feedbackLines().at(-1).updateId === 9035 && feedbackLines().at(-1).message.text === onRecord(editedQuestionId).text,
 );
 
+// A staged transaction must carry a safe embedded owner before it can append feedback or route a redo.
+const unsafePendingUpdate = 9036;
+const unsafePendingFile = join(root, `notify-telegram/reaction-pending/${unsafePendingUpdate}.json`);
+writeFileSync(
+	unsafePendingFile,
+	JSON.stringify({
+		transaction: 1,
+		updateId: unsafePendingUpdate,
+		feedback: { updateId: unsafePendingUpdate, message: { session: { id: "../escape" } } },
+		kind: "redo",
+		value: "unsafe pending redo",
+		messageId: statusId,
+		targetKind: "status",
+	}),
+);
+const unsafePendingOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const feedbackBeforeUnsafePending = feedbackLines().length;
+api.queued = [react(unsafePendingUpdate, statusId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+check(
+	"an unsafe staged transaction is rejected before feedback or inbox publication",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === unsafePendingOffset &&
+		feedbackLines().length === feedbackBeforeUnsafePending &&
+		!existsSync(join(root, `notify-telegram/escape/${unsafePendingUpdate}.json`)),
+);
+rmSync(unsafePendingFile, { force: true });
+
+// A redo already routed to a live session is delivered before shutdown publishes the dead owner state.
+const shutdownRedoSession = spawn("01a0700b-0000-0000-0000-000000000000", "/home/dev/work/shutdown-redo");
+await shutdownRedoSession.fire("session_start");
+await shutdownRedoSession.fire("input");
+await shutdownRedoSession.tools
+	.get("notify_status")
+	.execute(
+		"fb-shutdown-redo",
+		{ summary: "Ready to close after feedback.", urgency: "green" },
+		undefined,
+		undefined,
+		shutdownRedoSession.ctx,
+	);
+await shutdownRedoSession.fire("session_stop");
+await settle(150);
+const shutdownRedoMessageId = record(shutdownRedoSession.id).recent.at(-1);
+const shutdownRedoSteers = shutdownRedoSession.steers.length;
+api.queued = [react(9037, shutdownRedoMessageId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+check(
+	"a live owner has the redo queued before shutdown",
+	feedbackLines().at(-1).updateId === 9037 &&
+		feedbackLines().at(-1).redo === true &&
+		inboxCount(shutdownRedoSession.id) === 1,
+);
+await shutdownRedoSession.fire("session_shutdown");
+check(
+	"shutdown reclassifies its queued redo before marking the owner dead",
+	record(shutdownRedoSession.id).heartbeat === 0 &&
+		inboxCount(shutdownRedoSession.id) === 0 &&
+		shutdownRedoSession.steers.length === shutdownRedoSteers &&
+		lastCall("sendMessage").body.text.includes("session ended"),
+);
+
+// Commit and shutdown serialize through the same owner lock, then a retry records the now-dead route honestly.
+const routeRaceSession = spawn("01a0700c-0000-0000-0000-000000000000", "/home/dev/work/route-race");
+const routeLockDir = join(root, "notify-telegram/reaction-route-locks");
+mkdirSync(routeLockDir, { recursive: true });
+const routeLockFile = join(routeLockDir, `${routeRaceSession.id}.lock`);
+const routeClosingFile = join(routeLockDir, `${routeRaceSession.id}.closing`);
+writeFileSync(routeLockFile, "orphan");
+writeFileSync(routeClosingFile, "orphan");
+await routeRaceSession.fire("session_start");
+check(
+	"session startup removes its own orphaned reaction route state",
+	!existsSync(routeLockFile) && !existsSync(routeClosingFile),
+);
+await routeRaceSession.fire("input");
+await routeRaceSession.tools
+	.get("notify_status")
+	.execute(
+		"fb-route-race",
+		{ summary: "Race the shutdown boundary.", urgency: "green" },
+		undefined,
+		undefined,
+		routeRaceSession.ctx,
+	);
+await routeRaceSession.fire("session_stop");
+await settle(150);
+const routeRaceMessageId = record(routeRaceSession.id).recent.at(-1);
+writeFileSync(routeLockFile, JSON.stringify({ token: "held", pid: process.pid }));
+const routeRaceReaction = react(9038, routeRaceMessageId, ["\u{1F44E}"]);
+const routeRaceOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+api.queued = [routeRaceReaction];
+await ownershipPoller.pump(250);
+check(
+	"a held owner lock leaves the reaction transaction and offset pending",
+	JSON.parse(readFileSync(routeLockFile, "utf8")).token === "held" &&
+		existsSync(join(root, "notify-telegram/reaction-pending/9038.json")) &&
+		JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === routeRaceOffset,
+);
+const routeRaceShutdown = routeRaceSession.fire("session_shutdown");
+await settle(50);
+check("shutdown waits for the owner route lock before publishing death", record(routeRaceSession.id).heartbeat > 0);
+rmSync(routeLockFile, { force: true });
+await routeRaceShutdown;
+api.queued = [routeRaceReaction];
+await ownershipPoller.pump(250);
+const routeRaceFeedback = feedbackLines().at(-1);
+check(
+	"a transaction retried after locked shutdown is recorded without a lost redo",
+	routeRaceFeedback.updateId === 9038 &&
+		routeRaceFeedback.redo === false &&
+		!existsSync(join(root, "notify-telegram/reaction-pending/9038.json")) &&
+		inboxCount(routeRaceSession.id) === 0 &&
+		lastCall("sendMessage").body.text.includes("session ended"),
+);
+const fenceFailureSession = spawn("01a0700d-0000-0000-0000-000000000000", "/home/dev/work/fence-failure");
+await fenceFailureSession.fire("session_start");
+const fenceFailureLock = join(routeLockDir, `${fenceFailureSession.id}.lock`);
+const fenceFailureClosing = join(routeLockDir, `${fenceFailureSession.id}.closing`);
+const realRouteWrite = fs.writeFileSync;
+const realNow = Date.now;
+let routeDeadlineElapsed = false;
+fs.writeFileSync = (path, data, options) => {
+	if (String(path) === fenceFailureLock) {
+		routeDeadlineElapsed = true;
+		throw new Error("route lock unavailable");
+	}
+	return realRouteWrite(path, data, options);
+};
+Date.now = () => realNow() + (routeDeadlineElapsed ? 6_000 : 0);
+syncBuiltinESMExports();
+let fenceFailureThrown = false;
+try {
+	await fenceFailureSession.fire("session_shutdown");
+} catch {
+	fenceFailureThrown = true;
+} finally {
+	fs.writeFileSync = realRouteWrite;
+	Date.now = realNow;
+	syncBuiltinESMExports();
+}
+check(
+	"a failed forced route acquisition removes its shutdown fence",
+	fenceFailureThrown && !existsSync(fenceFailureClosing) && record(fenceFailureSession.id).heartbeat > 0,
+);
+await fenceFailureSession.fire("session_shutdown");
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");
 const freshRecord = join(sentDir, "2.json");
@@ -6831,6 +6976,7 @@ const ninetyOneDaysAgo = (Date.now() - 91 * 24 * 3600 * 1000) / 1000;
 utimesSync(staleRecord, ninetyOneDaysAgo, ninetyOneDaysAgo);
 const staleMedia = join(mediaDir, "stale-retention.bin");
 const freshMedia = join(mediaDir, "fresh-retention.bin");
+
 writeFileSync(staleMedia, "");
 writeFileSync(freshMedia, "");
 const eightDaysAgo = (Date.now() - 8 * 24 * 3600 * 1000) / 1000;
