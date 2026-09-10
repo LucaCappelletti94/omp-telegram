@@ -1,6 +1,7 @@
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
+	appendFileSync,
 	chmodSync,
 	existsSync,
 	mkdirSync,
@@ -10,6 +11,7 @@ import {
 	rmSync,
 	statSync,
 	unlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -51,6 +53,13 @@ const DASHBOARD_FILE = join(STATE_DIR, "dashboard.json");
 const DASHBOARD_LOCK_FILE = join(STATE_DIR, "dashboard.lock");
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const MEDIA_DIR = join(STATE_DIR, "media");
+/** Every session message as sent, keyed by message id: a reaction names only the id. */
+const SENT_DIR = join(STATE_DIR, "sent");
+const SENT_IN_FLIGHT_DIR = join(STATE_DIR, "sent-in-flight");
+const REACTION_PENDING_DIR = join(STATE_DIR, "reaction-pending");
+const REACTION_ROUTE_LOCK_DIR = join(STATE_DIR, "reaction-route-locks");
+/** One line per reaction change, holding the grade and the message it graded. */
+const FEEDBACK_FILE = join(STATE_DIR, "feedback.jsonl");
 /** The channel a process outside omp uses to ask one question and read its answer back. */
 const EXTERNAL_DIR = join(STATE_DIR, "external");
 const EXTERNAL_ANSWERS_DIR = join(EXTERNAL_DIR, "answers");
@@ -59,9 +68,12 @@ const EXTERNAL_KEY = /^[A-Za-z0-9._-]{1,64}$/u;
 /** Held only across a badge validate-and-persist, which is two file writes long. */
 const BADGE_LOCK_FILE = join(STATE_DIR, "badge.lock");
 
+const REACTION_ROUTE_WAIT_MS = 5_000;
 const HEARTBEAT_MS = 15_000;
 const LOCK_STALE_MS = 45_000;
 const DRAIN_MS = 1_000;
+/** Refreshed every heartbeat while work is active, with enough slack for delayed timer ticks. */
+const SENT_MARKER_STALE_MS = 2 * 60_000;
 const BADGE_CLAIM_STALE_MS = 5_000;
 const LONG_POLL_S = 25;
 const STATUS_OPTIONS_MIN = 2;
@@ -106,6 +118,102 @@ const QUESTION_STOP_REASON =
 
 const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;
+const SENT_KEEP_MS = 90 * 24 * 3600 * 1000;
+/** User-approved Telegram reactions, normalised without the optional U+FE0F selector. */
+const REACTION_SCALE: ReadonlyArray<readonly [number, readonly string[]]> = [
+	[3, ["\u{1F3C6}", "\u{1F4AF}", "\u{1F929}", "\u2764\u200D\u{1F525}", "\u{1F389}", "\u{1F525}"]],
+	[
+		2,
+		["\u{1F44D}", "\u2764", "\u{1F44F}", "\u{1F60D}", "\u{1F970}", "\u{1F44C}", "\u{1F64F}", "\u{1F601}", "\u{1F923}"],
+	],
+	[1, ["\u{1F60E}", "\u{1F91D}", "\u{1FAE1}", "\u{1F192}", "\u{1F440}", "\u{1F913}"]],
+	[0, ["\u{1F914}", "\u{1F928}", "\u{1F610}", "\u{1F937}", "\u{1F937}\u200D\u2642", "\u{1F937}\u200D\u2640"]],
+	[-1, ["\u{1F971}", "\u{1F634}", "\u{1F648}", "\u{1F622}", "\u{1F494}"]],
+	[-2, ["\u{1F44E}", "\u{1F628}", "\u{1F631}", "\u{1F62D}", "\u{1F92F}"]],
+	[-3, ["\u{1F4A9}", "\u{1F92E}", "\u{1F921}", "\u{1F92C}", "\u{1F621}", "\u{1F595}"]],
+];
+const REACTION_GRADES: Readonly<Record<string, number>> = Object.fromEntries(
+	REACTION_SCALE.flatMap(([grade, emoji]) => emoji.map((e) => [e, grade])),
+);
+/** A grade this low on an agent message sends the agent back to write it again. */
+const REDO_GRADE = -2;
+
+/** What a message was, so a grade on it can be read later and a redo can name the tool. */
+type SentKind = "status" | "question" | "standing" | "snippet" | "file" | "approval" | "notice";
+const SENT_KINDS: Readonly<Record<SentKind, true>> = {
+	status: true,
+	question: true,
+	standing: true,
+	snippet: true,
+	file: true,
+	approval: true,
+	notice: true,
+};
+
+interface SentRecord {
+	version: 1;
+	id: number;
+	at: number;
+	kind: SentKind;
+	/** The plain source as sent, head and footer included: what the reader graded. */
+	text: string;
+	session: { id: string; tag: string; emoji: string; name: string; cwd: string };
+	/** The structured call behind the message, where there was one. */
+	payload?: unknown;
+}
+
+interface TelegramReaction {
+	chat: { id: number };
+	message_id: number;
+	user?: { id: number };
+	date: number;
+	old_reaction: TelegramReactionType[];
+	new_reaction: TelegramReactionType[];
+}
+
+function isTelegramMessageId(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+function isStateToken(value: unknown): value is string {
+	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value);
+}
+
+type TelegramReactionType =
+	| { type: "emoji"; emoji: string }
+	| { type: "custom_emoji"; custom_emoji_id: string }
+	| { type: "paid" };
+
+type RedoTargetKind = Exclude<SentKind, "approval" | "notice">;
+const REDO_TARGET_KINDS: Readonly<Record<RedoTargetKind, true>> = {
+	status: true,
+	question: true,
+	standing: true,
+	snippet: true,
+	file: true,
+};
+
+function isRedoTargetKind(value: unknown): value is RedoTargetKind {
+	return typeof value === "string" && Object.hasOwn(REDO_TARGET_KINDS, value);
+}
+
+function gradeReaction(reaction: TelegramReactionType[]): {
+	emoji: string[];
+	grade: number | null;
+	ungraded: string[];
+} {
+	const emoji = reaction.map((item) =>
+		item.type === "emoji" ? item.emoji : item.type === "paid" ? "paid" : `custom:${item.custom_emoji_id}`,
+	);
+	let grade: number | null = null;
+	const ungraded: string[] = [];
+	for (const token of emoji) {
+		const value = REACTION_GRADES[token.replaceAll("\uFE0F", "")];
+		if (value === undefined) ungraded.push(token);
+		else grade = grade === null ? value : Math.min(grade, value);
+	}
+	return { emoji, grade: ungraded.length > 0 ? null : grade, ungraded };
+}
+
 const TYPING_MS = 5_000;
 const DRAFT_MS = 1_500;
 /** The party-popper send effect, verified against the live API; effects exist in private chats only. */
@@ -162,6 +270,10 @@ interface SessionRecord {
 	lastNotified: number;
 	/** Replying to one of these routes back here. */
 	recent: number[];
+	/** Message id of the native ask currently waiting for an answer. */
+	question: number | null;
+	/** Buttonless turn-end question still waiting for a Telegram reply. */
+	replyQuestion: number | null;
 	/** Standing turn-end question; survives a resume. */
 	standing: StandingQuestion | null;
 	/** Message carrying a live close-session button on a plain green summary. */
@@ -208,6 +320,7 @@ interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
 	callback_query?: TelegramCallbackQuery;
+	message_reaction?: TelegramReaction;
 }
 
 interface AskResult {
@@ -286,15 +399,26 @@ interface ModelUsage {
 }
 
 interface InboxEntry {
-	kind: "text" | "callback" | "file" | "command";
-	/** Text, callback payload, downloaded file path, or command name. */
+	kind: "text" | "callback" | "file" | "command" | "redo";
+	/** Text, callback payload, downloaded file path, command name, or the redo note. */
 	value: string;
-	/** Incoming Telegram message id, for delivery receipts. */
+	/** Incoming Telegram message id for delivery receipts. For a redo, the graded message. */
 	messageId?: number;
+	/** Original sent-message kind, used to reject a question redo that became stale in transit. */
+	targetKind?: SentKind;
+	/** True when a status message is itself a buttonless question. */
+	targetQuestion?: boolean;
+	/** True when eligibility was established from the record visible before an accepted edit. */
+	targetPreEdit?: boolean;
 	/** Message id the sender replied to. */
 	replyTo?: number;
 	caption?: string;
 	mime?: string;
+}
+interface ReactionTransaction extends Partial<InboxEntry> {
+	transaction: 1;
+	updateId: number;
+	feedback: Record<string, unknown>;
 }
 
 interface IncomingFile {
@@ -862,6 +986,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let standingSeq = 0;
 	let standingQuestion: StandingQuestion | null = null;
 	let closeOfferMessageId: number | null = null;
+	let replyQuestionMessageId: number | null = null;
+	let replyQuestionGeneration = 0;
 	let statusBlockUsed = false;
 	let lastState = "";
 	let lastHealth = "";
@@ -874,6 +1000,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	const recentMessages: number[] = [];
 	let lastNotifiedAt = 0;
 	let turnActive = false;
+	let sessionAlive = true;
 	let typingSentAt = 0;
 	/** Cleared when the turn carrying the answer ends: typing is chat-wide, so no session may hold it idly. */
 	let replyOwed = false;
@@ -919,54 +1046,207 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	/**
-	 * The record is the only thing the poller can match a reply against, so an id kept in memory is
-	 * a reply that gets refused until the next heartbeat rewrites the file. Persisting here rather
-	 * than at each send site is what keeps a newly added message replyable from the moment it exists.
-	 */
-	function trackSent(sent: TelegramMessage | null): void {
-		if (typeof sent?.message_id !== "number") return;
+	function parseSentRecord(parsed: unknown, id: number): SentRecord | null {
+		if (parsed === null || typeof parsed !== "object") return null;
+		const candidate = parsed as Partial<SentRecord>;
+		const session = candidate.session as Partial<SentRecord["session"]> | undefined;
+		if (
+			candidate.version !== 1 ||
+			candidate.id !== id ||
+			typeof candidate.at !== "number" ||
+			typeof candidate.kind !== "string" ||
+			!Object.hasOwn(SENT_KINDS, candidate.kind) ||
+			typeof candidate.text !== "string" ||
+			session === undefined ||
+			!isStateToken(session.id) ||
+			typeof session.tag !== "string" ||
+			typeof session.emoji !== "string" ||
+			typeof session.name !== "string" ||
+			typeof session.cwd !== "string"
+		) {
+			return null;
+		}
+		return candidate as SentRecord;
+	}
+
+	function readSentRecord(id: number): SentRecord | null {
+		if (!isTelegramMessageId(id)) return null;
+		try {
+			return parseSentRecord(JSON.parse(readFileSync(join(SENT_DIR, `${id}.json`), "utf8")), id);
+		} catch {
+			return null;
+		}
+	}
+	async function withSentRecordMarker<T>(work: (acceptEdit: () => void) => Promise<T>, messageId?: number): Promise<T> {
+		mkdirSync(SENT_IN_FLIGHT_DIR, { recursive: true, mode: 0o700 });
+		const prefix = messageId === undefined ? "new" : `edit-${messageId}`;
+		const marker = join(SENT_IN_FLIGHT_DIR, `${prefix}-${randomUUID()}`);
+		const previous = messageId === undefined ? null : readSentRecord(messageId);
+		writeFileSync(marker, previous === null ? "" : JSON.stringify(previous), { mode: 0o600 });
+		const heartbeat = setInterval(() => {
+			try {
+				const now = new Date();
+				utimesSync(marker, now, now);
+			} catch {}
+		}, HEARTBEAT_MS);
+		heartbeat.unref();
+		let accepted = false;
+		const acceptEdit = (): void => {
+			if (messageId === undefined || accepted) return;
+			writeFileAtomic(marker, "", 0o600);
+			accepted = true;
+		};
+		try {
+			return await work(acceptEdit);
+		} finally {
+			clearInterval(heartbeat);
+			rmSync(marker, { force: true });
+		}
+	}
+
+	function sentRecordInFlight(messageId: number, includeNew: boolean): boolean {
+		if (!existsSync(SENT_IN_FLIGHT_DIR)) return false;
+		let active = false;
+		for (const entry of readdirSync(SENT_IN_FLIGHT_DIR)) {
+			const marker = join(SENT_IN_FLIGHT_DIR, entry);
+			try {
+				if (Date.now() - statSync(marker).mtimeMs > SENT_MARKER_STALE_MS) unlinkSync(marker);
+				else if ((includeNew && entry.startsWith("new-")) || entry.startsWith(`edit-${messageId}-`)) active = true;
+			} catch {}
+		}
+		return active;
+	}
+
+	/** `undefined` means no edit, `null` means an accepted edit awaiting publication. */
+	function recordBeforePendingEdit(messageId: number): SentRecord | null | undefined {
+		if (!existsSync(SENT_IN_FLIGHT_DIR)) return;
+		let previous: SentRecord | undefined;
+		for (const entry of readdirSync(SENT_IN_FLIGHT_DIR)) {
+			if (!entry.startsWith(`edit-${messageId}-`)) continue;
+			const marker = join(SENT_IN_FLIGHT_DIR, entry);
+			try {
+				if (Date.now() - statSync(marker).mtimeMs > SENT_MARKER_STALE_MS) {
+					unlinkSync(marker);
+					continue;
+				}
+				const raw = readFileSync(marker, "utf8");
+				if (raw.length === 0) return null;
+				const candidate = parseSentRecord(JSON.parse(raw) as unknown, messageId);
+				if (candidate === null) return null;
+				if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(candidate)) return null;
+				previous = candidate;
+			} catch {
+				return null;
+			}
+		}
+		return previous;
+	}
+
+	function snapshotSentSession(): SentRecord["session"] {
+		const name = badgeOverride.length > 0 ? badgeOverride : (sessionCtx?.sessionManager.getSessionName() ?? "");
+		return { id: sessionId, tag: sessionTag, emoji: badgeEmoji, name, cwd: sessionCtx?.cwd ?? "" };
+	}
+
+	/** Persists what one Telegram message currently says so a later reaction can recover it. */
+	function recordSent(
+		id: number,
+		kind: SentKind,
+		text: string,
+		sentSession: SentRecord["session"],
+		payload?: unknown,
+	): void {
+		if (!isTelegramMessageId(id)) return;
+		const record: SentRecord = {
+			version: 1,
+			id,
+			at: Date.now(),
+			kind,
+			text,
+			session: sentSession,
+		};
+		if (payload !== undefined) record.payload = payload;
+		mkdirSync(SENT_DIR, { recursive: true, mode: 0o700 });
+		writeFileAtomic(join(SENT_DIR, `${id}.json`), JSON.stringify(record), 0o600);
+	}
+
+	/** New messages become reply targets and reaction records atomically with the successful send. */
+	function trackSent(
+		sent: TelegramMessage | null,
+		kind: SentKind,
+		text: string,
+		sentSession: SentRecord["session"],
+		payload?: unknown,
+		beforeRecord?: (messageId: number) => void,
+	): void {
+		if (!isTelegramMessageId(sent?.message_id)) return;
 		recentMessages.push(sent.message_id);
 		if (recentMessages.length > RECENT_MESSAGE_CAP) {
 			recentMessages.splice(0, recentMessages.length - RECENT_MESSAGE_CAP);
 		}
+		beforeRecord?.(sent.message_id);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+		recordSent(sent.message_id, kind, text, sentSession, payload);
 	}
 
-	/**
-	 * A send rejected over its markup retries as plain text, and the size limit is on the rendered
-	 * form. Nothing else retries: re-sending into a refusal adds a request to whatever is refusing
-	 * them, and drops formatting that was never at fault.
-	 */
+	/** Retries markup failures as plain text and records only messages with a non-null `kind`. */
 	async function sendOrEdit(
 		cfg: Config,
 		method: "sendMessage" | "editMessageText",
 		body: Record<string, unknown>,
 		plain: string,
 		keep = "",
-		track = true,
+		kind: SentKind | null = null,
+		payload?: unknown,
+		beforeRecord?: (messageId: number) => void,
+		sentSession = snapshotSentSession(),
 	): Promise<TelegramMessage | null> {
-		const quiet = { link_preview_options: { is_disabled: true } };
-		const source = fitToTelegram(plain, keep);
-		let refusal = "";
-		let sent = await callTelegramRaw<TelegramMessage>(
-			cfg,
-			method,
-			{ ...quiet, ...body, text: toTelegramHtml(source), parse_mode: "HTML" },
-			15_000,
-			(failure) => {
-				refusal = failure.description;
-			},
-		);
-		if (sent === null && isMarkupFailure(refusal)) {
-			pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method, description: refusal });
-			const { message_effect_id: _effect, ...safe } = body;
-			sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: plainStamps(source) }, 15_000);
-		} else if (sent === null) {
-			pi.logger.warn("telegram: send refused", { method, description: refusal });
-		}
-		if (method === "sendMessage" && track) trackSent(sent);
-		return sent;
+		const work = async (acceptEdit: () => void): Promise<TelegramMessage | null> => {
+			const quiet = { link_preview_options: { is_disabled: true } };
+			const source = fitToTelegram(plain, keep);
+			let sentText = source;
+			let refusal = "";
+			let sent = await callTelegramRaw<TelegramMessage>(
+				cfg,
+				method,
+				{ ...quiet, ...body, text: toTelegramHtml(source), parse_mode: "HTML" },
+				15_000,
+				(failure) => {
+					refusal = failure.description;
+				},
+			);
+			if (sent === null && isMarkupFailure(refusal)) {
+				pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method, description: refusal });
+				const { message_effect_id: _effect, ...safe } = body;
+				const fallback = plainStamps(source);
+				sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: fallback }, 15_000);
+				sentText = fallback;
+			} else if (sent === null) {
+				pi.logger.warn("telegram: send refused", { method, description: refusal });
+			}
+			if (sent !== null) {
+				if (method === "editMessageText") acceptEdit();
+				if (method === "sendMessage" && kind !== null) {
+					trackSent(sent, kind, sentText, sentSession, payload, beforeRecord);
+				} else if (method === "editMessageText" && isTelegramMessageId(body.message_id)) {
+					const previous = readSentRecord(body.message_id);
+					const editedKind = kind ?? previous?.kind;
+					if (editedKind !== undefined) {
+						beforeRecord?.(body.message_id);
+						if (beforeRecord !== undefined && sessionCtx !== null) writeSessionRecord(sessionCtx);
+						recordSent(body.message_id, editedKind, sentText, sentSession, payload ?? previous?.payload);
+					}
+				}
+			}
+			return sent;
+		};
+		if (method === "sendMessage" && kind !== null) return await withSentRecordMarker(work);
+		const editedMessageId =
+			method === "editMessageText" &&
+			isTelegramMessageId(body.message_id) &&
+			(kind !== null || readSentRecord(body.message_id) !== null)
+				? body.message_id
+				: undefined;
+		return editedMessageId === undefined ? await work(() => {}) : await withSentRecordMarker(work, editedMessageId);
 	}
 
 	/** What this session is doing right now, in the words `/status` uses. */
@@ -990,6 +1270,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			label: badgeOverride,
 			lastNotified: lastNotifiedAt,
 			recent: [...recentMessages],
+			question: pendingAsk?.messageId ?? null,
+			replyQuestion: replyQuestionMessageId,
 			standing: standingQuestion,
 			closeOffer: closeOfferMessageId,
 			pinned: pinnedMessageId,
@@ -997,7 +1279,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			health: lastHealth,
 			summary: lastSummary,
 			summaryAt: lastSummaryAt,
-			heartbeat: Date.now(),
+			heartbeat: sessionAlive ? Date.now() : 0,
 		};
 		writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(record), 0o600);
 	}
@@ -1006,6 +1288,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function noteState(): void {
 		if (sessionCtx === null || (sessionState() === lastState && turnHealth === lastHealth)) return;
 		writeSessionRecord(sessionCtx);
+	}
+	function closeReplyQuestion(target = replyQuestionMessageId): void {
+		if (target !== replyQuestionMessageId) return;
+		replyQuestionGeneration += 1;
+		if (replyQuestionMessageId === null) return;
+		replyQuestionMessageId = null;
+		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 	}
 
 	/**
@@ -1043,6 +1332,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				label: text(raw.label),
 				lastNotified: count(raw.lastNotified),
 				recent: Array.isArray(raw.recent) ? raw.recent.filter((m) => typeof m === "number") : [],
+				question: messageId(raw.question),
+				replyQuestion: messageId(raw.replyQuestion),
 				standing: typeof raw.standing === "object" && raw.standing !== null ? raw.standing : null,
 				closeOffer: messageId(raw.closeOffer),
 				pinned: messageId(raw.pinned),
@@ -1223,27 +1514,51 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		for (const entry of readdirSync(SESSIONS_DIR)) {
 			if (!entry.endsWith(".json")) continue;
 			const id = entry.slice(0, -5);
-			if (id === sessionId) continue;
+			if (!isStateToken(id) || id === sessionId) continue;
 			const record = readSessionRecord(id);
 			// A live session refreshes its heartbeat every 15 seconds, so a stale one is gone.
 			if (record !== null && Date.now() - record.heartbeat <= LOCK_STALE_MS) continue;
-			unlinkSync(join(SESSIONS_DIR, entry));
-			rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
+			mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+			const closing = reactionRouteClosingFile(id);
+			try {
+				writeFileSync(closing, randomUUID(), { flag: "wx", mode: 0o600 });
+			} catch {
+				continue;
+			}
+			try {
+				const queuedRedos = discardQueuedRedos(id);
+				if (queuedRedos > 0) {
+					detach(
+						serviceNotice("Grade kept, but its session ended before the queued redo could reach the agent.", false),
+						"dead-session redo notice",
+					);
+				}
+				unlinkSync(join(SESSIONS_DIR, entry));
+				rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
+				rmSync(reactionRouteLockFile(id), { force: true });
+			} finally {
+				rmSync(closing, { force: true });
+			}
 		}
 	}
 
-	let lastMediaReap = 0;
+	let lastReap = 0;
 
-	/** Downloaded Telegram files are working input, not an archive. */
-	function reapOldMedia(): void {
-		if (Date.now() - lastMediaReap < 3_600_000) return;
-		lastMediaReap = Date.now();
-		if (!existsSync(MEDIA_DIR)) return;
-		for (const entry of readdirSync(MEDIA_DIR)) {
-			const path = join(MEDIA_DIR, entry);
-			try {
-				if (Date.now() - statSync(path).mtimeMs > MEDIA_KEEP_MS) unlinkSync(path);
-			} catch {}
+	/** Downloaded files are working input, and sent messages are grading records. Neither is an archive. */
+	function reapOldFiles(): void {
+		if (Date.now() - lastReap < 3_600_000) return;
+		lastReap = Date.now();
+		for (const [dir, keepMs] of [
+			[MEDIA_DIR, MEDIA_KEEP_MS],
+			[SENT_DIR, SENT_KEEP_MS],
+		] as const) {
+			if (!existsSync(dir)) continue;
+			for (const entry of readdirSync(dir)) {
+				const path = join(dir, entry);
+				try {
+					if (Date.now() - statSync(path).mtimeMs > keepMs) unlinkSync(path);
+				} catch {}
+			}
 		}
 	}
 
@@ -1481,7 +1796,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 */
 	async function serviceNotice(text: string, routable = true): Promise<void> {
 		if (config === null) return;
-		await sendOrEdit(config, "sendMessage", { chat_id: config.chatId }, `\u{1F535} ${text}`, "", routable);
+		await sendOrEdit(
+			config,
+			"sendMessage",
+			{ chat_id: config.chatId },
+			`\u{1F535} ${text}`,
+			"",
+			routable ? "notice" : null,
+		);
 	}
 
 	async function sessionNotice(ctx: ExtensionContext, text: string): Promise<void> {
@@ -1493,33 +1815,49 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		cfg: Config,
 		body: Record<string, unknown>,
 		plain: string,
-		keep = "",
+		keep: string,
+		kind: SentKind,
+		payload?: unknown,
+		beforeRecord?: (messageId: number) => void,
 	): Promise<TelegramMessage | null> {
+		const sentSession = snapshotSentSession();
 		if (/```|(^|\n)\|.+\|/.test(plain)) {
-			const sent = await callTelegram<TelegramMessage>(
-				cfg,
-				"sendRichMessage",
-				{ ...body, rich_message: { markdown: plain + keep } },
-				15_000,
-			);
-			if (sent !== null) {
-				trackSent(sent);
-				return sent;
-			}
+			const sent = await withSentRecordMarker(async () => {
+				const accepted = await callTelegram<TelegramMessage>(
+					cfg,
+					"sendRichMessage",
+					{ ...body, rich_message: { markdown: plain + keep } },
+					15_000,
+				);
+				if (accepted !== null) trackSent(accepted, kind, plain + keep, sentSession, payload, beforeRecord);
+				return accepted;
+			});
+			if (sent !== null) return sent;
 		}
-		return await sendOrEdit(cfg, "sendMessage", body, plain, keep);
+		return await sendOrEdit(cfg, "sendMessage", body, plain, keep, kind, payload, beforeRecord, sentSession);
 	}
 
 	/** `keep` is a short tail exempt from truncation, so an oversized body cannot swallow the usage footer. */
 	async function notify(
 		ctx: ExtensionContext,
+		kind: SentKind,
 		title: string,
 		body: string,
 		extra: Record<string, unknown> = {},
 		keep = "",
+		payload?: unknown,
+		beforeRecord?: (messageId: number) => void,
 	): Promise<TelegramMessage | null> {
 		if (config === null) return null;
-		const sent = await sendStructured(config, { chat_id: config.chatId, ...extra }, withHead(ctx, title, body), keep);
+		const sent = await sendStructured(
+			config,
+			{ chat_id: config.chatId, ...extra },
+			withHead(ctx, title, body),
+			keep,
+			kind,
+			payload,
+			beforeRecord,
+		);
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
 		return sent;
@@ -2169,8 +2507,356 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<void> {
+	function isStatusQuestion(record: SentRecord): boolean {
+		return (
+			record.kind === "status" &&
+			record.payload !== null &&
+			typeof record.payload === "object" &&
+			typeof (record.payload as Partial<TurnStatus>).question === "string"
+		);
+	}
+
+	/** Builds the correction prompt used as either an ask answer or a steer. */
+	function redoNote(record: SentRecord, emoji: string[]): string {
+		const opening = `The user reacted ${emoji.join(" ")} on Telegram to`;
+		const body = record.text.split("\n\n").slice(1).join("\n\n") || record.text;
+		const quoted = `\n\n> ${clip(body, PREVIEW_MAX).replaceAll("\n", "\n> ")}`;
+		const statusQuestion = isStatusQuestion(record);
+		if (record.kind === "question" || record.kind === "standing" || statusQuestion) {
+			const viaStatus = record.kind === "question" ? "" : " through notify_status";
+			return `${opening} your question, which did not make sense on the phone: restate it with the context and definitions a reader who cannot see the terminal needs, spelling out every term this session introduced, then ask again${viaStatus}.${quoted}`;
+		}
+		switch (record.kind) {
+			case "snippet":
+				return `${opening} the snippet you sent, which did not make sense on the phone: send it again with notify_snippet, with a purpose line that says what the text is for and where it goes.${quoted}`;
+			case "file":
+				return `${opening} the file you sent, which did not make sense on the phone: send it again with notify_file, with a caption that says what it shows and why it matters.${quoted}`;
+			default:
+				return `${opening} your turn-end status, which did not stand on its own: write it again with notify_status, stating what changed, what is open, and what you need while assuming this message is all the reader sees.${quoted}`;
+		}
+	}
+
+	function feedbackHasUpdate(updateId: number): boolean {
+		let raw = "";
+		try {
+			raw = readFileSync(FEEDBACK_FILE, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+		for (const row of raw.split("\n")) {
+			if (row.length === 0) continue;
+			try {
+				const candidate = JSON.parse(row) as { updateId?: unknown };
+				if (candidate.updateId === updateId) return true;
+			} catch {}
+		}
+		return false;
+	}
+
+	function reactionTransactionFile(updateId: number): string {
+		return join(REACTION_PENDING_DIR, `${updateId}.json`);
+	}
+
+	function readReactionTransaction(updateId: number): ReactionTransaction | null {
+		try {
+			const parsed = JSON.parse(
+				readFileSync(reactionTransactionFile(updateId), "utf8"),
+			) as Partial<ReactionTransaction>;
+			if (
+				parsed.transaction !== 1 ||
+				parsed.updateId !== updateId ||
+				parsed.feedback === null ||
+				typeof parsed.feedback !== "object" ||
+				!("updateId" in parsed.feedback) ||
+				parsed.feedback.updateId !== updateId ||
+				(parsed.kind !== undefined && parsed.kind !== "redo")
+			) {
+				return null;
+			}
+			if (parsed.kind === "redo") {
+				if (
+					typeof parsed.value !== "string" ||
+					parsed.value.length === 0 ||
+					!isTelegramMessageId(parsed.messageId) ||
+					!isRedoTargetKind(parsed.targetKind) ||
+					(parsed.targetQuestion !== undefined && typeof parsed.targetQuestion !== "boolean") ||
+					(parsed.targetPreEdit !== undefined && typeof parsed.targetPreEdit !== "boolean") ||
+					!("redo" in parsed.feedback) ||
+					parsed.feedback.redo !== true ||
+					!("message" in parsed.feedback)
+				) {
+					return null;
+				}
+				const message = parseSentRecord(parsed.feedback.message, parsed.messageId);
+				if (
+					message === null ||
+					message.kind !== parsed.targetKind ||
+					parsed.targetQuestion !== isStatusQuestion(message)
+				) {
+					return null;
+				}
+			}
+			return parsed as ReactionTransaction;
+		} catch {
+			return null;
+		}
+	}
+
+	function reactionTransactionTarget(transaction: ReactionTransaction): string | null {
+		if (!("message" in transaction.feedback)) return null;
+		const message = transaction.feedback.message;
+		if (message === null || typeof message !== "object" || !("session" in message)) return null;
+		const session = message.session;
+		if (session === null || typeof session !== "object" || !("id" in session)) return null;
+		return isStateToken(session.id) ? session.id : null;
+	}
+
+	function reactionRouteLockFile(target: string): string {
+		return join(REACTION_ROUTE_LOCK_DIR, `${target}.lock`);
+	}
+
+	function reactionRouteClosingFile(target: string): string {
+		return join(REACTION_ROUTE_LOCK_DIR, `${target}.closing`);
+	}
+
+	function releaseReactionRouteLock(target: string, token: string): void {
+		const path = reactionRouteLockFile(target);
+		try {
+			if (readFileSync(path, "utf8") === token) unlinkSync(path);
+		} catch {}
+	}
+
+	function takeReactionRouteLock(target: string, duringShutdown = false): string | null {
+		mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+		const closing = reactionRouteClosingFile(target);
+		if (!duringShutdown && existsSync(closing)) return null;
+		const path = reactionRouteLockFile(target);
+		const token = randomUUID();
+		try {
+			writeFileSync(path, token, { flag: "wx", mode: 0o600 });
+		} catch {
+			return null;
+		}
+		if (!duringShutdown && existsSync(closing)) {
+			releaseReactionRouteLock(target, token);
+			return null;
+		}
+		return token;
+	}
+
+	function resetReactionRouteForStartup(target: string): void {
+		mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+		const closing = reactionRouteClosingFile(target);
+		rmSync(closing, { force: true });
+		writeFileSync(closing, randomUUID(), { flag: "wx", mode: 0o600 });
+		try {
+			rmSync(reactionRouteLockFile(target), { force: true });
+		} finally {
+			rmSync(closing, { force: true });
+		}
+	}
+
+	function ownsOpenReactionRoute(target: string, token: string): boolean {
+		if (existsSync(reactionRouteClosingFile(target))) return false;
+		try {
+			return readFileSync(reactionRouteLockFile(target), "utf8") === token;
+		} catch {
+			return false;
+		}
+	}
+
+	function commitReactionTransaction(transaction: ReactionTransaction): boolean {
+		if (transaction.kind === "redo") {
+			const target = reactionTransactionTarget(transaction);
+			if (target === null) throw new Error("Unsafe reaction inbox target");
+			const token = takeReactionRouteLock(target);
+			if (token === null) throw new Error("Reaction inbox route is busy");
+			try {
+				const owner = readSessionRecord(target);
+				const liveOwner = owner !== null && Date.now() - owner.heartbeat <= LOCK_STALE_MS;
+				if (!ownsOpenReactionRoute(target, token)) throw new Error("Reaction inbox route is closing");
+				const alreadyRecorded = feedbackHasUpdate(transaction.updateId);
+				if (!liveOwner) {
+					if (!alreadyRecorded) {
+						transaction.feedback.redo = false;
+						appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
+					}
+					rmSync(reactionTransactionFile(transaction.updateId), { force: true });
+					return false;
+				}
+				if (!alreadyRecorded) {
+					if (!ownsOpenReactionRoute(target, token)) throw new Error("Reaction inbox route is closing");
+					appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
+					if (!ownsOpenReactionRoute(target, token)) throw new Error("Reaction inbox route closed during commit");
+				}
+				const pending = reactionTransactionFile(transaction.updateId);
+				const dir = join(INBOX_DIR, target);
+				const inbox = join(dir, `${transaction.updateId}.json`);
+				mkdirSync(dir, { recursive: true, mode: 0o700 });
+				if (!ownsOpenReactionRoute(target, token)) throw new Error("Reaction inbox route is closing");
+				renameSync(pending, inbox);
+				if (!ownsOpenReactionRoute(target, token)) {
+					try {
+						renameSync(inbox, pending);
+					} catch {}
+					throw new Error("Reaction inbox route closed during publication");
+				}
+				return true;
+			} finally {
+				releaseReactionRouteLock(target, token);
+			}
+		}
+		if (!feedbackHasUpdate(transaction.updateId)) {
+			appendFileSync(FEEDBACK_FILE, `${JSON.stringify(transaction.feedback)}\n`, { mode: 0o600 });
+		}
+		rmSync(reactionTransactionFile(transaction.updateId), { force: true });
+		return true;
+	}
+
+	/** Records each reaction change and requests a rewrite for strongly negative grades on agent messages. */
+	async function handleReaction(cfg: Config, updateId: number, reaction: TelegramReaction): Promise<false | undefined> {
+		if (reaction.chat.id !== cfg.chatId || reaction.user?.id !== cfg.chatId) {
+			pi.logger.warn("telegram: rejected a reaction from an unexpected origin", {
+				chat: reaction.chat.id,
+				from: reaction.user?.id,
+			});
+			return;
+		}
+		if (!isTelegramMessageId(updateId)) {
+			pi.logger.warn("telegram: rejected a reaction with an invalid update id", { id: updateId });
+			return;
+		}
+		if (!isTelegramMessageId(reaction.message_id)) {
+			pi.logger.warn("telegram: rejected a reaction with an invalid message id", { id: reaction.message_id });
+			return;
+		}
+		const pendingExists = existsSync(reactionTransactionFile(updateId));
+		const pending = readReactionTransaction(updateId);
+		if (pending !== null) {
+			try {
+				if (!commitReactionTransaction(pending)) {
+					await serviceNotice(
+						"Grade kept, but that session ended before its queued redo could reach the agent.",
+						false,
+					);
+				}
+			} catch (error) {
+				pi.logger.warn("telegram: could not finish a reaction transaction", {
+					update: updateId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return false;
+			}
+			return;
+		}
+		if (pendingExists) {
+			pi.logger.warn("telegram: rejected a malformed reaction transaction", { update: updateId });
+			return false;
+		}
+		const beforeEdit = recordBeforePendingEdit(reaction.message_id);
+		if (beforeEdit === null) return false;
+		let record = beforeEdit === undefined ? readSentRecord(reaction.message_id) : beforeEdit;
+		if (beforeEdit === undefined && sentRecordInFlight(reaction.message_id, record === null)) return false;
+		if (beforeEdit === undefined) record = readSentRecord(reaction.message_id) ?? record;
+		if (record === null) {
+			await serviceNotice(
+				`Reaction error: that message is not on record, so the reaction was not kept; session messages stay gradable for ${SENT_KEEP_MS / 86_400_000} days.`,
+				false,
+			);
+			return;
+		}
+		try {
+			if (feedbackHasUpdate(updateId)) return;
+		} catch (error) {
+			pi.logger.warn("telegram: could not read reaction history", {
+				update: updateId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+		const current = gradeReaction(reaction.new_reaction);
+		const previous = gradeReaction(reaction.old_reaction);
+		const { emoji, grade, ungraded } = current;
+		const agentWrote = record.kind !== "notice" && record.kind !== "approval";
+		const wantsRedo = grade !== null && grade <= REDO_GRADE && (previous.grade === null || grade < previous.grade);
+		const owner = wantsRedo && agentWrote ? readSessionRecord(record.session.id) : null;
+		const liveOwner = owner !== null && Date.now() - owner.heartbeat <= LOCK_STALE_MS;
+		const statusQuestion = isStatusQuestion(record);
+		const targetOpen =
+			record.kind === "question"
+				? owner?.question === record.id
+				: record.kind === "standing"
+					? owner?.standing?.messageId === record.id
+					: statusQuestion
+						? owner?.replyQuestion === record.id
+						: true;
+		const redo = liveOwner && targetOpen;
+		const line = {
+			version: 1,
+			updateId,
+			at: reaction.date * 1000,
+			messageId: reaction.message_id,
+			emoji,
+			previous: previous.emoji,
+			grade,
+			redo,
+			message: record,
+		};
+		const redoEntry: InboxEntry | undefined = redo
+			? {
+					kind: "redo",
+					value: redoNote(record, emoji),
+					messageId: record.id,
+					targetKind: record.kind,
+					targetQuestion: statusQuestion,
+					targetPreEdit: beforeEdit !== undefined,
+				}
+			: undefined;
+		const transaction: ReactionTransaction = {
+			transaction: 1,
+			updateId,
+			feedback: line,
+			...redoEntry,
+		};
+		let redoRouted = true;
+		try {
+			mkdirSync(REACTION_PENDING_DIR, { recursive: true, mode: 0o700 });
+			writeFileAtomic(reactionTransactionFile(updateId), JSON.stringify(transaction), 0o600);
+			redoRouted = commitReactionTransaction(transaction);
+		} catch (error) {
+			pi.logger.warn("telegram: could not commit a reaction transaction", {
+				update: updateId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+		if (ungraded.length > 0) {
+			const scale = REACTION_SCALE.map(([g, set]) => `${g > 0 ? "+" : ""}${g} ${set.join("")}`).join(" \u00B7 ");
+			await serviceNotice(
+				`Reaction error: ${ungraded.join(" ")} is outside the grading scale, so it was kept without a grade; graded reactions: ${scale}.`,
+				false,
+			);
+		}
+		if (redo && !redoRouted) {
+			await serviceNotice("Grade kept, but that session ended before its queued redo could reach the agent.", false);
+		}
+		if (wantsRedo && !redo) {
+			const reason =
+				agentWrote && liveOwner && !targetOpen
+					? "Grade kept, but that question is already closed, so it was not reopened."
+					: agentWrote
+						? "Grade kept, but that session is gone, so nothing was redone."
+						: "Grade kept, but those were this bot's own words, so there is nothing to redo.";
+			await serviceNotice(reason, false);
+		}
+	}
+
+	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<false | undefined> {
 		const callback = update.callback_query;
+		if (update.message_reaction !== undefined) {
+			return await handleReaction(cfg, update.update_id, update.message_reaction);
+		}
 		if (callback !== undefined && callback.data !== undefined) {
 			if (callback.message?.chat.id !== cfg.chatId || callback.from?.id !== cfg.chatId) {
 				pi.logger.warn("telegram: rejected a button press from an unexpected origin", {
@@ -2400,7 +3086,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				{
 					offset: config.offset,
 					timeout: LONG_POLL_S,
-					allowed_updates: ["message", "callback_query"],
+					allowed_updates: ["message", "callback_query", "message_reaction"],
 				},
 				(LONG_POLL_S + 10) * 1000,
 			);
@@ -2409,9 +3095,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (!ownsLock()) return;
 			let highest = config.offset - 1;
 			for (const update of updates) {
-				highest = Math.max(highest, update.update_id);
 				try {
-					await handleUpdate(config, update);
+					const handled = await handleUpdate(config, update);
+					if (handled === false) break;
 				} catch (error) {
 					// One malformed or failing update must not wedge the batch: the offset still advances.
 					pi.logger.warn("notify-telegram: skipped a malformed update", {
@@ -2419,6 +3105,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						error: error instanceof Error ? error.message : String(error),
 					});
 				}
+				highest = Math.max(highest, update.update_id);
 			}
 			config.offset = highest + 1;
 			persistOffset(config.offset);
@@ -2463,11 +3150,28 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				"editMessageText",
 				{ chat_id: config.chatId, message_id: ask.messageId, reply_markup: markup },
 				body,
+				"",
+				"question",
+				{ context: ask.context, question },
 			);
 			return;
 		}
-		const sentMessage = await sendOrEdit(config, "sendMessage", { chat_id: config.chatId, reply_markup: markup }, body);
-		ask.messageId = sentMessage?.message_id ?? null;
+		const sentMessage = await sendOrEdit(
+			config,
+			"sendMessage",
+			{ chat_id: config.chatId, reply_markup: markup },
+			body,
+			"",
+			"question",
+			{ context: ask.context, question },
+			(messageId) => {
+				ask.messageId = messageId;
+			},
+		);
+		if (sentMessage === null && pendingAsk === ask) {
+			ask.messageId = null;
+			writeSessionRecord(ask.ctx);
+		}
 	}
 
 	/** Settled options survive as dead grey buttons. `settled`, not `keep`, which now means an untruncatable tail. */
@@ -2476,6 +3180,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		head: string,
 		result: string,
 		settled?: InlineButton[][],
+		beforeRecord?: (messageId: number) => void,
 	): Promise<void> {
 		if (config === null || messageId === null) return;
 		const inline_keyboard =
@@ -2487,6 +3192,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			"editMessageText",
 			{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard } },
 			`${head}\n\n${result}`,
+			"",
+			null,
+			undefined,
+			beforeRecord,
 		);
 	}
 
@@ -2496,10 +3205,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		messageId: number | null,
 		result: string,
 		settled?: InlineButton[][],
+		beforeRecord?: (messageId: number) => void,
 	): Promise<void> {
 		const question = ask.questions[ask.index];
 		if (question === undefined) return;
-		await settleQuestionMessage(messageId, `${messageHead(ask.ctx)}\n\n${question.question}`, result, settled);
+		await settleQuestionMessage(
+			messageId,
+			`${messageHead(ask.ctx)}\n\n${question.question}`,
+			result,
+			settled,
+			beforeRecord,
+		);
 	}
 
 	/** Blocks nothing: a press starts the next turn. Only the latest stands. */
@@ -2537,6 +3253,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}),
 		);
 		if (recorded.urgency === "green") keyboard.push([closeSessionButton()]);
+		const labels = recorded.options.map((option) => option.label);
+		const publishStanding = (messageId: number): void => {
+			standingQuestion = { id, messageId, labels, head: settlementHead };
+		};
 		const sent = await sendStructured(
 			config,
 			{
@@ -2546,13 +3266,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			},
 			body,
 			keep,
+			"standing",
+			recorded,
+			publishStanding,
 		);
-		standingQuestion = {
-			id,
-			messageId: sent?.message_id ?? null,
-			labels: recorded.options.map((option) => option.label),
-			head: settlementHead,
-		};
+		if (sent === null) standingQuestion = { id, messageId: null, labels, head: settlementHead };
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
 		if (recorded.urgency === "red") await pinRed(ctx, sent);
@@ -2572,21 +3290,38 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}));
 	}
 
-	async function advance(ask: PendingAsk): Promise<void> {
-		if (config === null) return;
+	async function advance(ask: PendingAsk): Promise<boolean> {
+		if (config === null) return false;
+		const messageId = ask.messageId;
 		const answered = ask.questions[ask.index];
 		const chosen = [...(ask.selected[ask.index] ?? new Set<string>())];
 		const shown = ask.custom[ask.index] ?? (chosen.length === 0 ? "no selection" : chosen.join(", "));
+		let advanced = false;
+		const publishAdvance = (settledMessageId: number): void => {
+			if (pendingAsk !== ask || ask.messageId !== settledMessageId) return;
+			ask.messageId = null;
+			ask.index += 1;
+			advanced = true;
+		};
 		if (answered !== undefined) {
 			const labels = answered.options.map((option) => option.label);
-			await settleAskMessage(ask, ask.messageId, `**Answered:** ${shown}`, settledKeyboard(labels, new Set(chosen)));
+			await settleAskMessage(
+				ask,
+				messageId,
+				`**Answered:** ${shown}`,
+				settledKeyboard(labels, new Set(chosen)),
+				publishAdvance,
+			);
 		}
-		if (pendingAsk !== ask) return; // Settled at the terminal while the closing edit was in flight.
-		ask.messageId = null;
-		ask.index += 1;
+		if (!advanced) {
+			if (messageId !== null) return pendingAsk !== ask || ask.messageId !== messageId;
+			if (pendingAsk !== ask || ask.messageId !== null) return true;
+			ask.index += 1;
+			writeSessionRecord(ask.ctx);
+		}
 		if (ask.index >= ask.questions.length) {
 			ask.finish(collectResults(ask));
-			return;
+			return true;
 		}
 		await presentQuestion(ask, false);
 		if (pendingAsk !== ask) {
@@ -2594,6 +3329,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			await settleAskMessage(ask, ask.messageId, "This question is no longer active.");
 			ask.messageId = null;
 		}
+		return true;
 	}
 
 	async function applyCallback(ask: PendingAsk, payload: string): Promise<void> {
@@ -2623,6 +3359,66 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await advance(ask);
 	}
 
+	async function closeReactionRouteForShutdown(): Promise<number> {
+		mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
+		const closing = reactionRouteClosingFile(sessionId);
+		writeFileSync(closing, randomUUID(), { flag: "wx", mode: 0o600 });
+		try {
+			const deadline = Date.now() + REACTION_ROUTE_WAIT_MS;
+			let token: string | null = null;
+			while (token === null && Date.now() < deadline) {
+				token = takeReactionRouteLock(sessionId, true);
+				if (token === null) await sleepMs(20);
+			}
+			if (token === null) {
+				rmSync(reactionRouteLockFile(sessionId), { force: true });
+				token = takeReactionRouteLock(sessionId, true);
+				if (token === null) throw new Error("Could not fence the reaction inbox route");
+			}
+			try {
+				const queuedRedos = discardQueuedRedos(sessionId);
+				sessionAlive = false;
+				if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+				return queuedRedos;
+			} finally {
+				releaseReactionRouteLock(sessionId, token);
+			}
+		} finally {
+			rmSync(closing, { force: true });
+		}
+	}
+
+	function discardQueuedRedos(target: string): number {
+		const dir = join(INBOX_DIR, target);
+		if (!existsSync(dir)) return 0;
+		let discarded = 0;
+		for (const name of readdirSync(dir)) {
+			if (!name.endsWith(".json") && !name.endsWith(".json.processing")) continue;
+			const path = join(dir, name);
+			try {
+				const entry: unknown = JSON.parse(readFileSync(path, "utf8"));
+				if (
+					entry === null ||
+					typeof entry !== "object" ||
+					!("kind" in entry) ||
+					entry.kind !== "redo" ||
+					!("value" in entry) ||
+					typeof entry.value !== "string"
+				) {
+					continue;
+				}
+				rmSync(path, { force: true });
+				discarded += 1;
+			} catch (error) {
+				pi.logger.warn("notify-telegram: could not reclassify a queued shutdown redo", {
+					name,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return discarded;
+	}
+
 	/** Sequential: two taps in one poll batch must see each other's state. */
 	async function drainInbox(): Promise<void> {
 		if (drainInFlight) return;
@@ -2631,26 +3427,34 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const dir = join(INBOX_DIR, sessionId);
 			if (!existsSync(dir)) return;
 			const names = readdirSync(dir)
-				.filter((entry) => entry.endsWith(".json"))
+				.filter((entry) => entry.endsWith(".json") || entry.endsWith(".json.processing"))
 				.sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10));
 			for (const name of names) {
-				const path = join(dir, name);
+				const queued = join(dir, name.endsWith(".processing") ? name.slice(0, -".processing".length) : name);
+				const processing = `${queued}.processing`;
+				if (!name.endsWith(".processing")) {
+					try {
+						renameSync(queued, processing);
+					} catch {
+						continue;
+					}
+				}
 				let raw = "";
 				try {
-					raw = readFileSync(path, "utf8");
-				} finally {
-					try {
-						unlinkSync(path);
-					} catch {}
+					raw = readFileSync(processing, "utf8");
+				} catch {
+					continue;
 				}
 				let parsed: unknown = null;
 				try {
 					parsed = JSON.parse(raw);
 				} catch {
+					rmSync(processing, { force: true });
 					pi.logger.warn("notify-telegram: discarded an unparseable inbox entry", { name });
 					continue;
 				}
 				if (parsed === null || typeof parsed !== "object") {
+					rmSync(processing, { force: true });
 					pi.logger.warn("notify-telegram: discarded an inbox entry that is not an object", {
 						name,
 						raw: clip(raw, 200),
@@ -2659,9 +3463,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 				const entry = parsed as Partial<InboxEntry>;
 				if (typeof entry.value !== "string" || entry.value.length === 0) {
+					rmSync(processing, { force: true });
 					pi.logger.warn("notify-telegram: discarded an inbox entry with no value", { name, raw: clip(raw, 200) });
 					continue;
 				}
+				if (
+					entry.kind === "redo" &&
+					(!isTelegramMessageId(entry.messageId) ||
+						!isRedoTargetKind(entry.targetKind) ||
+						(entry.targetQuestion !== undefined && typeof entry.targetQuestion !== "boolean") ||
+						(entry.targetPreEdit !== undefined && typeof entry.targetPreEdit !== "boolean"))
+				) {
+					rmSync(processing, { force: true });
+					pi.logger.warn("notify-telegram: discarded a malformed redo entry", { name, raw: clip(raw, 200) });
+					continue;
+				}
+				if (entry.kind !== "redo") rmSync(processing, { force: true });
 				// A reply or an answer means attention is on this session: put its window in front for the return.
 				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
 					focusTmuxWindow();
@@ -2673,8 +3490,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (entry.kind === "command") {
 					if (entry.value === "hidequestions") {
 						if (ask !== null && ask.messageId !== null) {
-							await settleAskMessage(ask, ask.messageId, "Question hidden. It stays open at the terminal.");
-							ask.messageId = null;
+							await settleAskMessage(
+								ask,
+								ask.messageId,
+								"Question hidden. It stays open at the terminal.",
+								undefined,
+								(messageId) => {
+									if (pendingAsk === ask && ask.messageId === messageId) ask.messageId = null;
+								},
+							);
 						}
 						const standing = standingQuestion;
 						if (standing !== null) {
@@ -2754,12 +3578,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						}
 						// No `deliverAs`: omp steers a running turn and starts one when idle. An explicit
 						// steer only interrupts, so on a finished session it delivered nothing at all.
+						closeReplyQuestion(entry.replyTo);
 						pi.sendUserMessage([
 							{ type: "image", data, mimeType: entry.mime },
 							{ type: "text", text: caption.length > 0 ? caption : "(image sent from Telegram)" },
 						]);
 					} else {
 						const tail = caption.length > 0 ? ` Caption: ${caption}` : "";
+						closeReplyQuestion(entry.replyTo);
 						pi.sendUserMessage(
 							`The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`,
 						);
@@ -2768,6 +3594,40 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					ackDelivered(entry.messageId);
 					continue;
 				}
+				// A grade on the open question answers it with the request to restate. A grade on any
+				// other message is a steer, which omp queues behind a running turn or starts one with.
+				if (entry.kind === "redo") {
+					const standingStillOpen = entry.targetKind !== "standing" || standingQuestion?.messageId === entry.messageId;
+					const statusStillOpen = entry.targetQuestion !== true || replyQuestionMessageId === entry.messageId;
+					if (ask !== null && ask.messageId === entry.messageId) {
+						focusTmuxWindow();
+						ask.custom[ask.index] = entry.value;
+						ask.selected[ask.index] = new Set<string>();
+						if (await advance(ask)) {
+							rmSync(processing, { force: true });
+							replyOwed = true;
+						} else {
+							try {
+								renameSync(processing, queued);
+							} catch {}
+						}
+						continue;
+					}
+					if (
+						(entry.targetKind === "question" || !standingStillOpen || !statusStillOpen) &&
+						entry.targetPreEdit !== true
+					) {
+						rmSync(processing, { force: true });
+						continue;
+					}
+					if (entry.targetQuestion === true) closeReplyQuestion(entry.messageId);
+					focusTmuxWindow();
+					pi.sendUserMessage(entry.value);
+					rmSync(processing, { force: true });
+					replyOwed = true;
+					continue;
+				}
+				if (entry.kind === "text") closeReplyQuestion(entry.replyTo);
 				// The ask blocks the turn, so text arriving now can only be its answer: the question opens
 				// the reply field itself, and a plain message routed here by the open question is the same.
 				if (ask !== null) {
@@ -2916,10 +3776,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					ask,
 					ask.messageId,
 					aborted ? "Cancelled at the terminal." : "This question is no longer active.",
+					undefined,
+					(messageId) => {
+						if (pendingAsk === ask && ask.messageId === messageId) pendingAsk = null;
+					},
 				);
 				throw error;
 			} finally {
-				pendingAsk = null;
+				if (pendingAsk === ask) pendingAsk = null;
 				// The record still says "waiting on a question" until this runs, which would send
 				// the next plain message to a session that is no longer asking anything.
 				noteState();
@@ -3156,6 +4020,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (config === null) {
 				return { content: [{ type: "text", text: "Error: Telegram is not configured" }], isError: true };
 			}
+			const cfg = config;
 			const requestedMode = typeof p.mode === "string" ? p.mode.trim().toLowerCase() : "";
 			const mode = requestedMode.length === 0 ? "auto" : requestedMode;
 			if (mode !== "auto" && mode !== "document") {
@@ -3166,6 +4031,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			const requestedCaption = typeof p.caption === "string" ? p.caption.trim() : "";
 			const context = messageHead(ctx);
+			const sentSession = snapshotSentSession();
 			const separator = requestedCaption.length > 0 ? "\n\n" : "";
 			const at = Date.now();
 			const owner = fileOwner(sessionTag, badgeEmoji);
@@ -3237,49 +4103,66 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					caption: captionOf(names[index] ?? "", index === 0),
 				}));
 				showUploading("upload_photo");
-				const sent = await uploadTelegram<TelegramMessage[]>(
-					config,
-					"sendMediaGroup",
-					{ ...base, media: JSON.stringify(media) },
-					loaded.map((file, index) => ({ field: `f${index}`, name: names[index] ?? file.original, data: file.data })),
-				);
+				const sent = await withSentRecordMarker(async () => {
+					const accepted = await uploadTelegram<TelegramMessage[]>(
+						cfg,
+						"sendMediaGroup",
+						{ ...base, media: JSON.stringify(media) },
+						loaded.map((file, index) => ({
+							field: `f${index}`,
+							name: names[index] ?? file.original,
+							data: file.data,
+						})),
+					);
+					if (accepted !== null) {
+						for (const [index, message] of accepted.entries()) {
+							trackSent(message, "file", media[index]?.caption ?? "", sentSession);
+						}
+					}
+					return accepted;
+				});
 				if (sent === null) {
 					return { content: [{ type: "text", text: "Error: Telegram rejected the album upload" }], isError: true };
 				}
-				for (const message of sent) {
-					trackSent(message);
-					sentIds.push(message.message_id);
-				}
+				for (const message of sent) sentIds.push(message.message_id);
 			} else {
 				for (const [index, file] of loaded.entries()) {
 					const kind = file.photo ? "photo" : "document";
 					const name = nameOf(file.original, kind);
 					const fields: Record<string, string | number> = { ...base, caption: captionOf(name, index === 0) };
 					fields[kind] = "attach://f0";
+					let visibleCaption = String(fields.caption);
 					showUploading(file.photo ? "upload_photo" : "upload_document");
-					let sent = await uploadTelegram<TelegramMessage>(config, file.photo ? "sendPhoto" : "sendDocument", fields, [
-						{ field: "f0", name, data: file.data },
-					]);
-					// Telegram rejects photos over its dimension limits; the same bytes go through as a document.
-					if (sent === null && file.photo) {
-						const fallback = nameOf(file.original, "document");
-						const retry: Record<string, string | number> = {
-							...base,
-							caption: captionOf(fallback, index === 0),
-							document: "attach://f0",
-						};
-						showUploading("upload_document");
-						sent = await uploadTelegram<TelegramMessage>(config, "sendDocument", retry, [
-							{ field: "f0", name: fallback, data: file.data },
-						]);
-					}
+					const sent = await withSentRecordMarker(async () => {
+						let accepted = await uploadTelegram<TelegramMessage>(
+							cfg,
+							file.photo ? "sendPhoto" : "sendDocument",
+							fields,
+							[{ field: "f0", name, data: file.data }],
+						);
+						// Telegram rejects photos over its dimension limits; the same bytes go through as a document.
+						if (accepted === null && file.photo) {
+							const fallback = nameOf(file.original, "document");
+							const retry: Record<string, string | number> = {
+								...base,
+								caption: captionOf(fallback, index === 0),
+								document: "attach://f0",
+							};
+							showUploading("upload_document");
+							accepted = await uploadTelegram<TelegramMessage>(cfg, "sendDocument", retry, [
+								{ field: "f0", name: fallback, data: file.data },
+							]);
+							visibleCaption = String(retry.caption);
+						}
+						if (accepted !== null) trackSent(accepted, "file", visibleCaption, sentSession);
+						return accepted;
+					});
 					if (sent === null) {
 						return {
 							content: [{ type: "text", text: `Error: Telegram rejected the upload of ${file.path}` }],
 							isError: true,
 						};
 					}
-					trackSent(sent);
 					sentIds.push(sent.message_id);
 				}
 			}
@@ -3358,7 +4241,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
-			const sent = await sendOrEdit(config, "sendMessage", { chat_id: config.chatId }, plain);
+			const sent = await sendOrEdit(config, "sendMessage", { chat_id: config.chatId }, plain, "", "snippet");
 			if (sent === null) {
 				return { content: [{ type: "text", text: "Error: Telegram rejected the snippet" }], isError: true };
 			}
@@ -3507,6 +4390,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			detach(
 				notify(
 					ctx,
+					"notice",
 					"\u2B06\uFE0F Upstream launched",
 					`${outcome.owner}/${outcome.name} \u2014 ${args.problem}\nBranch \`${outcome.branch}\` in ${where}. It runs in its own tmux tab now.`,
 				),
@@ -3545,9 +4429,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			chmodSync(STATE_DIR, 0o700);
 		} catch {}
 		mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
+		resetReactionRouteForStartup(sessionId);
+		sessionAlive = true;
 		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true, mode: 0o700 });
 		reapDeadSessions();
-		reapOldMedia();
+		reapOldFiles();
 		sessionTag = claimTag();
 		// Base-36 tag as a number: stable across resumes, unique across live sessions.
 		draftId = Number.parseInt(sessionTag, 36) + 1;
@@ -3565,6 +4451,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		lastNotifiedAt = typeof previous?.lastNotified === "number" ? previous.lastNotified : 0;
 		pinnedMessageId = typeof previous?.pinned === "number" ? previous.pinned : null;
 		closeOfferMessageId = typeof previous?.closeOffer === "number" ? previous.closeOffer : null;
+		replyQuestionMessageId = previous?.replyQuestion ?? null;
 		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
 			rmSync(LOCK_FILE, { recursive: true, force: true });
 		}
@@ -3624,7 +4511,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				reloadConfig();
 				writeSessionRecord(ctx);
 				if (badgeEmoji.length === 0) detach(claimBadgeIfMissing(ctx), "badge claim");
-				reapOldMedia();
+				reapOldFiles();
 				reapHeldMessages();
 				if (ownsLock()) refreshLock();
 				else acquireLock();
@@ -3657,6 +4544,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnSummary = null;
 		statusBlockUsed = false;
 		unpinRed(ctx);
+		closeReplyQuestion();
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
@@ -3675,6 +4563,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		statusBlockUsed = false;
 		unpinRed(ctx);
 		retireCloseOffer(true);
+		closeReplyQuestion();
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
@@ -3879,12 +4768,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
 				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
-				const work = notify(ctx, heads[recorded.urgency], body, extra, usageFooter()).then((sent) => {
-					if (recorded.urgency === "red") return pinRed(ctx, sent);
-					if (recorded.urgency === "green" && typeof sent?.message_id === "number") {
-						closeOfferMessageId = sent.message_id;
+				const replyQuestionToken = recorded.question === undefined ? null : ++replyQuestionGeneration;
+				const registerReplyQuestion = (messageId: number): void => {
+					if (replyQuestionToken === replyQuestionGeneration) replyQuestionMessageId = messageId;
+				};
+				const work = notify(
+					ctx,
+					"status",
+					heads[recorded.urgency],
+					body,
+					extra,
+					usageFooter(),
+					recorded,
+					replyQuestionToken === null ? undefined : registerReplyQuestion,
+				).then((sent) => {
+					const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
+					if (recorded.urgency === "green") {
+						closeOfferMessageId = messageId;
 						writeSessionRecord(ctx);
 					}
+					if (recorded.urgency === "red") return pinRed(ctx, sent);
 					return undefined;
 				});
 				detach(work, "turn-end notice");
@@ -3917,7 +4820,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					: wantsReply
 						? `...${clipEnd(tail, 600)}`
 						: `${clip(tail, 600)}...`;
-		detach(notify(ctx, title, body, quiet ? { disable_notification: true } : {}, usageFooter()), "turn-end notice");
+		detach(
+			notify(ctx, "status", title, body, quiet ? { disable_notification: true } : {}, usageFooter()),
+			"turn-end notice",
+		);
 	});
 
 	pi.on("tool_approval_requested", async (event, ctx) => {
@@ -3932,14 +4838,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			resolution: null,
 		};
 		approvalNotice = notice;
-		const work = notify(ctx, "\u{1F534} Approval needed", `${tool} is waiting for approval.`).then((sent) => {
-			notice.messageId = typeof sent?.message_id === "number" ? sent.message_id : null;
-			if (notice.messageId === null && notice.resolution !== null && approvalNotice === notice) {
-				approvalNotice = null;
-				return;
-			}
-			finishApprovalNotice(ctx, notice);
-		});
+		const work = notify(ctx, "approval", "\u{1F534} Approval needed", `${tool} is waiting for approval.`).then(
+			(sent) => {
+				notice.messageId = typeof sent?.message_id === "number" ? sent.message_id : null;
+				if (notice.messageId === null && notice.resolution !== null && approvalNotice === notice) {
+					approvalNotice = null;
+					return;
+				}
+				finishApprovalNotice(ctx, notice);
+			},
+		);
 		detach(work, "approval notice");
 	});
 
@@ -3961,7 +4869,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		detach(sessionNotice(ctx, `Credential disabled for ${provider}.`), "credential notice");
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
+		const queuedRedos = await closeReactionRouteForShutdown();
+		if (queuedRedos > 0) {
+			await serviceNotice("Grade kept, but this session ended before its queued redo could reach the agent.", false);
+		}
 		unsubscribeInput?.();
 		unsubscribeInput = null;
 		retireCloseOffer(true);
@@ -3986,6 +4898,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		}
 		if (sessionCtx !== null) unpinRed(sessionCtx);
+		closeReplyQuestion();
+		sessionAlive = false;
+		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		releaseLock();
 		// Handing the board on rather than leaving the next owner to wait out a stale claim.
 		releaseLock(DASHBOARD_LOCK_FILE);

@@ -1,17 +1,20 @@
 // Full suite against a stubbed Telegram API; sends nothing.
 
-import {
+import fs, {
 	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
 	unlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -38,6 +41,9 @@ const api = {
 	nextMessage: 7,
 	filePath: "documents/file_9.oga",
 	fileDownload: "ok",
+	sendMessageGate: null,
+	editMessageGate: null,
+	uploadGate: null,
 };
 globalThis.fetch = async (url, init) => {
 	if (String(url).includes("/file/bot")) {
@@ -60,6 +66,7 @@ globalThis.fetch = async (url, init) => {
 			}
 		}
 		api.calls.push({ method, body, files, bytes });
+		if (api.uploadGate !== null) await api.uploadGate;
 		if ((api.failMethods ?? []).includes(method)) {
 			return { ok: false, status: 400, json: async () => ({ ok: false, description: "failed by test" }) };
 		}
@@ -85,6 +92,8 @@ globalThis.fetch = async (url, init) => {
 	if (api.rejectHtml && body.parse_mode === "HTML") {
 		return { ok: false, status: 400, json: async () => ({ ok: false, description: "can't parse entities" }) };
 	}
+	if (method === "sendMessage" && api.sendMessageGate !== null) await api.sendMessageGate;
+	if (method === "editMessageText" && api.editMessageGate !== null) await api.editMessageGate;
 	const result =
 		method === "getUpdates"
 			? api.queued.splice(0, api.queued.length)
@@ -465,8 +474,8 @@ check(
 	one.warns.some((w) => w.m.includes("unexpected origin")),
 );
 check(
-	"allowed_updates asks for messages and button presses",
-	lastCall("getUpdates").body.allowed_updates.join(",") === "message,callback_query",
+	"allowed_updates asks for messages, button presses and reactions",
+	lastCall("getUpdates").body.allowed_updates.join(",") === "message,callback_query,message_reaction",
 );
 check(
 	"offset advances past rejected updates",
@@ -725,7 +734,7 @@ for (const path of crowd) rmSync(path, { force: true });
 heading("stale session reaping");
 const dead = "01a03000-dead-0000-0000-000000000000";
 mkdirSync(inboxOf(dead), { recursive: true });
-writeFileSync(join(inboxOf(dead), "1.json"), "{}");
+writeFileSync(join(inboxOf(dead), "1.json"), JSON.stringify({ kind: "redo", value: "retry dead work" }));
 writeFileSync(
 	join(sessionsDir, `${dead}.json`),
 	JSON.stringify({
@@ -739,11 +748,17 @@ writeFileSync(
 		heartbeat: Date.now() - 600_000,
 	}),
 );
+const staleReapNotices = called("sendMessage").length;
 const reaper = spawn("01a03500-0000-0000-0000-000000000000", "/home/dev/work/rats");
 await reaper.fire("session_start");
+await settle(50);
 check("stale record reaped", !existsSync(join(sessionsDir, `${dead}.json`)));
 check("stale inbox reaped", !existsSync(inboxOf(dead)));
 check("live records survive", existsSync(join(sessionsDir, `${one.id}.json`)));
+check(
+	"reaping a queued redo reports that its session ended",
+	called("sendMessage").length === staleReapNotices + 1 && lastCall("sendMessage").body.text.includes("session ended"),
+);
 
 // ------------------------------------------------------------- reply routing
 heading("reply routing");
@@ -3070,6 +3085,12 @@ check(
 check(
 	"a photo that falls back is named a document",
 	/__document__\S+__artefact\.png$/u.test(lastCall("sendDocument").files.f0),
+);
+const fallbackRecordId = record(fx.id).recent.at(-1);
+const fallbackRecord = JSON.parse(readFileSync(join(root, "notify-telegram/sent", `${fallbackRecordId}.json`), "utf8"));
+check(
+	"photo fallback records the caption Telegram accepted",
+	fallbackRecord.text === lastCall("sendDocument").body.caption,
 );
 
 // An uncompressed image needs no disguise: the caller asks for document delivery and the
@@ -5893,6 +5914,1302 @@ check(
 	"only the first press settles the keyboard",
 	called("editMessageReplyMarkup").filter((c) => c.body.message_id === 46).length === 1,
 );
+
+// ------------------------------------------------------------ reactions
+heading("reactions grade what the agent sent");
+// A reaction carries only a message id, so its grade stores the sent-message record with it.
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const fb = spawn("01a07000-0000-0000-0000-000000000000", "/home/dev/work/lexer");
+await fb.fire("session_start");
+const sentDir = join(root, "notify-telegram/sent");
+const feedbackFile = join(root, "notify-telegram/feedback.jsonl");
+const feedbackLines = () =>
+	existsSync(feedbackFile)
+		? readFileSync(feedbackFile, "utf8")
+				.split("\n")
+				.filter((line) => line.length > 0)
+				.map((line) => JSON.parse(line))
+		: [];
+const onRecord = (messageId) => JSON.parse(readFileSync(join(sentDir, `${messageId}.json`), "utf8"));
+const react = (updateId, messageId, emoji, previous = [], from = CHAT) => ({
+	update_id: updateId,
+	message_reaction: {
+		chat: { id: CHAT },
+		message_id: messageId,
+		user: { id: from },
+		date: 1,
+		old_reaction: previous.map((e) => ({ type: "emoji", emoji: e })),
+		new_reaction: emoji.map((e) => ({ type: "emoji", emoji: e })),
+	},
+});
+const answerButton = (updateId, messageId, data) => ({
+	update_id: updateId,
+	callback_query: {
+		id: `fb-${updateId}`,
+		data,
+		from: { id: CHAT },
+		message: { message_id: messageId, chat: { id: CHAT } },
+	},
+});
+const replyTo = (updateId, messageId, text) => ({
+	update_id: updateId,
+	message: {
+		message_id: 800_000 + updateId,
+		date: 1,
+		chat: { id: CHAT },
+		text,
+		reply_to_message: { message_id: messageId },
+	},
+});
+
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute("fb1", { summary: "Lexer rewritten; tests green.", urgency: "green" }, undefined, undefined, fb.ctx);
+await fb.fire("session_stop");
+await settle(150);
+const statusId = record(fb.id).recent.at(-1);
+const statusRecord = onRecord(statusId);
+check(
+	"a sent status is on record with its kind, text and session",
+	statusRecord.version === 1 &&
+		statusRecord.kind === "status" &&
+		statusRecord.text.includes("Lexer rewritten") &&
+		statusRecord.session.tag === record(fb.id).tag &&
+		statusRecord.session.id === fb.id &&
+		statusRecord.session.cwd === "/home/dev/work/lexer",
+);
+check("the record keeps the structured call behind the message", statusRecord.payload.urgency === "green");
+check("the record is private", (statSync(join(sentDir, `${statusId}.json`)).mode & 0o777) === 0o600);
+
+// A thumbs up is a grade and nothing else.
+const sendsBeforePraise = called("sendMessage").length;
+api.queued = [react(9001, statusId, ["\u{1F44D}"])];
+await fb.pump(200);
+let lines = feedbackLines();
+check(
+	"a thumbs up is recorded with its grade and the message it graded",
+	lines.length === 1 &&
+		lines[0].version === 1 &&
+		lines[0].at === 1000 &&
+		lines[0].updateId === 9001 &&
+		lines[0].grade === 2 &&
+		lines[0].emoji.join() === "\u{1F44D}" &&
+		lines[0].messageId === statusId &&
+		lines[0].message.kind === "status" &&
+		lines[0].redo === false,
+);
+check("a positive grade wakes nobody", inboxCount(fb.id) === 0 && called("sendMessage").length === sendsBeforePraise);
+check("the feedback log is private", (statSync(feedbackFile).mode & 0o777) === 0o600);
+
+// A private ledger file still cannot turn a session id into a path traversal.
+const unsafeSessionId = "../escape";
+const unsafeMessageId = 777_777;
+const unsafeOwnerFile = join(root, "notify-telegram/escape.json");
+const unsafeSentFile = join(sentDir, `${unsafeMessageId}.json`);
+writeFileSync(
+	unsafeOwnerFile,
+	JSON.stringify({ ...record(fb.id), id: unsafeSessionId, heartbeat: Date.now(), question: null }),
+);
+writeFileSync(
+	unsafeSentFile,
+	JSON.stringify({
+		...statusRecord,
+		id: unsafeMessageId,
+		session: { ...statusRecord.session, id: unsafeSessionId },
+	}),
+);
+const feedbackBeforeUnsafeSession = feedbackLines().length;
+api.queued = [react(8998, unsafeMessageId, ["\u{1F44E}"])];
+await fb.pump(200);
+check(
+	"an unsafe ledger session id is rejected before inbox routing",
+	feedbackLines().length === feedbackBeforeUnsafeSession &&
+		!existsSync(join(root, "notify-telegram/escape/8998.json")) &&
+		lastCall("sendMessage").body.text.includes("Reaction error"),
+);
+rmSync(unsafeOwnerFile, { force: true });
+rmSync(unsafeSentFile, { force: true });
+rmSync(join(root, "notify-telegram/escape"), { recursive: true, force: true });
+
+// A thumbs down on a status makes the agent write it again.
+api.queued = [react(9002, statusId, ["\u{1F44E}"], ["\u{1F44D}"])];
+await fb.pump(200);
+lines = feedbackLines();
+check(
+	"a changed reaction is recorded with what it replaced",
+	lines.at(-1).grade === -2 && lines.at(-1).previous.join() === "\u{1F44D}" && lines.at(-1).redo === true,
+);
+check("a redo reaches the owning session", inboxCount(fb.id) === 1);
+await fb.pump(150);
+check(
+	"the redo tells the agent which message to rewrite and through which tool",
+	fb.steers.length === 1 && fb.steers[0].text.includes("\u{1F44E}") && fb.steers[0].text.includes("notify_status"),
+);
+const feedbackAfterFirstRedo = feedbackLines().length;
+api.queued = [react(9002, statusId, ["\u{1F44E}"], ["\u{1F44D}"])];
+await fb.pump(200);
+check(
+	"a redelivered reaction update is recorded and dispatched only once",
+	feedbackLines().length === feedbackAfterFirstRedo && inboxCount(fb.id) === 0 && fb.steers.length === 1,
+);
+
+// A turn-end question without buttons gets the same phone-context correction as an ask.
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-question",
+		{ summary: "Need one detail.", urgency: "orange", question: "Should the frobnicator stay enabled?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+const statusQuestionId = record(fb.id).recent.at(-1);
+api.queued = [react(9003, statusQuestionId, ["\u{1F44E}"])];
+await fb.pump(200);
+await fb.pump(150);
+check(
+	"a negative status question asks for a contextual restatement",
+	fb.steers.at(-1).text.includes("restate") &&
+		fb.steers.at(-1).text.includes("definitions") &&
+		fb.steers.at(-1).text.includes("notify_status"),
+);
+
+// A strongly negative reaction on an open question answers it: restate, then ask again.
+const fbState = {};
+const fbAsk = fb.tools.get("ask").execute("fb2", singleQuestion, undefined, undefined, stubbornCtx(fb.ctx, fbState));
+await settle(150);
+const askMessageId = api.nextMessage - 1;
+check(
+	"a question is on record as one, with its options",
+	onRecord(askMessageId).kind === "question" && onRecord(askMessageId).payload.question.options.length === 2,
+);
+check("the live session record names its open question", record(fb.id).question === askMessageId);
+api.queued = [react(9004, askMessageId, ["\u{1F4A9}"])];
+await fb.pump(200);
+await fb.pump(150);
+const redone = await fbAsk;
+check(
+	"a strongly negative reaction on an open question answers it with a request to restate",
+	/restate/i.test(redone.details.customInput ?? "") && redone.details.selectedOptions.length === 0,
+);
+check("the terminal dialog is aborted", fbState.aborted === true);
+check(
+	"the question's grade is on file",
+	feedbackLines().at(-1).grade === -3 && feedbackLines().at(-1).message.kind === "question",
+);
+check(
+	"settling a question records the text now visible in Telegram",
+	onRecord(askMessageId).text.includes(redone.details.customInput),
+);
+check("the session record clears its settled question", record(fb.id).question === null);
+
+// An emoji outside the scale is recorded without a grade and the scale is shown.
+api.queued = [react(9005, statusId, ["\u{1F34C}"])];
+await fb.pump(200);
+check(
+	"an ungraded emoji records without a grade",
+	feedbackLines().at(-1).grade === null && feedbackLines().at(-1).emoji.join() === "\u{1F34C}",
+);
+const scaleNotice = lastCall("sendMessage").body.text;
+check(
+	"and the chat returns an error with the graded set",
+	scaleNotice.includes("Reaction error") &&
+		scaleNotice.includes("\u{1F34C}") &&
+		scaleNotice.includes("\u{1F44E}") &&
+		scaleNotice.includes("\u{1F3C6}"),
+);
+
+// A mixed set is ungraded rather than partly interpreted.
+const steersBeforeMixed = fb.steers.length;
+api.queued = [react(9006, statusId, ["\u{1F44E}", "\u{1F34C}"])];
+await fb.pump(200);
+check("a set containing an unknown emoji has no grade", feedbackLines().at(-1).grade === null);
+check("an ungraded set cannot trigger a redo", inboxCount(fb.id) === 0 && fb.steers.length === steersBeforeMixed);
+
+// Taking a reaction back is recorded, silently.
+const sendsBeforeRemoval = called("sendMessage").length;
+api.queued = [react(9007, statusId, [], ["\u{1F44E}", "\u{1F34C}"])];
+await fb.pump(200);
+check(
+	"removing a reaction records an empty set",
+	feedbackLines().at(-1).emoji.length === 0 && feedbackLines().at(-1).grade === null,
+);
+check("silently", called("sendMessage").length === sendsBeforeRemoval && inboxCount(fb.id) === 0);
+
+// A message not on record cannot be graded, and the chat says so.
+const linesBeforeUnknown = feedbackLines().length;
+api.queued = [react(9008, 1, ["\u{1F44D}"])];
+await fb.pump(200);
+check("a reaction to a message not on record is not recorded", feedbackLines().length === linesBeforeUnknown);
+check("and the chat is told why", /not on record/.test(lastCall("sendMessage").body.text));
+
+// A stranger's reaction passes the same origin gate every button passes.
+api.queued = [react(9009, statusId, ["\u{1F44E}"], [], STRANGER)];
+await fb.pump(200);
+check("a stranger's reaction is dropped", feedbackLines().length === linesBeforeUnknown && inboxCount(fb.id) === 0);
+check(
+	"and logged",
+	fb.warns.some((w) => w.m.includes("unexpected origin")),
+);
+
+// The bot's own words can be graded, but there is no agent message to redo.
+writeFileSync(join(inboxOf(fb.id), "9100.json"), JSON.stringify({ kind: "command", value: "stop" }));
+await fb.pump(200);
+const noticeId = record(fb.id).recent.at(-1);
+check("a session notice is on record as the bot's own", onRecord(noticeId).kind === "notice");
+const steersBeforeNotice = fb.steers.length;
+api.queued = [react(9010, noticeId, ["\u{1F44E}"])];
+await fb.pump(200);
+await fb.pump(150);
+check(
+	"a thumbs down on the bot's own words is recorded",
+	feedbackLines().at(-1).message.kind === "notice" && feedbackLines().at(-1).redo === false,
+);
+check(
+	"and redoes nothing",
+	fb.steers.length === steersBeforeNotice && /nothing to redo/i.test(lastCall("sendMessage").body.text),
+);
+
+// A session that is gone cannot redo anything. The grade is still kept.
+const gone = spawn("01a07001-0000-0000-0000-000000000000", "/home/dev/work/parser");
+await gone.fire("session_start");
+await gone.fire("input");
+await gone.tools
+	.get("notify_status")
+	.execute("fb3", { summary: "Parser done.", urgency: "green" }, undefined, undefined, gone.ctx);
+await gone.fire("session_stop");
+await settle(150);
+const goneId = record(gone.id).recent.at(-1);
+await gone.fire("session_shutdown");
+check("shutdown marks the session record dead immediately", record(gone.id).heartbeat === 0);
+api.queued = [react(9011, goneId, ["\u{1F44E}"])];
+await fb.pump(200);
+check("a redo for a session that is gone is recorded as not done", feedbackLines().at(-1).redo === false);
+check("the dead session receives no redo entry", inboxCount(gone.id) === 0);
+check("and the chat is told", /session is gone/.test(lastCall("sendMessage").body.text));
+
+// An unreadable record is refused instead of consuming a reaction without an explanation.
+const malformedRecordId = 424243;
+writeFileSync(join(sentDir, `${malformedRecordId}.json`), "{}");
+const linesBeforeMalformed = feedbackLines().length;
+api.queued = [react(9012, malformedRecordId, ["\u{1F44E}"])];
+await fb.pump(200);
+check("a malformed sent record produces no feedback", feedbackLines().length === linesBeforeMalformed);
+check("and returns a reaction error", lastCall("sendMessage").body.text.includes("Reaction error"));
+
+// Runtime Telegram JSON must not turn a string-shaped message id into a ledger path.
+const traversalId = "../traversal";
+const traversalRecord = join(root, "notify-telegram/traversal.json");
+writeFileSync(
+	traversalRecord,
+	JSON.stringify({
+		version: 1,
+		id: traversalId,
+		at: 1,
+		kind: "status",
+		text: "outside the sent ledger",
+		session: { id: fb.id, tag: record(fb.id).tag, emoji: "", name: "", cwd: "" },
+	}),
+);
+const linesBeforeTraversal = feedbackLines().length;
+api.queued = [react(9013, traversalId, ["\u{1F44D}"])];
+await fb.pump(200);
+check("a traversal-shaped message id cannot escape the sent ledger", feedbackLines().length === linesBeforeTraversal);
+unlinkSync(traversalRecord);
+
+// Negative feedback remains recorded after settlement but cannot reopen the closed question.
+const steersBeforeClosedQuestion = fb.steers.length;
+api.queued = [react(9014, askMessageId, ["\u{1F44E}"])];
+await fb.pump(200);
+check(
+	"a settled question keeps its negative grade without a redo",
+	feedbackLines().at(-1).grade === -2 &&
+		feedbackLines().at(-1).redo === false &&
+		fb.steers.length === steersBeforeClosedQuestion,
+);
+check("the chat says the settled question stayed closed", /already closed/i.test(lastCall("sendMessage").body.text));
+
+// A callback and reaction can share one poll batch. The callback settles first, so the queued redo is stale.
+const racedState = {};
+const racedAsk = fb.tools
+	.get("ask")
+	.execute("fb-race", singleQuestion, undefined, undefined, stubbornCtx(fb.ctx, racedState));
+await settle(150);
+const racedMessageId = api.nextMessage - 1;
+const racedButton = lastCall("sendMessage")
+	.body.reply_markup.inline_keyboard.flat()
+	.find((button) => button.callback_data?.startsWith("o:"));
+const steersBeforeRace = fb.steers.length;
+api.queued = [
+	answerButton(9015, racedMessageId, racedButton.callback_data),
+	react(9016, racedMessageId, ["\u{1F44E}"]),
+];
+await fb.pump(250);
+await fb.pump(250);
+const racedAnswer = await racedAsk;
+check("the earlier callback still answers the question", racedAnswer.details.selectedOptions.join() === "SQLite");
+check("the later queued redo cannot reopen it", fb.steers.length === steersBeforeRace);
+
+// Advancing a multi-question ask must publish the new message id before a prompt reaction arrives.
+const advancedState = {};
+const advancedAsk = fb.tools.get("ask").execute(
+	"fb-advanced",
+	{
+		questions: [
+			{ id: "first", question: "First choice?", options: askOpts("A", "B") },
+			{ id: "second", question: "Second choice?", options: askOpts("C", "D") },
+		],
+	},
+	undefined,
+	undefined,
+	stubbornCtx(fb.ctx, advancedState),
+);
+await settle(150);
+const firstAdvancedMessage = api.nextMessage - 1;
+const firstAdvancedButton = lastCall("sendMessage")
+	.body.reply_markup.inline_keyboard.flat()
+	.find((button) => button.callback_data?.startsWith("o:"));
+api.queued = [answerButton(9017, firstAdvancedMessage, firstAdvancedButton.callback_data)];
+await fb.pump(250);
+await fb.pump(250);
+const secondAdvancedMessage = api.nextMessage - 1;
+const secondAdvancedButton = lastCall("sendMessage")
+	.body.reply_markup.inline_keyboard.flat()
+	.find((button) => button.callback_data?.startsWith("o:"));
+check(
+	"the session record names an advanced open question immediately",
+	record(fb.id).question === secondAdvancedMessage,
+);
+api.queued = [react(9018, secondAdvancedMessage, ["\u{1F44E}"])];
+await fb.pump(250);
+await fb.pump(250);
+const advancedGrade = feedbackLines().at(-1);
+api.queued = [answerButton(9019, secondAdvancedMessage, secondAdvancedButton.callback_data)];
+await fb.pump(250);
+await fb.pump(250);
+const advancedAnswer = await advancedAsk;
+check(
+	"a prompt negative reaction redoes an advanced question",
+	advancedGrade.redo === true && /restate/i.test(advancedAnswer.details.results[1].customInput ?? ""),
+);
+// Replying to a buttonless status question closes it before any later reaction can redo it.
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-answered-status",
+		{ summary: "Need a decision.", urgency: "orange", question: "Keep the compatibility path?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+const answeredStatusId = record(fb.id).recent.at(-1);
+check("the session record names its buttonless status question", record(fb.id).replyQuestion === answeredStatusId);
+api.queued = [replyTo(9020, answeredStatusId, "Remove it")];
+await fb.pump(250);
+await fb.pump(250);
+const steersAfterStatusAnswer = fb.steers.length;
+check("a reply closes the buttonless status question", record(fb.id).replyQuestion === null);
+api.queued = [react(9021, answeredStatusId, ["\u{1F44E}"])];
+await fb.pump(250);
+await fb.pump(250);
+check("a reaction cannot reopen the answered status question", feedbackLines().at(-1).redo === false);
+check("the answered status question receives no redo", fb.steers.length === steersAfterStatusAnswer);
+// A media reply answers the same buttonless question just as text does.
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-media-status",
+		{ summary: "Need a file decision.", urgency: "orange", question: "Use the attached recording?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+const mediaStatusId = record(fb.id).recent.at(-1);
+api.queued = [
+	{
+		update_id: 9022,
+		message: {
+			message_id: 809_022,
+			date: 1,
+			chat: { id: CHAT },
+			voice: { file_id: "status-answer" },
+			reply_to_message: { message_id: mediaStatusId },
+		},
+	},
+];
+await fb.pump(250);
+await fb.pump(250);
+const steersAfterMediaAnswer = fb.steers.length;
+check("a media reply closes the buttonless status question", record(fb.id).replyQuestion === null);
+api.queued = [react(9023, mediaStatusId, ["\u{1F44E}"])];
+await fb.pump(250);
+await fb.pump(250);
+check("a reaction cannot reopen the media-answered question", feedbackLines().at(-1).redo === false);
+check("the media-answered question receives no redo", fb.steers.length === steersAfterMediaAnswer);
+// A reply to an older message must not answer the newer status question merely because it routes here.
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-other-reply",
+		{ summary: "Still need a decision.", urgency: "orange", question: "Keep the newer path?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+const newerStatusId = record(fb.id).recent.at(-1);
+api.queued = [replyTo(9024, statusId, "An unrelated follow-up")];
+await fb.pump(250);
+await fb.pump(250);
+check("a reply to an older message leaves the newer question open", record(fb.id).replyQuestion === newerStatusId);
+// A poller in another process can observe the reaction as soon as Telegram accepts the send.
+const ownershipPoller = spawn("01a07003-0000-0000-0000-000000000000", "/home/dev/work/poller");
+await ownershipPoller.fire("session_start");
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+ownershipPoller.heartbeat();
+await fb.fire("input");
+let releaseOwnedSend;
+api.sendMessageGate = new Promise((resolve) => {
+	releaseOwnedSend = resolve;
+});
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-owned-status",
+		{ summary: "Need an immediate decision.", urgency: "orange", question: "Keep ownership?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+const ownedStatusId = api.nextMessage;
+await fb.fire("session_stop");
+await settle(50);
+const ownedReaction = react(9025, ownedStatusId, ["\u{1F44E}"]);
+const offsetBeforeOwnedReaction = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+api.queued = [ownedReaction];
+await ownershipPoller.pump(250);
+check(
+	"a reaction awaiting its sent record does not advance the offset",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === offsetBeforeOwnedReaction,
+);
+releaseOwnedSend();
+api.sendMessageGate = null;
+await settle(50);
+api.queued = [ownedReaction];
+await ownershipPoller.pump(250);
+await fb.pump(250);
+check("another poller sees a newly accepted status question as open", feedbackLines().at(-1).redo === true);
+
+// A ledger observer stands in for another process polling at the exact publication boundary.
+const nativePublishSession = spawn("01a07006-0000-0000-0000-000000000000", "/home/dev/work/native-publish");
+await nativePublishSession.fire("session_start");
+const nativePublishState = {};
+const nativePublishMessageId = api.nextMessage;
+let nativeOwnerAtPublish;
+const realRenameSync = fs.renameSync;
+fs.renameSync = (from, to) => {
+	realRenameSync(from, to);
+	if (String(to) === join(sentDir, `${nativePublishMessageId}.json`)) {
+		nativeOwnerAtPublish = record(nativePublishSession.id).question;
+	}
+};
+syncBuiltinESMExports();
+const nativePublishAsk = nativePublishSession.tools
+	.get("ask")
+	.execute(
+		"fb-native-publish",
+		singleQuestion,
+		undefined,
+		undefined,
+		stubbornCtx(nativePublishSession.ctx, nativePublishState),
+	);
+await settle(150);
+fs.renameSync = realRenameSync;
+syncBuiltinESMExports();
+check(
+	"native question ownership exists when its ledger record becomes visible",
+	nativeOwnerAtPublish === nativePublishMessageId,
+);
+
+const nativePublishButton = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0];
+let nativeStateBeforeMarkerRemoval;
+const realRmSync = fs.rmSync;
+fs.rmSync = (path, options) => {
+	if (String(path).includes(`sent-in-flight/edit-${nativePublishMessageId}-`)) {
+		nativeStateBeforeMarkerRemoval = {
+			question: record(nativePublishSession.id).question,
+			text: onRecord(nativePublishMessageId).text,
+		};
+	}
+	return realRmSync(path, options);
+};
+syncBuiltinESMExports();
+writeFileSync(
+	join(inboxOf(nativePublishSession.id), "90260.json"),
+	JSON.stringify({ kind: "callback", value: nativePublishButton.callback_data }),
+);
+await nativePublishSession.pump(300);
+fs.rmSync = realRmSync;
+syncBuiltinESMExports();
+await nativePublishAsk;
+check(
+	"accepted settlement publishes closure before its edit marker disappears",
+	nativeStateBeforeMarkerRemoval?.question === null && nativeStateBeforeMarkerRemoval.text.includes("Answered"),
+);
+
+const standingPublishSession = spawn("01a07007-0000-0000-0000-000000000000", "/home/dev/work/standing-publish");
+await standingPublishSession.fire("session_start");
+const standingPublishMessageId = api.nextMessage;
+let standingOwnerAtPublish;
+fs.renameSync = (from, to) => {
+	realRenameSync(from, to);
+	if (String(to) === join(sentDir, `${standingPublishMessageId}.json`)) {
+		standingOwnerAtPublish = record(standingPublishSession.id).standing?.messageId;
+	}
+};
+syncBuiltinESMExports();
+await standingPublishSession.fire("input");
+await standingPublishSession.tools
+	.get("notify_status")
+	.execute(
+		"fb-standing-publish",
+		{ summary: "Need a choice.", urgency: "orange", question: "Choose now?", options: opts("Choose", "Wait") },
+		undefined,
+		undefined,
+		standingPublishSession.ctx,
+	);
+await standingPublishSession.fire("session_stop");
+await settle(150);
+fs.renameSync = realRenameSync;
+syncBuiltinESMExports();
+check(
+	"standing question ownership exists when its ledger record becomes visible",
+	standingOwnerAtPublish === standingPublishMessageId,
+);
+await standingPublishSession.fire("input");
+await settle(150);
+
+// The ledger records the fallback Telegram accepted, not rejected entity source.
+api.rejectHtml = true;
+await fb.fire("input");
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-plain-ledger",
+		{ summary: 'Clock <tg-time unix="1" format="r">then</tg-time>.', urgency: "green" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(150);
+api.rejectHtml = false;
+const plainStatusId = record(fb.id).recent.at(-1);
+const acceptedPlainText = lastCall("sendMessage").body.text;
+check(
+	"the ledger keeps the plain fallback Telegram displayed",
+	onRecord(plainStatusId).text === acceptedPlainText && !onRecord(plainStatusId).text.includes("<tg-time"),
+);
+api.queued = [react(9026, plainStatusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check("feedback embeds the displayed plain fallback", feedbackLines().at(-1).message.text === acceptedPlainText);
+// A negative reaction before a native-question edit is accepted grades the visible record and still reaches the agent.
+const preEditSession = spawn("01a0700a-0000-0000-0000-000000000000", "/home/dev/work/pre-edit");
+await preEditSession.fire("session_start");
+const preEditState = {};
+const preEditAsk = preEditSession.tools
+	.get("ask")
+	.execute("fb-pre-edit", singleQuestion, undefined, undefined, stubbornCtx(preEditSession.ctx, preEditState));
+await settle(150);
+const editedQuestionId = record(preEditSession.id).question;
+const preEditText = onRecord(editedQuestionId).text;
+const preEditButton = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0];
+let releaseEdit;
+api.editMessageGate = new Promise((resolve) => {
+	releaseEdit = resolve;
+});
+writeFileSync(
+	join(inboxOf(preEditSession.id), "90270.json"),
+	JSON.stringify({ kind: "callback", value: preEditButton.callback_data }),
+);
+const settlingPreEdit = preEditSession.pump(250);
+await settle(50);
+const editReaction = react(9027, editedQuestionId, ["\u{1F44E}"]);
+const preEditSteers = preEditSession.steers.length;
+api.queued = [editReaction];
+await ownershipPoller.pump(250);
+const preEditFeedback = feedbackLines().at(-1);
+check(
+	"a negative reaction before edit acceptance grades the previous question",
+	preEditFeedback.updateId === 9027 &&
+		preEditFeedback.message.text === preEditText &&
+		preEditFeedback.grade === -2 &&
+		preEditFeedback.redo === true,
+);
+releaseEdit();
+api.editMessageGate = null;
+await settlingPreEdit;
+await settle(50);
+await preEditAsk;
+await preEditSession.pump(250);
+check(
+	"the pre-edit question redo reaches the agent after settlement",
+	preEditSession.steers.length === preEditSteers + 1 && preEditSession.steers.at(-1).text.includes("reacted"),
+);
+
+// Media uploads hold the same publication marker until their sent records exist.
+const uploadSession = spawn("01a07004-0000-0000-0000-000000000000", root);
+await uploadSession.fire("session_start");
+const reactionUpload = join(root, "reaction-upload.png");
+writeFileSync(reactionUpload, "png-bytes");
+let releaseUpload;
+api.uploadGate = new Promise((resolve) => {
+	releaseUpload = resolve;
+});
+const uploadedMessageId = api.nextMessage;
+const uploadWork = uploadSession.tools
+	.get("notify_file")
+	.execute(
+		"fb-upload-ledger",
+		{ paths: [reactionUpload], caption: "Reaction upload" },
+		undefined,
+		undefined,
+		uploadSession.ctx,
+	);
+await settle(50);
+const uploadMarkerDir = join(root, "notify-telegram/sent-in-flight");
+const uploadMarker = join(
+	uploadMarkerDir,
+	readdirSync(uploadMarkerDir).find((entry) => entry.startsWith("new-")),
+);
+utimesSync(uploadMarker, new Date(0), new Date(0));
+await settle(16_000);
+check("an active upload marker is refreshed", statSync(uploadMarker).mtimeMs > 0);
+const unrelatedUploadReaction = react(9028, statusId, ["\u{1F44D}"]);
+const offsetBeforeUnrelatedReaction = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+api.queued = [unrelatedUploadReaction];
+await ownershipPoller.pump(250);
+check(
+	"an unrelated recorded message is graded during an upload",
+	feedbackLines().at(-1).messageId === statusId &&
+		JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset > offsetBeforeUnrelatedReaction,
+);
+const uploadReaction = react(9029, uploadedMessageId, ["\u{1F44D}"]);
+const offsetBeforeUploadReaction = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+api.queued = [uploadReaction];
+await ownershipPoller.pump(250);
+check(
+	"a reaction awaiting an upload record does not advance the offset",
+
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === offsetBeforeUploadReaction,
+);
+releaseUpload();
+api.uploadGate = null;
+await uploadWork;
+api.queued = [uploadReaction];
+await ownershipPoller.pump(250);
+check("feedback grades the accepted upload record", feedbackLines().at(-1).message.kind === "file");
+// A failed settlement edit leaves the visible native question open for another answer.
+const failedEditSession = spawn("01a07005-0000-0000-0000-000000000000", "/home/dev/work/failed-edit");
+await failedEditSession.fire("session_start");
+const failedEditState = {};
+const failedEditAsk = failedEditSession.tools
+	.get("ask")
+	.execute("fb-failed-edit", singleQuestion, undefined, undefined, stubbornCtx(failedEditSession.ctx, failedEditState));
+await settle(150);
+const failedEditQuestionId = api.nextMessage - 1;
+const failedEditButton = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0];
+api.failMethods = ["editMessageText"];
+api.queued = [answerButton(9030, failedEditQuestionId, failedEditButton.callback_data)];
+await ownershipPoller.pump(250);
+await failedEditSession.pump(250);
+check(
+	"a rejected settlement edit keeps question ownership open",
+	record(failedEditSession.id).question === failedEditQuestionId && failedEditState.aborted !== true,
+);
+api.failMethods = [];
+api.queued = [answerButton(9031, failedEditQuestionId, failedEditButton.callback_data)];
+await ownershipPoller.pump(250);
+await failedEditSession.pump(250);
+await failedEditAsk;
+
+// A staged redo survives a feedback append failure, then commits exactly once on redelivery.
+fb.heartbeat();
+const interruptedReaction = react(9032, statusId, ["\u{1F44E}"], ["\u{1F44D}"]);
+const interruptedOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const interruptedSteers = fb.steers.length;
+const realAppendFileSync = fs.appendFileSync;
+let rejectFeedbackAppend = true;
+fs.appendFileSync = (path, data, options) => {
+	if (rejectFeedbackAppend && String(path) === feedbackFile) {
+		rejectFeedbackAppend = false;
+		throw new Error("interrupted feedback append");
+	}
+	return realAppendFileSync(path, data, options);
+};
+syncBuiltinESMExports();
+api.queued = [interruptedReaction];
+await ownershipPoller.pump(250);
+fs.appendFileSync = realAppendFileSync;
+syncBuiltinESMExports();
+check(
+	"an uncommitted reaction leaves its update offset for retry",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === interruptedOffset &&
+		!feedbackLines().some((entry) => entry.updateId === 9032) &&
+		inboxCount(fb.id) === 0,
+);
+api.queued = [interruptedReaction];
+await ownershipPoller.pump(250);
+await fb.pump(250);
+check(
+	"a retried reaction commits its feedback and redo together",
+	feedbackLines().filter((entry) => entry.updateId === 9032).length === 1 && fb.steers.length === interruptedSteers + 1,
+);
+api.queued = [interruptedReaction];
+await ownershipPoller.pump(250);
+await fb.pump(250);
+check(
+	"a committed reaction redelivery produces no duplicate effects",
+	feedbackLines().filter((entry) => entry.updateId === 9032).length === 1 && fb.steers.length === interruptedSteers + 1,
+);
+
+const interruptedPublish = react(9033, statusId, ["\u{1F44E}"], ["\u{1F44D}"]);
+const publishOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const publishSteers = fb.steers.length;
+const realTransactionRename = fs.renameSync;
+let rejectTransactionPublish = true;
+fs.renameSync = (from, to) => {
+	if (
+		rejectTransactionPublish &&
+		String(from).endsWith("/reaction-pending/9033.json") &&
+		String(to).endsWith(`${fb.id}/9033.json`)
+	) {
+		rejectTransactionPublish = false;
+		throw new Error("interrupted redo publication");
+	}
+	return realTransactionRename(from, to);
+};
+syncBuiltinESMExports();
+api.queued = [interruptedPublish];
+await ownershipPoller.pump(250);
+fs.renameSync = realTransactionRename;
+syncBuiltinESMExports();
+check(
+	"a reaction committed before redo publication keeps its offset for retry",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === publishOffset &&
+		feedbackLines().filter((entry) => entry.updateId === 9033).length === 1 &&
+		inboxCount(fb.id) === 0,
+);
+api.queued = [interruptedPublish];
+await ownershipPoller.pump(250);
+await fb.pump(250);
+check(
+	"redelivery publishes a committed pending redo without another feedback row",
+	feedbackLines().filter((entry) => entry.updateId === 9033).length === 1 && fb.steers.length === publishSteers + 1,
+);
+api.queued = [interruptedPublish];
+await ownershipPoller.pump(250);
+await fb.pump(250);
+check(
+	"a published pending redo stays single on later redelivery",
+	feedbackLines().filter((entry) => entry.updateId === 9033).length === 1 && fb.steers.length === publishSteers + 1,
+);
+
+// A transient settlement failure requeues a redo because the user cannot resend the same update.
+const redoRetrySession = spawn("01a07008-0000-0000-0000-000000000000", "/home/dev/work/redo-retry");
+await redoRetrySession.fire("session_start");
+const redoRetryState = {};
+const redoRetryAsk = redoRetrySession.tools
+	.get("ask")
+	.execute("fb-redo-retry", singleQuestion, undefined, undefined, stubbornCtx(redoRetrySession.ctx, redoRetryState));
+await settle(150);
+const redoRetryMessageId = api.nextMessage - 1;
+api.queued = [react(9034, redoRetryMessageId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+api.failMethods = ["editMessageText"];
+await redoRetrySession.pump(250);
+check(
+	"a redo survives a rejected settlement edit",
+	record(redoRetrySession.id).question === redoRetryMessageId &&
+		inboxCount(redoRetrySession.id) === 1 &&
+		redoRetryState.aborted !== true,
+);
+api.failMethods = [];
+await redoRetrySession.pump(250);
+const redoRetryResult = await redoRetryAsk;
+check(
+	"the requeued redo reaches the blocked ask after settlement recovers",
+	redoRetryResult.details.customInput.includes("reacted") &&
+		feedbackLines().filter((entry) => entry.updateId === 9034).length === 1,
+);
+// A new turn can begin while Telegram is still accepting the previous turn's question.
+await fb.fire("input");
+let releaseStatusSend;
+api.sendMessageGate = new Promise((resolve) => {
+	releaseStatusSend = resolve;
+});
+await fb.tools
+	.get("notify_status")
+	.execute(
+		"fb-stale-status",
+		{ summary: "Need a delayed decision.", urgency: "orange", question: "Keep waiting?" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
+await fb.fire("session_stop");
+await settle(50);
+await fb.fire("input");
+releaseStatusSend();
+api.sendMessageGate = null;
+await settle(150);
+check("a late status send cannot reopen a superseded question", record(fb.id).replyQuestion === null);
+
+// Detached sends retain the metadata that accompanied their outgoing text.
+const metadataSession = spawn("01a07009-0000-0000-0000-000000000000", "/home/dev/work/metadata", "Before send");
+await metadataSession.fire("session_start");
+await metadataSession.fire("input");
+await metadataSession.tools
+	.get("notify_status")
+	.execute(
+		"fb-metadata",
+		{ summary: "Metadata snapshot.", urgency: "green" },
+		undefined,
+		undefined,
+		metadataSession.ctx,
+	);
+let releaseMetadataSend;
+api.sendMessageGate = new Promise((resolve) => {
+	releaseMetadataSend = resolve;
+});
+await metadataSession.fire("session_stop");
+await settle(50);
+metadataSession.setTitle("After send");
+releaseMetadataSend();
+api.sendMessageGate = null;
+await settle(150);
+const metadataMessageId = record(metadataSession.id).recent.at(-1);
+check(
+	"a sent record keeps the session metadata from before its network wait",
+	onRecord(metadataMessageId).session.name === "Before send",
+);
+
+// An accepted edit marker covers the interval before its replacement ledger record is published.
+const acceptedEditMarkerDir = join(root, "notify-telegram/sent-in-flight");
+mkdirSync(acceptedEditMarkerDir, { recursive: true });
+const acceptedEditMarker = join(acceptedEditMarkerDir, `edit-${editedQuestionId}-accepted-window`);
+writeFileSync(acceptedEditMarker, "");
+const acceptedEditReaction = react(9035, editedQuestionId, ["\u{1F44D}"]);
+const offsetBeforeAcceptedEdit = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const feedbackBeforeAcceptedEdit = feedbackLines().length;
+api.queued = [acceptedEditReaction];
+await ownershipPoller.pump(250);
+check(
+	"a reaction during accepted edit publication waits for the replacement record",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === offsetBeforeAcceptedEdit &&
+		feedbackLines().length === feedbackBeforeAcceptedEdit,
+);
+rmSync(acceptedEditMarker, { force: true });
+api.queued = [acceptedEditReaction];
+await ownershipPoller.pump(250);
+check(
+	"the deferred reaction grades the published replacement record",
+	feedbackLines().at(-1).updateId === 9035 && feedbackLines().at(-1).message.text === onRecord(editedQuestionId).text,
+);
+
+// A staged transaction must carry a safe embedded owner before it can append feedback or route a redo.
+const unsafePendingUpdate = 9036;
+const unsafePendingFile = join(root, `notify-telegram/reaction-pending/${unsafePendingUpdate}.json`);
+writeFileSync(
+	unsafePendingFile,
+	JSON.stringify({
+		transaction: 1,
+		updateId: unsafePendingUpdate,
+		feedback: { updateId: unsafePendingUpdate, message: { session: { id: "../escape" } } },
+		kind: "redo",
+		value: "unsafe pending redo",
+		messageId: statusId,
+		targetKind: "status",
+	}),
+);
+const unsafePendingOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const feedbackBeforeUnsafePending = feedbackLines().length;
+api.queued = [react(unsafePendingUpdate, statusId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+check(
+	"an unsafe staged transaction is rejected before feedback or inbox publication",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === unsafePendingOffset &&
+		feedbackLines().length === feedbackBeforeUnsafePending &&
+		!existsSync(join(root, `notify-telegram/escape/${unsafePendingUpdate}.json`)),
+);
+rmSync(unsafePendingFile, { force: true });
+
+// A redo already routed to a live session is delivered before shutdown publishes the dead owner state.
+const shutdownRedoSession = spawn("01a0700b-0000-0000-0000-000000000000", "/home/dev/work/shutdown-redo");
+await shutdownRedoSession.fire("session_start");
+await shutdownRedoSession.fire("input");
+await shutdownRedoSession.tools
+	.get("notify_status")
+	.execute(
+		"fb-shutdown-redo",
+		{ summary: "Ready to close after feedback.", urgency: "green" },
+		undefined,
+		undefined,
+		shutdownRedoSession.ctx,
+	);
+await shutdownRedoSession.fire("session_stop");
+await settle(150);
+const shutdownRedoMessageId = record(shutdownRedoSession.id).recent.at(-1);
+const shutdownRedoSteers = shutdownRedoSession.steers.length;
+api.queued = [react(9037, shutdownRedoMessageId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+check(
+	"a live owner has the redo queued before shutdown",
+	feedbackLines().at(-1).updateId === 9037 &&
+		feedbackLines().at(-1).redo === true &&
+		inboxCount(shutdownRedoSession.id) === 1,
+);
+await shutdownRedoSession.fire("session_shutdown");
+check(
+	"shutdown reclassifies its queued redo before marking the owner dead",
+	record(shutdownRedoSession.id).heartbeat === 0 &&
+		inboxCount(shutdownRedoSession.id) === 0 &&
+		shutdownRedoSession.steers.length === shutdownRedoSteers &&
+		lastCall("sendMessage").body.text.includes("session ended"),
+);
+
+// A redo being used to settle a native question remains visible to shutdown until it reaches the agent.
+const settlementRaceSession = spawn("01a0700e-0000-0000-0000-000000000000", "/home/dev/work/settlement-race");
+await settlementRaceSession.fire("session_start");
+const settlementRaceState = {};
+const _settlementRaceAsk = settlementRaceSession.tools
+	.get("ask")
+	.execute(
+		"fb-settlement-race",
+		singleQuestion,
+		undefined,
+		undefined,
+		stubbornCtx(settlementRaceSession.ctx, settlementRaceState),
+	);
+await settle(150);
+const settlementRaceQuestionId = record(settlementRaceSession.id).question;
+const settlementRaceInbox = inboxOf(settlementRaceSession.id);
+const settlementRaceEntry = join(settlementRaceInbox, "90375.json");
+const settlementRaceProcessing = `${settlementRaceEntry}.processing`;
+writeFileSync(
+	settlementRaceEntry,
+	JSON.stringify({
+		kind: "redo",
+		value: "Restate the question after negative feedback.",
+		messageId: settlementRaceQuestionId,
+		targetKind: "question",
+		targetQuestion: false,
+		targetPreEdit: false,
+	}),
+);
+const unreadableSettlementEntry = join(settlementRaceInbox, "unreadable.json");
+mkdirSync(unreadableSettlementEntry);
+let releaseSettlementEdit;
+api.editMessageGate = new Promise((resolve) => {
+	releaseSettlementEdit = resolve;
+});
+const settlementRaceSteers = settlementRaceSession.steers.length;
+const settlingRaceRedo = settlementRaceSession.pump(250);
+await settle(50);
+check("a settling native redo remains visible in the inbox", existsSync(settlementRaceProcessing));
+await settlementRaceSession.fire("session_shutdown");
+check(
+	"shutdown reclassifies a native redo whose settlement is in flight",
+	record(settlementRaceSession.id).heartbeat === 0 &&
+		!existsSync(settlementRaceEntry) &&
+		!existsSync(settlementRaceProcessing) &&
+		settlementRaceSession.steers.length === settlementRaceSteers &&
+		lastCall("sendMessage").body.text.includes("session ended") &&
+		settlementRaceSession.warns.some((warning) => warning.m.includes("queued shutdown redo")),
+);
+rmSync(unreadableSettlementEntry, { recursive: true, force: true });
+releaseSettlementEdit();
+api.editMessageGate = null;
+await settlingRaceRedo;
+await settle(50);
+
+// Commit and shutdown serialize through the same owner lock, then a retry records the now-dead route honestly.
+const routeRaceSession = spawn("01a0700c-0000-0000-0000-000000000000", "/home/dev/work/route-race");
+const routeLockDir = join(root, "notify-telegram/reaction-route-locks");
+mkdirSync(routeLockDir, { recursive: true });
+const routeLockFile = join(routeLockDir, `${routeRaceSession.id}.lock`);
+const routeClosingFile = join(routeLockDir, `${routeRaceSession.id}.closing`);
+writeFileSync(routeLockFile, "orphan");
+writeFileSync(routeClosingFile, "orphan");
+await routeRaceSession.fire("session_start");
+check(
+	"session startup removes its own orphaned reaction route state",
+	!existsSync(routeLockFile) && !existsSync(routeClosingFile),
+);
+await routeRaceSession.fire("input");
+await routeRaceSession.tools
+	.get("notify_status")
+	.execute(
+		"fb-route-race",
+		{ summary: "Race the shutdown boundary.", urgency: "green" },
+		undefined,
+		undefined,
+		routeRaceSession.ctx,
+	);
+await routeRaceSession.fire("session_stop");
+await settle(150);
+const routeRaceMessageId = record(routeRaceSession.id).recent.at(-1);
+writeFileSync(routeLockFile, JSON.stringify({ token: "held", pid: process.pid }));
+const routeRaceReaction = react(9038, routeRaceMessageId, ["\u{1F44E}"]);
+const routeRaceOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+api.queued = [routeRaceReaction];
+await ownershipPoller.pump(250);
+check(
+	"a held owner lock leaves the reaction transaction and offset pending",
+	JSON.parse(readFileSync(routeLockFile, "utf8")).token === "held" &&
+		existsSync(join(root, "notify-telegram/reaction-pending/9038.json")) &&
+		JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === routeRaceOffset,
+);
+const pendingRetryWarnings = ownershipPoller.warns.length;
+api.queued = [routeRaceReaction];
+await ownershipPoller.pump(250);
+check(
+	"a locked persisted transaction remains retryable",
+	existsSync(join(root, "notify-telegram/reaction-pending/9038.json")) &&
+		ownershipPoller.warns.length === pendingRetryWarnings + 1 &&
+		ownershipPoller.warns.at(-1).m.includes("finish a reaction transaction"),
+);
+const routeRaceShutdown = routeRaceSession.fire("session_shutdown");
+await settle(50);
+check("shutdown waits for the owner route lock before publishing death", record(routeRaceSession.id).heartbeat > 0);
+rmSync(routeLockFile, { force: true });
+await routeRaceShutdown;
+api.queued = [routeRaceReaction];
+await ownershipPoller.pump(250);
+const routeRaceFeedback = feedbackLines().at(-1);
+check(
+	"a transaction retried after locked shutdown is recorded without a lost redo",
+	routeRaceFeedback.updateId === 9038 &&
+		routeRaceFeedback.redo === false &&
+		!existsSync(join(root, "notify-telegram/reaction-pending/9038.json")) &&
+		inboxCount(routeRaceSession.id) === 0 &&
+		lastCall("sendMessage").body.text.includes("session ended"),
+);
+const fenceFailureSession = spawn("01a0700d-0000-0000-0000-000000000000", "/home/dev/work/fence-failure");
+await fenceFailureSession.fire("session_start");
+const fenceFailureLock = join(routeLockDir, `${fenceFailureSession.id}.lock`);
+const fenceFailureClosing = join(routeLockDir, `${fenceFailureSession.id}.closing`);
+const realRouteWrite = fs.writeFileSync;
+const realNow = Date.now;
+let routeDeadlineElapsed = false;
+fs.writeFileSync = (path, data, options) => {
+	if (String(path) === fenceFailureLock) {
+		routeDeadlineElapsed = true;
+		throw new Error("route lock unavailable");
+	}
+	return realRouteWrite(path, data, options);
+};
+Date.now = () => realNow() + (routeDeadlineElapsed ? 6_000 : 0);
+syncBuiltinESMExports();
+let fenceFailureThrown = false;
+try {
+	await fenceFailureSession.fire("session_shutdown");
+} catch {
+	fenceFailureThrown = true;
+} finally {
+	fs.writeFileSync = realRouteWrite;
+	Date.now = realNow;
+	syncBuiltinESMExports();
+}
+check(
+	"a failed forced route acquisition removes its shutdown fence",
+	fenceFailureThrown && !existsSync(fenceFailureClosing) && record(fenceFailureSession.id).heartbeat > 0,
+);
+await fenceFailureSession.fire("session_shutdown");
+const malformedStoredUpdate = 9039;
+const malformedStoredFile = join(root, `notify-telegram/reaction-pending/${malformedStoredUpdate}.json`);
+writeFileSync(
+	malformedStoredFile,
+	JSON.stringify({
+		transaction: 1,
+		updateId: malformedStoredUpdate,
+		feedback: {
+			updateId: malformedStoredUpdate,
+			redo: true,
+			message: onRecord(statusId),
+		},
+		kind: "redo",
+		value: "forged pre-edit redo",
+		messageId: statusId,
+		targetKind: "status",
+		targetQuestion: false,
+		targetPreEdit: "yes",
+	}),
+);
+const malformedStoredOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const feedbackBeforeMalformedStored = feedbackLines().length;
+api.queued = [react(malformedStoredUpdate, statusId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+check(
+	"a malformed stored redo cannot forge pre-edit eligibility",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === malformedStoredOffset &&
+		feedbackLines().length === feedbackBeforeMalformedStored &&
+		existsSync(malformedStoredFile) &&
+		inboxCount(fb.id) === 0,
+);
+rmSync(malformedStoredFile, { force: true });
+
+const malformedRedoFile = join(inboxOf(fb.id), "9040.json");
+const steersBeforeMalformedRedo = fb.steers.length;
+writeFileSync(
+	malformedRedoFile,
+	JSON.stringify({
+		kind: "redo",
+		value: "legacy ambiguous redo",
+		messageId: statusId,
+		targetQuestion: false,
+		targetPreEdit: false,
+	}),
+);
+await fb.pump(150);
+check(
+	"a redo without a known target kind is discarded",
+	!existsSync(malformedRedoFile) &&
+		fb.steers.length === steersBeforeMalformedRedo &&
+		fb.warns.at(-1).m.includes("malformed redo"),
+);
+
+const sentMarkerDir = join(root, "notify-telegram/sent-in-flight");
+mkdirSync(sentMarkerDir, { recursive: true });
+const staleEditMarker = join(sentMarkerDir, `edit-${statusId}-stale`);
+writeFileSync(staleEditMarker, JSON.stringify(statusRecord));
+const staleMarkerTime = (Date.now() - 3 * 60_000) / 1000;
+utimesSync(staleEditMarker, staleMarkerTime, staleMarkerTime);
+api.queued = [react(9041, statusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check(
+	"a stale edit marker is removed before grading the current record",
+	!existsSync(staleEditMarker) && feedbackLines().at(-1).updateId === 9041,
+);
+
+const corruptEditMarker = join(sentMarkerDir, `edit-${statusId}-corrupt`);
+writeFileSync(corruptEditMarker, "{");
+const corruptMarkerOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const feedbackBeforeCorruptMarker = feedbackLines().length;
+api.queued = [react(9042, statusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check(
+	"a corrupt active edit marker defers its reaction",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === corruptMarkerOffset &&
+		feedbackLines().length === feedbackBeforeCorruptMarker,
+);
+rmSync(corruptEditMarker, { force: true });
+
+const nullEditMarker = join(sentMarkerDir, `edit-${statusId}-null`);
+writeFileSync(nullEditMarker, "null");
+api.queued = [react(9043, statusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check("a non-record edit marker also defers its reaction", feedbackLines().length === feedbackBeforeCorruptMarker);
+rmSync(nullEditMarker, { force: true });
+
+const feedbackBackup = `${feedbackFile}.coverage`;
+renameSync(feedbackFile, feedbackBackup);
+mkdirSync(feedbackFile);
+const unreadableFeedbackOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const unreadableFeedbackWarnings = ownershipPoller.warns.length;
+api.queued = [react(9044, statusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check(
+	"an unreadable feedback log defers rather than duplicates a reaction",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === unreadableFeedbackOffset &&
+		ownershipPoller.warns.length === unreadableFeedbackWarnings + 1 &&
+		ownershipPoller.warns.at(-1).m.includes("reaction history"),
+);
+rmSync(feedbackFile, { recursive: true, force: true });
+renameSync(feedbackBackup, feedbackFile);
+
+const invalidUpdateFeedback = feedbackLines().length;
+api.queued = [react(0, statusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check(
+	"an invalid reaction update id never reaches feedback storage",
+	feedbackLines().length === invalidUpdateFeedback && ownershipPoller.warns.at(-1).m.includes("invalid update id"),
+);
+
+await fb.tools
+	.get("notify_snippet")
+	.execute("fb-snippet-redo", { purpose: "replacement query", text: "SELECT 1;" }, undefined, undefined, fb.ctx);
+const reactionSnippetId = record(fb.id).recent.at(-1);
+api.queued = [react(9045, reactionSnippetId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+await fb.pump(150);
+check("negative snippet feedback requests notify_snippet", fb.steers.at(-1).text.includes("notify_snippet"));
+
+const reactionFile = join(root, "reaction-feedback.log");
+writeFileSync(reactionFile, "failure");
+await fb.tools.get("notify_file").execute("fb-file-redo", { paths: [reactionFile] }, undefined, undefined, fb.ctx);
+const reactionFileId = record(fb.id).recent.at(-1);
+api.queued = [react(9046, reactionFileId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+await fb.pump(150);
+check("negative file feedback requests notify_file", fb.steers.at(-1).text.includes("notify_file"));
+
+const steersBeforeStableNegative = fb.steers.length;
+api.queued = [react(9047, statusId, ["\u{1F44E}", "\u{1F44D}"], ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+await fb.pump(150);
+check(
+	"adding praise to an existing negative grade does not request another redo",
+	feedbackLines().at(-1).updateId === 9047 &&
+		feedbackLines().at(-1).grade === -2 &&
+		feedbackLines().at(-1).redo === false &&
+		fb.steers.length === steersBeforeStableNegative &&
+		inboxCount(fb.id) === 0,
+);
+
+api.queued = [react(9048, statusId, ["\u{1F4A9}"], ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+await fb.pump(150);
+check(
+	"a more-negative grade requests a fresh redo",
+	feedbackLines().at(-1).updateId === 9048 &&
+		feedbackLines().at(-1).grade === -3 &&
+		feedbackLines().at(-1).redo === true &&
+		fb.steers.length === steersBeforeStableNegative + 1,
+);
+
+// Sent-message records have a longer retention period than downloaded media.
+const staleRecord = join(sentDir, "1.json");
+const freshRecord = join(sentDir, "2.json");
+writeFileSync(staleRecord, "{}");
+writeFileSync(freshRecord, "{}");
+const ninetyOneDaysAgo = (Date.now() - 91 * 24 * 3600 * 1000) / 1000;
+utimesSync(staleRecord, ninetyOneDaysAgo, ninetyOneDaysAgo);
+const staleMedia = join(mediaDir, "stale-retention.bin");
+const freshMedia = join(mediaDir, "fresh-retention.bin");
+
+writeFileSync(staleMedia, "");
+writeFileSync(freshMedia, "");
+const eightDaysAgo = (Date.now() - 8 * 24 * 3600 * 1000) / 1000;
+utimesSync(staleMedia, eightDaysAgo, eightDaysAgo);
+const sweeper = spawn("01a07002-0000-0000-0000-000000000000", "/home/dev/work/sweeper");
+await sweeper.fire("session_start");
+check("a record older than ninety days is swept", !existsSync(staleRecord));
+check("a younger record stays", existsSync(freshRecord));
+check("downloaded media older than seven days is swept", !existsSync(staleMedia));
+check("younger downloaded media stays", existsSync(freshMedia));
 
 // ------------------------------------------------------------ upstream_launch
 heading("upstream_launch");
