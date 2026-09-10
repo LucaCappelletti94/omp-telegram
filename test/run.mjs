@@ -7,6 +7,7 @@ import fs, {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
 	unlinkSync,
@@ -733,7 +734,7 @@ for (const path of crowd) rmSync(path, { force: true });
 heading("stale session reaping");
 const dead = "01a03000-dead-0000-0000-000000000000";
 mkdirSync(inboxOf(dead), { recursive: true });
-writeFileSync(join(inboxOf(dead), "1.json"), "{}");
+writeFileSync(join(inboxOf(dead), "1.json"), JSON.stringify({ kind: "redo", value: "retry dead work" }));
 writeFileSync(
 	join(sessionsDir, `${dead}.json`),
 	JSON.stringify({
@@ -747,11 +748,17 @@ writeFileSync(
 		heartbeat: Date.now() - 600_000,
 	}),
 );
+const staleReapNotices = called("sendMessage").length;
 const reaper = spawn("01a03500-0000-0000-0000-000000000000", "/home/dev/work/rats");
 await reaper.fire("session_start");
+await settle(50);
 check("stale record reaped", !existsSync(join(sessionsDir, `${dead}.json`)));
 check("stale inbox reaped", !existsSync(inboxOf(dead)));
 check("live records survive", existsSync(join(sessionsDir, `${one.id}.json`)));
+check(
+	"reaping a queued redo reports that its session ended",
+	called("sendMessage").length === staleReapNotices + 1 && lastCall("sendMessage").body.text.includes("session ended"),
+);
 
 // ------------------------------------------------------------- reply routing
 heading("reply routing");
@@ -6884,7 +6891,7 @@ check(
 );
 
 // A redo being used to settle a native question remains visible to shutdown until it reaches the agent.
-const settlementRaceSession = spawn("01a0700d-0000-0000-0000-000000000000", "/home/dev/work/settlement-race");
+const settlementRaceSession = spawn("01a0700e-0000-0000-0000-000000000000", "/home/dev/work/settlement-race");
 await settlementRaceSession.fire("session_start");
 const settlementRaceState = {};
 const _settlementRaceAsk = settlementRaceSession.tools
@@ -6912,6 +6919,8 @@ writeFileSync(
 		targetPreEdit: false,
 	}),
 );
+const unreadableSettlementEntry = join(settlementRaceInbox, "unreadable.json");
+mkdirSync(unreadableSettlementEntry);
 let releaseSettlementEdit;
 api.editMessageGate = new Promise((resolve) => {
 	releaseSettlementEdit = resolve;
@@ -6927,8 +6936,10 @@ check(
 		!existsSync(settlementRaceEntry) &&
 		!existsSync(settlementRaceProcessing) &&
 		settlementRaceSession.steers.length === settlementRaceSteers &&
-		lastCall("sendMessage").body.text.includes("session ended"),
+		lastCall("sendMessage").body.text.includes("session ended") &&
+		settlementRaceSession.warns.some((warning) => warning.m.includes("queued shutdown redo")),
 );
+rmSync(unreadableSettlementEntry, { recursive: true, force: true });
 releaseSettlementEdit();
 api.editMessageGate = null;
 await settlingRaceRedo;
@@ -6970,6 +6981,15 @@ check(
 	JSON.parse(readFileSync(routeLockFile, "utf8")).token === "held" &&
 		existsSync(join(root, "notify-telegram/reaction-pending/9038.json")) &&
 		JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === routeRaceOffset,
+);
+const pendingRetryWarnings = ownershipPoller.warns.length;
+api.queued = [routeRaceReaction];
+await ownershipPoller.pump(250);
+check(
+	"a locked persisted transaction remains retryable",
+	existsSync(join(root, "notify-telegram/reaction-pending/9038.json")) &&
+		ownershipPoller.warns.length === pendingRetryWarnings + 1 &&
+		ownershipPoller.warns.at(-1).m.includes("finish a reaction transaction"),
 );
 const routeRaceShutdown = routeRaceSession.fire("session_shutdown");
 await settle(50);
@@ -7050,6 +7070,81 @@ check(
 		inboxCount(fb.id) === 0,
 );
 rmSync(malformedStoredFile, { force: true });
+
+const sentMarkerDir = join(root, "notify-telegram/sent-in-flight");
+mkdirSync(sentMarkerDir, { recursive: true });
+const staleEditMarker = join(sentMarkerDir, `edit-${statusId}-stale`);
+writeFileSync(staleEditMarker, JSON.stringify(statusRecord));
+const staleMarkerTime = (Date.now() - 3 * 60_000) / 1000;
+utimesSync(staleEditMarker, staleMarkerTime, staleMarkerTime);
+api.queued = [react(9041, statusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check(
+	"a stale edit marker is removed before grading the current record",
+	!existsSync(staleEditMarker) && feedbackLines().at(-1).updateId === 9041,
+);
+
+const corruptEditMarker = join(sentMarkerDir, `edit-${statusId}-corrupt`);
+writeFileSync(corruptEditMarker, "{");
+const corruptMarkerOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const feedbackBeforeCorruptMarker = feedbackLines().length;
+api.queued = [react(9042, statusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check(
+	"a corrupt active edit marker defers its reaction",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === corruptMarkerOffset &&
+		feedbackLines().length === feedbackBeforeCorruptMarker,
+);
+rmSync(corruptEditMarker, { force: true });
+
+const nullEditMarker = join(sentMarkerDir, `edit-${statusId}-null`);
+writeFileSync(nullEditMarker, "null");
+api.queued = [react(9043, statusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check("a non-record edit marker also defers its reaction", feedbackLines().length === feedbackBeforeCorruptMarker);
+rmSync(nullEditMarker, { force: true });
+
+const feedbackBackup = `${feedbackFile}.coverage`;
+renameSync(feedbackFile, feedbackBackup);
+mkdirSync(feedbackFile);
+const unreadableFeedbackOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+const unreadableFeedbackWarnings = ownershipPoller.warns.length;
+api.queued = [react(9044, statusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check(
+	"an unreadable feedback log defers rather than duplicates a reaction",
+	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === unreadableFeedbackOffset &&
+		ownershipPoller.warns.length === unreadableFeedbackWarnings + 1 &&
+		ownershipPoller.warns.at(-1).m.includes("reaction history"),
+);
+rmSync(feedbackFile, { recursive: true, force: true });
+renameSync(feedbackBackup, feedbackFile);
+
+const invalidUpdateFeedback = feedbackLines().length;
+api.queued = [react(0, statusId, ["\u{1F44D}"])];
+await ownershipPoller.pump(250);
+check(
+	"an invalid reaction update id never reaches feedback storage",
+	feedbackLines().length === invalidUpdateFeedback && ownershipPoller.warns.at(-1).m.includes("invalid update id"),
+);
+
+await fb.tools
+	.get("notify_snippet")
+	.execute("fb-snippet-redo", { purpose: "replacement query", text: "SELECT 1;" }, undefined, undefined, fb.ctx);
+const reactionSnippetId = record(fb.id).recent.at(-1);
+api.queued = [react(9045, reactionSnippetId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+await fb.pump(150);
+check("negative snippet feedback requests notify_snippet", fb.steers.at(-1).text.includes("notify_snippet"));
+
+const reactionFile = join(root, "reaction-feedback.log");
+writeFileSync(reactionFile, "failure");
+await fb.tools.get("notify_file").execute("fb-file-redo", { paths: [reactionFile] }, undefined, undefined, fb.ctx);
+const reactionFileId = record(fb.id).recent.at(-1);
+api.queued = [react(9046, reactionFileId, ["\u{1F44E}"])];
+await ownershipPoller.pump(250);
+await fb.pump(150);
+check("negative file feedback requests notify_file", fb.steers.at(-1).text.includes("notify_file"));
 
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");
