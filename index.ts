@@ -215,6 +215,8 @@ function gradeReaction(reaction: TelegramReactionType[]): {
 }
 
 const TYPING_MS = 5_000;
+/** How long a delivered Telegram answer justifies the typing status: Telegram's own claim is 5s. */
+const OWED_TYPING_MS = 30_000;
 const DRAFT_MS = 1_500;
 /** The party-popper send effect, verified against the live API; effects exist in private chats only. */
 const GREEN_EFFECT_ID = "5046509860389126442";
@@ -1002,8 +1004,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let turnActive = false;
 	let sessionAlive = true;
 	let typingSentAt = 0;
-	/** Cleared when the turn carrying the answer ends: typing is chat-wide, so no session may hold it idly. */
-	let replyOwed = false;
+	/** When a delivered Telegram entry reached the agent; 0 once the turn carrying its answer ended. */
+	let replyOwedAt = 0;
+	/** Session messages the user is waiting on right now, so typing is claimed only while one is out. */
+	let sendsInFlight = 0;
+	let sendingTicks = 0;
 	let dashboardPublishedAt = 0;
 	let approvalWaiting = false;
 	let approvalNotice: ApprovalNotice | null = null;
@@ -1188,6 +1193,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		recordSent(sent.message_id, kind, text, sentSession, payload);
 	}
 
+	/** Marks a message the user is waiting on, which is the one window where typing is not a lie. */
+	async function whileSending<T>(work: () => Promise<T>): Promise<T> {
+		sendsInFlight += 1;
+		try {
+			return await work();
+		} finally {
+			sendsInFlight -= 1;
+		}
+	}
+
 	/** Retries markup failures as plain text and records only messages with a non-null `kind`. */
 	async function sendOrEdit(
 		cfg: Config,
@@ -1200,7 +1215,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		beforeRecord?: (messageId: number) => void,
 		sentSession = snapshotSentSession(),
 	): Promise<TelegramMessage | null> {
-		const work = async (acceptEdit: () => void): Promise<TelegramMessage | null> => {
+		const deliver = async (acceptEdit: () => void): Promise<TelegramMessage | null> => {
 			const quiet = { link_preview_options: { is_disabled: true } };
 			const source = fitToTelegram(plain, keep);
 			let sentText = source;
@@ -1239,6 +1254,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			return sent;
 		};
+		const work = async (acceptEdit: () => void): Promise<TelegramMessage | null> =>
+			method === "sendMessage" ? await whileSending(() => deliver(acceptEdit)) : await deliver(acceptEdit);
 		if (method === "sendMessage" && kind !== null) return await withSentRecordMarker(work);
 		const editedMessageId =
 			method === "editMessageText" &&
@@ -1822,16 +1839,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	): Promise<TelegramMessage | null> {
 		const sentSession = snapshotSentSession();
 		if (/```|(^|\n)\|.+\|/.test(plain)) {
-			const sent = await withSentRecordMarker(async () => {
-				const accepted = await callTelegram<TelegramMessage>(
-					cfg,
-					"sendRichMessage",
-					{ ...body, rich_message: { markdown: plain + keep } },
-					15_000,
-				);
-				if (accepted !== null) trackSent(accepted, kind, plain + keep, sentSession, payload, beforeRecord);
-				return accepted;
-			});
+			const sent = await whileSending(() =>
+				withSentRecordMarker(async () => {
+					const accepted = await callTelegram<TelegramMessage>(
+						cfg,
+						"sendRichMessage",
+						{ ...body, rich_message: { markdown: plain + keep } },
+						15_000,
+					);
+					if (accepted !== null) trackSent(accepted, kind, plain + keep, sentSession, payload, beforeRecord);
+					return accepted;
+				}),
+			);
 			if (sent !== null) return sent;
 		}
 		return await sendOrEdit(cfg, "sendMessage", body, plain, keep, kind, payload, beforeRecord, sentSession);
@@ -2039,9 +2058,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	/** Typing is chat-wide but a turn is not, so only a session that owes the user an answer claims it. */
+	/**
+	 * Telegram holds the status for five seconds, so it promises a message in seconds. A turn runs
+	 * for minutes: the claim is bounded to the grace after an answer reaches the agent and to a send
+	 * that outlives a tick, since one landing sooner needs no announcement.
+	 */
 	function maybeType(): void {
-		if (config === null || !turnActive || !replyOwed || pendingAsk !== null || approvalWaiting) return;
+		if (config === null) return;
+		sendingTicks = sendsInFlight > 0 ? sendingTicks + 1 : 0;
+		const owed =
+			turnActive &&
+			replyOwedAt > 0 &&
+			Date.now() - replyOwedAt < OWED_TYPING_MS &&
+			pendingAsk === null &&
+			!approvalWaiting;
+		if (!owed && sendingTicks < 2) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
 		if (Date.now() - draftSentAt < 10_000) return;
 		if (Date.now() - typingSentAt < TYPING_MS) return;
@@ -3483,7 +3514,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
 					focusTmuxWindow();
 				}
-				// `replyOwed` is set where the entry reaches the agent, never before: an entry answered
+				// `replyOwedAt` is stamped where the entry reaches the agent, never before: an entry answered
 				// locally, such as an unreadable file, leaves no answer for this session to write.
 
 				const ask = pendingAsk;
@@ -3545,7 +3576,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						);
 						if (label !== undefined) {
 							pi.sendUserMessage(label);
-							replyOwed = true;
+							replyOwedAt = Date.now();
 						}
 					} else if (sessionCtx !== null) {
 						await sessionNotice(sessionCtx, "That question is closed. It was superseded or already answered.");
@@ -3557,7 +3588,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (entry.kind === "callback") {
 					if (ask !== null) {
 						await applyCallback(ask, entry.value);
-						replyOwed = true;
+						replyOwedAt = Date.now();
 					} else if (sessionCtx !== null) {
 						await sessionNotice(sessionCtx, "That question is closed. It was answered or cancelled at the terminal.");
 					} else {
@@ -3590,7 +3621,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							`The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`,
 						);
 					}
-					replyOwed = true;
+					replyOwedAt = Date.now();
 					ackDelivered(entry.messageId);
 					continue;
 				}
@@ -3605,7 +3636,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						ask.selected[ask.index] = new Set<string>();
 						if (await advance(ask)) {
 							rmSync(processing, { force: true });
-							replyOwed = true;
+							replyOwedAt = Date.now();
 						} else {
 							try {
 								renameSync(processing, queued);
@@ -3624,7 +3655,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					focusTmuxWindow();
 					pi.sendUserMessage(entry.value);
 					rmSync(processing, { force: true });
-					replyOwed = true;
+					replyOwedAt = Date.now();
 					continue;
 				}
 				if (entry.kind === "text") closeReplyQuestion(entry.replyTo);
@@ -3633,12 +3664,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (ask !== null) {
 					ask.custom[ask.index] = entry.value;
 					ask.selected[ask.index] = new Set<string>();
-					replyOwed = true;
+					replyOwedAt = Date.now();
 					await advance(ask);
 					continue;
 				}
 				pi.sendUserMessage(entry.value);
-				replyOwed = true;
+				replyOwedAt = Date.now();
 				ackDelivered(entry.messageId);
 			}
 		} finally {
@@ -4593,7 +4624,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	pi.on("agent_end", async () => {
 		turnActive = false;
-		replyOwed = false;
+		replyOwedAt = 0;
 		turnEndedAt = Date.now();
 		approvalWaiting = false;
 		draftText = "";
@@ -4747,7 +4778,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	pi.on("session_stop", async (_event, ctx) => {
 		turnActive = false;
-		replyOwed = false;
+		replyOwedAt = 0;
 		approvalWaiting = false;
 		if (config === null || !config.notifyOnTurnEnd) return;
 		const quiet = Date.now() - lastLocalInput < config.quietSeconds * 1000;

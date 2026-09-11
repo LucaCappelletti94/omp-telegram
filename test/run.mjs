@@ -119,6 +119,13 @@ const check = (label, ok) => {
 	if (!ok) fails++;
 };
 const settle = (ms = 90) => new Promise((r) => setTimeout(r, ms));
+/** Walks the clock the extension reads, forward only: a stamp from the future would read as fresh. */
+const baseNow = Date.now;
+let clockSkew = 0;
+Date.now = () => baseNow() + clockSkew;
+const jump = (ms) => {
+	clockSkew += ms;
+};
 const called = (method) => api.calls.filter((c) => c.method === method);
 const lastCall = (method) => called(method).at(-1);
 const sessionsDir = join(root, "notify-telegram/sessions");
@@ -2238,6 +2245,10 @@ await ux.pump(150);
 await ux.pump(150);
 check("a reply arriving mid-turn shows typing", called("sendChatAction").length === typingBefore + 1);
 check("the action is typing", lastCall("sendChatAction").body.action === "typing");
+// A turn lasts minutes; typing promises a message in seconds, so the claim after a reply is bounded.
+jump(31_000);
+await ux.pump(150);
+check("a turn running on past the grace stops typing", called("sendChatAction").length === typingBefore + 1);
 await ux.fire("agent_end");
 await ux.fire("agent_start");
 await ux.pump(150);
@@ -2271,6 +2282,24 @@ await ux.fire("agent_start");
 await ux.pump(150);
 check("text that looks like a close press still types", called("sendChatAction").length === typingBefore + 3);
 await ux.fire("agent_end");
+// A message actually going out is the honest case, turn or no turn.
+jump(31_000);
+const slowSend = Promise.withResolvers();
+api.sendMessageGate = slowSend.promise;
+writeFileSync(join(inboxOf(ux.id), "6150.json"), JSON.stringify({ kind: "command", value: "status" }));
+await ux.pump(150);
+await ux.pump(150);
+check("a message still going out types", called("sendChatAction").length === typingBefore + 4);
+slowSend.resolve();
+api.sendMessageGate = null;
+await settle(150);
+jump(6_000);
+await ux.pump(150);
+check("typing stops once the message has landed", called("sendChatAction").length === typingBefore + 4);
+writeFileSync(join(inboxOf(ux.id), "6151.json"), JSON.stringify({ kind: "command", value: "status" }));
+await ux.pump(150);
+await ux.pump(150);
+check("a send that lands inside the tick never flickers typing", called("sendChatAction").length === typingBefore + 4);
 
 // A text reply to the question message answers it, no button needed.
 const uxState = {};
@@ -7012,16 +7041,13 @@ await fenceFailureSession.fire("session_start");
 const fenceFailureLock = join(routeLockDir, `${fenceFailureSession.id}.lock`);
 const fenceFailureClosing = join(routeLockDir, `${fenceFailureSession.id}.closing`);
 const realRouteWrite = fs.writeFileSync;
-const realNow = Date.now;
-let routeDeadlineElapsed = false;
 fs.writeFileSync = (path, data, options) => {
 	if (String(path) === fenceFailureLock) {
-		routeDeadlineElapsed = true;
+		jump(6_000);
 		throw new Error("route lock unavailable");
 	}
 	return realRouteWrite(path, data, options);
 };
-Date.now = () => realNow() + (routeDeadlineElapsed ? 6_000 : 0);
 syncBuiltinESMExports();
 let fenceFailureThrown = false;
 try {
@@ -7030,7 +7056,6 @@ try {
 	fenceFailureThrown = true;
 } finally {
 	fs.writeFileSync = realRouteWrite;
-	Date.now = realNow;
 	syncBuiltinESMExports();
 }
 check(
