@@ -3,12 +3,11 @@
 [![CI](https://github.com/LucaCappelletti94/omp-telegram/actions/workflows/ci.yml/badge.svg)](https://github.com/LucaCappelletti94/omp-telegram/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/LucaCappelletti94/omp-telegram/graph/badge.svg)](https://codecov.io/gh/LucaCappelletti94/omp-telegram)
 [![Quality gate](https://sonarcloud.io/api/project_badges/measure?project=LucaCappelletti94_omp-telegram&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=LucaCappelletti94_omp-telegram)
-[![Codacy](https://app.codacy.com/project/badge/Grade/31d0370cc25441c682e437e4712e97aa)](https://app.codacy.com/gh/LucaCappelletti94/omp-telegram/dashboard)
 [![License](https://img.shields.io/github/license/LucaCappelletti94/omp-telegram)](https://github.com/LucaCappelletti94/omp-telegram/blob/main/LICENSE)
 
-Telegram notifications and remote control for [Oh My Pi](https://github.com/can1357/oh-my-pi) sessions. Turn ends arrive as a short agent-written summary of a sentence or two with an urgency light and optional tappable choices whose label starts the next turn. Every choice carries a line saying what it does, so a button never has to be guessed at, and `ask` questions appear at the terminal and on Telegram at once, where the first answer wins.
+Telegram notifications and remote control for [Oh My Pi](https://github.com/can1357/oh-my-pi) sessions. Turn ends arrive as a short agent-written summary with an urgency light and optional tappable choices whose label starts the next turn; every choice carries a line saying what it does. `ask` questions appear at the terminal and on Telegram at once, and the first answer wins.
 
-Parallel sessions share one bot. Every message a session sends opens with the same two lines, its badge and then its task, current model, and exact tmux `session:window.pane` when attached, so a notification read on a phone identifies itself without the terminal. The badge keeps replies routed to that session. A badge emoji is chosen by the session's own agent to depict its task, and is unique among live sessions.
+Parallel sessions share one bot. Every message opens with the session's badge and then its task, model, and tmux `session:window.pane` when attached, so a phone notification identifies itself and keeps replies routed. The badge emoji is chosen by the session's own agent and is unique among live sessions.
 
 ## Setup
 
@@ -20,29 +19,45 @@ cd omp-telegram
 node setup.mjs
 ```
 
-It validates the token, then waits for you to message the bot. That message has to be a private one, sent directly to the bot, since the pairing binds a single direct chat and a group message cannot stand in for it. It then writes `~/.omp/agent/notify-telegram.json`. Then list the checkout in `~/.omp/agent/config.yml` and restart omp:
+It validates the token, then waits for a direct private message to the bot; the pairing binds one direct chat, so a group message does not work. It writes `~/.omp/agent/notify-telegram.json`. List the checkout in `~/.omp/agent/config.yml` and restart omp:
 
 ```yaml
 extensions:
   - ~/path/to/omp-telegram
 ```
 
-In the JSON config, `quietSeconds` (default 45) makes turn-end notices arrive without a sound while you are typing at the terminal, `notifyOnTurnEnd: false` disables them, and `streamDrafts: false` turns off live draft streaming. `pinnedDashboard: true` adds a pinned message that always shows every live session and rewrites itself in place, no more than once every `dashboardSeconds` (default 30) and only when the text actually changed. Edits apply within about fifteen seconds to sessions already running, so no restart is needed. Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops omp's own bell from flagging tmux windows.
+JSON config (`~/.omp/agent/notify-telegram.json`):
+
+- `quietSeconds` (default 45): turn-end notices arrive without sound while you are typing at the terminal.
+- `notifyOnTurnEnd: false`: disables turn-end notices.
+- `streamDrafts: false`: turns off live draft streaming.
+- `pinnedDashboard: true`: a pinned message showing every live session, rewritten in place at most every `dashboardSeconds` (default 30) when the text changed.
+
+Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops omp's bell from flagging tmux windows. Edits apply to running sessions within about fifteen seconds, so no restart is needed.
 
 ## Answering
 
-Tap a button, reply to a session's message, or send a bare message for the last session that notified you. While a question is open, any text you send that session answers it in your own words, photos reach the agent as images, and voice notes, audio files, and documents are saved to disk and handed to the agent as file paths. Files this bot saves or sends are named `<UTC stamp>__<kind>__<session>__<original name>`, incoming ones carrying the Telegram update id too, and a photo repeats that name in its caption because Telegram drops a photo's filename. The chat shows a typing status only while the session you wrote to is working on your answer and an upload status while a file goes up, delivered messages get a thumbs-up reaction, red statuses stay pinned until the next turn, and `/hidequestions` clears open question buttons. Unroutable messages are refused with an explanation, and presses on settled questions get a closure notice. Question text renders a Markdown subset: code, fences, bold, italic, strikethrough, spoilers, quotes, links.
-
-Text you are meant to paste elsewhere, an issue body, a PR post, a review reply, a patch, arrives as its own message ending in one fenced block that holds it verbatim, so the block's copy control yields exactly the payload. Anything too large for one message is refused rather than cut, and goes as a file instead. While a turn runs, the answer streams into an ephemeral draft bubble with the same head and the tool activity. `/stop` aborts the running turn: sent bare it reaches the one session mid-turn and offers a button per session when several are, sent as a reply it stops the session that message belongs to. Turn-end summaries report tokens and cost separately for each model, rich content stays native, artifacts arrive as media or documents, and a finished green summary can close the session and its tmux tab. `/status` reports session state, `/fleet` lists omp tmux windows, context compaction announces itself, retries and model fallbacks show as a provider note on the board and in `/status` rather than a message per session, and all commands sit in the bot menu.
+- Tap a button, reply to a session's message, or send a bare message to the last session that notified you; while a question is open, any text to that session answers it.
+- Photos reach the agent as images; voice notes, audio files, and documents are saved to disk and handed over as file paths.
+- Files are named `<UTC stamp>__<kind>__<session>__<original name>`, incoming ones carrying the Telegram update id; a photo repeats the name in its caption because Telegram drops photo filenames.
+- The chat shows a typing status while the session works your answer and an upload status while a file goes up; delivered messages get a thumbs-up reaction; red statuses stay pinned until the next turn; `/hidequestions` clears open question buttons.
+- Unroutable messages are refused with an explanation; presses on settled questions get a closure notice.
+- Question text renders a Markdown subset: code, fences, bold, italic, strikethrough, spoilers, quotes, links.
+- Text meant to be pasted elsewhere arrives as its own message ending in one fenced block holding it verbatim; payloads too large for one message are refused rather than cut and go as a file.
+- While a turn runs, the answer streams into an ephemeral draft bubble with the same head and the tool activity.
+- `/stop` aborts the running turn: sent bare it reaches the one session mid-turn and offers a button per session when several are, sent as a reply it stops the session that message belongs to.
+- Turn-end summaries report tokens and cost per model; rich content stays native; artifacts arrive as media or documents; a finished green summary can close the session and its tmux tab.
+- `/status` reports session state, `/fleet` lists omp tmux windows, and all commands sit in the bot menu.
+- Context compaction announces itself; retries and model fallbacks show as a provider note on the board and in `/status` rather than a message per session.
 
 ## Grading with reactions
 
 React to any message a session sent and the reaction is kept as a grade on it. The scale is +3 🏆 💯 🤩 ❤️‍🔥 🎉 🔥, +2 👍 ❤️ 👏 😍 🥰 👌 🙏 😁 🤣, +1 😎 🤝 🫡 🆒 👀 🤓, 0 🤔 🤨 😐 🤷, -1 🥱 😴 🙈 😢 💔, -2 👎 😨 😱 😭 🤯, -3 💩 🤮 🤡 🤬 😡 🖕. Any other emoji is kept without a grade and returns a reaction error containing the scale.
 
-A grade of -2 or lower on something the agent wrote sends it back to do that message again: on an open question it answers the question with a request to restate it with the context a phone reader needs, on a turn-end status, a standing question, a snippet or a file it starts a turn asking for that message to be redone with the right tool. The bot's own notices can be graded too, but there is nothing to redo. Messages whose session has ended and questions that are already closed keep their grade without a redo.
+A grade of -2 or lower on something the agent wrote triggers a redo: an open question gets a restate request carrying the context a phone reader needs; a turn-end status, standing question, snippet or file starts a turn asking for that message redone with the right tool. Bot notices, ended sessions, and closed questions keep their grade without a redo.
 
-Every change of reaction appends one line to `~/.omp/agent/notify-telegram/feedback.jsonl`: `version`, `updateId` (the Telegram update id), `at` (the Telegram reaction time in milliseconds), `messageId`, `emoji` (the reactions now set, empty when you take one back), `previous`, `grade` (the lowest graded emoji, or `null` when any emoji is outside the scale), `redo`, and `message`, the record of what was sent: `kind` (`status`, `question`, `standing`, `snippet`, `file`, `approval` or `notice`), the `text` as sent, the `session` (omp session id, routing tag, badge emoji, name, working directory) and, for statuses and questions, the `payload` the tool was called with. The last line per message is its current state. Those records live under `notify-telegram/sent/<message id>.json` for ninety days, so feedback remains self-contained after they expire.
+Every change of reaction appends one line to `~/.omp/agent/notify-telegram/feedback.jsonl`: `version`, `updateId` (the Telegram update id), `at` (reaction time in ms), `messageId`, `emoji` (reactions now set, empty when you take one back), `previous`, `grade` (lowest graded emoji, `null` when any emoji is outside the scale), `redo`, and `message`, the record of what was sent: `kind` (`status`, `question`, `standing`, `snippet`, `file`, `approval` or `notice`), the `text` as sent, the `session` (omp session id, routing tag, badge emoji, name, working directory) and, for statuses and questions, the `payload` the tool was called with. The last line per message is its current state; sent records live under `notify-telegram/sent/<message id>.json` for ninety days, so feedback remains self-contained after they expire.
 
 ## Upstream fixes
 
-When a session finds that a bug belongs in a repository this one depends on, it writes the finding up and calls the `upstream_launch` tool. The tool shows a Launch or Cancel card and does nothing until you tap Launch, then it resolves the target on your GitHub account (your own repository, or a fork it reuses or creates), clones it under `~/github`, cuts a worktree on a fresh `upstream/<slug>` branch off the latest default branch, carries the finding in, and opens a new omp session in its own tmux tab to carry out the fix. That session asks you what it needs, does the work, self-reviews as the maintainer would, pushes a branch, and sends you the compare link and the pull-request text, then waits for you to open the PR before it watches CI. The launching session never writes in the upstream repository itself.
+When a session finds that a bug belongs in a repository this one depends on, it writes the finding up and calls `upstream_launch`. The tool shows a Launch or Cancel card and does nothing until you tap Launch, then it resolves the target on your GitHub account (your own repo, or a fork it reuses or creates), clones it under `~/github`, cuts a worktree on a fresh `upstream/<slug>` branch off the latest default branch, carries the finding in, and opens a new omp session in its own tmux tab. That session asks what it needs, does the work, self-reviews as the maintainer would, pushes a branch, and sends the compare link and pull-request text, then waits for you to open the PR before it watches CI. The launching session never writes in the upstream repository itself.
