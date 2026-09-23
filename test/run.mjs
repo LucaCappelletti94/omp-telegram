@@ -7645,7 +7645,7 @@ esac
 	);
 	check(
 		"a clone with both remotes present is neither re-cloned nor re-wired",
-		!/^clone |remote (add|set-url|rename|remove)/mu.test(splitGit),
+		!/^(?:clone |.*remote (?:add|set-url|rename|remove))/mu.test(splitGit),
 	);
 	check(
 		"the branch is cut from the remote that points at the target",
