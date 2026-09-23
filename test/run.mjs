@@ -7816,6 +7816,22 @@ esac
 			/worktree add .* origin\/main$/mu.test(triangleGit),
 	);
 
+	// x2. A remote that fetches a mirror but pushes to the fork makes the clone usable, not refused.
+	mkdirSync(join(root, "github", "mirrored", ".git", "info"), { recursive: true });
+	freshLogs();
+	const mirrored = await errLaunch("x2-mirrored", "upstreamorg/mirrored", "P.", {
+		GH_FORK_EXISTING: "LucaCappelletti94/mirrored",
+		GIT_REMOTES: "origin git@github.com:mirrororg/mirrored.git git@github.com:LucaCappelletti94/mirrored.git",
+	});
+	const mirroredGit = readFileSync(gitLog, "utf8");
+	check(
+		"a clone known only by a push url launches, pushing there and branching from the added target",
+		mirrored.details?.launched === true &&
+			mirrored.details.pushRemote === "origin" &&
+			mirroredGit.includes("remote add upstream git@github.com:upstreamorg/mirrored.git") &&
+			/worktree add .* upstream\/main$/mu.test(mirroredGit),
+	);
+
 	// y. A checkout with no remotes at all is refused and left as it is.
 	mkdirSync(join(root, "github", "bare", ".git", "info"), { recursive: true });
 	freshLogs();
