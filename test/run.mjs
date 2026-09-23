@@ -7251,13 +7251,16 @@ args="$*"
 case "$args" in
   "api user "*) if [ "$GH_NOLOGIN" = "1" ]; then exit 1; else echo "LucaCappelletti94"; fi ;;
   *defaultBranchRef*) if [ "$GH_NODEFAULT" = "1" ]; then exit 1; else echo "main"; fi ;;
-  *"repo view"*isFork*)
-    case "$GH_FORK" in
-      missing) echo "not found" 1>&2; exit 1 ;;
-      collision) printf 'false\\t\\n' ;;
-      *) printf 'true\\t%s\\n' "$GH_UPSTREAM" ;;
-    esac ;;
-  "repo fork"*) if [ "$GH_FORKFAIL" = "1" ]; then echo "fork failed" 1>&2; exit 1; else echo forked; fi ;;
+  *"--method POST"*)
+    if [ "$GH_FORKFAIL" = "1" ]; then echo "fork failed" 1>&2; exit 1
+    elif [ -n "$GH_FORK_CREATED" ]; then echo "$GH_FORK_CREATED"
+    else name=\${args#*repos/*/}; echo "LucaCappelletti94/\${name%%/*}"; fi ;;
+  *"/forks"*)
+    if [ "$GH_FORKSFAIL" = "1" ]; then echo "HTTP 502" 1>&2; exit 1
+    elif [ -n "$GH_FORK_EXISTING" ]; then echo "$GH_FORK_EXISTING"; fi ;;
+  *".permissions.push"*)
+    if [ "$GH_NOREPO" = "1" ]; then echo "Not Found (HTTP 404)" 1>&2; exit 1
+    elif [ "$GH_PUSH" = "1" ]; then echo true; else echo false; fi ;;
   *) echo "unhandled gh $args" 1>&2; exit 1 ;;
 esac
 `,
@@ -7267,10 +7270,15 @@ esac
 		join(upBin, "git"),
 		`#!/bin/sh
 args="$*"
+[ -n "$GIT_LOG" ] && echo "$args" >> "$GIT_LOG"
 case "$args" in
-  *"remote get-url origin"*) echo "$GIT_ORIGIN" ;;
-  *"remote get-url upstream"*) [ "$GIT_UPSTREAM" = "1" ] && echo up || exit 1 ;;
-  *"rev-parse"*) exit 1 ;;
+  *"remote -v"*)
+    if [ "$GIT_NOTREPO" = "1" ]; then echo "not a git repository" 1>&2; exit 128; fi
+    printf '%s\\n' "$GIT_REMOTES" | tr ';' '\\n' | while read -r n u; do
+      if [ -n "$n" ]; then printf '%s\\t%s (fetch)\\n%s\\t%s (push)\\n' "$n" "$u" "$n" "$u"; fi
+    done ;;
+  *"show-ref"*) [ "$GIT_BRANCH_EXISTS" = "1" ] ;;
+  *"remote add"*) if [ "$GIT_ADDFAIL" = "1" ]; then echo "add failed" 1>&2; exit 1; fi ;;
   *clone*) if [ "$GIT_CLONEFAIL" = "1" ]; then echo "clone failed" 1>&2; exit 1; elif [ -n "$GIT_CLONE_FLAKY" ]; then if [ -f "$GIT_CLONE_FLAKY" ]; then exit 0; else : > "$GIT_CLONE_FLAKY"; echo "not ready" 1>&2; exit 1; fi; else exit 0; fi ;;
   *fetch*) if [ "$GIT_FETCHFAIL" = "1" ]; then echo "fetch failed" 1>&2; exit 1; else exit 0; fi ;;
   *"worktree add"*) if [ "$GIT_WTFAIL" = "1" ]; then echo "wt failed" 1>&2; exit 1; else exit 0; fi ;;
@@ -7283,6 +7291,7 @@ esac
 	writeFileSync(
 		join(upBin, "tmux"),
 		`#!/bin/sh
+[ -n "$TMUX_LOG" ] && echo "$*" >> "$TMUX_LOG"
 case "$1" in
   new-window) if [ "$TMUX_NEWWIN_FAIL" = "1" ]; then echo "nw failed" 1>&2; exit 1; else echo "@42"; fi ;;
   display-message) printf 'work\\t3\\t1\\n' ;;
@@ -7293,8 +7302,15 @@ esac
 	);
 	process.env.PATH = `${upBin}:${savedPath}`;
 	const ghLog = join(root, "gh-invocations.log");
+	const gitLog = join(root, "git-invocations.log");
+	const tmuxLog = join(root, "tmux-invocations.log");
 	process.env.GH_LOG = ghLog;
-	writeFileSync(ghLog, "");
+	process.env.GIT_LOG = gitLog;
+	process.env.TMUX_LOG = tmuxLog;
+	const freshLogs = () => {
+		for (const log of [ghLog, gitLog, tmuxLog]) writeFileSync(log, "");
+	};
+	freshLogs();
 	process.env.HOME = root;
 	process.env.TMUX = "/tmp/fake-tmux,1,0";
 	process.env.TMUX_PANE = "%1";
@@ -7324,7 +7340,7 @@ esac
 
 	// a. The user's own repository: reuse an existing clone, fork nothing.
 	mkdirSync(join(root, "github", "dep", ".git", "info"), { recursive: true });
-	process.env.GIT_ORIGIN = "git@github.com:LucaCappelletti94/dep.git";
+	process.env.GIT_REMOTES = "origin git@github.com:LucaCappelletti94/dep.git";
 	const ownRun = up.tools
 		.get("upstream_launch")
 		.execute(
@@ -7339,9 +7355,12 @@ esac
 	check("own-repo launch succeeds", ownResult.details?.launched === true);
 	check(
 		"own-repo launch uses the user's own repository",
-		ownResult.details.mode === "own" && ownResult.details.created === false,
+		ownResult.details?.mode === "own" && ownResult.details.created === false,
 	);
-	check("launch cuts an upstream/ branch from the problem", ownResult.details.branch === "upstream/it-rejects-valid-x");
+	check(
+		"launch cuts an upstream/ branch from the problem",
+		ownResult.details?.branch === "upstream/it-rejects-valid-x",
+	);
 	check(
 		"launch carries the request into the worktree",
 		existsSync(join(root, "github", "dep.upstreams", "it-rejects-valid-x", "upstream", "request.md")),
@@ -7350,13 +7369,13 @@ esac
 		"launch excludes upstream/ through the private exclude",
 		readFileSync(join(root, "github", "dep", ".git", "info", "exclude"), "utf8").includes("upstream/"),
 	);
-	check("launch reports the new tmux window", ownResult.details.windowId === "@42");
+	check("launch reports the new tmux window", ownResult.details?.windowId === "@42");
 	check("launch notifies Telegram it opened", lastCall("sendMessage").body.text.includes("Upstream launched"));
-	check("case a forks nothing", !readFileSync(ghLog, "utf8").includes("repo fork"));
+	check("case a neither lists nor creates a fork", !readFileSync(ghLog, "utf8").includes("forks"));
 
-	// b. A third-party repository with no fork yet: the fork is created.
-	process.env.GH_FORK = "missing";
-	delete process.env.GIT_UPSTREAM;
+	// b. A third-party repository with no fork yet: the fork is created, under whatever name GitHub gave it.
+	process.env.GH_FORK_CREATED = "LucaCappelletti94/widget-1";
+	freshLogs();
 	const forkRun = up.tools
 		.get("upstream_launch")
 		.execute(
@@ -7373,17 +7392,28 @@ esac
 		forkResult.details?.launched === true && forkResult.details.mode === "fork" && forkResult.details.created === true,
 	);
 	check(
+		"a created fork's real name is carried as the push repository",
+		forkResult.details?.pushRepo === "LucaCappelletti94/widget-1",
+	);
+	check(
+		"a created fork is cloned by its real name",
+		readFileSync(gitLog, "utf8").includes(
+			`clone git@github.com:LucaCappelletti94/widget-1.git ${join(root, "github", "widget")}`,
+		),
+	);
+	check(
 		"the created fork's worktree holds the request",
 		existsSync(join(root, "github", "widget.upstreams", "widget-mis-encodes-y", "upstream", "request.md")),
 	);
+	delete process.env.GH_FORK_CREATED;
 
-	// c. A third-party repository already forked: reuse it, fork nothing.
-	process.env.GH_FORK = "reuse";
-	process.env.GH_UPSTREAM = "someorg/gadget";
+	// c. A third-party repository already forked: reuse it, fork nothing, and never re-point a remote
+	// that already names something else.
+	process.env.GH_FORK_EXISTING = "LucaCappelletti94/gadget";
 	mkdirSync(join(root, "github", "gadget", ".git", "info"), { recursive: true });
-	process.env.GIT_ORIGIN = "git@github.com:LucaCappelletti94/gadget.git";
-	process.env.GIT_UPSTREAM = "1";
-	writeFileSync(ghLog, "");
+	process.env.GIT_REMOTES =
+		"origin git@github.com:LucaCappelletti94/gadget.git;upstream git@github.com:someoneelse/gadget.git";
+	freshLogs();
 	const reuseRun = up.tools
 		.get("upstream_launch")
 		.execute(
@@ -7401,7 +7431,15 @@ esac
 			reuseResult.details.mode === "fork" &&
 			reuseResult.details.created === false,
 	);
-	check("case c reuses without forking", !readFileSync(ghLog, "utf8").includes("repo fork"));
+	check("case c reuses without forking", !readFileSync(ghLog, "utf8").includes("--method POST"));
+	const gadgetGit = readFileSync(gitLog, "utf8");
+	check("case c never re-points an existing remote", !gadgetGit.includes("set-url") && !gadgetGit.includes("rename"));
+	check(
+		"case c adds the target under a free remote name and branches from it",
+		gadgetGit.includes("remote add someorg git@github.com:someorg/gadget.git") &&
+			/worktree add .* someorg\/main$/mu.test(gadgetGit),
+	);
+	delete process.env.GH_FORK_EXISTING;
 
 	// d. Cancel forks, clones, and opens nothing.
 	const cancelRun = up.tools
@@ -7455,16 +7493,23 @@ esac
 	const noLogin = await errLaunch("e-login", "LucaCappelletti94/dep", "P.", { GH_NOLOGIN: "1" });
 	check("an unreadable gh login is refused", noLogin.isError === true);
 
-	const collision = await errLaunch("e-collision", "someorg/coll", "P.", { GH_FORK: "collision" });
-	check("a name collision that is not a fork is refused", collision.isError === true);
+	const noTarget = await errLaunch("e-notarget", "someorg/gone", "P.", { GH_NOREPO: "1" });
+	check("an unreadable target repository is refused", noTarget.isError === true);
+
+	freshLogs();
+	const forksFail = await errLaunch("e-forksfail", "someorg/unlisted", "P.", { GH_FORKSFAIL: "1" });
+	check(
+		"a fork listing that fails is refused without forking",
+		forksFail.isError === true && !readFileSync(ghLog, "utf8").includes("--method POST"),
+	);
 
 	mkdirSync(join(root, "github", "diffrepo", ".git", "info"), { recursive: true });
 	const wrongRepo = await errLaunch("e-wrong", "LucaCappelletti94/diffrepo", "P.", {
-		GIT_ORIGIN: "git@github.com:someoneelse/other.git",
+		GIT_REMOTES: "origin git@github.com:someoneelse/other.git",
 	});
 	check("a clone holding a different repository is refused", wrongRepo.isError === true);
 
-	const forkFail = await errLaunch("e-forkfail", "someorg/ff", "P.", { GH_FORK: "missing", GH_FORKFAIL: "1" });
+	const forkFail = await errLaunch("e-forkfail", "someorg/ff", "P.", { GH_FORKFAIL: "1" });
 	check("a failed fork is reported", forkFail.isError === true);
 
 	const cloneFail = await errLaunch("e-clonefail", "LucaCappelletti94/clonefail", "P.", { GIT_CLONEFAIL: "1" });
@@ -7472,21 +7517,21 @@ esac
 
 	mkdirSync(join(root, "github", "fetchfail", ".git", "info"), { recursive: true });
 	const fetchFail = await errLaunch("e-fetchfail", "LucaCappelletti94/fetchfail", "P.", {
-		GIT_ORIGIN: "git@github.com:LucaCappelletti94/fetchfail.git",
+		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/fetchfail.git",
 		GIT_FETCHFAIL: "1",
 	});
 	check("a failed fetch is reported", fetchFail.isError === true);
 
 	mkdirSync(join(root, "github", "deffail", ".git", "info"), { recursive: true });
 	const defFail = await errLaunch("e-deffail", "LucaCappelletti94/deffail", "P.", {
-		GIT_ORIGIN: "git@github.com:LucaCappelletti94/deffail.git",
+		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/deffail.git",
 		GH_NODEFAULT: "1",
 	});
 	check("an unreadable default branch is reported", defFail.isError === true);
 
 	mkdirSync(join(root, "github", "wtfail", ".git", "info"), { recursive: true });
 	const wtFail = await errLaunch("e-wtfail", "LucaCappelletti94/wtfail", "P.", {
-		GIT_ORIGIN: "git@github.com:LucaCappelletti94/wtfail.git",
+		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/wtfail.git",
 		GIT_WTFAIL: "1",
 	});
 	check("a failed worktree add is reported", wtFail.isError === true);
@@ -7494,7 +7539,7 @@ esac
 	mkdirSync(join(root, "github", "wtexists", ".git", "info"), { recursive: true });
 	mkdirSync(join(root, "github", "wtexists.upstreams", "edge-case"), { recursive: true });
 	const wtExists = await errLaunch("e-wtexists", "LucaCappelletti94/wtexists", "Edge case.", {
-		GIT_ORIGIN: "git@github.com:LucaCappelletti94/wtexists.git",
+		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/wtexists.git",
 	});
 	check("an existing worktree is refused", wtExists.isError === true);
 
@@ -7539,26 +7584,209 @@ esac
 	// k. A fresh fork whose first clone is not ready yet is retried to success.
 	const flakyMarker = join(root, "flaky-clone-marker");
 	rmSync(flakyMarker, { force: true });
-	const flaky = await errLaunch("e-flaky", "someorg/flaky", "P.", { GH_FORK: "missing", GIT_CLONE_FLAKY: flakyMarker });
+	const flaky = await errLaunch("e-flaky", "someorg/flaky", "P.", { GIT_CLONE_FLAKY: flakyMarker });
 	check("a fork whose first clone is not ready is retried to success", flaky.details?.launched === true);
 
 	// l. A launch that cannot open its tmux window rolls the worktree back and reports it.
 	mkdirSync(join(root, "github", "rollback", ".git", "info"), { recursive: true });
 	const rolledBack = await errLaunch("e-rollback", "LucaCappelletti94/rollback", "P.", {
-		GIT_ORIGIN: "git@github.com:LucaCappelletti94/rollback.git",
+		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/rollback.git",
 		TMUX_NEWWIN_FAIL: "1",
 	});
 	check("a failed tmux window rolls the launch back and reports it", rolledBack.isError === true);
 	check("the rolled-back worktree is gone", !existsSync(join(root, "github", "rollback.upstreams", "p")));
 
+	// m. A fork named differently from its parent is found by its parent and used by its real name.
+	freshLogs();
+	const renamed = await errLaunch("m-renamed", "upstreamorg/longname-rs", "P.", {
+		GH_FORK_EXISTING: "LucaCappelletti94/shortname-rs",
+	});
+	const renamedGit = readFileSync(gitLog, "utf8");
+	const renamedKickoff = readFileSync(tmuxLog, "utf8");
+	check(
+		"a differently named fork is reused without forking again",
+		renamed.details?.launched === true &&
+			renamed.details.created === false &&
+			renamed.details.pushRepo === "LucaCappelletti94/shortname-rs" &&
+			!readFileSync(ghLog, "utf8").includes("--method POST"),
+	);
+	check(
+		"a differently named fork is cloned by its real name",
+		renamedGit.includes(
+			`clone git@github.com:LucaCappelletti94/shortname-rs.git ${join(root, "github", "longname-rs")}`,
+		),
+	);
+	check(
+		"the fresh fork clone gains the target remote and branches from it",
+		renamedGit.includes("remote add upstream git@github.com:upstreamorg/longname-rs.git") &&
+			/worktree add .* upstream\/main$/mu.test(renamedGit),
+	);
+	check(
+		"the kickoff names the fork's push remote and its real compare page",
+		renamedKickoff.includes("`origin`") &&
+			renamedKickoff.includes(
+				"https://github.com/upstreamorg/longname-rs/compare/main...LucaCappelletti94:shortname-rs:upstream/p",
+			),
+	);
+
+	// n. A clone whose origin is the target and whose fork sits on another remote is used as it stands.
+	const splitPath = join(root, "github", "sqlish-rs");
+	mkdirSync(join(splitPath, ".git", "info"), { recursive: true });
+	freshLogs();
+	const split = await errLaunch("n-split", "upstreamorg/sqlish-rs", "P.", {
+		GH_FORK_EXISTING: "LucaCappelletti94/sqlish",
+		GIT_REMOTES: "origin git@github.com:upstreamorg/sqlish-rs.git;fork git@github.com:LucaCappelletti94/sqlish.git",
+	});
+	const splitGit = readFileSync(gitLog, "utf8");
+	const splitKickoff = readFileSync(tmuxLog, "utf8");
+	check(
+		"a clone with the target on origin launches",
+		split.details?.launched === true && split.details.mode === "fork",
+	);
+	check(
+		"a clone with both remotes present is neither re-cloned nor re-wired",
+		!/^clone |remote (add|set-url|rename|remove)/mu.test(splitGit),
+	);
+	check(
+		"the branch is cut from the remote that points at the target",
+		splitGit.includes(`-C ${splitPath} fetch origin`) && /worktree add .* origin\/main$/mu.test(splitGit),
+	);
+	check(
+		"the kickoff names the remote that points at the fork",
+		splitKickoff.includes("`fork`") &&
+			splitKickoff.includes(
+				"https://github.com/upstreamorg/sqlish-rs/compare/main...LucaCappelletti94:sqlish:upstream/p",
+			),
+	);
+
+	// o. With push permission on the target, the branch goes to the target itself and no fork is involved.
+	mkdirSync(join(root, "github", "maintained", ".git", "info"), { recursive: true });
+	freshLogs();
+	const maintained = await errLaunch("o-push", "upstreamorg/maintained", "P.", {
+		GH_PUSH: "1",
+		GIT_REMOTES:
+			"origin git@github.com:upstreamorg/maintained.git;fork git@github.com:LucaCappelletti94/maintained-fork.git",
+	});
+	const maintainedGit = readFileSync(gitLog, "utf8");
+	const maintainedKickoff = readFileSync(tmuxLog, "utf8");
+	check(
+		"push permission launches against the target itself",
+		maintained.details?.launched === true &&
+			maintained.details.mode === "maintainer" &&
+			maintained.details.pushRepo === "upstreamorg/maintained",
+	);
+	check("push permission never looks for or makes a fork", !readFileSync(ghLog, "utf8").includes("forks"));
+	check(
+		"push permission branches from the target remote without re-wiring",
+		/worktree add .* origin\/main$/mu.test(maintainedGit) && !/remote (add|set-url|rename|remove)/u.test(maintainedGit),
+	);
+	check(
+		"the kickoff sends the push to the target remote",
+		maintainedKickoff.includes("`origin`") &&
+			maintainedKickoff.includes("https://github.com/upstreamorg/maintained/compare/main...upstream/p"),
+	);
+
+	// p. A clone with no remote pointing at the target or the fork is refused and left untouched.
+	const strangerPath = join(root, "github", "stranger");
+	mkdirSync(join(strangerPath, ".git", "info"), { recursive: true });
+	freshLogs();
+	const stranger = await errLaunch("p-stranger", "upstreamorg/stranger", "P.", {
+		GH_FORK_EXISTING: "LucaCappelletti94/stranger-fork",
+		GIT_REMOTES: "origin git@github.com:someoneelse/other.git;upstream git@github.com:third/party.git",
+	});
+	const strangerText = stranger.content?.[0]?.text ?? "";
+	const strangerGit = readFileSync(gitLog, "utf8")
+		.split("\n")
+		.filter((line) => line.length > 0);
+	check("a clone pointing at neither repository is refused", stranger.isError === true);
+	check(
+		"the refusal names both repositories it looked for",
+		strangerText.includes("upstreamorg/stranger") && strangerText.includes("LucaCappelletti94/stranger-fork"),
+	);
+	check(
+		"the refused clone is only read, never touched",
+		strangerGit.length > 0 && strangerGit.every((line) => line === `-C ${strangerPath} remote -v`),
+	);
+	check("no worktree is cut for a refused clone", !existsSync(join(root, "github", "stranger.upstreams")));
+
+	// q. A branch left by an earlier launch is refused, never reset over its commits.
+	mkdirSync(join(root, "github", "branchy", ".git", "info"), { recursive: true });
+	freshLogs();
+	const branchy = await errLaunch("q-branchy", "LucaCappelletti94/branchy", "P.", {
+		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/branchy.git",
+		GIT_BRANCH_EXISTS: "1",
+	});
+	check(
+		"an existing upstream branch is refused by name",
+		branchy.isError === true && (branchy.content?.[0]?.text ?? "").includes("upstream/p"),
+	);
+	check("an existing upstream branch is never reset", !readFileSync(gitLog, "utf8").includes("worktree add"));
+
+	// r. When every preferred remote name is held by something else, the target gets a numbered one.
+	mkdirSync(join(root, "github", "crowded", ".git", "info"), { recursive: true });
+	freshLogs();
+	const crowded = await errLaunch("r-crowded", "crowdorg/crowded", "P.", {
+		GH_FORK_EXISTING: "LucaCappelletti94/crowded",
+		GIT_REMOTES:
+			"origin git@github.com:LucaCappelletti94/crowded.git;upstream git@github.com:x/crowded.git;crowdorg git@github.com:y/crowded.git",
+	});
+	const crowdedGit = readFileSync(gitLog, "utf8");
+	check(
+		"a crowded clone gains the target under a numbered name and branches from it",
+		crowded.details?.launched === true &&
+			crowdedGit.includes("remote add upstream-2 git@github.com:crowdorg/crowded.git") &&
+			/worktree add .* upstream-2\/main$/mu.test(crowdedGit),
+	);
+
+	// s. A fork creation that answers without a repository name is refused before anything is cloned.
+	freshLogs();
+	const nameless = await errLaunch("s-nameless", "someorg/nameless", "P.", { GH_FORK_CREATED: "null" });
+	check(
+		"a fork creation without a name is refused before cloning",
+		nameless.isError === true && !readFileSync(gitLog, "utf8").includes("clone"),
+	);
+
+	// t. A directory at the clone path that is not a git checkout is refused.
+	mkdirSync(join(root, "github", "notrepo"), { recursive: true });
+	freshLogs();
+	const notRepo = await errLaunch("t-notrepo", "LucaCappelletti94/notrepo", "P.", { GIT_NOTREPO: "1" });
+	check(
+		"a clone path that is not a git checkout is refused",
+		notRepo.isError === true && !readFileSync(gitLog, "utf8").includes("worktree add"),
+	);
+
+	// u. A target remote that cannot be added stops the launch before it fetches.
+	freshLogs();
+	const baseAdd = await errLaunch("u-baseadd", "someorg/baseadd", "P.", { GIT_ADDFAIL: "1" });
+	check(
+		"a failed target remote add stops the launch before fetching",
+		baseAdd.isError === true && !readFileSync(gitLog, "utf8").includes("fetch"),
+	);
+
+	// v. A fork remote that cannot be added stops the launch too, after choosing a name origin does not hold.
+	mkdirSync(join(root, "github", "pushadd", ".git", "info"), { recursive: true });
+	freshLogs();
+	const pushAdd = await errLaunch("v-pushadd", "someorg/pushadd", "P.", {
+		GH_FORK_EXISTING: "LucaCappelletti94/pushadd",
+		GIT_REMOTES: "origin git@github.com:someorg/pushadd.git",
+		GIT_ADDFAIL: "1",
+	});
+	const pushAddGit = readFileSync(gitLog, "utf8");
+	check(
+		"a failed fork remote add stops the launch before any worktree",
+		pushAdd.isError === true &&
+			pushAddGit.includes("remote add fork git@github.com:LucaCappelletti94/pushadd.git") &&
+			!pushAddGit.includes("worktree add"),
+	);
+
 	process.env.PATH = savedPath;
 	process.env.HOME = savedHome;
 	delete process.env.TMUX;
 	delete process.env.TMUX_PANE;
-	delete process.env.GH_FORK;
-	delete process.env.GH_UPSTREAM;
-	delete process.env.GIT_ORIGIN;
-	delete process.env.GIT_UPSTREAM;
+	delete process.env.GH_LOG;
+	delete process.env.GIT_LOG;
+	delete process.env.TMUX_LOG;
+	delete process.env.GIT_REMOTES;
 }
 
 rmSync(root, { recursive: true, force: true });

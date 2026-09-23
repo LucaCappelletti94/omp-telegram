@@ -683,14 +683,38 @@ async function sleepMs(ms: number): Promise<void> {
 	await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** A remote url and an `owner/name` name the same repository whether it is ssh or https, with or without `.git`. */
-function sameRepo(url: string, owner: string, name: string): boolean {
+/** A remote url names `owner/name` whether it is ssh or https, with or without `.git`. */
+function sameRepo(url: string, repo: string): boolean {
 	const normalised = url
 		.trim()
 		.replace(/\.git$/u, "")
 		.toLowerCase();
-	const target = `${owner}/${name}`.toLowerCase();
+	const target = repo.toLowerCase();
 	return normalised.endsWith(`:${target}`) || normalised.endsWith(`/${target}`);
+}
+
+/** Remote names and their fetch urls, as `git remote -v` lists them. */
+function parseRemotes(listing: string): Map<string, string> {
+	const remotes = new Map<string, string>();
+	for (const line of listing.split("\n")) {
+		const match = /^(\S+)\t(\S+) \(fetch\)$/u.exec(line);
+		if (match?.[1] !== undefined && match[2] !== undefined) remotes.set(match[1], match[2]);
+	}
+	return remotes;
+}
+
+function remoteFor(remotes: Map<string, string>, repo: string): string | undefined {
+	for (const [name, url] of remotes) if (sameRepo(url, repo)) return name;
+	return undefined;
+}
+
+/** The first preferred name no remote holds, numbered past the first preference when all are held. */
+function freeRemoteName(remotes: Map<string, string>, preferred: string[]): string {
+	const free = preferred.find((name) => !remotes.has(name));
+	if (free !== undefined) return free;
+	let n = 2;
+	while (remotes.has(`${preferred[0]}-${n}`)) n++;
+	return `${preferred[0]}-${n}`;
 }
 
 /** Excludes a path through the checkout's private exclude, shared across worktrees, never through tracked `.gitignore`. */
@@ -726,13 +750,18 @@ interface LaunchArgs {
 	problem: string;
 }
 
+/** Where the branch goes: the user's own repository, a target the user may push to, or the user's fork. */
+type LaunchMode = "own" | "maintainer" | "fork";
+
 type LaunchOutcome =
 	| {
 			ok: true;
 			owner: string;
 			name: string;
 			login: string;
-			mode: "own" | "fork";
+			mode: LaunchMode;
+			pushRepo: string;
+			pushRemote: string;
 			created: boolean;
 			clonePath: string;
 			worktreePath: string;
@@ -781,18 +810,17 @@ function validateLaunchParams(
 
 interface LaunchTarget {
 	login: string;
-	isOwn: boolean;
-	cloneOwner: string;
+	mode: LaunchMode;
+	/** `owner/name` the branch is pushed to, the fork under its real name when it is one. */
+	pushRepo: string;
 	created: boolean;
 }
 
-/** A gh failure that means the repository is genuinely absent, the only case that justifies forking. */
-const GH_ABSENT = /not found|could not resolve|no such|404/iu;
-
-/** Resolves the target on the user's account: their own repository, an existing fork, or a fork it creates. */
+/** Resolves where the branch goes: the target itself when the user owns it or may push to it, otherwise the user's fork. */
 async function resolveTarget(
 	a: LaunchArgs,
 ): Promise<{ ok: true; target: LaunchTarget } | { ok: false; error: string }> {
+	const repo = `${a.owner}/${a.name}`;
 	const who = await run("gh", ["api", "user", "-q", ".login"]);
 	if (!who.ok || who.stdout.length === 0) {
 		return {
@@ -802,114 +830,162 @@ async function resolveTarget(
 	}
 	const login = who.stdout;
 	if (a.owner.toLowerCase() === login.toLowerCase()) {
-		return { ok: true, target: { login, isOwn: true, cloneOwner: a.owner, created: false } };
+		return { ok: true, target: { login, mode: "own", pushRepo: repo, created: false } };
 	}
-	const view = await run("gh", [
-		"repo",
-		"view",
-		`${login}/${a.name}`,
-		"--json",
-		"isFork,parent",
-		"-q",
-		'[(.isFork | tostring), (if .parent then .parent.owner.login + "/" + .parent.name else "" end)] | @tsv',
-	]);
-	if (view.ok) {
-		const [isFork, parent] = view.stdout.split("\t");
-		if (isFork !== "true" || (parent ?? "").toLowerCase() !== `${a.owner}/${a.name}`.toLowerCase()) {
-			return {
-				ok: false,
-				error: `${login}/${a.name} already exists but is not a fork of ${a.owner}/${a.name}; move or rename it, then retry`,
-			};
-		}
-		return { ok: true, target: { login, isOwn: false, cloneOwner: login, created: false } };
-	}
-	// A non-OK view is only "fork does not exist" when gh says so; a network or auth failure must not fork.
-	if (!GH_ABSENT.test(view.stderr)) {
+	const push = await run("gh", ["api", `repos/${repo}`, "--jq", ".permissions.push"]);
+	if (!push.ok) {
 		return {
 			ok: false,
-			error: `could not check whether ${login}/${a.name} exists (${view.stderr || "no output"}); resolve the gh error and retry`,
+			error: `could not read ${repo} from GitHub (${push.stderr || "no output"}); check the name and that gh is authenticated`,
 		};
 	}
-	const fork = await run("gh", ["repo", "fork", `${a.owner}/${a.name}`, "--clone=false"]);
-	if (!fork.ok) return { ok: false, error: `gh repo fork ${a.owner}/${a.name} failed: ${fork.stderr}` };
-	return { ok: true, target: { login, isOwn: false, cloneOwner: login, created: true } };
+	if (push.stdout === "true")
+		return { ok: true, target: { login, mode: "maintainer", pushRepo: repo, created: false } };
+	// A fork keeps whatever name it was given, so it is found by its parent, never by the target's name.
+	const forks = await run("gh", [
+		"api",
+		"--paginate",
+		`repos/${repo}/forks?per_page=100`,
+		"--jq",
+		`.[] | select(.owner.login | ascii_downcase == "${login.toLowerCase()}") | .full_name`,
+	]);
+	if (!forks.ok) {
+		return {
+			ok: false,
+			error: `could not list the forks of ${repo} (${forks.stderr || "no output"}); resolve the gh error and retry`,
+		};
+	}
+	const existing = forks.stdout.replace(/\n[\s\S]*/u, "");
+	if (existing.length > 0) return { ok: true, target: { login, mode: "fork", pushRepo: existing, created: false } };
+	// GitHub names a new fork after its parent unless that name is taken, so the name is read back, not assumed.
+	const fork = await run("gh", ["api", "--method", "POST", `repos/${repo}/forks`, "--jq", ".full_name"]);
+	if (!fork.ok) return { ok: false, error: `forking ${repo} failed: ${fork.stderr}` };
+	if (!/^[\w.-]+\/[\w.-]+$/u.test(fork.stdout)) {
+		return { ok: false, error: `forking ${repo} returned no repository name (${fork.stdout || "no output"})` };
+	}
+	return { ok: true, target: { login, mode: "fork", pushRepo: fork.stdout, created: true } };
 }
 
-/** Ensures the clone exists with the right remotes, fetches, and returns the base ref to branch from. */
+interface PreparedClone {
+	clonePath: string;
+	/** `<remote>/<default branch>` of the remote that points at the target. */
+	base: string;
+	defaultBranch: string;
+	/** The remote that points at the push repository. */
+	pushRemote: string;
+}
+
+/**
+ * Ensures the clone at `~/github/<name>` knows the target and the push repository under whatever remote names it
+ * already has, adding a missing one only under a free name, then fetches the target and returns the base to branch from.
+ */
 async function prepareClone(
 	a: LaunchArgs,
 	target: LaunchTarget,
-): Promise<{ ok: true; clonePath: string; base: string } | { ok: false; error: string }> {
+): Promise<({ ok: true } & PreparedClone) | { ok: false; error: string }> {
+	const repo = `${a.owner}/${a.name}`;
 	const clonePath = join(homedir(), "github", a.name);
-	const originUrl = `git@github.com:${target.cloneOwner}/${a.name}.git`;
-	const upstreamUrl = `git@github.com:${a.owner}/${a.name}.git`;
+	let remotes: Map<string, string>;
 	if (existsSync(clonePath)) {
-		const remote = await run("git", ["-C", clonePath, "remote", "get-url", "origin"]);
-		if (!remote.ok) return { ok: false, error: `${clonePath} exists but is not a git checkout` };
-		if (!sameRepo(remote.stdout, target.cloneOwner, a.name)) {
+		const listed = await run("git", ["-C", clonePath, "remote", "-v"]);
+		if (!listed.ok) return { ok: false, error: `${clonePath} exists but is not a git checkout` };
+		remotes = parseRemotes(listed.stdout);
+		if (remoteFor(remotes, repo) === undefined && remoteFor(remotes, target.pushRepo) === undefined) {
+			const wanted = target.pushRepo === repo ? repo : `${repo} or ${target.pushRepo}`;
+			const held = [...remotes].map(([name, url]) => `${name} ${url}`).join(", ") || "no remotes";
 			return {
 				ok: false,
-				error: `${clonePath} holds ${remote.stdout}, not ${target.cloneOwner}/${a.name}; move it aside first`,
+				error: `${clonePath} has no remote pointing at ${wanted} (it has ${held}); it was left untouched, so add such a remote or move it aside, then retry`,
 			};
 		}
 	} else {
+		const pushUrl = `git@github.com:${target.pushRepo}.git`;
 		const attempts = target.created ? 6 : 1;
-		let cloned = await run("git", ["clone", originUrl, clonePath]);
+		let cloned = await run("git", ["clone", pushUrl, clonePath]);
 		// A freshly created fork can lag behind its own API object, so a first clone may 404.
 		for (let attempt = 1; attempt < attempts && !cloned.ok; attempt++) {
 			await sleepMs(2000);
-			cloned = await run("git", ["clone", originUrl, clonePath]);
+			cloned = await run("git", ["clone", pushUrl, clonePath]);
 		}
-		if (!cloned.ok) return { ok: false, error: `git clone ${originUrl} failed: ${cloned.stderr}` };
+		if (!cloned.ok) return { ok: false, error: `git clone ${pushUrl} failed: ${cloned.stderr}` };
+		remotes = new Map([["origin", pushUrl]]);
 	}
-	if (!target.isOwn) {
-		const current = await run("git", ["-C", clonePath, "remote", "get-url", "upstream"]);
-		if (!current.ok) await run("git", ["-C", clonePath, "remote", "add", "upstream", upstreamUrl]);
-		else if (!sameRepo(current.stdout, a.owner, a.name)) {
-			await run("git", ["-C", clonePath, "remote", "set-url", "upstream", upstreamUrl]);
-		}
-	}
-	const remoteName = target.isOwn ? "origin" : "upstream";
-	const fetched = await run("git", ["-C", clonePath, "fetch", remoteName]);
-	if (!fetched.ok) return { ok: false, error: `git fetch ${remoteName} failed: ${fetched.stderr}` };
-	const def = await run("gh", [
-		"repo",
-		"view",
-		`${a.owner}/${a.name}`,
-		"--json",
-		"defaultBranchRef",
-		"-q",
-		".defaultBranchRef.name",
-	]);
+	const ensureRemote = async (
+		wanted: string,
+		preferred: string[],
+	): Promise<{ ok: true; name: string } | { ok: false; error: string }> => {
+		const held = remoteFor(remotes, wanted);
+		if (held !== undefined) return { ok: true, name: held };
+		const name = freeRemoteName(remotes, preferred);
+		const url = `git@github.com:${wanted}.git`;
+		const added = await run("git", ["-C", clonePath, "remote", "add", name, url]);
+		if (!added.ok) return { ok: false, error: `git remote add ${name} ${url} failed: ${added.stderr}` };
+		remotes.set(name, url);
+		return { ok: true, name };
+	};
+	const baseRemote = await ensureRemote(repo, ["upstream", a.owner.toLowerCase()]);
+	if (!baseRemote.ok) return baseRemote;
+	const pushRemote = await ensureRemote(target.pushRepo, ["origin", "fork", target.login.toLowerCase()]);
+	if (!pushRemote.ok) return pushRemote;
+	const fetched = await run("git", ["-C", clonePath, "fetch", baseRemote.name]);
+	if (!fetched.ok) return { ok: false, error: `git fetch ${baseRemote.name} failed: ${fetched.stderr}` };
+	const def = await run("gh", ["repo", "view", repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"]);
 	if (!def.ok || def.stdout.length === 0) {
-		return {
-			ok: false,
-			error: `could not read the default branch of ${a.owner}/${a.name}: ${def.stderr || "no output"}`,
-		};
+		return { ok: false, error: `could not read the default branch of ${repo}: ${def.stderr || "no output"}` };
 	}
-	return { ok: true, clonePath, base: `${remoteName}/${def.stdout}` };
+	return {
+		ok: true,
+		clonePath,
+		base: `${baseRemote.name}/${def.stdout}`,
+		defaultBranch: def.stdout,
+		pushRemote: pushRemote.name,
+	};
+}
+
+/** The spawned session's instructions, naming where its branch goes because its skill assumes an own repository or a fork. */
+function upstreamKickoff(a: LaunchArgs, target: LaunchTarget, clone: PreparedClone, branch: string): string {
+	const repo = `${a.owner}/${a.name}`;
+	const head = target.mode === "fork" ? `${target.pushRepo.replace("/", ":")}:${branch}` : branch;
+	const whose = {
+		own: "your own repository",
+		maintainer: "the target itself, which you may push to but do not own",
+		fork: `your fork of ${repo}`,
+	}[target.mode];
+	return [
+		`You are the upstream agent for ${repo}.`,
+		"Read upstream/request.md in this worktree and the skill skill://upstream-agent, then carry out the upstream procedure.",
+		`In one sentence, the request is: ${a.problem}`,
+		`Push the branch to the remote \`${clone.pushRemote}\`, which is ${target.pushRepo}, ${whose}.`,
+		`The pull request opens from https://github.com/${repo}/compare/${clone.defaultBranch}...${head}.`,
+	].join(" ");
 }
 
 /** Cuts the worktree off the base, carries the request in, and opens the tmux tab, rolling back on failure. */
 async function openWorktree(
 	a: LaunchArgs,
-	clonePath: string,
-	base: string,
+	target: LaunchTarget,
+	clone: PreparedClone,
 ): Promise<{ ok: true; worktreePath: string; branch: string; windowId: string } | { ok: false; error: string }> {
+	const { clonePath, base } = clone;
 	const branch = `upstream/${a.slug}`;
 	const worktreeParent = join(homedir(), "github", `${a.name}.upstreams`);
 	const worktreePath = join(worktreeParent, a.slug);
 	if (existsSync(worktreePath)) {
 		return { ok: false, error: `a worktree already exists at ${worktreePath}; remove it or choose another slug` };
 	}
+	const branchHeld = await run("git", ["-C", clonePath, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+	if (branchHeld.ok) {
+		return {
+			ok: false,
+			error: `${clonePath} already has a branch ${branch}, which may hold an earlier launch's work; delete it or choose another slug`,
+		};
+	}
 	mkdirSync(worktreeParent, { recursive: true });
 	const rollback = async (): Promise<void> => {
 		await run("git", ["-C", clonePath, "worktree", "remove", "--force", worktreePath]);
 		await run("git", ["-C", clonePath, "branch", "-D", branch]);
 	};
-	// -B recreates the branch from the freshly fetched base, so a stale branch a prior aborted launch
-	// left behind never checks out at its old tip.
-	const added = await run("git", ["-C", clonePath, "worktree", "add", "-B", branch, worktreePath, base]);
+	const added = await run("git", ["-C", clonePath, "worktree", "add", "-b", branch, worktreePath, base]);
 	if (!added.ok) return { ok: false, error: `git worktree add failed: ${added.stderr}` };
 	try {
 		mkdirSync(join(worktreePath, "upstream"), { recursive: true });
@@ -919,11 +995,7 @@ async function openWorktree(
 		return { ok: false, error: `could not write the request into the worktree: ${(error as Error).message}` };
 	}
 	excludePath(clonePath, "upstream/");
-	const kickoff = [
-		`You are the upstream agent for ${a.owner}/${a.name}.`,
-		"Read upstream/request.md in this worktree and the skill skill://upstream-agent, then carry out the upstream procedure.",
-		`In one sentence, the request is: ${a.problem}`,
-	].join(" ");
+	const kickoff = upstreamKickoff(a, target, clone, branch);
 	const window = await run("tmux", [
 		"new-window",
 		"-c",
@@ -945,24 +1017,27 @@ async function openWorktree(
 }
 
 /**
- * The mechanical half of the procedure, run on the extension thread but off the synchronous path: resolve or
- * create the fork, ensure the clone, cut a worktree off the latest default branch, carry the request in, and
- * open a new omp session in a tmux tab. It writes only under the user's own account and `~/github`.
+ * The mechanical half of the procedure, run on the extension thread but off the synchronous path: resolve where
+ * the branch goes, ensure the clone, cut a worktree off the latest default branch, carry the request in, and
+ * open a new omp session in a tmux tab. It writes only to GitHub repositories the user may push to and under `~/github`.
  */
 async function performUpstreamLaunch(a: LaunchArgs): Promise<LaunchOutcome> {
 	const resolved = await resolveTarget(a);
 	if (!resolved.ok) return { ok: false, error: resolved.error };
-	const prepared = await prepareClone(a, resolved.target);
+	const { target } = resolved;
+	const prepared = await prepareClone(a, target);
 	if (!prepared.ok) return { ok: false, error: prepared.error };
-	const opened = await openWorktree(a, prepared.clonePath, prepared.base);
+	const opened = await openWorktree(a, target, prepared);
 	if (!opened.ok) return { ok: false, error: opened.error };
 	return {
 		ok: true,
 		owner: a.owner,
 		name: a.name,
-		login: resolved.target.login,
-		mode: resolved.target.isOwn ? "own" : "fork",
-		created: resolved.target.created,
+		login: target.login,
+		mode: target.mode,
+		pushRepo: target.pushRepo,
+		pushRemote: prepared.pushRemote,
+		created: target.created,
 		clonePath: prepared.clonePath,
 		worktreePath: opened.worktreePath,
 		branch: opened.branch,
@@ -4368,7 +4443,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "upstream_launch",
 		label: "Upstream Launch",
 		description:
-			"Start the upstream procedure for a fix that belongs in a repository this one depends on. Call it only after you have written the upstream request document (per the upstream-finding-as-document rule) and the user has agreed an upstream fix is wanted. It opens a Telegram Launch/Cancel card and does nothing until Launch is tapped. On Launch it resolves the target on the user's GitHub account (their own repository when they own it, otherwise a fork it reuses or creates), ensures a clone under `~/github`, cuts a worktree on a new `upstream/<slug>` branch off the latest default branch so it never disturbs work already open there, carries the request document into that worktree, and opens a new omp session in a fresh tmux tab to carry out the fix. It writes only on the user's account and under `~/github`, never in this repository, and the spawned session does the upstream work from there. `repo`: the uphill repository as `owner/name`. `document`: path to the request document you wrote, resolved against this session's working directory. `problem`: one sentence naming what the dependency does wrong, shown on the card and given to the new session. `slug`: optional short kebab identifier for the branch and worktree, derived from `problem` when omitted.",
+			"Start the upstream procedure for a fix that belongs in a repository this one depends on. Call it only after you have written the upstream request document (per the upstream-finding-as-document rule) and the user has agreed an upstream fix is wanted. It opens a Telegram Launch/Cancel card and does nothing until Launch is tapped. On Launch it sends the branch to the target itself when the user owns it or has push permission on it, and otherwise to the user's fork of it, found by its parent whatever the fork is named, or created when none exists. It uses the clone at `~/github/<name>` with whatever remote names it already has, adding a missing remote only under a free name and never re-pointing one, or clones there when nothing exists, cuts a worktree on a new `upstream/<slug>` branch off the target's latest default branch so it never disturbs work already open there, carries the request document into that worktree, and opens a new omp session in a fresh tmux tab told which remote to push to. It writes only to repositories the user may push to and under `~/github`, never in this repository, and the spawned session does the upstream work from there. `repo`: the uphill repository as `owner/name`. `document`: path to the request document you wrote, resolved against this session's working directory. `problem`: one sentence naming what the dependency does wrong, shown on the card and given to the new session. `slug`: optional short kebab identifier for the branch and worktree, derived from `problem` when omitted.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -4416,8 +4491,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 			const outcome = await performUpstreamLaunch(args);
 			if (!outcome.ok) return fail(outcome.error);
-			const where =
-				outcome.mode === "own" ? "your own repository" : outcome.created ? "a new fork" : "your existing fork";
+			const where = {
+				own: "your own repository",
+				maintainer: `${outcome.pushRepo} itself, where you have push access`,
+				fork: `${outcome.created ? "a new fork" : "your existing fork"} ${outcome.pushRepo}`,
+			}[outcome.mode];
 			detach(
 				notify(
 					ctx,
