@@ -7255,7 +7255,7 @@ case "$args" in
     if [ "$GH_FORKFAIL" = "1" ]; then echo "fork failed" 1>&2; exit 1
     elif [ -n "$GH_FORK_CREATED" ]; then echo "$GH_FORK_CREATED"
     else name=\${args#*repos/*/}; echo "LucaCappelletti94/\${name%%/*}"; fi ;;
-  *"/forks"*)
+  *graphql*)
     if [ "$GH_FORKSFAIL" = "1" ]; then echo "HTTP 502" 1>&2; exit 1
     elif [ -n "$GH_FORK_EXISTING" ]; then echo "$GH_FORK_EXISTING"; fi ;;
   *".permissions.push"*)
@@ -7274,8 +7274,8 @@ args="$*"
 case "$args" in
   *"remote -v"*)
     if [ "$GIT_NOTREPO" = "1" ]; then echo "not a git repository" 1>&2; exit 128; fi
-    printf '%s\\n' "$GIT_REMOTES" | tr ';' '\\n' | while read -r n u; do
-      if [ -n "$n" ]; then printf '%s\\t%s (fetch)\\n%s\\t%s (push)\\n' "$n" "$u" "$n" "$u"; fi
+    printf '%s\\n' "$GIT_REMOTES" | tr ';' '\\n' | while read -r n u p; do
+      if [ -n "$n" ]; then printf '%s\\t%s (fetch)\\n%s\\t%s (push)\\n' "$n" "$u" "$n" "\${p:-$u}"; fi
     done ;;
   *"show-ref"*) [ "$GIT_BRANCH_EXISTS" = "1" ] ;;
   *"remote add"*) if [ "$GIT_ADDFAIL" = "1" ]; then echo "add failed" 1>&2; exit 1; fi ;;
@@ -7499,7 +7499,7 @@ esac
 	freshLogs();
 	const forksFail = await errLaunch("e-forksfail", "someorg/unlisted", "P.", { GH_FORKSFAIL: "1" });
 	check(
-		"a fork listing that fails is refused without forking",
+		"a fork lookup that fails is refused without forking",
 		forksFail.isError === true && !readFileSync(ghLog, "utf8").includes("--method POST"),
 	);
 
@@ -7777,6 +7777,54 @@ esac
 		pushAdd.isError === true &&
 			pushAddGit.includes("remote add fork git@github.com:LucaCappelletti94/pushadd.git") &&
 			!pushAddGit.includes("worktree add"),
+	);
+
+	// w. A remote that fetches the target but pushes elsewhere is not where a maintainer's branch goes.
+	mkdirSync(join(root, "github", "pushurl", ".git", "info"), { recursive: true });
+	freshLogs();
+	const pushUrl = await errLaunch("w-pushurl", "upstreamorg/pushurl", "P.", {
+		GH_PUSH: "1",
+		GIT_REMOTES: "origin git@github.com:upstreamorg/pushurl.git git@github.com:LucaCappelletti94/pushurl.git",
+	});
+	const pushUrlGit = readFileSync(gitLog, "utf8");
+	const pushUrlKickoff = readFileSync(tmuxLog, "utf8");
+	check(
+		"a remote pushing away from the target is not the maintainer's push remote",
+		pushUrl.details?.launched === true &&
+			pushUrl.details.pushRemote === "upstream" &&
+			pushUrlGit.includes("remote add upstream git@github.com:upstreamorg/pushurl.git") &&
+			pushUrlKickoff.includes("`upstream`"),
+	);
+	check(
+		"the maintainer's branch is still cut from the fetching remote",
+		/worktree add .* origin\/main$/mu.test(pushUrlGit),
+	);
+
+	// x. A remote that fetches the target and pushes to the fork serves as both, with nothing added.
+	mkdirSync(join(root, "github", "triangle", ".git", "info"), { recursive: true });
+	freshLogs();
+	const triangle = await errLaunch("x-triangle", "upstreamorg/triangle", "P.", {
+		GH_FORK_EXISTING: "LucaCappelletti94/triangle-fork",
+		GIT_REMOTES: "origin git@github.com:upstreamorg/triangle.git git@github.com:LucaCappelletti94/triangle-fork.git",
+	});
+	const triangleGit = readFileSync(gitLog, "utf8");
+	check(
+		"a remote fetching the target and pushing to the fork is used for both",
+		triangle.details?.launched === true &&
+			triangle.details.pushRemote === "origin" &&
+			!triangleGit.includes("remote add") &&
+			/worktree add .* origin\/main$/mu.test(triangleGit),
+	);
+
+	// y. A checkout with no remotes at all is refused and left as it is.
+	mkdirSync(join(root, "github", "bare", ".git", "info"), { recursive: true });
+	freshLogs();
+	const bare = await errLaunch("y-bare", "LucaCappelletti94/bare", "P.", { GIT_REMOTES: "" });
+	check(
+		"a checkout without remotes is refused untouched",
+		bare.isError === true &&
+			(bare.content?.[0]?.text ?? "").includes("no remotes") &&
+			!readFileSync(gitLog, "utf8").includes("remote add"),
 	);
 
 	process.env.PATH = savedPath;

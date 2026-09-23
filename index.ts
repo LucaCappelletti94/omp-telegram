@@ -693,23 +693,32 @@ function sameRepo(url: string, repo: string): boolean {
 	return normalised.endsWith(`:${target}`) || normalised.endsWith(`/${target}`);
 }
 
-/** Remote names and their fetch urls, as `git remote -v` lists them. */
-function parseRemotes(listing: string): Map<string, string> {
-	const remotes = new Map<string, string>();
+/** Where one remote fetches from and pushes to, which differ when it has a `pushurl`. */
+interface RemoteUrls {
+	fetch: string;
+	push: string;
+}
+
+/** Remote names and their urls, as `git remote -v` lists them. */
+function parseRemotes(listing: string): Map<string, RemoteUrls> {
+	const remotes = new Map<string, RemoteUrls>();
 	for (const line of listing.split("\n")) {
-		const match = /^(\S+)\t(\S+) \(fetch\)$/u.exec(line);
-		if (match?.[1] !== undefined && match[2] !== undefined) remotes.set(match[1], match[2]);
+		const match = /^(\S+)\t(\S+) \((fetch|push)\)$/u.exec(line);
+		if (match?.[1] === undefined || match[2] === undefined) continue;
+		const urls = remotes.get(match[1]) ?? { fetch: match[2], push: match[2] };
+		urls[match[3] === "push" ? "push" : "fetch"] = match[2];
+		remotes.set(match[1], urls);
 	}
 	return remotes;
 }
 
-function remoteFor(remotes: Map<string, string>, repo: string): string | undefined {
-	for (const [name, url] of remotes) if (sameRepo(url, repo)) return name;
+function remoteFor(remotes: Map<string, RemoteUrls>, repo: string, side: keyof RemoteUrls): string | undefined {
+	for (const [name, urls] of remotes) if (sameRepo(urls[side], repo)) return name;
 	return undefined;
 }
 
 /** The first preferred name no remote holds, numbered past the first preference when all are held. */
-function freeRemoteName(remotes: Map<string, string>, preferred: string[]): string {
+function freeRemoteName(remotes: ReadonlyMap<string, unknown>, preferred: string[]): string {
 	const free = preferred.find((name) => !remotes.has(name));
 	if (free !== undefined) return free;
 	let n = 2;
@@ -841,21 +850,26 @@ async function resolveTarget(
 	}
 	if (push.stdout === "true")
 		return { ok: true, target: { login, mode: "maintainer", pushRepo: repo, created: false } };
-	// A fork keeps whatever name it was given, so it is found by its parent, never by the target's name.
+	// A fork keeps whatever name it was given, so it is found among the target's forks the user owns.
 	const forks = await run("gh", [
 		"api",
-		"--paginate",
-		`repos/${repo}/forks?per_page=100`,
+		"graphql",
+		"-f",
+		"query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){forks(first:1,affiliations:[OWNER]){nodes{nameWithOwner}}}}",
+		"-f",
+		`owner=${a.owner}`,
+		"-f",
+		`name=${a.name}`,
 		"--jq",
-		`.[] | select(.owner.login | ascii_downcase == "${login.toLowerCase()}") | .full_name`,
+		'.data.repository.forks.nodes[0].nameWithOwner // ""',
 	]);
 	if (!forks.ok) {
 		return {
 			ok: false,
-			error: `could not list the forks of ${repo} (${forks.stderr || "no output"}); resolve the gh error and retry`,
+			error: `could not look up your fork of ${repo} (${forks.stderr || "no output"}); resolve the gh error and retry`,
 		};
 	}
-	const existing = forks.stdout.replace(/\n[\s\S]*/u, "");
+	const existing = forks.stdout;
 	if (existing.length > 0) return { ok: true, target: { login, mode: "fork", pushRepo: existing, created: false } };
 	// GitHub names a new fork after its parent unless that name is taken, so the name is read back, not assumed.
 	const fork = await run("gh", ["api", "--method", "POST", `repos/${repo}/forks`, "--jq", ".full_name"]);
@@ -885,14 +899,17 @@ async function prepareClone(
 ): Promise<({ ok: true } & PreparedClone) | { ok: false; error: string }> {
 	const repo = `${a.owner}/${a.name}`;
 	const clonePath = join(homedir(), "github", a.name);
-	let remotes: Map<string, string>;
+	let remotes: Map<string, RemoteUrls>;
 	if (existsSync(clonePath)) {
 		const listed = await run("git", ["-C", clonePath, "remote", "-v"]);
 		if (!listed.ok) return { ok: false, error: `${clonePath} exists but is not a git checkout` };
 		remotes = parseRemotes(listed.stdout);
-		if (remoteFor(remotes, repo) === undefined && remoteFor(remotes, target.pushRepo) === undefined) {
+		const known = [repo, target.pushRepo].some(
+			(wanted) => remoteFor(remotes, wanted, "fetch") !== undefined || remoteFor(remotes, wanted, "push") !== undefined,
+		);
+		if (!known) {
 			const wanted = target.pushRepo === repo ? repo : `${repo} or ${target.pushRepo}`;
-			const held = [...remotes].map(([name, url]) => `${name} ${url}`).join(", ") || "no remotes";
+			const held = [...remotes].map(([name, urls]) => `${name} ${urls.fetch}`).join(", ") || "no remotes";
 			return {
 				ok: false,
 				error: `${clonePath} has no remote pointing at ${wanted} (it has ${held}); it was left untouched, so add such a remote or move it aside, then retry`,
@@ -908,24 +925,30 @@ async function prepareClone(
 			cloned = await run("git", ["clone", pushUrl, clonePath]);
 		}
 		if (!cloned.ok) return { ok: false, error: `git clone ${pushUrl} failed: ${cloned.stderr}` };
-		remotes = new Map([["origin", pushUrl]]);
+		remotes = new Map([["origin", { fetch: pushUrl, push: pushUrl }]]);
 	}
 	const ensureRemote = async (
 		wanted: string,
+		side: keyof RemoteUrls,
 		preferred: string[],
 	): Promise<{ ok: true; name: string } | { ok: false; error: string }> => {
-		const held = remoteFor(remotes, wanted);
+		const held = remoteFor(remotes, wanted, side);
 		if (held !== undefined) return { ok: true, name: held };
 		const name = freeRemoteName(remotes, preferred);
 		const url = `git@github.com:${wanted}.git`;
 		const added = await run("git", ["-C", clonePath, "remote", "add", name, url]);
 		if (!added.ok) return { ok: false, error: `git remote add ${name} ${url} failed: ${added.stderr}` };
-		remotes.set(name, url);
+		remotes.set(name, { fetch: url, push: url });
 		return { ok: true, name };
 	};
-	const baseRemote = await ensureRemote(repo, ["upstream", a.owner.toLowerCase()]);
+	const targetNames = ["upstream", a.owner.toLowerCase()];
+	const baseRemote = await ensureRemote(repo, "fetch", targetNames);
 	if (!baseRemote.ok) return baseRemote;
-	const pushRemote = await ensureRemote(target.pushRepo, ["origin", "fork", target.login.toLowerCase()]);
+	const pushRemote = await ensureRemote(
+		target.pushRepo,
+		"push",
+		target.pushRepo === repo ? targetNames : ["origin", "fork", target.login.toLowerCase()],
+	);
 	if (!pushRemote.ok) return pushRemote;
 	const fetched = await run("git", ["-C", clonePath, "fetch", baseRemote.name]);
 	if (!fetched.ok) return { ok: false, error: `git fetch ${baseRemote.name} failed: ${fetched.stderr}` };
