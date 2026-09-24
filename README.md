@@ -32,6 +32,7 @@ JSON config (`~/.omp/agent/notify-telegram.json`):
 - `notifyOnTurnEnd: false`: disables turn-end notices.
 - `streamDrafts: false`: turns off live draft streaming.
 - `pinnedDashboard: true`: a pinned message showing every live session, rewritten in place at most every `dashboardSeconds` (default 30) when the text changed.
+- `userName`: what `ask` options call you, as in "Luca will review the diff". Learned from your Telegram first name on your first message or button press, and a name written here by hand is kept.
 
 Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops omp's bell from flagging tmux windows. Edits apply to running sessions within about fifteen seconds, so no restart is needed.
 
@@ -43,6 +44,7 @@ Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops om
 - The chat shows a typing status while the session works your answer and an upload status while a file goes up; delivered messages get a thumbs-up reaction; red statuses stay pinned until the next turn; `/hidequestions` clears open question buttons.
 - Unroutable messages are refused with an explanation; presses on settled questions get a closure notice.
 - Question text renders a Markdown subset: code, fences, bold, italic, strikethrough, spoilers, quotes, links.
+- Question options and turn-end buttons name who acts, "Agent will …" or your name, and one saying I, me, you, your, we or us is refused, because a tapped option reads as your own reply and a pronoun there could mean either side.
 - Text meant to be pasted elsewhere arrives as its own message ending in one fenced block holding it verbatim; payloads too large for one message are refused rather than cut and go as a file.
 - While a turn runs, the answer streams into an ephemeral draft bubble with the same head and the tool activity.
 - `/stop` aborts the running turn: sent bare it reaches the one session mid-turn and offers a button per session when several are, sent as a reply it stops the session that message belongs to.

@@ -957,6 +957,89 @@ check(
 );
 check("a described question alongside it is not blamed", namelessAsk.content[0].text.includes("second") === false);
 
+// ------------------------------------------------ an option that says I or you
+heading("an ask option voiced in the first or second person");
+const voicedAsk = await ctxSession.tools.get("ask").execute(
+	"voice1",
+	{
+		questions: [
+			{
+				id: "rebase",
+				question: "How should the branch land?",
+				options: [
+					{ label: "I'll rebase onto main", description: "Rewrites the branch history before the merge." },
+					{ label: "Merge as is", description: "You review the merge commit afterwards." },
+					{ label: "Squash", description: "One commit, the history is lost." },
+				],
+			},
+		],
+	},
+	undefined,
+	undefined,
+	ctxSession.ctx,
+);
+check("an option saying I or you is refused", voicedAsk.isError === true);
+const voicedText = voicedAsk.content[0].text;
+check(
+	"the refusal names each voiced option and the word it used",
+	voicedText.includes('"I" in "I\'ll rebase onto main"') && voicedText.includes('"You" in "Merge as is"'),
+);
+check("a third-person option alongside them is not blamed", voicedText.includes("Squash") === false);
+check(
+	"the refusal says why a pronoun leaves the actor unclear",
+	voicedText.includes("could mean the agent or the user"),
+);
+check(
+	"with no known name the refusal asks for Agent and User",
+	voicedText.includes('"Agent will') && voicedText.includes('"User will') && voicedText.includes("if you know it"),
+);
+check(
+	"the voiced refusal reaches no chat",
+	lastCall("sendMessage").body.text.includes("How should the branch land?") === false,
+);
+// Code spans, I/O and the US are not pronouns, and a list with one real fault reports only that fault.
+const lookalikeAsk = await ctxSession.tools.get("ask").execute(
+	"voice2",
+	{
+		questions: [
+			{
+				id: "suite",
+				question: "Which suite?",
+				options: [
+					{ label: "Run the I/O suite", description: "Touches `my_config` and `we` only, in the US region." },
+					{ label: "Skip" },
+				],
+			},
+		],
+	},
+	undefined,
+	undefined,
+	ctxSession.ctx,
+);
+const lookalikeText = lookalikeAsk.content[0].text;
+check(
+	"lookalikes of pronouns are not refused",
+	lookalikeText.includes('"Skip" with no description') && lookalikeText.includes("could mean") === false,
+);
+// Both faults in one list come back in one refusal, so a single retry can fix both.
+const bothAsk = await ctxSession.tools
+	.get("ask")
+	.execute(
+		"voice3",
+		{ questions: [{ id: "both", question: "Go?", options: [{ label: "We ship it" }, askOpt("Hold")] }] },
+		undefined,
+		undefined,
+		ctxSession.ctx,
+	);
+check(
+	"one refusal carries both the missing description and the pronoun",
+	bothAsk.content[0].text.includes("with no description") && bothAsk.content[0].text.includes('"We" in "We ship it"'),
+);
+check(
+	"tool description asks for the actor by name instead of I or you",
+	askDoc.includes('"Agent will') && askDoc.includes('"User will') && askDoc.includes("never I, me, you"),
+);
+
 // ------------------------------------------------------------- poller mutual exclusion
 heading("poller mutual exclusion");
 const lockPath = join(root, "notify-telegram/poller.lock");
@@ -1013,6 +1096,67 @@ for (const s of contenders) {
 	);
 	break;
 }
+
+// The user's name comes from Telegram, and a name already in the config file is theirs to keep.
+heading("the user's name");
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+const nm = spawn("01a07a00-0000-0000-0000-000000000000", "/home/dev/work/naming");
+await nm.fire("session_start");
+const configName = () => JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).userName;
+api.queued = [
+	{ update_id: 7100, message: { message_id: 7100, date: 1, chat: { id: CHAT, first_name: "Ada" }, text: "hello" } },
+];
+await nm.pump(250);
+check("the first name of the chat is learned", configName() === "Ada");
+const namedAsk = await nm.tools.get("ask").execute(
+	"voice4",
+	{
+		questions: [{ id: "q", question: "Who reviews?", options: [{ label: "You review", description: "Takes a day." }] }],
+	},
+	undefined,
+	undefined,
+	nm.ctx,
+);
+check(
+	"a known name replaces User in the refusal",
+	namedAsk.content[0].text.includes('"Ada will') && namedAsk.content[0].text.includes('"User will') === false,
+);
+// The session forgets Ada with the file, then the user writes a name by hand while it runs.
+writeConfig();
+nm.heartbeat();
+await settle(60);
+writeConfig({ userName: "Luca" });
+api.queued = [
+	{
+		update_id: 7101,
+		callback_query: {
+			id: "cbname",
+			data: "x",
+			from: { id: CHAT, first_name: "Ada" },
+			message: { message_id: 7, chat: { id: CHAT } },
+		},
+	},
+	{ update_id: 7102, message: { message_id: 7102, date: 1, chat: { id: CHAT, first_name: "Ada" }, text: "again" } },
+];
+await nm.pump(250);
+check("a name written in the config file is not overwritten", configName() === "Luca");
+writeConfig();
+nm.heartbeat();
+await settle(60);
+api.queued = [
+	{
+		update_id: 7103,
+		callback_query: {
+			id: "cbname2",
+			data: "x",
+			from: { id: CHAT, first_name: "Grace" },
+			message: { message_id: 7, chat: { id: CHAT } },
+		},
+	},
+];
+await nm.pump(250);
+check("a button press teaches the name too", configName() === "Grace");
+writeConfig();
 
 // -------------------------------------------------- multi-question, real poller path
 heading("multi-question through the poller");
@@ -1871,6 +2015,13 @@ check(
 		rs.tools.get("notify_status").description.includes("what choosing it does or costs") &&
 		rs.tools.get("notify_status").description.includes("an option with no description is refused") &&
 		rs.tools.get("notify_status").description.includes("Never use only a phase number or letter"),
+);
+check(
+	"the block and notify_status both ask for the actor by name instead of I or you",
+	blockReason.includes('"Agent will') &&
+		blockReason.includes("never I, me, you") &&
+		rs.tools.get("notify_status").description.includes('"Agent will') &&
+		rs.tools.get("notify_status").description.includes("never I, me, you"),
 );
 check(
 	"the block holds next steps to the long-term standard",
@@ -4789,6 +4940,30 @@ heading("a bad options list costs a retry, never the notification");
 	const good = await send("bo5", { summary: "All good.", urgency: "orange", options: opts("Yes", "No") });
 	check("a valid options list still renders", good.buttons.length === 2);
 	check("a valid options list draws no complaint", !/dropped|unusable|ignored|refused/i.test(good.note));
+
+	// f. A tapped button starts the next turn as the user's own words, so I and you name nobody.
+	const voiced = await send("bo6", {
+		summary: "Ready to land.",
+		urgency: "orange",
+		options: [
+			{ label: "I'll merge it", description: "Lands on main now." },
+			{ label: "Hold", description: "You review the diff first." },
+			{ label: "Close the PR", description: "The branch is dropped." },
+		],
+	});
+	check("a voiced options list is refused", voiced.isError);
+	check("a voiced options list records no status", !voiced.text.includes("Ready to land."));
+	check("a voiced options list blocks the turn for a retry", voiced.blocked);
+	check(
+		"the refusal names each voiced option and the word it used",
+		voiced.note.includes('"I" in "I\'ll merge it"') &&
+			voiced.note.includes('"You" in "Hold"') &&
+			!voiced.note.includes("Close the PR"),
+	);
+	check(
+		"the refusal asks for Agent and the user by name",
+		voiced.note.includes('"Agent will') && voiced.note.includes('"User will'),
+	);
 }
 
 heading("ambiguous plain messages ask which session");

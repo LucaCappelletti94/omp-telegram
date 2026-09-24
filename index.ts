@@ -258,6 +258,8 @@ interface Config {
 	pinnedDashboard: boolean;
 	/** Minimum gap between board rewrites, which is what actually protects the rate limit. */
 	dashboardSeconds: number;
+	/** What an option calls the user instead of "you". Learned from Telegram unless set by hand. */
+	userName: string | null;
 }
 
 interface SessionRecord {
@@ -295,7 +297,8 @@ interface SessionRecord {
 interface TelegramMessage {
 	message_id: number;
 	date: number;
-	chat: { id: number };
+	/** A private chat carries its user's first name. */
+	chat: { id: number; first_name?: string };
 	reply_to_message?: { message_id: number };
 	text?: string;
 	caption?: string;
@@ -310,7 +313,7 @@ interface TelegramMessage {
 interface TelegramCallbackQuery {
 	id: string;
 	data?: string;
-	from?: { id: number };
+	from?: { id: number; first_name?: string };
 	message?: {
 		message_id: number;
 		chat: { id: number };
@@ -336,6 +339,55 @@ interface AskResult {
 
 /** Past the ask tool's own refusal every option carries a description, so nothing downstream weighs its absence. */
 type ExplainedQuestion = Omit<AskQuestion, "options"> & { options: (AskOption & { description: string })[] };
+
+/** Words whose referent depends on who reads the option aloud, the agent who wrote it or the user who taps it. */
+const SHIFTING_PERSON: Record<string, true> = {
+	i: true,
+	me: true,
+	my: true,
+	mine: true,
+	myself: true,
+	you: true,
+	your: true,
+	yours: true,
+	yourself: true,
+	yourselves: true,
+	we: true,
+	us: true,
+	our: true,
+	ours: true,
+	ourselves: true,
+};
+
+/**
+ * The first and second person words in option text, each once, as written. Code spans and link
+ * targets are not prose, a lowercase i is an identifier, and I/O and the US are not people.
+ */
+function shiftingPersonWords(text: string): string[] {
+	const prose = text.replaceAll(/(`+)[\s\S]*?\1/gu, " ").replaceAll(/\]\([^)]*\)/gu, "]");
+	const found: string[] = [];
+	for (const match of prose.matchAll(/(?<![\p{L}\p{N}_/'’-])(\p{L}+)(?:['’]\p{L}+)?(?![\p{L}\p{N}_/-])/gu)) {
+		const word = match[1] ?? "";
+		if (SHIFTING_PERSON[word.toLowerCase()] !== true || word === "i" || word === "US") continue;
+		if (!found.includes(word)) found.push(word);
+	}
+	return found;
+}
+
+/** One entry per option that says I or you, naming the words and the option, in list order. */
+function voicedOptions(options: readonly { label: string; description?: string }[]): string[] {
+	return options.flatMap((option, index) => {
+		const words = shiftingPersonWords(`${option.label}\n${option.description ?? ""}`);
+		const name = option.label.trim().length > 0 ? `"${option.label.trim()}"` : `option ${index + 1}`;
+		return words.length === 0 ? [] : [`${words.map((word) => `"${word}"`).join(", ")} in ${name}`];
+	});
+}
+
+/** The rewrite a refusal of a voiced option asks for, with the user's name when it is known. */
+function nameTheActor(user: string | null): string {
+	const fallback = user === null ? ", or the user's name in place of User if you know it" : "";
+	return `Name who acts instead, writing "Agent will …" for the agent and "${user ?? "User"} will …" for the user${fallback}.`;
+}
 
 interface PendingAsk {
 	askId: string;
@@ -541,6 +593,7 @@ function loadConfig(): Config | null {
 		// Opt-in: a permanently pinned message is too strong an opinion to impose by default.
 		pinnedDashboard: raw.pinnedDashboard === true,
 		dashboardSeconds: typeof raw.dashboardSeconds === "number" ? raw.dashboardSeconds : 30,
+		userName: typeof raw.userName === "string" && raw.userName.trim().length > 0 ? raw.userName.trim() : null,
 	};
 }
 
@@ -557,6 +610,21 @@ function persistOffset(offset: number): void {
 	if (typeof record.offset === "number" && record.offset >= offset) return;
 	const next = { ...record, offset };
 	writeFileAtomic(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, 0o600);
+}
+
+/** A name already in the file wins, whether learned earlier or written by the user. Returns the name the file holds. */
+function persistUserName(name: string): string | null {
+	let parsed: unknown = null;
+	try {
+		parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+	} catch {
+		return null; // Torn read; the next message from the user tries again.
+	}
+	if (parsed === null || typeof parsed !== "object") return null;
+	const record = parsed as Record<string, unknown>;
+	if (typeof record.userName === "string" && record.userName.trim().length > 0) return record.userName.trim();
+	writeFileAtomic(CONFIG_PATH, `${JSON.stringify({ ...record, userName: name }, null, 2)}\n`, 0o600);
+	return name;
 }
 
 interface TelegramFailure {
@@ -2981,6 +3049,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	function learnUserName(cfg: Config, name: string | undefined): void {
+		const trimmed = name?.trim() ?? "";
+		if (cfg.userName !== null || trimmed.length === 0) return;
+		cfg.userName = persistUserName(trimmed);
+	}
+
 	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<false | undefined> {
 		const callback = update.callback_query;
 		if (update.message_reaction !== undefined) {
@@ -2994,6 +3068,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				});
 				return;
 			}
+			learnUserName(cfg, callback.from?.first_name);
 			if (callback.data.startsWith("m:")) {
 				await deliverHeldMessage(cfg, callback);
 				return;
@@ -3050,6 +3125,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pi.logger.warn("telegram: rejected a message from an unexpected chat", { chat: message.chat.id });
 			return;
 		}
+		learnUserName(cfg, message.chat.first_name);
 		if (isChatEvent(message)) return;
 		const replyTo = message.reply_to_message?.message_id;
 		const text = message.text ?? message.caption;
@@ -3779,7 +3855,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "ask",
 		label: "Ask",
 		description:
-			"Ask the interactive user one or more questions. Answerable at the terminal or from Telegram, whichever answers first. Set `context` when the question cannot be judged from the option list alone, for example the finding that prompted it or what each alternative costs. Context is shown in both places. Question, option and context text render as Markdown on Telegram. Supported: `inline code` for identifiers, paths and values, triple-backtick fences with a language for multi-line code, **bold**, *italic* or _italic_, ~~strikethrough~~, ||spoiler||, a leading angle bracket for a quoted line, a leading hash for a heading, and [label](https://url) links. Tables, bullet nesting and anything else render as plain text, so prefer a fenced block for tabular output. Mark desirability so a choice reads at a glance, as a three colour semaphore: set `recommended` to the index of the one option you would take, set `lukewarm` on an option that would work but that you would not pick, and set `discouraged` on an option offered only for contrast. Preferable renders green, lukewarm carries an orange marker, and discouraged renders red, all labelled, on Telegram and in the terminal. Leave every mark unset for options that are genuinely equivalent. Every option carries a one-line `description` of what choosing it does or costs: it is not optional, an option without one is refused, nothing is asked, and the refusal names the bare options. Options are the paths that are actually open, and the set must hold the one that is best once the work is finished, stated on its own terms and never folded into a cheaper option as a caveat. `recommended` marks that path, not the quickest one. Effort, edit count and churn are never grounds to prefer or to demote an option: a flaw sitting at many call sites is a reason to correct it now, not a reason to keep it. Offer a partial or temporary path only when a named concrete blocker, never cost, rules the complete one out; mark it `lukewarm` or `discouraged`, and let its description say which complete solution it defers and what the deferral costs. Where the repository is not the user's to break, a compatibility-keeping option may sit beside the complete one, and its description names the release that drops it. When one path is plainly better and nothing left in the choice is a matter of the user's taste or priorities, take it and report it instead of asking.",
+			'Ask the interactive user one or more questions. Answerable at the terminal or from Telegram, whichever answers first. Set `context` when the question cannot be judged from the option list alone, for example the finding that prompted it or what each alternative costs. Context is shown in both places. Question, option and context text render as Markdown on Telegram. Supported: `inline code` for identifiers, paths and values, triple-backtick fences with a language for multi-line code, **bold**, *italic* or _italic_, ~~strikethrough~~, ||spoiler||, a leading angle bracket for a quoted line, a leading hash for a heading, and [label](https://url) links. Tables, bullet nesting and anything else render as plain text, so prefer a fenced block for tabular output. Mark desirability so a choice reads at a glance, as a three colour semaphore: set `recommended` to the index of the one option you would take, set `lukewarm` on an option that would work but that you would not pick, and set `discouraged` on an option offered only for contrast. Preferable renders green, lukewarm carries an orange marker, and discouraged renders red, all labelled, on Telegram and in the terminal. Leave every mark unset for options that are genuinely equivalent. Every option carries a one-line `description` of what choosing it does or costs: it is not optional, an option without one is refused, nothing is asked, and the refusal names the bare options. Option labels and descriptions name who acts, as in "Agent will rebase the branch" or "User will review the diff" with the user\'s name in place of User when it is known, and never I, me, you, your, we or us, because the user taps an option as their own reply and a pronoun there could mean either side, so such an option is refused too. Options are the paths that are actually open, and the set must hold the one that is best once the work is finished, stated on its own terms and never folded into a cheaper option as a caveat. `recommended` marks that path, not the quickest one. Effort, edit count and churn are never grounds to prefer or to demote an option: a flaw sitting at many call sites is a reason to correct it now, not a reason to keep it. Offer a partial or temporary path only when a named concrete blocker, never cost, rules the complete one out; mark it `lukewarm` or `discouraged`, and let its description say which complete solution it defers and what the deferral costs. Where the repository is not the user\'s to break, a compatibility-keeping option may sit beside the complete one, and its description names the release that drops it. When one path is plainly better and nothing left in the choice is a matter of the user\'s taste or priorities, take it and report it instead of asking.',
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -3810,6 +3886,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			// A button is the whole of what Telegram shows, so an option nobody explained is refused
 			// before anything reaches the chat or the terminal, with the reason spelled out: an agent
 			// told only "invalid" writes the same lazy list again.
+			const where = (question: AskQuestion) =>
+				question.id.trim().length > 0 ? `question "${question.id.trim()}"` : "the question";
 			const unexplained = p.questions.flatMap((question) => {
 				const naked = question.options
 					.map((option, index) => ({ option, index }))
@@ -3818,15 +3896,31 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						option.label.trim().length > 0 ? `"${option.label.trim()}"` : `option ${index + 1}`,
 					);
 				if (naked.length === 0) return [];
-				const where = question.id.trim().length > 0 ? `question "${question.id.trim()}"` : "the question";
-				return [`${where} offers ${naked.join(", ")} with no description`];
+				return [`${where(question)} offers ${naked.join(", ")} with no description`];
 			});
-			if (unexplained.length > 0) {
+			// An option reads on Telegram as the user's own reply, so "I" and "you" name nobody.
+			const voiced = p.questions.flatMap((question) => {
+				const found = voicedOptions(question.options);
+				if (found.length === 0) return [];
+				return [`${where(question)} says ${found.join(", ")}`];
+			});
+			if (unexplained.length > 0 || voiced.length > 0) {
+				const reasons: string[] = [];
+				if (unexplained.length > 0) {
+					reasons.push(
+						"A description is the line the user reads under the button, and on Telegram the label alone is what arrives, so an undescribed option is a choice the user cannot judge and may tap by mistake. Write one line per option saying what choosing it does or costs, and name what the option gives up rather than repeating the label.",
+					);
+				}
+				if (voiced.length > 0) {
+					reasons.push(
+						`The user taps an option as their own reply, so I, me, you, your, we or us in it could mean the agent or the user. ${nameTheActor(config?.userName ?? null)}`,
+					);
+				}
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `Error: nothing was asked because ${unexplained.join(", and ")}. A description is the line the user reads under the button, and on Telegram the label alone is what arrives, so an undescribed option is a choice the user cannot judge and may tap by mistake. Write one line per option saying what choosing it does or costs, name what the option gives up rather than repeating the label, and call ask again with the whole list.`,
+							text: `Error: nothing was asked because ${[...unexplained, ...voiced].join(", and ")}. ${reasons.join(" ")} Then call ask again with the whole list.`,
 						},
 					],
 					isError: true,
@@ -3924,7 +4018,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "notify_status",
 		label: "Notify Status",
 		description:
-			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two plain sentences when no choice is attached, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 `options` drawn from those real next steps. Every option is an object with a short `label` naming the action and a one-line `description` of what choosing it does or costs, and at most one of `recommended`, `lukewarm` or `discouraged` to colour the button. The description is not optional: the button is the whole of what a phone shows, so an option with no description is refused and no status is recorded. Never use only a phase number or letter, such as `Start Phase 7`. Each description becomes its own section under the summary, and the buttons start the next turn with the most likely choice first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices. The notification must be answerable from a phone without terminal context, so the `summary` names the decision and says why it is needed now. The next steps are held to the same standard as the work: the option that finishes the work properly belongs in the list and carries `recommended`, effort is never a reason to demote it, and any option that leaves a known defect standing says so in its own description and is marked `lukewarm` or `discouraged`. Text the user is meant to copy, an issue body, a PR post, a patch, goes out through `notify_snippet` instead of riding in the summary.",
+			'Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two plain sentences when no choice is attached, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository\'s maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 `options` drawn from those real next steps. Every option is an object with a short `label` naming the action and a one-line `description` of what choosing it does or costs, and at most one of `recommended`, `lukewarm` or `discouraged` to colour the button. The description is not optional: the button is the whole of what a phone shows, so an option with no description is refused and no status is recorded. Labels and descriptions name who acts, as in "Agent will rebase the branch" or "User will review the diff" with the user\'s name in place of User when it is known, and never I, me, you, your, we or us, because a tapped button starts the next turn as the user\'s own words and a pronoun there could mean either side, so such an option is refused too. Never use only a phase number or letter, such as `Start Phase 7`. Each description becomes its own section under the summary, and the buttons start the next turn with the most likely choice first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices. The notification must be answerable from a phone without terminal context, so the `summary` names the decision and says why it is needed now. The next steps are held to the same standard as the work: the option that finishes the work properly belongs in the list and carries `recommended`, effort is never a reason to demote it, and any option that leaves a known defect standing says so in its own description and is marked `lukewarm` or `discouraged`. Text the user is meant to copy, an issue body, a PR post, a patch, goes out through `notify_snippet` instead of riding in the summary.',
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -3967,24 +4061,33 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const requested = Array.isArray(p.options) ? p.options : [];
 			const parsed = requested.map(parseStatusOption);
 			const unlabelled = parsed.filter((option) => option === null).length;
-			const bare = parsed
-				.filter((option): option is StatusOption => option !== null && option.description === undefined)
-				.map((option) => `"${option.label}"`);
-			if (unlabelled > 0 || bare.length > 0) {
+			const usable = parsed.filter((option): option is StatusOption => option !== null);
+			const bare = usable.filter((option) => option.description === undefined).map((option) => `"${option.label}"`);
+			// A tapped button starts the next turn as the user's own words, so "I" and "you" name nobody.
+			const voiced = voicedOptions(usable);
+			if (unlabelled > 0 || bare.length > 0 || voiced.length > 0) {
 				const faults: string[] = [];
 				if (unlabelled > 0) faults.push(`${unlabelled} of ${requested.length} carry no label`);
 				if (bare.length > 0) faults.push(`${bare.join(", ")} carry no description`);
+				if (voiced.length > 0) faults.push(`the options say ${voiced.join(", ")}`);
+				const reasons = [
+					"Every option is an object with a short label naming the action and a one-line description of what choosing it does or costs.",
+				];
+				if (voiced.length > 0) {
+					reasons.push(
+						`A tapped button starts the next turn as the user's own words, so I, me, you, your, we or us in it could mean the agent or the user. ${nameTheActor(config?.userName ?? null)}`,
+					);
+				}
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Error: nothing was recorded because ${faults.join(" and ")}. Every option is an object with a short label naming the action and a one-line description of what choosing it does or costs. Call notify_status again with the whole list.`,
+							text: `Error: nothing was recorded because ${faults.join(" and ")}. ${reasons.join(" ")} Call notify_status again with the whole list.`,
 						},
 					],
 					isError: true,
 				};
 			}
-			const usable = parsed.filter((option): option is StatusOption => option !== null);
 			const offered = usable.length >= STATUS_OPTIONS_MIN ? usable.slice(0, STATUS_OPTIONS_MAX) : [];
 			const notes: string[] = [];
 			if (offered.length > 0 && usable.length > offered.length) {
@@ -4937,7 +5040,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return {
 				decision: "block" as const,
 				reason:
-					"Before finishing, call notify_status with a one-or-two-sentence summary when no choice is attached and an urgency (green done, orange reply wanted, red blocked). Be proactive about next steps: name the concrete ones when they exist, and say plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. If any user action is wanted, also set question and 2 to 6 options drawn from those real next steps. Every option is an object with a short label naming the action and a one-line description saying what choosing it does or costs: a button is all a phone shows, so an option with no description is refused and nothing is recorded. The notification must be answerable from a phone without terminal context. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit them when there is genuinely nothing to ask. The next steps are held to the same standard as the work: the option that finishes the work properly belongs in the list and carries `recommended`, effort is never a reason to demote it, and any option that leaves a known defect standing says so in its own description and is marked `lukewarm` or `discouraged`.",
+					'Before finishing, call notify_status with a one-or-two-sentence summary when no choice is attached and an urgency (green done, orange reply wanted, red blocked). Be proactive about next steps: name the concrete ones when they exist, and say plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository\'s maintainer would run it. If any user action is wanted, also set question and 2 to 6 options drawn from those real next steps. Every option is an object with a short label naming the action and a one-line description saying what choosing it does or costs: a button is all a phone shows, so an option with no description is refused and nothing is recorded. Labels and descriptions name who acts, as in "Agent will rebase the branch" or "User will review the diff" with the user\'s name in place of User when it is known, and never I, me, you, your, we or us, because a tapped button starts the next turn as the user\'s own words and a pronoun there could mean either side, so such an option is refused too. The notification must be answerable from a phone without terminal context. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit them when there is genuinely nothing to ask. The next steps are held to the same standard as the work: the option that finishes the work properly belongs in the list and carries `recommended`, effort is never a reason to demote it, and any option that leaves a known defect standing says so in its own description and is marked `lukewarm` or `discouraged`.',
 			};
 		}
 
