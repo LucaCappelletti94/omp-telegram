@@ -364,9 +364,12 @@ const SHIFTING_PERSON: Record<string, true> = {
  * targets are not prose, a lowercase i is an identifier, and I/O and the US are not people.
  */
 function shiftingPersonWords(text: string): string[] {
-	const prose = text.replaceAll(/(`+)[\s\S]*?\1/gu, " ").replaceAll(/\]\([^)]*\)/gu, "]");
+	const prose = text
+		.replaceAll(/(`+)[\s\S]*?\1/gu, " ")
+		.replaceAll(/\]\([^)]*\)/gu, "]")
+		.replaceAll(/\bI\/O\b/gu, " ");
 	const found: string[] = [];
-	for (const match of prose.matchAll(/(?<![\p{L}\p{N}_/'’-])(\p{L}+)(?:['’]\p{L}+)?(?![\p{L}\p{N}_/-])/gu)) {
+	for (const match of prose.matchAll(/(?<![\p{L}\p{N}_'’-])(\p{L}+)(?:['’]\p{L}+)?(?![\p{L}\p{N}_-])/gu)) {
 		const word = match[1] ?? "";
 		if (SHIFTING_PERSON[word.toLowerCase()] !== true || word === "i" || word === "US") continue;
 		if (!found.includes(word)) found.push(word);
@@ -597,34 +600,25 @@ function loadConfig(): Config | null {
 	};
 }
 
-function persistOffset(offset: number): void {
+/**
+ * Rewrites the config file with what `change` returns, or leaves it alone on null. Returns the
+ * record the file holds afterwards, or null on a torn read, which the next caller retries.
+ */
+function patchConfig(
+	change: (record: Record<string, unknown>) => Record<string, unknown> | null,
+): Record<string, unknown> | null {
 	let parsed: unknown = null;
 	try {
 		parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
 	} catch {
-		return; // Torn read; the next poll cycle persists again.
-	}
-	if (parsed === null || typeof parsed !== "object") return;
-	const record = parsed as Record<string, unknown>;
-	// A stale poller must never rewind an offset another process already advanced past.
-	if (typeof record.offset === "number" && record.offset >= offset) return;
-	const next = { ...record, offset };
-	writeFileAtomic(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, 0o600);
-}
-
-/** A name already in the file wins, whether learned earlier or written by the user. Returns the name the file holds. */
-function persistUserName(name: string): string | null {
-	let parsed: unknown = null;
-	try {
-		parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
-	} catch {
-		return null; // Torn read; the next message from the user tries again.
+		return null;
 	}
 	if (parsed === null || typeof parsed !== "object") return null;
 	const record = parsed as Record<string, unknown>;
-	if (typeof record.userName === "string" && record.userName.trim().length > 0) return record.userName.trim();
-	writeFileAtomic(CONFIG_PATH, `${JSON.stringify({ ...record, userName: name }, null, 2)}\n`, 0o600);
-	return name;
+	const next = change(record);
+	if (next === null) return record;
+	writeFileAtomic(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, 0o600);
+	return next;
 }
 
 interface TelegramFailure {
@@ -3052,7 +3046,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function learnUserName(cfg: Config, name: string | undefined): void {
 		const trimmed = name?.trim() ?? "";
 		if (cfg.userName !== null || trimmed.length === 0) return;
-		cfg.userName = persistUserName(trimmed);
+		// A name already in the file wins, whether learned earlier or written by the user.
+		const record = patchConfig((current) =>
+			typeof current.userName === "string" && current.userName.trim().length > 0
+				? null
+				: { ...current, userName: trimmed },
+		);
+		cfg.userName = typeof record?.userName === "string" ? record.userName.trim() : null;
 	}
 
 	async function handleUpdate(cfg: Config, update: TelegramUpdate): Promise<false | undefined> {
@@ -3312,8 +3312,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 				highest = Math.max(highest, update.update_id);
 			}
-			config.offset = highest + 1;
-			persistOffset(config.offset);
+			const offset = highest + 1;
+			config.offset = offset;
+			// A stale poller must never rewind an offset another process already advanced past.
+			patchConfig((record) =>
+				typeof record.offset === "number" && record.offset >= offset ? null : { ...record, offset },
+			);
 		} catch (error) {
 			pi.logger.debug("telegram poll failed", { error: error instanceof Error ? error.message : String(error) });
 		} finally {

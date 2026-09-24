@@ -1021,6 +1021,26 @@ check(
 	"lookalikes of pronouns are not refused",
 	lookalikeText.includes('"Skip" with no description') && lookalikeText.includes("could mean") === false,
 );
+// I/O is the one slash pair that is not people, so a pronoun on either side of any other slash still counts.
+const slashAsk = await ctxSession.tools.get("ask").execute(
+	"voice2b",
+	{
+		questions: [
+			{
+				id: "owner",
+				question: "Who owns the migration?",
+				options: [{ label: "Split it", description: "Divide the work between you/me by ownership." }],
+			},
+		],
+	},
+	undefined,
+	undefined,
+	ctxSession.ctx,
+);
+check(
+	"a pronoun beside a slash is still refused",
+	slashAsk.isError === true && slashAsk.content[0].text.includes('"you", "me" in "Split it"'),
+);
 // Both faults in one list come back in one refusal, so a single retry can fix both.
 const bothAsk = await ctxSession.tools
 	.get("ask")
@@ -3630,7 +3650,7 @@ check(
 	lastCodeUnit < 0xd800 || lastCodeUnit > 0xdbff,
 );
 
-// d. persistOffset must not lower an offset another process already advanced past.
+// d. Persisting the offset must not lower one another process already advanced past.
 writeConfig({ offset: 100 });
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 const noRwSess = spawn("01a05000-0000-0000-0000-000000000000", "/home/dev/work/norewind");
@@ -3640,7 +3660,7 @@ writeConfig({ offset: 500 });
 api.queued = [{ update_id: 150, message: { message_id: 1, date: 1, chat: { id: CHAT }, text: "late" } }];
 await noRwSess.pump(250);
 check(
-	"persistOffset does not lower an offset already advanced by another process",
+	"persisting the offset does not lower one already advanced by another process",
 	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset >= 500,
 );
 writeConfig();
