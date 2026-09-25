@@ -185,6 +185,7 @@ const spawn = (id, cwd, title = "") => {
 	const tools = new Map();
 	const warns = [];
 	const steers = [];
+	const customs = [];
 	let name = title;
 	const pi = {
 		zod: chain,
@@ -192,6 +193,7 @@ const spawn = (id, cwd, title = "") => {
 		on: (event, fn) => handlers.set(event, [...(handlers.get(event) ?? []), fn]),
 		registerTool: (def) => tools.set(def.name, def),
 		sendUserMessage: (text, options) => steers.push({ text, options }),
+		sendMessage: (message, options) => customs.push({ message, options }),
 	};
 	let aborts = 0;
 	const ctx = {
@@ -215,6 +217,7 @@ const spawn = (id, cwd, title = "") => {
 		timers,
 		warns,
 		steers,
+		customs,
 		get aborts() {
 			return aborts;
 		},
@@ -8046,6 +8049,219 @@ esac
 	delete process.env.GIT_LOG;
 	delete process.env.TMUX_LOG;
 	delete process.env.GIT_REMOTES;
+}
+
+heading("session_message between live sessions");
+{
+	const parrot = "\u{1F99C}";
+	const hedgehog = "\u{1F994}";
+	const jelly = "\u{1FABC}";
+	const a = spawn("0b1f0000-aaaa-7000-8000-00000000000a", "/home/dev/work/alpha");
+	const b = spawn("0b1f0000-bbbb-7000-8000-00000000000b", "/home/dev/work/beta");
+	const c = spawn("0b1f0000-cccc-7000-8000-00000000000c", "/home/dev/work/gamma");
+	for (const [s, emoji, label] of [
+		[a, parrot, "alpha work"],
+		[b, hedgehog, "beta work"],
+		[c, jelly, "gamma work"],
+	]) {
+		await s.fire("session_start");
+		await s.tools.get("session_badge").execute("sb", { emoji, label }, undefined, undefined, s.ctx);
+	}
+	const message = (from, args, signal) =>
+		from.tools.get("session_message").execute("sm", args, signal, undefined, from.ctx);
+	/** Sends, lets the peer's drain tick once, then returns the settled tool result. */
+	const exchange = async (from, to, args) => {
+		const pending = message(from, args);
+		await settle(50);
+		await to.pump(150);
+		return pending;
+	};
+	const telegramTraffic = () =>
+		api.calls.filter((call) => ["sendMessage", "setMessageReaction", "sendChatAction"].includes(call.method)).length;
+
+	check("session_message is registered", a.tools.has("session_message"));
+
+	const listing = await message(a, {});
+	const listText = listing.content[0].text;
+	check(
+		"a bare call lists every other live session with its badge and folder",
+		listText.includes(hedgehog) && listText.includes("/home/dev/work/beta") && listText.includes(jelly),
+	);
+	check("the listing names the caller's own badge", listText.includes(parrot));
+	check("the caller is not listed as its own peer", !listing.details.peers.some((peer) => peer.emoji === parrot));
+
+	const trafficBefore = telegramTraffic();
+	const first = await exchange(a, b, { to: hedgehog, text: "Which branch holds the fix?" });
+	check("a drained message reports delivered", first.details?.delivered === true && first.isError !== true);
+	check("a first message starts the chain at hop 1", first.details.hop === 1);
+	const firstId = first.details.id;
+	check("the message carries an id", typeof firstId === "string" && firstId.length >= 8);
+	const arrived = b.customs.at(-1);
+	check(
+		"the peer receives it as an aside that wakes an idle session",
+		b.customs.length === 1 && arrived.options.deliverAs === "aside" && arrived.options.triggerTurn === true,
+	);
+	check("the message is shown in the transcript", arrived.message.display === true);
+	check("the message is attributed to an agent", arrived.message.attribution === "agent");
+	check(
+		"the reply instruction names the sender's stable tag, which a later badge change cannot reroute",
+		arrived.message.content.includes(`to "${record(a.id).tag}"`),
+	);
+	check(
+		"the delivered text names the sender badge, the id and the body",
+		arrived.message.content.includes(parrot) &&
+			arrived.message.content.includes(firstId) &&
+			arrived.message.content.includes("Which branch holds the fix?"),
+	);
+	check("an agent message never goes through the prompt flow", b.steers.length === 0);
+	check("an agent message sends nothing to Telegram", telegramTraffic() === trafficBefore);
+	check("the peer's inbox is empty after delivery", inboxCount(b.id) === 0);
+
+	const reply = await exchange(b, a, { to: parrot, text: "fix/drain", reply_to: firstId });
+	check("a reply one step down the chain is hop 2", reply.details?.delivered === true && reply.details.hop === 2);
+	const replyArrived = a.customs.at(-1);
+	check(
+		"the reply quotes the message it answers",
+		replyArrived.message.content.includes(firstId) && replyArrived.message.details.replyTo === firstId,
+	);
+
+	let last = reply;
+	for (let hop = 3; hop <= 6; hop++) {
+		const [from, to, target] = hop % 2 === 1 ? [a, b, hedgehog] : [b, a, parrot];
+		last = await exchange(from, to, { to: target, text: `step ${hop}`, reply_to: last.details.id });
+	}
+	check("the chain reaches hop 6", last.details?.delivered === true && last.details.hop === 6);
+	check(
+		"the final hop tells the recipient to stop relaying",
+		a.customs.at(-1).message.content.includes("do not answer"),
+	);
+	const beyond = await message(a, { to: hedgehog, text: "step 7", reply_to: last.details.id });
+	check("hop 7 is refused", beyond.isError === true && beyond.details.sent === false);
+	check("a refused message never reaches the inbox", inboxCount(b.id) === 0);
+
+	await a.fire("input", {});
+	const fresh = await exchange(a, b, { to: hedgehog, text: "new question from the user" });
+	check("user input starts a fresh chain", fresh.details?.delivered === true && fresh.details.hop === 1);
+
+	const unknown = await message(a, { to: "\u{1F996}", text: "hello?" });
+	check(
+		"an unknown badge is refused with the live peers listed",
+		unknown.isError === true && unknown.content[0].text.includes(hedgehog),
+	);
+	const own = await message(a, { to: parrot, text: "talking to myself" });
+	check("a session cannot message itself", own.isError === true);
+	const empty = await message(a, { to: hedgehog, text: "   " });
+	check("an empty message is refused", empty.isError === true);
+	const huge = await message(a, { to: hedgehog, text: "x".repeat(40_000) });
+	check("an oversized message is refused", huge.isError === true && inboxCount(b.id) === 0);
+
+	// The native ask blocks the turn, and only the user may answer it.
+	const askState = {};
+	const runAsk = b.tools
+		.get("ask")
+		.execute("sm-ask", singleQuestion, undefined, undefined, stubbornCtx(b.ctx, askState));
+	let askSettled = false;
+	runAsk.then(() => {
+		askSettled = true;
+	});
+	await settle(150);
+	const duringAsk = await exchange(a, b, { to: hedgehog, text: "use Postgres" });
+	await settle(100);
+	check("a message to a session with an open ask is still delivered", duringAsk.details?.delivered === true);
+	check("an agent message never answers the user's ask", askSettled === false);
+	writeFileSync(join(inboxOf(b.id), "9001.json"), JSON.stringify({ kind: "text", value: "SQLite" }));
+	await b.pump(150);
+	check("the ask still takes the user's answer", (await runAsk).details.customInput === "SQLite");
+
+	const started = performance.now();
+	const queued = await message(a, { to: jelly, text: "are you there?" });
+	const waited = performance.now() - started;
+	check(
+		"an undrained message reports not yet delivered after a bounded wait",
+		queued.details?.delivered === false && queued.isError !== true && waited >= 2_500 && waited < 6_000,
+	);
+	check("the undrained message stays queued for the peer", inboxCount(c.id) === 1);
+	await c.pump(150);
+	check("the queued message arrives once the peer drains", c.customs.length === 1 && inboxCount(c.id) === 0);
+
+	const controller = new AbortController();
+	const abortStart = performance.now();
+	const abortedSend = message(a, { to: jelly, text: "second" }, controller.signal);
+	await settle(100);
+	controller.abort();
+	const aborted = await abortedSend;
+	check(
+		"aborting the wait returns at once with the message still queued",
+		aborted.details?.delivered === false && performance.now() - abortStart < 1_500 && inboxCount(c.id) === 1,
+	);
+	await c.pump(150);
+
+	writeFileSync(join(inboxOf(c.id), `${Date.now()}-bad.json`), JSON.stringify({ kind: "agent", value: "no sender" }));
+	const customsBeforeBad = c.customs.length;
+	const warnsBeforeBad = c.warns.length;
+	await c.pump(150);
+	check(
+		"a malformed agent entry is discarded with a warning",
+		c.customs.length === customsBeforeBad && inboxCount(c.id) === 0 && c.warns.length > warnsBeforeBad,
+	);
+
+	// A live peer can hold no emoji once the palette runs out, and its tag still names it.
+	const blankId = "0b1f0000-eeee-7000-8000-00000000000e";
+	writeFileSync(
+		join(sessionsDir, `${blankId}.json`),
+		JSON.stringify({ ...record(c.id), emoji: "", emojiChosen: false, tag: "zz9", heartbeat: Date.now() }),
+	);
+	check("the listing shows a peer's tag", (await message(a, {})).content[0].text.includes("zz9"));
+	const byTag = await message(a, { to: "zz9", text: "reach me by tag" }, AbortSignal.abort());
+	check(
+		"a peer without an emoji is addressable by its tag",
+		byTag.details?.sent === true && byTag.isError !== true && inboxCount(blankId) === 1,
+	);
+	const ownTag = await message(a, { to: record(a.id).tag, text: "me again" });
+	check("a session cannot message itself by its tag", ownTag.isError === true);
+	writeFileSync(
+		join(inboxOf(c.id), `${Date.now()}-0123456789ab.json`),
+		JSON.stringify({
+			kind: "agent",
+			value: "from a session without an emoji",
+			id: "0123456789ab",
+			hop: 1,
+			from: { session: blankId, emoji: "", label: "", cwd: "/home/dev/work/blank", tag: "zz9" },
+		}),
+	);
+	await c.pump(150);
+	check(
+		"a message from a session without an emoji says to answer by its tag",
+		c.customs.at(-1).message.content.includes('to "zz9"'),
+	);
+	rmSync(join(sessionsDir, `${blankId}.json`), { force: true });
+
+	const unpaired = spawn("0b1f0000-dddd-7000-8000-00000000000d", "/home/dev/work/delta");
+	const unpairedSend = await message(unpaired, { to: hedgehog, text: "anyone?" });
+	check(
+		"a session without the Telegram pairing is told messaging needs it",
+		unpairedSend.isError === true && unpairedSend.content[0].text.includes("setup.mjs"),
+	);
+
+	// An older omp-telegram drains an unknown kind as user text, so it must never be sent one.
+	const legacyId = "0b1f0000-ffff-7000-8000-00000000000f";
+	const { messaging: _dropped, ...legacyRecord } = record(c.id);
+	writeFileSync(
+		join(sessionsDir, `${legacyId}.json`),
+		JSON.stringify({ ...legacyRecord, emoji: "\u{1F9A5}", tag: "old1", heartbeat: Date.now() }),
+	);
+	const legacy = await message(a, { to: "\u{1F9A5}", text: "hello old friend" });
+	check(
+		"a peer running a version without messaging is refused and named for a restart",
+		legacy.isError === true && legacy.content[0].text.includes("restart") && inboxCount(legacyId) === 0,
+	);
+	rmSync(join(sessionsDir, `${legacyId}.json`), { force: true });
+
+	jump(46_000);
+	const stale = await message(a, { to: hedgehog, text: "still there?" });
+	check("a session whose heartbeat went stale is not addressable", stale.isError === true);
+
+	for (const s of [a, b, c]) await s.fire("session_shutdown");
 }
 
 rmSync(root, { recursive: true, force: true });

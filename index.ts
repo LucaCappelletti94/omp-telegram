@@ -72,6 +72,15 @@ const REACTION_ROUTE_WAIT_MS = 5_000;
 const HEARTBEAT_MS = 15_000;
 const LOCK_STALE_MS = 45_000;
 const DRAIN_MS = 1_000;
+/** A chain of agent messages ends here unless a user prompt starts a new one. */
+const AGENT_MAX_HOPS = 6;
+/** How long a sender waits for the peer's drain, a few ticks of `DRAIN_MS`. */
+const AGENT_DELIVERY_WAIT_MS = 3_000;
+const AGENT_DELIVERY_POLL_MS = 100;
+const AGENT_TEXT_MAX = 16_000;
+const AGENT_MESSAGE_TYPE = "omp-telegram.session-message";
+/** Written into every session record. A peer below it drains agent entries as user text. */
+const AGENT_PROTOCOL = 1;
 /** Refreshed every heartbeat while work is active, with enough slack for delayed timer ticks. */
 const SENT_MARKER_STALE_MS = 2 * 60_000;
 const BADGE_CLAIM_STALE_MS = 5_000;
@@ -286,6 +295,8 @@ interface SessionRecord {
 	pinned: number | null;
 	/** What this session is doing, so one session can answer `/status` for the whole fleet. */
 	state: string;
+	/** Agent message protocol this session drains, 0 for a version that reads one as user text. */
+	messaging: number;
 	/** Provider weather for the current turn: a retry, a fallback, or a recovery. */
 	health: string;
 	/** First line of the last turn-end summary, and when it landed. */
@@ -455,9 +466,18 @@ interface ModelUsage {
 	cost: number;
 }
 
+interface AgentSender {
+	session: string;
+	emoji: string;
+	label: string;
+	cwd: string;
+	/** Reply address, stable while the badge emoji can change or pass to another session. */
+	tag: string;
+}
+
 interface InboxEntry {
-	kind: "text" | "callback" | "file" | "command" | "redo";
-	/** Text, callback payload, downloaded file path, command name, or the redo note. */
+	kind: "text" | "callback" | "file" | "command" | "redo" | "agent";
+	/** Text, callback payload, downloaded file path, command name, redo note, or agent message body. */
 	value: string;
 	/** Incoming Telegram message id for delivery receipts. For a redo, the graded message. */
 	messageId?: number;
@@ -471,6 +491,13 @@ interface InboxEntry {
 	replyTo?: number;
 	caption?: string;
 	mime?: string;
+	/** Agent message id, which a reply quotes. */
+	id?: string;
+	/** Agent message id this one answers. */
+	agentReplyTo?: string;
+	/** Agent messages since the last user prompt, this one included. */
+	hop?: number;
+	from?: AgentSender;
 }
 interface ReactionTransaction extends Partial<InboxEntry> {
 	transaction: 1;
@@ -530,6 +557,55 @@ function writeFileAtomic(path: string, content: string, mode?: number): void {
 	const temp = `${path}.${process.pid}.${Date.now().toString(36)}.tmp`;
 	writeFileSync(temp, content, mode === undefined ? {} : { mode });
 	renameSync(temp, path);
+}
+
+const AGENT_MESSAGE_ID = /^[0-9a-f]{12}$/u;
+
+interface AgentMessage {
+	id: string;
+	text: string;
+	hop: number;
+	replyTo?: string;
+	from: AgentSender;
+}
+
+/** An agent entry crosses a process boundary, so every field is checked before it reaches a model. */
+function agentMessageOf(entry: Partial<InboxEntry>): AgentMessage | null {
+	const { id, value, hop, agentReplyTo, from } = entry;
+	if (typeof id !== "string" || !AGENT_MESSAGE_ID.test(id)) return null;
+	if (typeof value !== "string" || value.trim().length === 0) return null;
+	if (typeof hop !== "number" || !Number.isInteger(hop) || hop < 1 || hop > AGENT_MAX_HOPS) return null;
+	if (agentReplyTo !== undefined && (typeof agentReplyTo !== "string" || !AGENT_MESSAGE_ID.test(agentReplyTo))) {
+		return null;
+	}
+	if (from === null || typeof from !== "object") return null;
+	const { session, emoji, label, cwd, tag } = from;
+	if (!isStateToken(session) || typeof emoji !== "string" || !isStateToken(tag)) return null;
+	if (typeof label !== "string" || typeof cwd !== "string") return null;
+	return { id, text: value, hop, replyTo: agentReplyTo, from: { session, emoji, label, cwd, tag } };
+}
+
+/** What the recipient's model reads: who wrote, where the chain stands, and how to answer. */
+function agentMessageText(message: AgentMessage): string {
+	const shown = message.from.emoji.length > 0 ? `${message.from.emoji} (tag ${message.from.tag})` : message.from.tag;
+	const sender = message.from.label.length > 0 ? `${shown} ${message.from.label}` : shown;
+	const answering = message.replyTo === undefined ? "" : `, answering your message ${message.replyTo}`;
+	const head = `Message ${message.id} from the agent of the omp session ${sender} in ${message.from.cwd}${answering}, written by that agent and never by your user. Hop ${message.hop} of ${AGENT_MAX_HOPS}.`;
+	const tail =
+		message.hop >= AGENT_MAX_HOPS
+			? "This is the last hop of the chain, so do not answer with session_message. Tell your user if it matters."
+			: `To answer, call session_message with to "${message.from.tag}" and reply_to "${message.id}". Every message costs its recipient a turn, so skip acknowledgements.`;
+	return `${head}\n\n${message.text}\n\n${tail}`;
+}
+
+/** True once the recipient's drain has taken the entry, false when the bound or an abort comes first. */
+async function awaitDrain(file: string, signal: AbortSignal | undefined): Promise<boolean> {
+	const deadline = performance.now() + AGENT_DELIVERY_WAIT_MS;
+	for (;;) {
+		if (!existsSync(file) && !existsSync(`${file}.processing`)) return true;
+		if (signal?.aborted === true || performance.now() >= deadline) return false;
+		await new Promise((resolve) => setTimeout(resolve, AGENT_DELIVERY_POLL_MS));
+	}
 }
 
 /** Colons are illegal in filenames on Windows and awkward in shells; the rest of ISO-8601 sorts as it reads. */
@@ -1166,6 +1242,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let typingSentAt = 0;
 	/** When a delivered Telegram entry reached the agent; 0 once the turn carrying its answer ended. */
 	let replyOwedAt = 0;
+	/** Highest hop of an agent message delivered here since the last user input, or null. */
+	let chainHop: number | null = null;
 	/** Session messages the user is waiting on right now, so typing is claimed only while one is out. */
 	let sendsInFlight = 0;
 	let sendingTicks = 0;
@@ -1457,6 +1535,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			summary: lastSummary,
 			summaryAt: lastSummaryAt,
 			heartbeat: sessionAlive ? Date.now() : 0,
+			messaging: AGENT_PROTOCOL,
 		};
 		writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(record), 0o600);
 	}
@@ -1519,6 +1598,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				summary: text(raw.summary),
 				summaryAt: count(raw.summaryAt),
 				heartbeat: count(raw.heartbeat),
+				messaging: count(raw.messaging),
 			};
 		} catch {
 			return null;
@@ -3687,6 +3767,28 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					pi.logger.warn("notify-telegram: discarded a malformed redo entry", { name, raw: clip(raw, 200) });
 					continue;
 				}
+				// Another session wrote this, so it answers no question, owes no Telegram reply and steals
+				// no tmux focus. `sendMessage` stays out of the prompt flow and fires no `input`.
+				if (entry.kind === "agent") {
+					rmSync(processing, { force: true });
+					const message = agentMessageOf(entry);
+					if (message === null) {
+						pi.logger.warn("notify-telegram: discarded a malformed agent message", { name, raw: clip(raw, 200) });
+						continue;
+					}
+					chainHop = Math.max(chainHop ?? 0, message.hop);
+					pi.sendMessage(
+						{
+							customType: AGENT_MESSAGE_TYPE,
+							content: agentMessageText(message),
+							display: true,
+							attribution: "agent",
+							details: { id: message.id, hop: message.hop, replyTo: message.replyTo, from: message.from },
+						},
+						{ deliverAs: "aside", triggerTurn: true },
+					);
+					continue;
+				}
 				if (entry.kind !== "redo") rmSync(processing, { force: true });
 				// A reply or an answer means attention is on this session: put its window in front for the return.
 				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
@@ -4205,6 +4307,121 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					(taken.length === 0 ? "" : ` Held by other live sessions and therefore refused: ${taken}.`),
 			},
 		};
+	});
+
+	pi.registerTool({
+		name: "session_message",
+		label: "Session Message",
+		description: `Message another live omp session on this machine, addressed by the badge emoji it shows in Telegram, or by its tag when it has none. Call it with no \`to\` to list the live sessions with their badge, tag, state and folder. With \`to\` and \`text\`, the message reaches that session's agent at its next step without interrupting its tool calls, and wakes it when idle. Every message gets an \`id\`, and an answer passes it as \`reply_to\`. A chain of messages without a user prompt ends after ${AGENT_MAX_HOPS} hops and a send beyond that is refused, so report to your user instead of relaying further. Each message costs its recipient a turn, so send questions, answers and handoffs, never acknowledgements. \`text\` holds at most ${AGENT_TEXT_MAX} characters. For longer content, write a file and send its path.`,
+		approval: "read",
+		parameters: z.object({
+			to: z.string().optional(),
+			text: z.string().optional(),
+			reply_to: z.string().optional(),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (config === null) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: "Session messaging rides the omp-telegram session registry, which starts only once the bot is paired with `node setup.mjs`.",
+						},
+					],
+					details: { sent: false },
+					isError: true,
+				};
+			}
+			const p = params as { to?: unknown; text?: unknown; reply_to?: unknown };
+			const to = typeof p.to === "string" ? p.to.trim() : "";
+			const text = typeof p.text === "string" ? p.text.trim() : "";
+			const replyTo = typeof p.reply_to === "string" && p.reply_to.trim().length > 0 ? p.reply_to.trim() : undefined;
+			const live = allRecords().filter(
+				({ id, record }) => id !== sessionId && Date.now() - record.heartbeat <= LOCK_STALE_MS,
+			);
+			const peers =
+				live.length === 0
+					? "No other omp session is live."
+					: `Live sessions:\n${live
+							.map(
+								({ record }) =>
+									`${badgeOf(record)} \u2014 tag ${record.tag} \u2014 ${record.state.length > 0 ? record.state : "idle"} \u2014 ${record.cwd}`,
+							)
+							.join("\n")}`;
+			const refuse = (reason: string) => ({
+				content: [{ type: "text" as const, text: reason }],
+				details: { sent: false },
+				isError: true,
+			});
+			if (to.length === 0) {
+				if (text.length > 0) return refuse(`Name the recipient in \`to\` by its badge emoji or tag. ${peers}`);
+				return {
+					content: [{ type: "text" as const, text: `This session is ${badge(ctx)}.\n${peers}` }],
+					details: {
+						peers: live.map(({ record }) => ({
+							emoji: record.emoji,
+							tag: record.tag,
+							label: record.label,
+							cwd: record.cwd,
+							state: record.state,
+						})),
+					},
+				};
+			}
+			if ((badgeEmoji.length > 0 && to === badgeEmoji) || to === sessionTag) {
+				return refuse(`${to} is this session's own address. ${peers}`);
+			}
+			const target =
+				live.find(({ record }) => record.emoji.length > 0 && record.emoji === to) ??
+				live.find(({ record }) => record.tag === to);
+			if (target === undefined) return refuse(`No live session shows ${to}. ${peers}`);
+			if (target.record.messaging < AGENT_PROTOCOL) {
+				return refuse(
+					`${badgeOf(target.record)} runs an omp-telegram without session messaging and would read the message as user input. It can receive messages after a restart.`,
+				);
+			}
+			if (text.length === 0) return refuse("The message is empty. Put its body in `text`.");
+			if (text.length > AGENT_TEXT_MAX) {
+				return refuse(
+					`The message has ${text.length} characters and the limit is ${AGENT_TEXT_MAX}. Write it to a file and send the path.`,
+				);
+			}
+			if (replyTo !== undefined && !AGENT_MESSAGE_ID.test(replyTo)) {
+				return refuse(`"${replyTo}" is not a message id. Pass the id of the message this answers.`);
+			}
+			const hop = (chainHop ?? 0) + 1;
+			if (hop > AGENT_MAX_HOPS) {
+				return refuse(
+					`This message would be hop ${hop} of a chain limited to ${AGENT_MAX_HOPS} without a user prompt, so it was not sent. Report to your user instead.`,
+				);
+			}
+			const id = randomUUID().replaceAll("-", "").slice(0, 12);
+			const entry: InboxEntry = {
+				kind: "agent",
+				value: text,
+				id,
+				hop,
+				agentReplyTo: replyTo,
+				from: { session: sessionId, emoji: badgeEmoji, label: taskName(ctx), cwd: ctx.cwd, tag: sessionTag },
+			};
+			const dir = join(INBOX_DIR, target.id);
+			mkdirSync(dir, { recursive: true, mode: 0o700 });
+			const file = join(dir, `${Date.now()}-${id}.json`);
+			writeFileAtomic(file, JSON.stringify(entry), 0o600);
+			const delivered = await awaitDrain(file, signal);
+			const recipient = badgeOf(target.record);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: delivered
+							? `Delivered message ${id} to ${recipient}, hop ${hop} of ${AGENT_MAX_HOPS}. An answer arrives here as a new message quoting ${id}.`
+							: `Message ${id} is queued for ${recipient}, which has not picked it up within ${AGENT_DELIVERY_WAIT_MS / 1000} s. It arrives when that session next drains its inbox and is lost if the session ends first.`,
+					},
+				],
+				details: { sent: true, delivered, id, hop, to },
+			};
+		},
 	});
 
 	/** Multipart upload for outbound files; JSON callTelegram cannot carry bytes. */
@@ -4781,6 +4998,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	pi.on("input", async (_event, ctx) => {
 		turnSummary = null;
+		chainHop = null;
 		statusBlockUsed = false;
 		unpinRed(ctx);
 		closeReplyQuestion();
