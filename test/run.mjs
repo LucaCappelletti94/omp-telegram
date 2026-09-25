@@ -8104,6 +8104,10 @@ heading("session_message between live sessions");
 	check("the message is shown in the transcript", arrived.message.display === true);
 	check("the message is attributed to an agent", arrived.message.attribution === "agent");
 	check(
+		"the reply instruction names the sender's stable tag, which a later badge change cannot reroute",
+		arrived.message.content.includes(`to "${record(a.id).tag}"`),
+	);
+	check(
 		"the delivered text names the sender badge, the id and the body",
 		arrived.message.content.includes(parrot) &&
 			arrived.message.content.includes(firstId) &&

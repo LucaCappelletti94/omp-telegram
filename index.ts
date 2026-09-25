@@ -471,7 +471,7 @@ interface AgentSender {
 	emoji: string;
 	label: string;
 	cwd: string;
-	/** Reply address when `emoji` is empty. */
+	/** Reply address, stable while the badge emoji can change or pass to another session. */
 	tag: string;
 }
 
@@ -587,14 +587,14 @@ function agentMessageOf(entry: Partial<InboxEntry>): AgentMessage | null {
 
 /** What the recipient's model reads: who wrote, where the chain stands, and how to answer. */
 function agentMessageText(message: AgentMessage): string {
-	const address = message.from.emoji.length > 0 ? message.from.emoji : message.from.tag;
-	const sender = message.from.label.length > 0 ? `${address} ${message.from.label}` : address;
+	const shown = message.from.emoji.length > 0 ? `${message.from.emoji} (tag ${message.from.tag})` : message.from.tag;
+	const sender = message.from.label.length > 0 ? `${shown} ${message.from.label}` : shown;
 	const answering = message.replyTo === undefined ? "" : `, answering your message ${message.replyTo}`;
 	const head = `Message ${message.id} from the agent of the omp session ${sender} in ${message.from.cwd}${answering}, written by that agent and never by your user. Hop ${message.hop} of ${AGENT_MAX_HOPS}.`;
 	const tail =
 		message.hop >= AGENT_MAX_HOPS
 			? "This is the last hop of the chain, so do not answer with session_message. Tell your user if it matters."
-			: `To answer, call session_message with to "${address}" and reply_to "${message.id}". Every message costs its recipient a turn, so skip acknowledgements.`;
+			: `To answer, call session_message with to "${message.from.tag}" and reply_to "${message.id}". Every message costs its recipient a turn, so skip acknowledgements.`;
 	return `${head}\n\n${message.text}\n\n${tail}`;
 }
 
