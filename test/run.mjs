@@ -7570,6 +7570,30 @@ esac
 	check("launch reports the new tmux window", ownResult.details?.windowId === "@42");
 	check("launch notifies Telegram it opened", lastCall("sendMessage").body.text.includes("Upstream launched"));
 	check("case a neither lists nor creates a fork", !readFileSync(ghLog, "utf8").includes("forks"));
+	check(
+		"the launching session gets a node so its dependency can reach it",
+		existsSync(join(root, "notify-telegram/graph/nodes", `${up.id}.json`)),
+	);
+	const launchesDir = join(root, "notify-telegram/graph/launches");
+	const launchFiles = () =>
+		existsSync(launchesDir) ? readdirSync(launchesDir).filter((f) => f.endsWith(".json")) : [];
+	const ownLaunches = launchFiles().map((f) => JSON.parse(readFileSync(join(launchesDir, f), "utf8")));
+	const ownLaunch = ownLaunches.find((l) => l.repo === "LucaCappelletti94/dep");
+	check(
+		"launch records its parent, target and branch for the child to claim",
+		ownLaunch?.parent === up.id &&
+			ownLaunch.branch === "upstream/it-rejects-valid-x" &&
+			ownLaunch.problem === "It rejects valid X.",
+	);
+	check(
+		"the child window carries the launch id in its environment",
+		readFileSync(tmuxLog, "utf8").includes(`-e OMP_TELEGRAM_LAUNCH=${ownLaunch?.id}`),
+	);
+	check("the kickoff names the parent session to send doubts to", readFileSync(tmuxLog, "utf8").includes(up.id));
+	check(
+		"the launch file is private",
+		ownLaunch !== undefined && (statSync(join(launchesDir, `${ownLaunch.id}.json`)).mode & 0o077) === 0,
+	);
 
 	// b. A third-party repository with no fork yet: the fork is created, under whatever name GitHub gave it.
 	process.env.GH_FORK_CREATED = "LucaCappelletti94/widget-1";
@@ -7602,6 +7626,13 @@ esac
 	check(
 		"the created fork's worktree holds the request",
 		existsSync(join(root, "github", "widget.upstreams", "widget-mis-encodes-y", "upstream", "request.md")),
+	);
+	const forkLaunch = launchFiles()
+		.map((f) => JSON.parse(readFileSync(join(launchesDir, f), "utf8")))
+		.find((l) => l.repo === "someorg/widget");
+	check(
+		"a fork launch records the head as owner:branch",
+		forkLaunch?.branch === "LucaCappelletti94:upstream/widget-mis-encodes-y",
 	);
 	delete process.env.GH_FORK_CREATED;
 
@@ -7793,6 +7824,12 @@ esac
 	});
 	check("a failed tmux window rolls the launch back and reports it", rolledBack.isError === true);
 	check("the rolled-back worktree is gone", !existsSync(join(root, "github", "rollback.upstreams", "p")));
+	check(
+		"a rolled-back launch leaves no launch record",
+		!launchFiles().some(
+			(f) => JSON.parse(readFileSync(join(launchesDir, f), "utf8")).repo === "LucaCappelletti94/rollback",
+		),
+	);
 
 	// m. A fork named differently from its parent is found by its parent and used by its real name.
 	freshLogs();
@@ -8262,6 +8299,584 @@ heading("session_message between live sessions");
 	check("a session whose heartbeat went stale is not addressable", stale.isError === true);
 
 	for (const s of [a, b, c]) await s.fire("session_shutdown");
+}
+
+heading("dependency graph across sessions");
+{
+	const graphDir = join(root, "notify-telegram/graph");
+	rmSync(graphDir, { recursive: true, force: true });
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const savedPath = process.env.PATH;
+	const gBin = join(root, "graph-bin");
+	mkdirSync(gBin, { recursive: true });
+	const ghLog = join(root, "graph-gh.log");
+	const tmuxLog = join(root, "graph-tmux.log");
+	const mmdcLog = join(root, "graph-mmdc.log");
+	const prJson = join(root, "graph-pr.json");
+	for (const log of [ghLog, tmuxLog, mmdcLog]) writeFileSync(log, "");
+	writeFileSync(
+		join(gBin, "gh"),
+		`#!/bin/sh\necho "$*" >> ${ghLog}\ncase "$1 $2" in\n  "pr view") cat ${prJson} ;;\n  "pr list") printf '%s' "$GRAPH_PR_LIST" ;;\n  *) exit 1 ;;\nesac\n`,
+		{ mode: 0o755 },
+	);
+	writeFileSync(
+		join(gBin, "tmux"),
+		`#!/bin/sh\necho "$*" >> ${tmuxLog}\ncase "$1" in\n  display-message) echo work ;;\n  has-session) exit 0 ;;\n  new-window) echo @77 ;;\nesac\n`,
+		{ mode: 0o755 },
+	);
+	const onePixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+	const mmdcScript = `#!/bin/sh\necho "$*" >> ${mmdcLog}\nout=""; in=""; prev=""\nfor a in "$@"; do [ "$prev" = "-o" ] && out="$a"; [ "$prev" = "-i" ] && in="$a"; prev="$a"; done\ncat "$in" >> ${mmdcLog}\nprintf '%s' '${onePixel}' | base64 -d > "$out"\n`;
+	writeFileSync(join(gBin, "mmdc"), mmdcScript, { mode: 0o755 });
+	process.env.PATH = `${gBin}:${savedPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	process.env.TMUX_PANE = "%9";
+	process.env.GRAPH_PR_LIST = "[]";
+
+	const parentId = "0c1a0001-0000-7000-8000-00000000000a";
+	const waiterId = "0c1a0002-0000-7000-8000-00000000000b";
+	const followerId = "0c1a0003-0000-7000-8000-00000000000c";
+	const childId = "0c1a0004-0000-7000-8000-00000000000d";
+	const nodeFile = (id) => join(graphDir, "nodes", `${id}.json`);
+	const nodeOf = (id) => JSON.parse(readFileSync(nodeFile(id), "utf8"));
+	const pendingOf = (id) =>
+		existsSync(join(graphDir, "pending", id))
+			? readdirSync(join(graphDir, "pending", id)).filter((f) => f.endsWith(".json") && f !== "card.json")
+			: [];
+	const graph = (s, args) => s.tools.get("session_graph").execute("g", args, undefined, undefined, s.ctx);
+	const text = (result) => result.content[0].text;
+	const beatAll = (...sessions) => {
+		for (const s of sessions) s.heartbeat();
+	};
+
+	const appDir = join(root, "work-app");
+	mkdirSync(appDir, { recursive: true });
+	const parent = spawn(parentId, appDir);
+	await parent.fire("session_start");
+	check("session_graph is registered", parent.tools.has("session_graph"));
+	const parentStatus = await graph(parent, { action: "status", status: "waiting", note: "on the widget fix" });
+	check("a session records its own status", parentStatus.isError !== true && nodeOf(parentId).status === "waiting");
+
+	const launchId = "0c1a1a00-0000-7000-8000-000000000001";
+	mkdirSync(join(graphDir, "launches"), { recursive: true });
+	writeFileSync(
+		join(graphDir, "launches", `${launchId}.json`),
+		JSON.stringify({
+			id: launchId,
+			parent: parentId,
+			repo: "someorg/widget",
+			branch: "LucaCappelletti94:upstream/fix-y",
+			problem: "Widget mis-encodes Y.",
+			worktree: "/home/dev/widget.upstreams/fix-y",
+			at: Date.now(),
+		}),
+	);
+	process.env.OMP_TELEGRAM_LAUNCH = launchId;
+	const child = spawn(childId, "/home/dev/widget.upstreams/fix-y");
+	await child.fire("session_start");
+	const childNode = nodeOf(childId);
+	check(
+		"a child claims its launch into a node with an upstream edge from its parent",
+		childNode.edges.some((e) => e.type === "upstream" && e.from === parentId && e.to === childId) &&
+			childNode.repo === "someorg/widget" &&
+			childNode.branch === "LucaCappelletti94:upstream/fix-y",
+	);
+	check("the child's node is labelled by the problem", childNode.label.includes("Widget mis-encodes Y"));
+	check("the claimed launch record is gone", !existsSync(join(graphDir, "launches", `${launchId}.json`)));
+	check("a claim clears the launch id from the environment", process.env.OMP_TELEGRAM_LAUNCH === undefined);
+	check("the node records how to relaunch the session", Array.isArray(childNode.launch?.argv));
+	check("a node file is private", (statSync(nodeFile(childId)).mode & 0o077) === 0);
+
+	const waiter = spawn(waiterId, "/home/dev/work/web");
+	await waiter.fire("session_start");
+	const follower = spawn(followerId, "/home/dev/work/docs");
+	await follower.fire("session_start");
+	const linked = await graph(waiter, { action: "link", type: "waits-on", to: childId.slice(0, 8) });
+	check("a session declares that it waits on another by session id prefix", linked.isError !== true);
+	const followed = await graph(follower, { action: "link", type: "follows-up", to: record(childId).tag });
+	check("a session declares a follow-up by tag", followed.isError !== true);
+	check(
+		"an upstream edge can only come from a launch",
+		(await graph(waiter, { action: "link", type: "upstream", to: childId.slice(0, 8) })).isError === true,
+	);
+	check(
+		"a link to an unknown session is refused",
+		(await graph(waiter, { action: "link", type: "waits-on", to: "ffffffff" })).isError === true,
+	);
+	check(
+		"a session cannot depend on itself",
+		(await graph(waiter, { action: "link", type: "waits-on", to: waiterId.slice(0, 8) })).isError === true,
+	);
+
+	const loop = await graph(child, { action: "link", type: "waits-on", to: waiterId.slice(0, 8) });
+	check(
+		"a blocking link that would close a loop is refused with the loop named",
+		loop.isError === true && text(loop).includes(waiterId) && !nodeOf(childId).edges.some((e) => e.to === waiterId),
+	);
+	check(
+		"a non-blocking link may point back along a loop",
+		(await graph(child, { action: "link", type: "related", to: waiterId.slice(0, 8) })).isError !== true,
+	);
+	await graph(child, { action: "unlink", type: "related", to: waiterId.slice(0, 8) });
+
+	const parentView = text(await graph(parent, {}));
+	check(
+		"show lists what a session waits on, with the edge and its status",
+		parentView.includes("Widget mis-encodes Y") && parentView.includes("upstream") && parentView.includes("working"),
+	);
+	const childView = text(await graph(child, {}));
+	check(
+		"show lists who waits on a session",
+		childView.includes(parentId.slice(0, 8)) &&
+			childView.includes(waiterId.slice(0, 8)) &&
+			childView.includes("follows up"),
+	);
+	const found = text(await graph(waiter, { action: "find", query: "WIDGET" }));
+	check("find matches a node by repository, case-insensitively", found.includes(childId));
+
+	await graph(child, { action: "status", status: "blocked", note: "asking Luca" });
+	for (const s of [parent, waiter, follower]) await s.pump(120);
+	check("a status that is not an outcome wakes nobody", parent.customs.length === 0 && waiter.customs.length === 0);
+	check("an unknown status is refused", (await graph(child, { action: "status", status: "shipped" })).isError === true);
+	check(
+		"a PR link that is not a GitHub pull request is refused",
+		(await graph(child, { action: "status", status: "working", pr: "https://example.com/x" })).isError === true,
+	);
+
+	await graph(child, { action: "status", status: "pushed" });
+	for (const s of [parent, waiter, follower]) await s.pump(150);
+	const pushed = parent.customs.at(-1);
+	check(
+		"an outcome reaches the upstream parent as an aside that wakes it",
+		parent.customs.length === 1 &&
+			pushed.options.deliverAs === "aside" &&
+			pushed.options.triggerTurn === true &&
+			pushed.message.customType === "omp-telegram.dependency",
+	);
+	check(
+		"the outcome names the dependency and what happened",
+		pushed.message.content.includes("Widget mis-encodes Y") && pushed.message.content.includes("pushed"),
+	);
+	check("a waits-on dependent is woken too", waiter.customs.length === 1);
+	check("a follow-up session is not woken", follower.customs.length === 0);
+	check("a delivered outcome leaves nothing pending", pendingOf(parentId).length === 0);
+	await graph(child, { action: "status", status: "pushed" });
+	for (const s of [parent, waiter]) await s.pump(120);
+	check("repeating an outcome status sends nothing twice", parent.customs.length === 1 && waiter.customs.length === 1);
+
+	// The poller finds the PR from the recorded head branch.
+	writeFileSync(
+		prJson,
+		JSON.stringify({
+			state: "OPEN",
+			isDraft: false,
+			reviewDecision: "",
+			latestReviews: [],
+			statusCheckRollup: [],
+			url: "https://github.com/someorg/widget/pull/5",
+			number: 5,
+		}),
+	);
+	process.env.GRAPH_PR_LIST = JSON.stringify([
+		{ number: 5, url: "https://github.com/someorg/widget/pull/5", headRepositoryOwner: { login: "LucaCappelletti94" } },
+	]);
+	jump(10 * 60_000 + 1_000);
+	beatAll(parent, waiter, follower, child);
+	await settle(400);
+	for (const s of [parent, waiter]) await s.pump(150);
+	check(
+		"the poller looks the PR up by its head branch on the target",
+		readFileSync(ghLog, "utf8").includes("pr list --repo someorg/widget --head upstream/fix-y"),
+	);
+	const prRecord = JSON.parse(readFileSync(join(graphDir, "pr", `${childId}.json`), "utf8"));
+	check("the PR state is recorded", prRecord.state === "pr-open" && prRecord.number === 5);
+	check(
+		"a PR first seen open wakes the dependents with its link",
+		parent.customs.at(-1).message.content.includes("pull/5") && waiter.customs.length === 2,
+	);
+
+	writeFileSync(
+		prJson,
+		JSON.stringify({ ...JSON.parse(readFileSync(prJson, "utf8")), reviewDecision: "CHANGES_REQUESTED" }),
+	);
+	jump(10 * 60_000 + 1_000);
+	beatAll(parent, waiter, follower, child);
+	await settle(400);
+	for (const s of [parent, waiter]) await s.pump(150);
+	check(
+		"requested changes update the ledger without waking anyone",
+		JSON.parse(readFileSync(join(graphDir, "pr", `${childId}.json`), "utf8")).state === "changes-requested" &&
+			parent.customs.length === 2,
+	);
+
+	// The parent ends before the merge, so the merge is held for it and a resume card goes out.
+	await parent.fire("session_shutdown");
+	writeFileSync(prJson, JSON.stringify({ ...JSON.parse(readFileSync(prJson, "utf8")), state: "MERGED" }));
+	jump(10 * 60_000 + 1_000);
+	beatAll(waiter, follower, child);
+	await settle(400);
+	await waiter.pump(150);
+	check("the merge reaches the live waiter", waiter.customs.at(-1).message.content.includes("merged"));
+	check("the merge is held for the ended parent", pendingOf(parentId).length === 1);
+	const cardCalls = () =>
+		called("sendMessage").filter((c) =>
+			c.body.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data === `r:${parentId}`),
+		);
+	const card = cardCalls()[0];
+	check("an outcome for an ended session raises a resume card", cardCalls().length === 1);
+	check(
+		"the card offers Later beside Resume",
+		card?.body.reply_markup.inline_keyboard.flat().some((b) => b.callback_data === `l:${parentId}`) === true,
+	);
+	check("the card names what is waiting", card?.body.text.includes("merged") === true);
+	jump(10 * 60_000 + 1_000);
+	beatAll(waiter, follower, child);
+	await settle(400);
+	check("a repeated poll holds nothing twice", pendingOf(parentId).length === 1 && cardCalls().length === 1);
+
+	const editsBefore = called("editMessageText").length;
+	const heldSend = await child.tools
+		.get("session_message")
+		.execute("m", { to: parentId, text: "Is Z acceptable?" }, undefined, undefined, child.ctx);
+	await settle(150);
+	check("a message to an ended node is held and says so", heldSend.details?.held === true && heldSend.isError !== true);
+	check(
+		"a second held item edits the open card instead of sending another",
+		cardCalls().length === 1 && called("editMessageText").length > editsBefore,
+	);
+
+	const cardId = 424242;
+	api.queued = [
+		{
+			update_id: 9101,
+			callback_query: {
+				id: "gl",
+				data: `l:${parentId}`,
+				from: { id: CHAT },
+				message: { message_id: cardId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await waiter.pump(250);
+	check(
+		"Later keeps the items and marks the card held",
+		pendingOf(parentId).length === 2 && lastCall("editMessageText").body.text.includes("held"),
+	);
+
+	api.queued = [{ update_id: 9102, message: { message_id: 902, date: 1, chat: { id: CHAT }, text: "/resume" } }];
+	await waiter.pump(250);
+	check(
+		"/resume lists ended sessions with waiting items as buttons",
+		lastCall("sendMessage")
+			.body.reply_markup?.inline_keyboard?.flat()
+			.some((b) => b.callback_data === `r:${parentId}`) === true,
+	);
+
+	renameSync(appDir, `${appDir}-gone`);
+	writeFileSync(tmuxLog, "");
+	api.queued = [
+		{
+			update_id: 9111,
+			callback_query: {
+				id: "grg",
+				data: `r:${parentId}`,
+				from: { id: CHAT },
+				message: { message_id: cardId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await waiter.pump(250);
+	check(
+		"Resume on a session whose folder is gone opens nothing and names the folder",
+		!readFileSync(tmuxLog, "utf8").includes("new-window") && lastCall("answerCallbackQuery").body.text.includes(appDir),
+	);
+	renameSync(`${appDir}-gone`, appDir);
+
+	writeFileSync(tmuxLog, "");
+	api.queued = [
+		{
+			update_id: 9103,
+			callback_query: {
+				id: "gr",
+				data: `r:${parentId}`,
+				from: { id: CHAT },
+				message: { message_id: cardId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await waiter.pump(300);
+	const resumed = readFileSync(tmuxLog, "utf8");
+	check(
+		"Resume opens a tmux window in the session's folder that resumes it",
+		resumed.includes("new-window") && resumed.includes(`-c ${appDir}`) && resumed.includes(`--resume ${parentId}`),
+	);
+	check("Resume targets the tmux session the node started in", resumed.includes("-t work:"));
+	check("the card says the session is resuming", lastCall("editMessageText").body.text.includes("Resuming"));
+	writeFileSync(tmuxLog, "");
+	api.queued = [
+		{
+			update_id: 9108,
+			callback_query: {
+				id: "gr1",
+				data: `r:${parentId}`,
+				from: { id: CHAT },
+				message: { message_id: cardId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await waiter.pump(250);
+	check(
+		"a second Resume tap while the session starts opens no second window",
+		!readFileSync(tmuxLog, "utf8").includes("new-window") &&
+			lastCall("answerCallbackQuery").body.text.includes("already starting"),
+	);
+
+	api.queued = [
+		{
+			update_id: 9104,
+			callback_query: {
+				id: "gr2",
+				data: `r:${waiterId}`,
+				from: { id: CHAT },
+				message: { message_id: 5, chat: { id: CHAT } },
+			},
+		},
+	];
+	writeFileSync(tmuxLog, "");
+	await waiter.pump(250);
+	check(
+		"Resume on a live session opens nothing and says it is running",
+		!readFileSync(tmuxLog, "utf8").includes("new-window") &&
+			lastCall("answerCallbackQuery").body.text.includes("already running"),
+	);
+
+	// An imported worktree whose session never existed has nothing to resume.
+	const orphan = "import-widget-fix-z";
+	writeFileSync(
+		nodeFile(orphan),
+		JSON.stringify({
+			session: orphan,
+			label: "Widget fix Z",
+			emoji: "",
+			tag: "",
+			cwd: "/home/dev/widget.upstreams/fix-z",
+			status: "pushed",
+			note: "",
+			edges: [],
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+		}),
+	);
+	writeFileSync(tmuxLog, "");
+	api.queued = [
+		{
+			update_id: 9109,
+			callback_query: {
+				id: "gro",
+				data: `r:${orphan}`,
+				from: { id: CHAT },
+				message: { message_id: 6, chat: { id: CHAT } },
+			},
+		},
+	];
+	await waiter.pump(250);
+	check(
+		"Resume on a node with no omp session behind it opens nothing and says why",
+		!readFileSync(tmuxLog, "utf8").includes("new-window") &&
+			lastCall("answerCallbackQuery").body.text.includes("no omp session"),
+	);
+	rmSync(nodeFile(orphan));
+
+	mkdirSync(join(graphDir, "pending", parentId), { recursive: true });
+	writeFileSync(join(graphDir, "pending", parentId, "z-bad.json"), "{not json");
+	const back = spawn(parentId, appDir);
+	await back.fire("session_start");
+	await back.pump(200);
+	check(
+		"a resumed session receives what was held, in order",
+		back.customs.length === 2 &&
+			back.customs[0].message.content.includes("merged") &&
+			back.customs[1].message.content.includes("Is Z acceptable?"),
+	);
+	check("a held agent message keeps its agent attribution", back.customs[1].message.attribution === "agent");
+	check("a malformed held item is discarded with a warning", back.warns.length > 0 && pendingOf(parentId).length === 0);
+	check("the card says the items were delivered", lastCall("editMessageText").body.text.includes("Delivered"));
+
+	// A launch nobody claimed shows as never started.
+	writeFileSync(
+		join(graphDir, "launches", "0c1a1a00-0000-7000-8000-000000000002.json"),
+		JSON.stringify({
+			id: "0c1a1a00-0000-7000-8000-000000000002",
+			parent: "0c1a0009-0000-7000-8000-000000000009",
+			repo: "someorg/gizmo",
+			branch: "upstream/g",
+			problem: "Gizmo leaks.",
+			worktree: "/home/dev/gizmo.upstreams/g",
+			at: Date.now() - 2 * 3_600_000,
+		}),
+	);
+	const photosBefore = called("sendPhoto").length;
+	api.queued = [{ update_id: 9105, message: { message_id: 903, date: 1, chat: { id: CHAT }, text: "/deps" } }];
+	await waiter.pump(600);
+	check("/deps sends the rendered diagram as a photo", called("sendPhoto").length === photosBefore + 1);
+	const diagram = readFileSync(mmdcLog, "utf8");
+	check(
+		"the diagram holds the nodes and typed edges",
+		diagram.includes("Widget mis-encodes Y") && diagram.includes("==>|upstream|") && diagram.includes("-->|waits on|"),
+	);
+	const listing = lastCall("sendMessage").body.text;
+	check("/deps follows with the status list and PR links", listing.includes("merged") && listing.includes("pull/5"));
+	check(
+		"an unclaimed launch shows as never started",
+		listing.includes("Gizmo leaks") && listing.includes("not-started"),
+	);
+
+	// A long ledger is split across messages rather than cut.
+	const bulk = Array.from({ length: 60 }, (_, i) => `0c1ab${String(i).padStart(3, "0")}-0000-7000-8000-000000000000`);
+	for (const [i, id] of bulk.entries()) {
+		writeFileSync(
+			nodeFile(id),
+			JSON.stringify({
+				session: id,
+				label: `Bulk task number ${i} with a fairly long descriptive label`,
+				emoji: "",
+				tag: "",
+				cwd: `/home/dev/bulk/${i}`,
+				repo: `someorg/bulk-repository-${i}`,
+				status: "working",
+				note: "",
+				edges: [],
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			}),
+		);
+	}
+	const sendsBefore = called("sendMessage").length;
+	api.queued = [{ update_id: 9110, message: { message_id: 906, date: 1, chat: { id: CHAT }, text: "/deps bulk" } }];
+	await waiter.pump(800);
+	const bulkTexts = called("sendMessage")
+		.slice(sendsBefore)
+		.map((c) => c.body.text);
+	check(
+		"a status list too long for one message is split across several with nothing cut",
+		bulkTexts.length > 1 &&
+			bulkTexts.every((t) => t.length <= 4096) &&
+			bulk.every((_, i) => bulkTexts.some((t) => t.includes(`Bulk task number ${i} with`))),
+	);
+	for (const id of bulk) rmSync(nodeFile(id));
+
+	writeFileSync(mmdcLog, "");
+	api.queued = [{ update_id: 9106, message: { message_id: 904, date: 1, chat: { id: CHAT }, text: "/deps gizmo" } }];
+	await waiter.pump(600);
+	check(
+		"a /deps filter keeps only the matching component",
+		readFileSync(mmdcLog, "utf8").includes("Gizmo leaks") &&
+			!readFileSync(mmdcLog, "utf8").includes("Widget mis-encodes Y"),
+	);
+
+	// A PATH with no mmdc anywhere, so an installed one on this machine cannot answer.
+	rmSync(join(gBin, "mmdc"));
+	process.env.PATH = `${gBin}:/usr/bin:/bin`;
+	const photosBeforeMissing = called("sendPhoto").length;
+	api.queued = [{ update_id: 9107, message: { message_id: 905, date: 1, chat: { id: CHAT }, text: "/deps" } }];
+	await waiter.pump(400);
+	process.env.PATH = `${gBin}:${savedPath}`;
+	check(
+		"without mmdc /deps still sends the list and says why there is no diagram",
+		called("sendPhoto").length === photosBeforeMissing && lastCall("sendMessage").body.text.includes("mmdc"),
+	);
+
+	const unlinked = await graph(follower, { action: "unlink", type: "follows-up", to: childId.slice(0, 8) });
+	check(
+		"unlink removes the declared edge",
+		unlinked.isError !== true && !nodeOf(followerId).edges.some((e) => e.to === childId),
+	);
+
+	// A card that Telegram refused is sent again with the next held item rather than edited into nothing.
+	const quietId = "0c1a0005-0000-7000-8000-000000000005";
+	writeFileSync(
+		nodeFile(quietId),
+		JSON.stringify({
+			session: quietId,
+			label: "quiet ended session",
+			emoji: "",
+			tag: "",
+			cwd: appDir,
+			status: "waiting",
+			note: "",
+			edges: [],
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+			launch: { argv: [], tmuxSession: "" },
+		}),
+	);
+	const quietCards = () =>
+		called("sendMessage").filter((c) =>
+			c.body.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data === `r:${quietId}`),
+		).length;
+	const sendQuiet = (body) =>
+		waiter.tools.get("session_message").execute("q", { to: quietId, text: body }, undefined, undefined, waiter.ctx);
+	api.failMethods = ["sendMessage"];
+	await sendQuiet("first try");
+	await settle(150);
+	api.failMethods = [];
+	const cardsAfterFailure = quietCards();
+	await sendQuiet("second try");
+	await settle(150);
+	check(
+		"a resume card Telegram refused is sent with the next held item",
+		quietCards() === cardsAfterFailure + 1 && pendingOf(quietId).length === 2,
+	);
+	rmSync(nodeFile(quietId));
+	rmSync(join(graphDir, "pending", quietId), { recursive: true, force: true });
+
+	// A pull request gh cannot read keeps its last known state and wakes nobody.
+	await graph(follower, { action: "status", status: "working", pr: "https://github.com/someorg/docs/pull/9" });
+	writeFileSync(prJson, "not json");
+	const waiterWarns = waiter.warns.length;
+	const waiterCustoms = waiter.customs.length;
+	jump(10 * 60_000 + 1_000);
+	beatAll(waiter, follower, back);
+	await settle(400);
+	await waiter.pump(150);
+	check(
+		"an unreadable pull request is logged, recorded as nothing and wakes nobody",
+		!existsSync(join(graphDir, "pr", `${followerId}.json`)) &&
+			waiter.warns.slice(waiterWarns).some((w) => w.m.includes("could not read a pull request")) &&
+			waiter.customs.length === waiterCustoms,
+	);
+
+	check(
+		"unlinking an edge the session never declared is refused",
+		(await graph(follower, { action: "unlink", type: "related", to: waiterId.slice(0, 8) })).isError === true,
+	);
+
+	// A live session that never wrote a node still shows as the end of an edge, named from its record.
+	const bareId = "0c1a0006-0000-7000-8000-000000000006";
+	const bare = spawn(bareId, join(root, "bare-folder"));
+	await bare.fire("session_start");
+	await graph(waiter, { action: "link", type: "related", to: record(bareId).tag });
+	check(
+		"a linked live session with no node of its own is described from the registry",
+		!existsSync(nodeFile(bareId)) && text(await graph(waiter, {})).includes("bare-folder"),
+	);
+	await graph(waiter, { action: "unlink", type: "related", to: bareId.slice(0, 8) });
+	await bare.fire("session_shutdown");
+
+	// A year later, ended sessions' nodes are pruned and live ones stay.
+	jump(366 * 24 * 3_600_000);
+	beatAll(waiter, back);
+	await settle(400);
+	check(
+		"a year-old node of an ended session is pruned with its PR record",
+		!existsSync(nodeFile(childId)) && !existsSync(join(graphDir, "pr", `${childId}.json`)),
+	);
+	check("a live session's node survives the prune", existsSync(nodeFile(waiterId)));
+
+	for (const s of [back, waiter, follower, child]) await s.fire("session_shutdown");
+	process.env.PATH = savedPath;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+	delete process.env.GRAPH_PR_LIST;
 }
 
 rmSync(root, { recursive: true, force: true });

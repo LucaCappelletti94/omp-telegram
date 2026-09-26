@@ -19,6 +19,28 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
+	AGENT_STATUSES,
+	blockingPath,
+	classifyPr,
+	dependentsOf,
+	displayedStatus,
+	EDGE_TYPES,
+	type EdgeType,
+	type GhPr,
+	GRAPH_RETENTION_MS,
+	type GraphNode,
+	isFinished,
+	type Outcome,
+	outcomeOfPr,
+	outcomeOfStatus,
+	type PrRecord,
+	type PrState,
+	resumeArgs,
+	selectNodes,
+	statusList,
+	toMermaid,
+} from "./graph.ts";
+import {
 	type AskOption,
 	type AskQuestion,
 	badgeLine,
@@ -608,6 +630,297 @@ async function awaitDrain(file: string, signal: AbortSignal | undefined): Promis
 	}
 }
 
+const GRAPH_DIR = join(STATE_DIR, "graph");
+const NODES_DIR = join(GRAPH_DIR, "nodes");
+const PR_DIR = join(GRAPH_DIR, "pr");
+const LAUNCHES_DIR = join(GRAPH_DIR, "launches");
+const PENDING_DIR = join(GRAPH_DIR, "pending");
+const RENDER_DIR = join(GRAPH_DIR, "render");
+const GRAPH_POLL_MS = 10 * 60_000;
+const GRAPH_PRUNE_MS = 24 * 3_600_000;
+/** A launch its child has not claimed within this long is shown as never started. */
+const LAUNCH_STALE_MS = 3_600_000;
+const LAUNCH_ENV = "OMP_TELEGRAM_LAUNCH";
+/** How long a resumed session gets to come live before another Resume tap opens a window again. */
+const RESUME_START_MS = 60_000;
+const DEPENDENCY_MESSAGE_TYPE = "omp-telegram.dependency";
+const MMDC_TIMEOUT_MS = 60_000;
+const PHOTO_MAX_BYTES = 10 * 1024 * 1024;
+/** Below Telegram's 4096 so the entities the HTML adds never push a chunk over. */
+const STATUS_CHUNK_MAX = 3_800;
+/** Telegram shrinks a photo to 2560 pixels on its longer side, which leaves a larger diagram unreadable. */
+const PHOTO_MAX_SIDE = 2560;
+const GITHUB_PR_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/u;
+
+interface LaunchSpec {
+	/** Flags the session started with that a resume repeats, filtered by `resumeArgs`. */
+	argv: string[];
+	tmuxSession: string;
+}
+
+interface LedgerNode extends GraphNode {
+	launch?: LaunchSpec;
+}
+
+interface LaunchRecord {
+	id: string;
+	parent: string;
+	repo: string;
+	branch: string;
+	problem: string;
+	worktree: string;
+	at: number;
+}
+
+type PendingItem =
+	| {
+			kind: "outcome";
+			at: number;
+			outcome: Outcome;
+			source: string;
+			title: string;
+			place: string;
+			edge: EdgeType;
+			link?: string;
+			note?: string;
+	  }
+	| { kind: "message"; at: number; message: AgentMessage };
+
+function readJsonFile(path: string): unknown {
+	try {
+		return JSON.parse(readFileSync(path, "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+function writePrivateJson(dir: string, name: string, value: unknown): void {
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	writeFileAtomic(join(dir, name), JSON.stringify(value), 0o600);
+}
+
+function isEdge(value: unknown): value is GraphNode["edges"][number] {
+	if (value === null || typeof value !== "object") return false;
+	const e = value as Record<string, unknown>;
+	return (
+		isStateToken(e.from) &&
+		isStateToken(e.to) &&
+		(EDGE_TYPES as readonly unknown[]).includes(e.type) &&
+		typeof e.at === "number"
+	);
+}
+
+function parseNode(raw: unknown): LedgerNode | null {
+	if (raw === null || typeof raw !== "object") return null;
+	const n = raw as Record<string, unknown>;
+	const text = (key: string): string => (typeof n[key] === "string" ? (n[key] as string) : "");
+	if (!isStateToken(n.session) || typeof n.status !== "string" || !Array.isArray(n.edges)) return null;
+	if (typeof n.createdAt !== "number" || typeof n.updatedAt !== "number") return null;
+	const launch = n.launch as Partial<LaunchSpec> | undefined;
+	return {
+		session: n.session,
+		label: text("label"),
+		emoji: text("emoji"),
+		tag: text("tag"),
+		cwd: text("cwd"),
+		repo: typeof n.repo === "string" ? n.repo : undefined,
+		branch: typeof n.branch === "string" ? n.branch : undefined,
+		status: n.status as LedgerNode["status"],
+		note: text("note"),
+		pr: typeof n.pr === "string" ? n.pr : undefined,
+		edges: n.edges.filter(isEdge),
+		createdAt: n.createdAt,
+		updatedAt: n.updatedAt,
+		launch:
+			launch !== undefined && Array.isArray(launch.argv) && typeof launch.tmuxSession === "string"
+				? { argv: launch.argv.filter((a): a is string => typeof a === "string"), tmuxSession: launch.tmuxSession }
+				: undefined,
+	};
+}
+
+function readNode(id: string): LedgerNode | null {
+	return isStateToken(id) ? parseNode(readJsonFile(join(NODES_DIR, `${id}.json`))) : null;
+}
+
+function listJson(dir: string): string[] {
+	if (!existsSync(dir)) return [];
+	return readdirSync(dir).filter((entry) => entry.endsWith(".json"));
+}
+
+function allNodes(): LedgerNode[] {
+	return listJson(NODES_DIR)
+		.map((entry) => parseNode(readJsonFile(join(NODES_DIR, entry))))
+		.filter((node): node is LedgerNode => node !== null);
+}
+
+function readPr(id: string): PrRecord | null {
+	const raw = readJsonFile(join(PR_DIR, `${id}.json`)) as Partial<PrRecord> | null;
+	if (raw === null || typeof raw.url !== "string" || typeof raw.state !== "string") return null;
+	return {
+		url: raw.url,
+		number: typeof raw.number === "number" ? raw.number : 0,
+		state: raw.state as PrState,
+		checkedAt: typeof raw.checkedAt === "number" ? raw.checkedAt : 0,
+		changedAt: typeof raw.changedAt === "number" ? raw.changedAt : 0,
+		emitted: Array.isArray(raw.emitted) ? raw.emitted : [],
+	};
+}
+
+function parseLaunch(raw: unknown): LaunchRecord | null {
+	if (raw === null || typeof raw !== "object") return null;
+	const l = raw as Record<string, unknown>;
+	if (!isStateToken(l.id) || !isStateToken(l.parent) || typeof l.at !== "number") return null;
+	for (const key of ["repo", "branch", "problem", "worktree"]) if (typeof l[key] !== "string") return null;
+	return l as unknown as LaunchRecord;
+}
+
+function allLaunches(): LaunchRecord[] {
+	return listJson(LAUNCHES_DIR)
+		.map((entry) => parseLaunch(readJsonFile(join(LAUNCHES_DIR, entry))))
+		.filter((launch): launch is LaunchRecord => launch !== null);
+}
+
+/** An unclaimed launch, drawn as the child it should have become. */
+function launchNode(launch: LaunchRecord, now: number): LedgerNode {
+	return {
+		session: launch.id,
+		label: launch.problem,
+		emoji: "",
+		tag: "",
+		cwd: launch.worktree,
+		repo: launch.repo,
+		branch: launch.branch,
+		status: now - launch.at > LAUNCH_STALE_MS ? "not-started" : "working",
+		note: "",
+		edges: [{ from: launch.parent, to: launch.id, type: "upstream", at: launch.at }],
+		createdAt: launch.at,
+		updatedAt: launch.at,
+	};
+}
+
+function nodeTitle(node: GraphNode): string {
+	const name = node.label.length > 0 ? node.label : node.tag.length > 0 ? node.tag : node.session.slice(0, 8);
+	return node.emoji.length > 0 ? `${node.emoji} ${name}` : name;
+}
+
+function nodePlace(node: GraphNode): string {
+	return (
+		node.repo ??
+		node.cwd
+			.split("/")
+			.filter((part) => part.length > 0)
+			.at(-1) ??
+		node.cwd
+	);
+}
+
+function pendingItemOf(raw: unknown): PendingItem | null {
+	if (raw === null || typeof raw !== "object") return null;
+	const item = raw as Record<string, unknown>;
+	if (typeof item.at !== "number") return null;
+	if (item.kind === "message") {
+		const m = item.message as Record<string, unknown> | undefined;
+		if (m === undefined || m === null) return null;
+		const message = agentMessageOf({
+			id: m.id as string,
+			value: m.text as string,
+			hop: m.hop as number,
+			agentReplyTo: m.replyTo as string | undefined,
+			from: m.from as AgentSender,
+		});
+		return message === null ? null : { kind: "message", at: item.at, message };
+	}
+	if (item.kind !== "outcome") return null;
+	if (!isStateToken(item.source) || typeof item.outcome !== "string" || typeof item.title !== "string") return null;
+	if (typeof item.place !== "string" || !(EDGE_TYPES as readonly unknown[]).includes(item.edge)) return null;
+	return item as unknown as PendingItem;
+}
+
+const OUTCOME_PHRASE: Record<Outcome, string> = {
+	pushed: "pushed its branch and waits for the pull request to be opened",
+	done: "reported its work done",
+	"not-needed": "found that the fix is not needed",
+	abandoned: "was abandoned",
+	"pr-opened": "opened its pull request",
+	merged: "was merged",
+	closed: "closed its pull request without merging",
+};
+
+function outcomeSummary(item: Extract<PendingItem, { kind: "outcome" }>): string {
+	return `${item.title} ${OUTCOME_PHRASE[item.outcome]}`;
+}
+
+/** What the dependent's model reads when a session it depends on reaches an outcome. */
+function outcomeText(item: Extract<PendingItem, { kind: "outcome" }>): string {
+	const lines = [
+		`Automatic dependency update from the session graph, written by no one: ${outcomeSummary(item)} (${item.outcome}). You depend on it through ${item.edge === "upstream" ? "an upstream" : "a waits-on"} edge. It lives in ${item.place}, session ${item.source}.`,
+	];
+	if (item.link !== undefined) lines.push(`Pull request: ${item.link}`);
+	if (item.note !== undefined && item.note.length > 0) lines.push(`Its note: ${item.note}`);
+	lines.push(
+		"Call session_graph for the whole picture. This is a status update, not a message, so there is no one to reply to.",
+	);
+	return lines.join("\n");
+}
+
+/** A PNG's width and height from its IHDR chunk, or null when the bytes are not a PNG. */
+function pngSize(bytes: Uint8Array): { width: number; height: number } | null {
+	if (bytes.length < 24 || bytes[0] !== 0x89 || bytes[1] !== 0x50) return null;
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	return { width: view.getUint32(16), height: view.getUint32(20) };
+}
+
+function findChrome(): string | null {
+	const configured = process.env.OMP_TELEGRAM_CHROME;
+	if (configured !== undefined && existsSync(configured)) return configured;
+	for (const candidate of [
+		"/usr/bin/google-chrome",
+		"/usr/bin/chromium",
+		"/usr/bin/chromium-browser",
+		"/snap/bin/chromium",
+	]) {
+		if (existsSync(candidate)) return candidate;
+	}
+	return null;
+}
+
+/** Renders Mermaid text to a PNG with `mmdc`, shrinking it losslessly with `oxipng` when that is installed. */
+async function renderMermaid(text: string): Promise<{ ok: true; png: Uint8Array } | { ok: false; error: string }> {
+	mkdirSync(RENDER_DIR, { recursive: true, mode: 0o700 });
+	const stamp = randomUUID();
+	const input = join(RENDER_DIR, `${stamp}.mmd`);
+	const output = join(RENDER_DIR, `${stamp}.png`);
+	const puppeteer = join(RENDER_DIR, `${stamp}.puppeteer.json`);
+	const settings = join(RENDER_DIR, `${stamp}.mermaid.json`);
+	try {
+		writeFileSync(input, text, { mode: 0o600 });
+		// At its natural width, since fitting a wide graph into mmdc's 800-pixel page shrinks its text.
+		writeFileSync(settings, JSON.stringify({ flowchart: { useMaxWidth: false } }), { mode: 0o600 });
+		const args = ["-i", input, "-o", output, "-c", settings, "-s", "2", "-b", "white"];
+		const chrome = findChrome();
+		if (chrome !== null) {
+			writeFileSync(puppeteer, JSON.stringify({ executablePath: chrome }), { mode: 0o600 });
+			args.push("-p", puppeteer);
+		}
+		try {
+			await execFileAsync("mmdc", args, { timeout: MMDC_TIMEOUT_MS });
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			return {
+				ok: false,
+				error:
+					code === "ENOENT"
+						? "mmdc is not installed, so there is no diagram. Install it with `npm i -g @mermaid-js/mermaid-cli`."
+						: `mmdc failed, so there is no diagram: ${clip((error as Error).message, 300)}`,
+			};
+		}
+		await run("oxipng", ["-q", "-o", "2", "--strip", "safe", output]);
+		return { ok: true, png: new Uint8Array(readFileSync(output)) };
+	} finally {
+		for (const path of [input, output, puppeteer, settings]) rmSync(path, { force: true });
+	}
+}
+
 /** Colons are illegal in filenames on Windows and awkward in shells; the rest of ISO-8601 sorts as it reads. */
 function utcStamp(at: number): string {
 	return new Date(at)
@@ -1104,7 +1417,13 @@ async function prepareClone(
 }
 
 /** The spawned session's instructions, naming where its branch goes because its skill assumes an own repository or a fork. */
-function upstreamKickoff(a: LaunchArgs, target: LaunchTarget, clone: PreparedClone, branch: string): string {
+function upstreamKickoff(
+	a: LaunchArgs,
+	target: LaunchTarget,
+	clone: PreparedClone,
+	branch: string,
+	parent: string,
+): string {
 	const repo = `${a.owner}/${a.name}`;
 	const head = target.mode === "fork" ? `${target.pushRepo.replace("/", ":")}:${branch}` : branch;
 	const whose = {
@@ -1118,6 +1437,7 @@ function upstreamKickoff(a: LaunchArgs, target: LaunchTarget, clone: PreparedClo
 		`In one sentence, the request is: ${a.problem}`,
 		`Push the branch to the remote \`${clone.pushRemote}\`, which is ${target.pushRepo}, ${whose}.`,
 		`The pull request opens from https://github.com/${repo}/compare/${clone.defaultBranch}...${head}.`,
+		`The session that asked for this fix is ${parent}. Send it your doubts about the request with session_message to "${parent}", and record each step with session_graph status.`,
 	].join(" ");
 }
 
@@ -1126,6 +1446,7 @@ async function openWorktree(
 	a: LaunchArgs,
 	target: LaunchTarget,
 	clone: PreparedClone,
+	parent: string,
 ): Promise<{ ok: true; worktreePath: string; branch: string; windowId: string } | { ok: false; error: string }> {
 	const { clonePath, base } = clone;
 	const branch = `upstream/${a.slug}`;
@@ -1156,13 +1477,25 @@ async function openWorktree(
 		return { ok: false, error: `could not write the request into the worktree: ${(error as Error).message}` };
 	}
 	excludePath(clonePath, "upstream/");
-	const kickoff = upstreamKickoff(a, target, clone, branch);
+	const kickoff = upstreamKickoff(a, target, clone, branch, parent);
+	const launch: LaunchRecord = {
+		id: randomUUID(),
+		parent,
+		repo: `${a.owner}/${a.name}`,
+		branch: target.mode === "fork" ? `${target.pushRepo.split("/")[0]}:${branch}` : branch,
+		problem: a.problem,
+		worktree: worktreePath,
+		at: Date.now(),
+	};
+	writePrivateJson(LAUNCHES_DIR, `${launch.id}.json`, launch);
 	const window = await run("tmux", [
 		"new-window",
 		"-c",
 		worktreePath,
 		"-n",
 		`${a.name}\u2191`,
+		"-e",
+		`${LAUNCH_ENV}=${launch.id}`,
 		"-P",
 		"-F",
 		"#{window_id}",
@@ -1171,6 +1504,7 @@ async function openWorktree(
 		kickoff,
 	]);
 	if (!window.ok) {
+		rmSync(join(LAUNCHES_DIR, `${launch.id}.json`), { force: true });
 		await rollback();
 		return { ok: false, error: `tmux new-window failed: ${window.stderr}` };
 	}
@@ -1182,13 +1516,13 @@ async function openWorktree(
  * the branch goes, ensure the clone, cut a worktree off the latest default branch, carry the request in, and
  * open a new omp session in a tmux tab. It writes only to GitHub repositories the user may push to and under `~/github`.
  */
-async function performUpstreamLaunch(a: LaunchArgs): Promise<LaunchOutcome> {
+async function performUpstreamLaunch(a: LaunchArgs, parent: string): Promise<LaunchOutcome> {
 	const resolved = await resolveTarget(a);
 	if (!resolved.ok) return { ok: false, error: resolved.error };
 	const { target } = resolved;
 	const prepared = await prepareClone(a, target);
 	if (!prepared.ok) return { ok: false, error: prepared.error };
-	const opened = await openWorktree(a, target, prepared);
+	const opened = await openWorktree(a, target, prepared, parent);
 	if (!opened.ok) return { ok: false, error: opened.error };
 	return {
 		ok: true,
@@ -1792,6 +2126,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 				unlinkSync(join(SESSIONS_DIR, entry));
 				rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
+				if (listPending(id).items.length > 0) detach(raiseResumeCard(id), "resume card");
 				rmSync(reactionRouteLockFile(id), { force: true });
 			} finally {
 				rmSync(closing, { force: true });
@@ -3157,6 +3492,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await answerExternalQuestion(cfg, callback);
 				return;
 			}
+			if (callback.data.startsWith("r:") || callback.data.startsWith("l:")) {
+				await answerResumeCallback(cfg, callback);
+				return;
+			}
 			// A press on a settled question's dead buttons is not a routing failure, and saying the
 			// session is gone claims something alarming and untrue.
 			if (callback.data === SETTLED_CALLBACK) {
@@ -3211,7 +3550,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const text = message.text ?? message.caption;
 
 		const command =
-			typeof text === "string" ? /^\/(hidequestions|status|fleet|stop)\b/u.exec(text.trim())?.[1] : undefined;
+			typeof text === "string"
+				? /^\/(hidequestions|status|fleet|stop|deps|resume)\b/u.exec(text.trim())?.[1]
+				: undefined;
+		if (command === "deps") {
+			// Rendering starts a browser, which must not hold up the updates queued behind this one.
+			detach(
+				sendDependencyGraph(
+					cfg,
+					(text ?? "")
+						.trim()
+						.replace(/^\/deps(@\w+)?/u, "")
+						.trim(),
+				),
+				"dependency graph",
+			);
+			return;
+		}
+		if (command === "resume") {
+			await sendResumeList(cfg);
+			return;
+		}
 		if (command === "fleet") {
 			// Sent directly rather than through sendOrEdit: a fleet listing is not a session message
 			// and must stay out of the reply-routing history.
@@ -3776,17 +4135,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						pi.logger.warn("notify-telegram: discarded a malformed agent message", { name, raw: clip(raw, 200) });
 						continue;
 					}
-					chainHop = Math.max(chainHop ?? 0, message.hop);
-					pi.sendMessage(
-						{
-							customType: AGENT_MESSAGE_TYPE,
-							content: agentMessageText(message),
-							display: true,
-							attribution: "agent",
-							details: { id: message.id, hop: message.hop, replyTo: message.replyTo, from: message.from },
-						},
-						{ deliverAs: "aside", triggerTurn: true },
-					);
+					deliverAgentMessage(message);
 					continue;
 				}
 				if (entry.kind !== "redo") rmSync(processing, { force: true });
@@ -4309,6 +4658,726 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		};
 	});
 
+	// ------------------------------------------------------------------ dependency graph
+
+	const launchSpec: LaunchSpec = { argv: resumeArgs(process.argv.slice(2)), tmuxSession: "" };
+	let lastGraphPoll = 0;
+	let lastGraphPrune = 0;
+	let graphPollInFlight = false;
+
+	function isLiveSession(id: string): boolean {
+		if (id === sessionId) return sessionAlive;
+		const record = readSessionRecord(id);
+		return record !== null && Date.now() - record.heartbeat <= LOCK_STALE_MS;
+	}
+
+	/** Another session wrote this, so it answers no question and fires no `input`. */
+	function deliverAgentMessage(message: AgentMessage): void {
+		chainHop = Math.max(chainHop ?? 0, message.hop);
+		pi.sendMessage(
+			{
+				customType: AGENT_MESSAGE_TYPE,
+				content: agentMessageText(message),
+				display: true,
+				attribution: "agent",
+				details: { id: message.id, hop: message.hop, replyTo: message.replyTo, from: message.from },
+			},
+			{ deliverAs: "aside", triggerTurn: true },
+		);
+	}
+
+	/** Writes this session's node, the only file this session writes in `nodes/`, refreshing its identity. */
+	function saveOwnNode(ctx: ExtensionContext, change: (node: LedgerNode) => void = () => {}): LedgerNode {
+		const id = ctx.sessionManager.getSessionId();
+		const now = Date.now();
+		const node: LedgerNode = readNode(id) ?? {
+			session: id,
+			label: taskName(ctx),
+			emoji: "",
+			tag: "",
+			cwd: ctx.cwd,
+			status: "working",
+			note: "",
+			edges: [],
+			createdAt: now,
+			updatedAt: now,
+		};
+		change(node);
+		if (badgeOverride.length > 0) node.label = badgeOverride;
+		node.emoji = badgeEmoji;
+		node.tag = sessionTag;
+		node.cwd = ctx.cwd;
+		node.launch = launchSpec;
+		node.updatedAt = now;
+		writePrivateJson(NODES_DIR, `${id}.json`, node);
+		return node;
+	}
+
+	function syncOwnNode(ctx: ExtensionContext): void {
+		const node = readNode(ctx.sessionManager.getSessionId());
+		if (node === null) return;
+		const relabel = badgeOverride.length > 0 && node.label !== badgeOverride;
+		if (relabel || node.emoji !== badgeEmoji || node.tag !== sessionTag || node.cwd !== ctx.cwd) saveOwnNode(ctx);
+	}
+
+	/** Ledger nodes, unclaimed launches, and edge ends that only the live registry knows. */
+	function graphSnapshot(): { nodes: LedgerNode[]; prs: Map<string, PrRecord> } {
+		const now = Date.now();
+		const nodes = [...allNodes(), ...allLaunches().map((launch) => launchNode(launch, now))];
+		const prs = new Map<string, PrRecord>();
+		for (const node of nodes) {
+			const pr = readPr(node.session);
+			if (pr === null) continue;
+			prs.set(node.session, pr);
+			node.updatedAt = Math.max(node.updatedAt, pr.changedAt);
+		}
+		const known = new Set(nodes.map((node) => node.session));
+		for (const edge of nodes.flatMap((node) => node.edges)) {
+			for (const end of [edge.from, edge.to]) {
+				if (known.has(end)) continue;
+				known.add(end);
+				const record = readSessionRecord(end);
+				if (record === null) continue;
+				nodes.push({
+					session: end,
+					label: record.label.length > 0 ? record.label : record.name,
+					emoji: record.emoji,
+					tag: record.tag,
+					cwd: record.cwd,
+					status: "working",
+					note: "",
+					edges: [],
+					createdAt: now,
+					updatedAt: now,
+				});
+			}
+		}
+		return { nodes, prs };
+	}
+
+	/** A badge or tag of a live session, or an id prefix of any live session or graph node, when unambiguous. */
+	function resolveSession(to: string): string | null {
+		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
+		const byBadge =
+			live.find(({ record }) => record.emoji.length > 0 && record.emoji === to) ??
+			live.find(({ record }) => record.tag === to);
+		if (byBadge !== undefined) return byBadge.id;
+		const needle = to.toLowerCase();
+		if (!/^[0-9a-f-]{8,36}$/u.test(needle)) return null;
+		const ids = new Set([...live.map(({ id }) => id), ...allNodes().map((node) => node.session)]);
+		const matches = [...ids].filter((id) => id.toLowerCase().startsWith(needle));
+		return matches.length === 1 ? (matches[0] as string) : null;
+	}
+
+	function listPending(id: string): { items: Array<{ file: string; item: PendingItem }>; bad: string[] } {
+		const dir = join(PENDING_DIR, id);
+		const items: Array<{ file: string; item: PendingItem }> = [];
+		const bad: string[] = [];
+		for (const entry of listJson(dir)) {
+			if (entry === "card.json" || entry === "resuming.json") continue;
+			const file = join(dir, entry);
+			const item = pendingItemOf(readJsonFile(file));
+			if (item === null) bad.push(file);
+			else items.push({ file, item });
+		}
+		items.sort((a, b) => a.item.at - b.item.at);
+		return { items, bad };
+	}
+
+	function titleOf(id: string): string {
+		const node = readNode(id);
+		return node === null ? id.slice(0, 8) : nodeTitle(node);
+	}
+
+	function updates(count: number): string {
+		return count === 1 ? "1 update" : `${count} updates`;
+	}
+
+	/** Sends an outcome of `source` to every session with an `upstream` or `waits-on` edge to it. */
+	function emitOutcome(source: GraphNode, outcome: Outcome, link: string | undefined): number {
+		const { nodes } = graphSnapshot();
+		const edges = nodes.flatMap((node) => node.edges);
+		const dependents = dependentsOf(nodes, source.session).filter((id) => id !== source.session && isStateToken(id));
+		for (const dependent of dependents) {
+			const edge = edges.find((e) => e.from === dependent && e.to === source.session && e.type === "upstream")
+				? "upstream"
+				: "waits-on";
+			const item: PendingItem = {
+				kind: "outcome",
+				at: Date.now(),
+				outcome,
+				source: source.session,
+				title: nodeTitle(source),
+				place: nodePlace(source),
+				edge,
+				link,
+				note: source.note.length > 0 ? source.note : undefined,
+			};
+			writePrivateJson(join(PENDING_DIR, dependent), `o-${source.session}-${outcome}.json`, item);
+			if (!isLiveSession(dependent)) detach(raiseResumeCard(dependent), "resume card");
+		}
+		return dependents.length;
+	}
+
+	/** Delivers what was held for this session, in the order it happened. */
+	function drainPending(): void {
+		if (sessionCtx === null || !sessionAlive) return;
+		const id = sessionCtx.sessionManager.getSessionId();
+		if (!existsSync(join(PENDING_DIR, id))) return;
+		const { items, bad } = listPending(id);
+		for (const file of bad) {
+			rmSync(file, { force: true });
+			pi.logger.warn("notify-telegram: discarded a malformed pending item", { file });
+		}
+		for (const { file, item } of items) {
+			rmSync(file, { force: true });
+			if (item.kind === "message") {
+				deliverAgentMessage(item.message);
+				continue;
+			}
+			pi.sendMessage(
+				{ customType: DEPENDENCY_MESSAGE_TYPE, content: outcomeText(item), display: true, details: item },
+				{ deliverAs: "aside", triggerTurn: true },
+			);
+		}
+		rmSync(join(PENDING_DIR, id, "resuming.json"), { force: true });
+		if (items.length > 0) {
+			detach(
+				settleResumeCard(id, `\u2705 Delivered ${updates(items.length)} to **${titleOf(id)}**.`, false),
+				"resume card settle",
+			);
+		}
+	}
+
+	function cardFile(id: string): string {
+		return join(PENDING_DIR, id, "card.json");
+	}
+
+	function readCardId(id: string): number | null {
+		const raw = readJsonFile(cardFile(id)) as { messageId?: unknown } | null;
+		return typeof raw?.messageId === "number" ? raw.messageId : null;
+	}
+
+	/** When a Resume tap last opened a window, so a second tap before the session is live opens none. */
+	function readResumingAt(id: string): number {
+		const raw = readJsonFile(join(PENDING_DIR, id, "resuming.json")) as { at?: unknown } | null;
+		return typeof raw?.at === "number" ? raw.at : 0;
+	}
+
+	function resumeButtons(id: string, withLater: boolean): InlineButton[][] {
+		const resume: InlineButton = { text: "Resume", callback_data: `r:${id}`, style: "success" };
+		return [withLater ? [resume, { text: "Later", callback_data: `l:${id}` }] : [resume]];
+	}
+
+	/** One card per ended session: the first held item sends it, later ones edit it. */
+	async function raiseResumeCard(id: string): Promise<void> {
+		if (config === null || !isStateToken(id)) return;
+		const { items } = listPending(id);
+		if (items.length === 0) return;
+		const lines = items
+			.slice(-5)
+			.map(({ item }) =>
+				item.kind === "outcome"
+					? `- ${outcomeSummary(item)}`
+					: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
+			);
+		const text = `\u23F8\uFE0F **${titleOf(id)}** has ended with ${updates(items.length)} waiting:\n${lines.join("\n")}\n\nResume it to deliver them?`;
+		const body = {
+			chat_id: config.chatId,
+			text: toTelegramHtml(fitToTelegram(text, "")),
+			parse_mode: "HTML",
+			reply_markup: { inline_keyboard: resumeButtons(id, true) },
+		};
+		mkdirSync(join(PENDING_DIR, id), { recursive: true, mode: 0o700 });
+		try {
+			writeFileSync(cardFile(id), "{}", { flag: "wx", mode: 0o600 });
+		} catch {
+			const messageId = readCardId(id);
+			if (messageId !== null) await callTelegram(config, "editMessageText", { ...body, message_id: messageId }, 15_000);
+			return;
+		}
+		const sent = await callTelegram<TelegramMessage>(config, "sendMessage", body, 15_000);
+		if (sent === null) {
+			rmSync(cardFile(id), { force: true });
+			return;
+		}
+		writeFileAtomic(cardFile(id), JSON.stringify({ messageId: sent.message_id }), 0o600);
+	}
+
+	/** `keep` leaves the card open with a Resume button, for Later and for a resume still starting. */
+	async function settleResumeCard(id: string, text: string, keep: boolean): Promise<void> {
+		if (config === null) return;
+		const messageId = readCardId(id);
+		if (messageId === null) return;
+		if (!keep) rmSync(cardFile(id), { force: true });
+		await callTelegram(
+			config,
+			"editMessageText",
+			{
+				chat_id: config.chatId,
+				message_id: messageId,
+				text: toTelegramHtml(text),
+				parse_mode: "HTML",
+				reply_markup: { inline_keyboard: keep ? resumeButtons(id, false) : [] },
+			},
+			15_000,
+		);
+	}
+
+	async function resumeSession(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
+		const node = readNode(id);
+		if (node === null) return { ok: false, error: "That session is not in the dependency graph." };
+		if (node.launch === undefined) return { ok: false, error: "That node has no omp session behind it to resume." };
+		if (!existsSync(node.cwd)) {
+			return { ok: false, error: `Its folder ${node.cwd} no longer exists, so omp would resume it somewhere else.` };
+		}
+		if (process.env.TMUX === undefined) {
+			return { ok: false, error: "The session handling Telegram runs outside tmux, so it cannot open a window." };
+		}
+		let target = node.launch?.tmuxSession ?? "";
+		if (target.length > 0 && !(await run("tmux", ["has-session", "-t", `=${target}`])).ok) target = "";
+		const opened = await run("tmux", [
+			"new-window",
+			...(target.length > 0 ? ["-t", `${target}:`] : []),
+			"-c",
+			node.cwd,
+			"-n",
+			clip(nodePlace(node), 30),
+			"omp",
+			...(node.launch?.argv ?? []),
+			"--resume",
+			id,
+		]);
+		return opened.ok ? { ok: true } : { ok: false, error: `tmux new-window failed: ${clip(opened.stderr, 150)}` };
+	}
+
+	async function answerResumeCallback(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
+		const data = callback.data ?? "";
+		const id = data.slice(2);
+		let toast: string;
+		if (!isStateToken(id)) {
+			toast = "That session is unknown.";
+		} else if (isLiveSession(id)) {
+			toast = "That session is already running, so its updates reach it directly.";
+		} else if (data.startsWith("l:")) {
+			const count = listPending(id).items.length;
+			await settleResumeCard(
+				id,
+				`\u23F8\uFE0F ${updates(count)} for **${titleOf(id)}** ${count === 1 ? "is" : "are"} held until you resume it. /resume lists it.`,
+				true,
+			);
+			toast = "Held until you resume it.";
+		} else if (Date.now() - readResumingAt(id) < RESUME_START_MS) {
+			toast = "That session is already starting.";
+		} else {
+			const resumed = await resumeSession(id);
+			if (resumed.ok) {
+				writePrivateJson(join(PENDING_DIR, id), "resuming.json", { at: Date.now() });
+				await settleResumeCard(id, `\u25B6\uFE0F Resuming **${titleOf(id)}** in a new tmux window.`, true);
+				toast = "Resuming in a new tmux window.";
+			} else {
+				toast = clip(resumed.error, 190);
+			}
+		}
+		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callback.id, text: toast }, 10_000);
+	}
+
+	async function sendResumeList(cfg: Config): Promise<void> {
+		const waiting = (existsSync(PENDING_DIR) ? readdirSync(PENDING_DIR) : []).filter(
+			(id) => isStateToken(id) && !isLiveSession(id) && listPending(id).items.length > 0,
+		);
+		await callTelegram(
+			cfg,
+			"sendMessage",
+			{
+				chat_id: cfg.chatId,
+				text:
+					waiting.length === 0
+						? "\u{1F535} No ended session has updates waiting."
+						: `\u23F8\uFE0F ${waiting.length === 1 ? "An ended session has" : `${waiting.length} ended sessions have`} updates waiting. Resume one to deliver them.`,
+				...(waiting.length === 0
+					? {}
+					: {
+							reply_markup: {
+								inline_keyboard: waiting.map((id) => [
+									{
+										text: buttonText(`${titleOf(id)} (${listPending(id).items.length})`),
+										callback_data: `r:${id}`,
+									},
+								]),
+							},
+						}),
+			},
+			15_000,
+		);
+	}
+
+	async function sendDependencyGraph(cfg: Config, filter: string): Promise<void> {
+		const now = Date.now();
+		const { nodes, prs } = graphSnapshot();
+		const selected = selectNodes(nodes, filter, now);
+		let note = "";
+		if (selected.length > 0) {
+			const rendered = await renderMermaid(toMermaid(selected, prs, now));
+			if (rendered.ok) {
+				const size = pngSize(rendered.png);
+				const photo =
+					rendered.png.byteLength <= PHOTO_MAX_BYTES &&
+					size !== null &&
+					Math.max(size.width, size.height) <= PHOTO_MAX_SIDE;
+				const sent = await uploadTelegram(
+					cfg,
+					photo ? "sendPhoto" : "sendDocument",
+					{ chat_id: cfg.chatId, caption: filter.length > 0 ? `Dependencies matching ${filter}` : "Dependencies" },
+					[{ field: photo ? "photo" : "document", name: "dependencies.png", data: rendered.png }],
+				);
+				if (sent === null) note = "The diagram could not be uploaded.";
+			} else {
+				note = rendered.error;
+			}
+		}
+		const heading =
+			filter.length > 0 ? `\u{1F578}\uFE0F Dependencies matching "${filter}"` : "\u{1F578}\uFE0F Dependencies";
+		const body = [heading, statusList(selected, prs), note].filter((part) => part.length > 0).join("\n\n");
+		// A year of dependencies outgrows one message, and a cut list would hide exactly the oldest work.
+		const chunks: string[] = [];
+		let chunk = "";
+		for (const line of body.split("\n")) {
+			const next = chunk.length === 0 ? line : `${chunk}\n${line}`;
+			if (chunk.length > 0 && toTelegramHtml(next).length > STATUS_CHUNK_MAX) {
+				chunks.push(chunk);
+				chunk = line;
+			} else {
+				chunk = next;
+			}
+		}
+		if (chunk.trim().length > 0) chunks.push(chunk);
+		for (const part of chunks) {
+			await callTelegram(
+				cfg,
+				"sendMessage",
+				{
+					chat_id: cfg.chatId,
+					text: toTelegramHtml(fitToTelegram(part, "")),
+					parse_mode: "HTML",
+					link_preview_options: { is_disabled: true },
+				},
+				15_000,
+			);
+		}
+	}
+
+	async function findPr(node: LedgerNode): Promise<string | undefined> {
+		if (node.repo === undefined || node.branch === undefined) return undefined;
+		const colon = node.branch.indexOf(":");
+		const owner = colon > 0 ? node.branch.slice(0, colon).toLowerCase() : undefined;
+		const head = colon > 0 ? node.branch.slice(colon + 1) : node.branch;
+		const listed = await run("gh", [
+			"pr",
+			"list",
+			"--repo",
+			node.repo,
+			"--head",
+			head,
+			"--state",
+			"all",
+			"--json",
+			"number,url,headRepositoryOwner",
+			"--limit",
+			"20",
+		]);
+		if (!listed.ok) {
+			pi.logger.warn("notify-telegram: gh pr list failed", { repo: node.repo, stderr: clip(listed.stderr, 200) });
+			return undefined;
+		}
+		try {
+			const rows = JSON.parse(listed.stdout) as Array<{ url?: unknown; headRepositoryOwner?: { login?: unknown } }>;
+			const match = rows.find(
+				(row) =>
+					typeof row.url === "string" &&
+					(owner === undefined ||
+						(typeof row.headRepositoryOwner?.login === "string" &&
+							row.headRepositoryOwner.login.toLowerCase() === owner)),
+			);
+			return match?.url as string | undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Refreshes the PR state of every unfinished node, emitting each PR outcome once. */
+	async function pollGraph(): Promise<void> {
+		if (graphPollInFlight) return;
+		graphPollInFlight = true;
+		try {
+			for (const node of allNodes()) {
+				const previous = readPr(node.session);
+				if (isFinished(displayedStatus(node, previous ?? undefined))) continue;
+				const url = node.pr ?? previous?.url ?? (await findPr(node));
+				if (url === undefined) continue;
+				const viewed = await run("gh", [
+					"pr",
+					"view",
+					url,
+					"--json",
+					"state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,number",
+				]);
+				let data: (GhPr & { number?: unknown }) | null = null;
+				try {
+					data = viewed.ok ? JSON.parse(viewed.stdout) : null;
+				} catch {}
+				const state = data === null ? null : classifyPr(data);
+				if (data === null || state === null) {
+					pi.logger.warn("notify-telegram: could not read a pull request", { url, stderr: clip(viewed.stderr, 200) });
+					continue;
+				}
+				const emitted = previous?.emitted ?? [];
+				const outcome = outcomeOfPr(previous?.state, state, emitted);
+				// Emitted before the record is written: a crash in between repeats an outcome rather than losing it.
+				if (outcome !== null) emitOutcome(node, outcome, url);
+				const now = Date.now();
+				const record: PrRecord = {
+					url,
+					number: typeof data.number === "number" ? data.number : 0,
+					state,
+					checkedAt: now,
+					changedAt: previous !== null && previous.state === state ? previous.changedAt : now,
+					emitted: outcome === null ? emitted : [...emitted, outcome],
+				};
+				writePrivateJson(PR_DIR, `${node.session}.json`, record);
+			}
+		} finally {
+			graphPollInFlight = false;
+		}
+	}
+
+	function pruneGraph(): void {
+		const now = Date.now();
+		for (const node of allNodes()) {
+			if (isLiveSession(node.session)) continue;
+			const pr = readPr(node.session);
+			if (now - Math.max(node.updatedAt, pr?.changedAt ?? 0) <= GRAPH_RETENTION_MS) continue;
+			rmSync(join(NODES_DIR, `${node.session}.json`), { force: true });
+			rmSync(join(PR_DIR, `${node.session}.json`), { force: true });
+			rmSync(join(PENDING_DIR, node.session), { recursive: true, force: true });
+		}
+		for (const launch of allLaunches()) {
+			if (now - launch.at > GRAPH_RETENTION_MS) rmSync(join(LAUNCHES_DIR, `${launch.id}.json`), { force: true });
+		}
+	}
+
+	/** Run by the Telegram lock holder only, so one process polls GitHub and prunes. */
+	function graphTick(): void {
+		const now = Date.now();
+		if (now - lastGraphPrune >= GRAPH_PRUNE_MS) {
+			lastGraphPrune = now;
+			pruneGraph();
+		}
+		if (now - lastGraphPoll >= GRAPH_POLL_MS) {
+			lastGraphPoll = now;
+			detach(pollGraph(), "dependency poll");
+		}
+	}
+
+	function claimLaunch(ctx: ExtensionContext): void {
+		const id = process.env[LAUNCH_ENV];
+		if (id === undefined) return;
+		// Cleared so a shell or a nested omp started from this session cannot claim it again.
+		delete process.env[LAUNCH_ENV];
+		if (!isStateToken(id)) return;
+		const file = join(LAUNCHES_DIR, `${id}.json`);
+		const launch = parseLaunch(readJsonFile(file));
+		if (launch === null) return;
+		const self = ctx.sessionManager.getSessionId();
+		saveOwnNode(ctx, (node) => {
+			node.label = clip(launch.problem, 80);
+			node.repo = launch.repo;
+			node.branch = launch.branch;
+			if (!node.edges.some((e) => e.type === "upstream" && e.from === launch.parent && e.to === self)) {
+				node.edges.push({ from: launch.parent, to: self, type: "upstream", at: launch.at });
+			}
+		});
+		rmSync(file, { force: true });
+	}
+
+	const EDGE_WORDS: Record<EdgeType, string> = {
+		upstream: "upstream",
+		"waits-on": "waits on",
+		"follows-up": "follows up",
+		related: "related",
+	};
+
+	pi.registerTool({
+		name: "session_graph",
+		label: "Session Graph",
+		description: `Record and read the dependencies between omp sessions, kept for a year across restarts. \`action\` \`show\` (the default) lists what this session waits on and who waits on it, each with its status and pull request. \`status\` sets this session's \`status\` to one of ${AGENT_STATUSES.join(", ")}, with an optional \`note\` and an optional GitHub pull request URL in \`pr\` whose state is then polled. \`pushed\`, \`done\`, \`not-needed\` and \`abandoned\` are outcomes that wake every session waiting on this one, and so are a PR opening, merging or closing. \`link\` declares an edge from this session of \`type\` \`waits-on\` (this session needs \`to\` to reach an outcome first, and is woken by its outcomes), \`follows-up\` (this session continues the work of \`to\`) or \`related\`. \`unlink\` removes an edge this session declared. \`to\` is a live session's badge emoji or tag, or a session id prefix of at least 8 characters, which also reaches ended sessions. \`find\` lists the sessions whose label, repository or folder contains \`query\`, with their ids. Upstream edges come only from upstream_launch.`,
+		approval: "read",
+		parameters: z.object({
+			action: z.string().optional(),
+			status: z.string().optional(),
+			note: z.string().optional(),
+			pr: z.string().optional(),
+			type: z.string().optional(),
+			to: z.string().optional(),
+			query: z.string().optional(),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const p = params as Record<string, unknown>;
+			const arg = (key: string): string => (typeof p[key] === "string" ? (p[key] as string).trim() : "");
+			const reply = (text: string, details: Record<string, unknown> = {}) => ({
+				content: [{ type: "text" as const, text }],
+				details,
+			});
+			const refuse = (text: string) => ({ ...reply(text), isError: true });
+			if (config === null) {
+				return refuse(
+					"The dependency graph rides the omp-telegram session registry, which starts only once the bot is paired with `node setup.mjs`.",
+				);
+			}
+			const self = ctx.sessionManager.getSessionId();
+			const action = arg("action").length > 0 ? arg("action") : "show";
+			const { nodes, prs } = graphSnapshot();
+			const byId = new Map(nodes.map((node) => [node.session, node]));
+			const describe = (id: string): string => {
+				const node = byId.get(id);
+				if (node === undefined) return `session ${id}`;
+				const pr = prs.get(id);
+				const link = pr?.url ?? node.pr;
+				return `${nodeTitle(node)} \u2014 ${displayedStatus(node, pr)} \u2014 ${nodePlace(node)}${link === undefined ? "" : ` \u2014 ${link}`} \u2014 session ${id}`;
+			};
+
+			if (action === "show") {
+				const edges = [
+					...new Map(nodes.flatMap((n) => n.edges).map((e) => [`${e.type} ${e.from} ${e.to}`, e])).values(),
+				];
+				const blocking = (type: EdgeType) => type === "upstream" || type === "waits-on";
+				const sections: [string, string[]][] = [
+					[
+						"Waits on",
+						edges
+							.filter((e) => e.from === self && blocking(e.type))
+							.map((e) => `- [${EDGE_WORDS[e.type]}] ${describe(e.to)}`),
+					],
+					[
+						"Waited on by",
+						edges
+							.filter((e) => e.to === self && blocking(e.type))
+							.map((e) => `- [${EDGE_WORDS[e.type]}] ${describe(e.from)}`),
+					],
+					[
+						"Other links",
+						edges
+							.filter((e) => !blocking(e.type) && (e.from === self || e.to === self))
+							.map((e) =>
+								e.type === "related"
+									? `- related to ${describe(e.from === self ? e.to : e.from)}`
+									: e.from === self
+										? `- this session follows up ${describe(e.to)}`
+										: `- ${describe(e.from)} follows up this session`,
+							),
+					],
+				];
+				const own = byId.get(self);
+				const head =
+					own === undefined
+						? `This session (${self}) has no node yet. Set a status or declare a link to create it.`
+						: `This session: ${describe(self)}${own.note.length > 0 ? `\nNote: ${own.note}` : ""}`;
+				const body = sections
+					.filter(([, lines]) => lines.length > 0)
+					.map(([title, lines]) => `${title}:\n${lines.join("\n")}`);
+				return reply([head, ...body].join("\n\n"));
+			}
+
+			if (action === "find") {
+				const needle = arg("query").toLowerCase();
+				if (needle.length === 0) return refuse("Pass the text to look for in `query`.");
+				const found = nodes.filter((node) =>
+					[node.label, node.repo ?? "", node.cwd, node.branch ?? "", node.session].some((field) =>
+						field.toLowerCase().includes(needle),
+					),
+				);
+				return reply(
+					found.length === 0
+						? `No session matches "${needle}".`
+						: found.map((node) => `- ${describe(node.session)}`).join("\n"),
+				);
+			}
+
+			if (action === "status") {
+				const status = arg("status");
+				if (!(AGENT_STATUSES as readonly string[]).includes(status)) {
+					return refuse(`\`status\` must be one of ${AGENT_STATUSES.join(", ")}.`);
+				}
+				const pr = arg("pr");
+				if (pr.length > 0 && !GITHUB_PR_URL.test(pr)) {
+					return refuse("`pr` must be a GitHub pull request URL, such as https://github.com/owner/repo/pull/12.");
+				}
+				const before = readNode(self)?.status;
+				const node = saveOwnNode(ctx, (n) => {
+					n.status = status as LedgerNode["status"];
+					n.note = clip(arg("note"), 500);
+					if (pr.length > 0) n.pr = pr;
+				});
+				const outcome = outcomeOfStatus(before, status as (typeof AGENT_STATUSES)[number]);
+				const woken = outcome === null ? 0 : emitOutcome(node, outcome, node.pr ?? readPr(self)?.url);
+				return reply(
+					`Recorded status ${status}.${outcome === null ? "" : ` It is an outcome, sent to ${woken} dependent session${woken === 1 ? "" : "s"}.`}`,
+					{ status, outcome, woken },
+				);
+			}
+
+			if (action === "link" || action === "unlink") {
+				const type = arg("type") as EdgeType;
+				if (type === "upstream") return refuse("Upstream edges come only from upstream_launch.");
+				if (!(["waits-on", "follows-up", "related"] as string[]).includes(type)) {
+					return refuse("`type` must be waits-on, follows-up or related.");
+				}
+				const to = arg("to");
+				if (action === "unlink") {
+					const own = readNode(self);
+					const target = resolveSession(to) ?? "";
+					const kept = (own?.edges ?? []).filter(
+						(e) =>
+							!(
+								e.from === self &&
+								e.type === type &&
+								(e.to === target || (to.length >= 8 && e.to.startsWith(to.toLowerCase())))
+							),
+					);
+					if (own === null || kept.length === own.edges.length) {
+						return refuse(`This session declared no ${EDGE_WORDS[type]} edge to ${to}.`);
+					}
+					saveOwnNode(ctx, (n) => {
+						n.edges = kept;
+					});
+					return reply(`Removed the ${EDGE_WORDS[type]} edge to ${to}.`);
+				}
+				const target = resolveSession(to);
+				if (target === null) {
+					return refuse(
+						`No live session or graph node answers to ${to}. Use a badge emoji, a tag, or a session id prefix of at least 8 characters from \`find\`.`,
+					);
+				}
+				if (target === self) return refuse("A session cannot depend on itself.");
+				if (type === "waits-on") {
+					const loop = blockingPath(nodes, self, target);
+					if (loop !== null) {
+						return refuse(
+							`${describe(target)} already waits on this session through ${[...loop, target].map((id) => id.slice(0, 13)).join(" -> ")}, so this link would close a loop that nothing could ever wake. Report the conflict to your user.`,
+						);
+					}
+				}
+				saveOwnNode(ctx, (n) => {
+					if (!n.edges.some((e) => e.type === type && e.to === target)) {
+						n.edges.push({ from: self, to: target, type, at: Date.now() });
+					}
+				});
+				return reply(`Recorded: this session ${EDGE_WORDS[type]} ${describe(target)}.`, { to: target, type });
+			}
+			return refuse("`action` must be show, status, link, unlink or find.");
+		},
+	});
+
 	pi.registerTool({
 		name: "session_message",
 		label: "Session Message",
@@ -4368,14 +5437,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					},
 				};
 			}
-			if ((badgeEmoji.length > 0 && to === badgeEmoji) || to === sessionTag) {
+			const self = ctx.sessionManager.getSessionId();
+			const ownId = to.length >= 8 && self.startsWith(to.toLowerCase());
+			if ((badgeEmoji.length > 0 && to === badgeEmoji) || to === sessionTag || ownId) {
 				return refuse(`${to} is this session's own address. ${peers}`);
 			}
-			const target =
-				live.find(({ record }) => record.emoji.length > 0 && record.emoji === to) ??
-				live.find(({ record }) => record.tag === to);
-			if (target === undefined) return refuse(`No live session shows ${to}. ${peers}`);
-			if (target.record.messaging < AGENT_PROTOCOL) {
+			const resolved = resolveSession(to);
+			const target = resolved === null ? undefined : live.find(({ id }) => id === resolved);
+			// An ended session in the dependency graph gets the message held until it resumes.
+			const held = resolved !== null && target === undefined && readNode(resolved) !== null ? resolved : null;
+			if (target === undefined && held === null) {
+				return refuse(`No live session shows ${to}, and no session in the dependency graph has that id. ${peers}`);
+			}
+			if (target !== undefined && target.record.messaging < AGENT_PROTOCOL) {
 				return refuse(
 					`${badgeOf(target.record)} runs an omp-telegram without session messaging and would read the message as user input. It can receive messages after a restart.`,
 				);
@@ -4396,14 +5470,28 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				);
 			}
 			const id = randomUUID().replaceAll("-", "").slice(0, 12);
-			const entry: InboxEntry = {
-				kind: "agent",
-				value: text,
-				id,
-				hop,
-				agentReplyTo: replyTo,
-				from: { session: sessionId, emoji: badgeEmoji, label: taskName(ctx), cwd: ctx.cwd, tag: sessionTag },
-			};
+			const from = { session: sessionId, emoji: badgeEmoji, label: taskName(ctx), cwd: ctx.cwd, tag: sessionTag };
+			if (held !== null) {
+				const recipient = held;
+				const message: AgentMessage = { id, text, hop, replyTo, from };
+				writePrivateJson(join(PENDING_DIR, recipient), `m-${Date.now()}-${id}.json`, {
+					kind: "message",
+					at: Date.now(),
+					message,
+				});
+				detach(raiseResumeCard(recipient), "resume card");
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `${titleOf(recipient)} has ended, so message ${id} is held for it and the user was asked on Telegram whether to resume it. It arrives when that session resumes.`,
+						},
+					],
+					details: { sent: true, held: true, delivered: false, id, hop, to },
+				};
+			}
+			if (target === undefined) return refuse(`No live session shows ${to}. ${peers}`);
+			const entry: InboxEntry = { kind: "agent", value: text, id, hop, agentReplyTo: replyTo, from };
 			const dir = join(INBOX_DIR, target.id);
 			mkdirSync(dir, { recursive: true, mode: 0o700 });
 			const file = join(dir, `${Date.now()}-${id}.json`);
@@ -4836,8 +5924,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				};
 			}
 
-			const outcome = await performUpstreamLaunch(args);
+			const outcome = await performUpstreamLaunch(args, ctx.sessionManager.getSessionId());
 			if (!outcome.ok) return fail(outcome.error);
+			saveOwnNode(ctx);
 			const where = {
 				own: "your own repository",
 				maintainer: `${outcome.pushRepo} itself, where you have push access`,
@@ -4946,6 +6035,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						{ command: "fleet", description: "List every tmux omp window and its state" },
 						{ command: "hidequestions", description: "Hide open question buttons" },
 						{ command: "stop", description: "Abort the running turn, reply to pick the session" },
+						{ command: "deps", description: "Draw the dependencies between sessions" },
+						{ command: "resume", description: "Resume an ended session that has updates waiting" },
 					],
 				},
 				15_000,
@@ -4971,6 +6062,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				reapHeldMessages();
 				if (ownsLock()) refreshLock();
 				else acquireLock();
+				syncOwnNode(ctx);
+				if (ownsLock()) graphTick();
 			} catch (error) {
 				pi.logger.warn("notify-telegram: heartbeat failed", {
 					error: error instanceof Error ? error.message : String(error),
@@ -4981,6 +6074,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		ctx.setInterval(() => {
 			try {
 				detach(drainInbox(), "inbox drain");
+				drainPending();
 				maybeType();
 				maybeDraft();
 				maybeDashboard();
@@ -4992,6 +6086,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				});
 			}
 		}, DRAIN_MS);
+
+		if (process.env.TMUX !== undefined) {
+			const pane = process.env.TMUX_PANE;
+			const shown = await run("tmux", ["display-message", "-p", ...(pane === undefined ? [] : ["-t", pane]), "#S"]);
+			if (shown.ok) launchSpec.tmuxSession = shown.stdout.trim();
+		}
+		claimLaunch(ctx);
+		syncOwnNode(ctx);
 
 		writeSessionRecord(ctx);
 	});
