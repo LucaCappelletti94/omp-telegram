@@ -8791,6 +8791,77 @@ heading("dependency graph across sessions");
 		unlinked.isError !== true && !nodeOf(followerId).edges.some((e) => e.to === childId),
 	);
 
+	// A card that Telegram refused is sent again with the next held item rather than edited into nothing.
+	const quietId = "0c1a0005-0000-7000-8000-000000000005";
+	writeFileSync(
+		nodeFile(quietId),
+		JSON.stringify({
+			session: quietId,
+			label: "quiet ended session",
+			emoji: "",
+			tag: "",
+			cwd: appDir,
+			status: "waiting",
+			note: "",
+			edges: [],
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+			launch: { argv: [], tmuxSession: "" },
+		}),
+	);
+	const quietCards = () =>
+		called("sendMessage").filter((c) =>
+			c.body.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data === `r:${quietId}`),
+		).length;
+	const sendQuiet = (body) =>
+		waiter.tools.get("session_message").execute("q", { to: quietId, text: body }, undefined, undefined, waiter.ctx);
+	api.failMethods = ["sendMessage"];
+	await sendQuiet("first try");
+	await settle(150);
+	api.failMethods = [];
+	const cardsAfterFailure = quietCards();
+	await sendQuiet("second try");
+	await settle(150);
+	check(
+		"a resume card Telegram refused is sent with the next held item",
+		quietCards() === cardsAfterFailure + 1 && pendingOf(quietId).length === 2,
+	);
+	rmSync(nodeFile(quietId));
+	rmSync(join(graphDir, "pending", quietId), { recursive: true, force: true });
+
+	// A pull request gh cannot read keeps its last known state and wakes nobody.
+	await graph(follower, { action: "status", status: "working", pr: "https://github.com/someorg/docs/pull/9" });
+	writeFileSync(prJson, "not json");
+	const waiterWarns = waiter.warns.length;
+	const waiterCustoms = waiter.customs.length;
+	jump(10 * 60_000 + 1_000);
+	beatAll(waiter, follower, back);
+	await settle(400);
+	await waiter.pump(150);
+	check(
+		"an unreadable pull request is logged, recorded as nothing and wakes nobody",
+		!existsSync(join(graphDir, "pr", `${followerId}.json`)) &&
+			waiter.warns.slice(waiterWarns).some((w) => w.m.includes("could not read a pull request")) &&
+			waiter.customs.length === waiterCustoms,
+	);
+
+	check(
+		"unlinking an edge the session never declared is refused",
+		(await graph(follower, { action: "unlink", type: "related", to: waiterId.slice(0, 8) })).isError === true,
+	);
+
+	// A live session that never wrote a node still shows as the end of an edge, named from its record.
+	const bareId = "0c1a0006-0000-7000-8000-000000000006";
+	const bare = spawn(bareId, join(root, "bare-folder"));
+	await bare.fire("session_start");
+	await graph(waiter, { action: "link", type: "related", to: record(bareId).tag });
+	check(
+		"a linked live session with no node of its own is described from the registry",
+		!existsSync(nodeFile(bareId)) && text(await graph(waiter, {})).includes("bare-folder"),
+	);
+	await graph(waiter, { action: "unlink", type: "related", to: bareId.slice(0, 8) });
+	await bare.fire("session_shutdown");
+
 	// A year later, ended sessions' nodes are pruned and live ones stay.
 	jump(366 * 24 * 3_600_000);
 	beatAll(waiter, back);
