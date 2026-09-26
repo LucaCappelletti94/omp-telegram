@@ -12,5 +12,5 @@
 		"skipLibCheck": true,
 		"noUncheckedIndexedAccess": true
 	},
-	"include": ["index.ts", "render.ts"]
+	"include": ["index.ts", "render.ts", "graph.ts"]
 }
