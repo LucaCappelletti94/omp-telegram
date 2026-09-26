@@ -249,8 +249,23 @@ const TYPING_MS = 5_000;
 /** How long a delivered Telegram answer justifies the typing status: Telegram's own claim is 5s. */
 const OWED_TYPING_MS = 30_000;
 const DRAFT_MS = 1_500;
-/** The party-popper send effect, verified against the live API; effects exist in private chats only. */
-const GREEN_EFFECT_ID = "5046509860389126442";
+/**
+ * The send effects a green status may play, each verified against the live API. Effects exist in
+ * private chats only.
+ */
+const TURN_EFFECTS = {
+	party: { id: "5046509860389126442", glyph: "\u{1F389}", fits: "work that landed as hoped" },
+	fire: { id: "5104841245755180586", glyph: "\u{1F525}", fits: "an outstanding result" },
+	thumbs_up: { id: "5107584321108051014", glyph: "\u{1F44D}", fits: "a routine step done" },
+	heart: { id: "5159385139981059251", glyph: "\u2764\uFE0F", fits: "a fix the user was waiting on" },
+	thumbs_down: { id: "5104858069142078462", glyph: "\u{1F44E}", fits: "a finish that fell short of its aim" },
+	poop: { id: "5046589136895476101", glyph: "\u{1F4A9}", fits: "a finish that exposed something broken out of reach" },
+} as const;
+type TurnEffect = keyof typeof TURN_EFFECTS;
+const EFFECT_GUIDE = [
+	...Object.entries(TURN_EFFECTS).map(([name, effect]) => `\`${name}\` ${effect.glyph} for ${effect.fits}`),
+	"`none` for a sober finish that deserves no animation",
+].join(", ");
 
 const BADGE_PALETTE = [
 	"\u{1F98A}", // fox
@@ -448,6 +463,8 @@ interface ApprovalNotice {
 interface TurnStatus {
 	text: string;
 	urgency: "green" | "orange" | "red";
+	/** Absent unless the status is green and its agent chose an effect other than `none`. */
+	effect?: TurnEffect;
 	question?: string;
 	options?: StatusOption[];
 }
@@ -473,6 +490,29 @@ function parseStatusOption(raw: unknown): StatusOption | null {
 		lukewarm: source.lukewarm === true,
 		discouraged: source.discouraged === true,
 	};
+}
+
+/**
+ * The effect a status plays, with `undefined` for none, or why nothing is recorded. A green status
+ * must name one, `none` included, so the animation is always a choice made for that turn.
+ */
+function parseEffect(
+	urgency: TurnStatus["urgency"],
+	requested: unknown,
+): { effect: TurnEffect | undefined } | { refusal: string } {
+	if (urgency !== "green") {
+		if (requested === undefined) return { effect: undefined };
+		return { refusal: `an effect plays only on a green status, and this one is ${urgency}` };
+	}
+	if (requested === undefined) {
+		return {
+			refusal: `a green status needs an effect, the animation Telegram plays over the summary. Choose the one that fits how the turn went: ${EFFECT_GUIDE}`,
+		};
+	}
+	const name = String(requested).trim().toLowerCase();
+	if (name === "none") return { effect: undefined };
+	if (Object.hasOwn(TURN_EFFECTS, name)) return { effect: name as TurnEffect };
+	return { refusal: `"${name}" is not an effect Telegram plays. Choose one of ${EFFECT_GUIDE}` };
 }
 
 interface StandingQuestion {
@@ -2758,13 +2798,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Green gets the celebration effect; red gets pinned by the caller. A turn ending while the
-	 * user is typing at the terminal still lands, without a sound and without the confetti.
+	 * A green turn plays the effect its agent chose, red gets pinned by the caller. A turn ending
+	 * while the user is typing at the terminal still lands, without a sound and without the effect.
 	 */
-	function urgencyExtras(urgency: TurnStatus["urgency"], quiet: boolean): Record<string, unknown> {
+	function urgencyExtras(status: TurnStatus, quiet: boolean): Record<string, unknown> {
 		if (quiet) return { disable_notification: true };
-		if (urgency !== "green" || config === null || config.chatId <= 0) return {};
-		return { message_effect_id: GREEN_EFFECT_ID };
+		if (status.effect === undefined || config === null || config.chatId <= 0) return {};
+		return { message_effect_id: TURN_EFFECTS[status.effect].id };
 	}
 
 	/** A red status stays pinned until the next turn touches the session. */
@@ -3910,7 +3950,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			{
 				chat_id: config.chatId,
 				reply_markup: { inline_keyboard: keyboard, force_reply: true },
-				...urgencyExtras(recorded.urgency, quiet),
+				...urgencyExtras(recorded, quiet),
 			},
 			body,
 			keep,
@@ -4473,12 +4513,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "notify_status",
 		label: "Notify Status",
 		description:
-			'Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two plain sentences when no choice is attached, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository\'s maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. Whenever any user action is wanted, also set `question` and 2 to 6 `options` drawn from those real next steps. Every option is an object with a short `label` naming the action and a one-line `description` of what choosing it does or costs, and at most one of `recommended`, `lukewarm` or `discouraged` to colour the button. The description is not optional: the button is the whole of what a phone shows, so an option with no description is refused and no status is recorded. Labels and descriptions name who acts, as in "Agent will rebase the branch" or "User will review the diff" with the user\'s name in place of User when it is known, and never I, me, you, your, we or us, because a tapped button starts the next turn as the user\'s own words and a pronoun there could mean either side, so such an option is refused too. Never use only a phase number or letter, such as `Start Phase 7`. Each description becomes its own section under the summary, and the buttons start the next turn with the most likely choice first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices. The notification must be answerable from a phone without terminal context, so the `summary` names the decision and says why it is needed now. The next steps are held to the same standard as the work: the option that finishes the work properly belongs in the list and carries `recommended`, effort is never a reason to demote it, and any option that leaves a known defect standing says so in its own description and is marked `lukewarm` or `discouraged`. Text the user is meant to copy, an issue body, a PR post, a patch, goes out through `notify_snippet` instead of riding in the summary.',
+			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two plain sentences when no choice is attached, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. " +
+			`A green status also takes \`effect\`, the animation Telegram plays over the summary, chosen for how the turn went: ${EFFECT_GUIDE}. A green status without an effect, or any other status with one, is refused. ` +
+			'Whenever any user action is wanted, also set `question` and 2 to 6 `options` drawn from those real next steps. Every option is an object with a short `label` naming the action and a one-line `description` of what choosing it does or costs, and at most one of `recommended`, `lukewarm` or `discouraged` to colour the button. The description is not optional: the button is the whole of what a phone shows, so an option with no description is refused and no status is recorded. Labels and descriptions name who acts, as in "Agent will rebase the branch" or "User will review the diff" with the user\'s name in place of User when it is known, and never I, me, you, your, we or us, because a tapped button starts the next turn as the user\'s own words and a pronoun there could mean either side, so such an option is refused too. Never use only a phase number or letter, such as `Start Phase 7`. Each description becomes its own section under the summary, and the buttons start the next turn with the most likely choice first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices. The notification must be answerable from a phone without terminal context, so the `summary` names the decision and says why it is needed now. The next steps are held to the same standard as the work: the option that finishes the work properly belongs in the list and carries `recommended`, effort is never a reason to demote it, and any option that leaves a known defect standing says so in its own description and is marked `lukewarm` or `discouraged`. Text the user is meant to copy, an issue body, a PR post, a patch, goes out through `notify_snippet` instead of riding in the summary.',
 		approval: "read",
 		strict: true,
 		parameters: z.object({
 			summary: z.string(),
 			urgency: z.string(),
+			effect: z.string().optional(),
 			question: z.string().optional(),
 			options: z
 				.array(
@@ -4496,7 +4539,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				.optional(),
 		}),
 		async execute(_toolCallId, params) {
-			const p = params as { summary?: unknown; urgency?: unknown; question?: unknown; options?: unknown };
+			const p = params as {
+				summary?: unknown;
+				urgency?: unknown;
+				effect?: unknown;
+				question?: unknown;
+				options?: unknown;
+			};
 			const summary = typeof p.summary === "string" ? p.summary.trim() : "";
 			const raw = typeof p.urgency === "string" ? p.urgency.trim().toLowerCase() : "";
 			if (raw !== "red" && raw !== "orange" && raw !== "green") {
@@ -4508,6 +4557,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const urgency = raw;
 			if (summary.length === 0) {
 				return { content: [{ type: "text", text: "Error: summary must not be empty" }], isError: true };
+			}
+			const effect = parseEffect(urgency, p.effect);
+			if ("refusal" in effect) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: nothing was recorded because ${effect.refusal}. Call notify_status again with the effect fixed.`,
+						},
+					],
+					isError: true,
+				};
 			}
 			// A button is the whole of what a phone shows, so an option nobody explained is refused
 			// outright: nothing is recorded, and the turn-end block asks for the list again. A list
@@ -4557,6 +4618,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			turnSummary = {
 				text: clip(summary, SUMMARY_MAX),
 				urgency,
+				effect: effect.effect,
 				question: typeof p.question === "string" && p.question.trim().length > 0 ? p.question.trim() : undefined,
 				options: offered.length > 0 ? offered : undefined,
 			};
@@ -6323,7 +6385,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			lastSummary = clip(recorded.text.split("\n")[0]?.trim() ?? "", STATUS_SUMMARY_MAX);
 			lastSummaryAt = Date.now();
 			if (recorded.options === undefined) {
-				const extra: Record<string, unknown> = { ...urgencyExtras(recorded.urgency, quiet) };
+				const extra: Record<string, unknown> = { ...urgencyExtras(recorded, quiet) };
 				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
 				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
@@ -6364,7 +6426,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return {
 				decision: "block" as const,
 				reason:
-					'Before finishing, call notify_status with a one-or-two-sentence summary when no choice is attached and an urgency (green done, orange reply wanted, red blocked). Be proactive about next steps: name the concrete ones when they exist, and say plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository\'s maintainer would run it. If any user action is wanted, also set question and 2 to 6 options drawn from those real next steps. Every option is an object with a short label naming the action and a one-line description saying what choosing it does or costs: a button is all a phone shows, so an option with no description is refused and nothing is recorded. Labels and descriptions name who acts, as in "Agent will rebase the branch" or "User will review the diff" with the user\'s name in place of User when it is known, and never I, me, you, your, we or us, because a tapped button starts the next turn as the user\'s own words and a pronoun there could mean either side, so such an option is refused too. The notification must be answerable from a phone without terminal context. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit them when there is genuinely nothing to ask. The next steps are held to the same standard as the work: the option that finishes the work properly belongs in the list and carries `recommended`, effort is never a reason to demote it, and any option that leaves a known defect standing says so in its own description and is marked `lukewarm` or `discouraged`.',
+					'Before finishing, call notify_status with a one-or-two-sentence summary when no choice is attached and an urgency (green done, orange reply wanted, red blocked), plus, on green, an effect that fits how the turn went. Be proactive about next steps: name the concrete ones when they exist, and say plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository\'s maintainer would run it. If any user action is wanted, also set question and 2 to 6 options drawn from those real next steps. Every option is an object with a short label naming the action and a one-line description saying what choosing it does or costs: a button is all a phone shows, so an option with no description is refused and nothing is recorded. Labels and descriptions name who acts, as in "Agent will rebase the branch" or "User will review the diff" with the user\'s name in place of User when it is known, and never I, me, you, your, we or us, because a tapped button starts the next turn as the user\'s own words and a pronoun there could mean either side, so such an option is refused too. The notification must be answerable from a phone without terminal context. Never use only a phase number or letter, such as `Start Phase 7`. The buttons start the next turn, and the most likely choice goes first. Omit them when there is genuinely nothing to ask. The next steps are held to the same standard as the work: the option that finishes the work properly belongs in the list and carries `recommended`, effort is never a reason to demote it, and any option that leaves a known defect standing says so in its own description and is marked `lukewarm` or `discouraged`.',
 			};
 		}
 

@@ -299,7 +299,7 @@ const quiet = spawn("01a03410-0000-0000-0000-000000000000", "/home/dev/work/los"
 await quiet.fire("session_start");
 await quiet.tools
 	.get("notify_status")
-	.execute("q1", { summary: "Quietly done.", urgency: "green" }, undefined, undefined, quiet.ctx);
+	.execute("q1", { summary: "Quietly done.", urgency: "green", effect: "none" }, undefined, undefined, quiet.ctx);
 await quiet.fire("session_stop");
 await settle();
 const quietSent = lastCall("sendMessage").body;
@@ -547,7 +547,13 @@ const beforeThrottled = called("sendMessage").length;
 await two.fire("input");
 await two.tools
 	.get("notify_status")
-	.execute("thr1", { summary: "A throttled summary.", urgency: "green" }, undefined, undefined, two.ctx);
+	.execute(
+		"thr1",
+		{ summary: "A throttled summary.", urgency: "green", effect: "none" },
+		undefined,
+		undefined,
+		two.ctx,
+	);
 await two.fire("session_stop");
 await settle(200);
 api.failMethods = [];
@@ -570,7 +576,13 @@ const beforeMarkup = called("sendMessage").length;
 await two.fire("input");
 await two.tools
 	.get("notify_status")
-	.execute("mk1", { summary: "A summary with a button.", urgency: "green" }, undefined, undefined, two.ctx);
+	.execute(
+		"mk1",
+		{ summary: "A summary with a button.", urgency: "green", effect: "none" },
+		undefined,
+		undefined,
+		two.ctx,
+	);
 await two.fire("session_stop");
 await settle(200);
 api.failMethods = [];
@@ -2075,7 +2087,7 @@ await rs.tools
 	.get("notify_status")
 	.execute(
 		"n1",
-		{ summary: "Migration rewritten and **all 14 tests pass**. Nothing pending.", urgency: "green" },
+		{ summary: "Migration rewritten and **all 14 tests pass**. Nothing pending.", urgency: "green", effect: "none" },
 		undefined,
 		undefined,
 		rs.ctx,
@@ -2108,7 +2120,7 @@ check("an unknown urgency is rejected", unknownUrgency.isError === true);
 await rs.fire("input");
 const empty = await rs.tools
 	.get("notify_status")
-	.execute("n4", { summary: "   ", urgency: "green" }, undefined, undefined, rs.ctx);
+	.execute("n4", { summary: "   ", urgency: "green", effect: "none" }, undefined, undefined, rs.ctx);
 check("an empty summary is rejected", empty.isError === true);
 const blockedAgain = await rs.fire("session_stop");
 check(
@@ -2305,7 +2317,13 @@ check("the retired standing question is cleared from the record", record(tq.id).
 // notify_status validation: a bad options list costs the buttons, never the notification.
 const badOpts = await tq.tools
 	.get("notify_status")
-	.execute("q4", { summary: "x", urgency: "green", options: opts("only-one") }, undefined, undefined, tq.ctx);
+	.execute(
+		"q4",
+		{ summary: "x", urgency: "green", effect: "none", options: opts("only-one") },
+		undefined,
+		undefined,
+		tq.ctx,
+	);
 check("a single option still records the status", badOpts.isError !== true);
 check("a single option is reported as too few", /fewer than 2/.test(badOpts.content[0].text));
 
@@ -2662,7 +2680,7 @@ check(
 
 await ux.tools
 	.get("notify_status")
-	.execute("ux-hide", { summary: "Done.", urgency: "green" }, undefined, undefined, ux.ctx);
+	.execute("ux-hide", { summary: "Done.", urgency: "green", effect: "none" }, undefined, undefined, ux.ctx);
 await ux.fire("session_stop");
 await settle(150);
 const hiddenOfferId = record(ux.id).closeOffer;
@@ -2815,16 +2833,67 @@ await settle(150);
 check("a Telegram-started turn unpins it", lastCall("unpinChatMessage").body.message_id === pinnedCall.body.message_id);
 check("the record clears", record(ux.id).pinned === null);
 
-// Green statuses celebrate.
+// A green status plays the effect the agent chose for how the turn went, or none at all.
 await ux.tools
 	.get("notify_status")
-	.execute("ux5", { summary: "All 14 tests pass, nothing remains.", urgency: "green" }, undefined, undefined, ux.ctx);
+	.execute(
+		"ux5",
+		{ summary: "All 14 tests pass, nothing remains.", urgency: "green", effect: "fire" },
+		undefined,
+		undefined,
+		ux.ctx,
+	);
 await ux.fire("session_stop");
 await settle(150);
 const green = called("sendMessage").findLast(
 	(c) => typeof c.body.text === "string" && c.body.text.includes("nothing remains"),
 );
-check("a green status carries the celebration effect", green?.body.message_effect_id === "5046509860389126442");
+check("a green status plays the effect the agent chose", green?.body.message_effect_id === "5104841245755180586");
+await ux.tools
+	.get("notify_status")
+	.execute(
+		"ux6",
+		{ summary: "The benchmark regressed and nothing more fits here.", urgency: "green", effect: "none" },
+		undefined,
+		undefined,
+		ux.ctx,
+	);
+await ux.fire("session_stop");
+await settle(150);
+const sober = called("sendMessage").findLast(
+	(c) => typeof c.body.text === "string" && c.body.text.includes("benchmark regressed"),
+);
+check("a green status with effect none plays nothing", sober !== undefined && !("message_effect_id" in sober.body));
+await ux.fire("input");
+const effectless = await ux.tools
+	.get("notify_status")
+	.execute("ux7", { summary: "Done.", urgency: "green" }, undefined, undefined, ux.ctx);
+check(
+	"a green status without an effect is refused, naming every choice",
+	effectless.isError === true &&
+		["party", "fire", "thumbs_up", "heart", "thumbs_down", "poop", "none"].every((name) =>
+			effectless.content[0].text.includes(`\`${name}\``),
+		),
+);
+const unknownEffect = await ux.tools
+	.get("notify_status")
+	.execute("ux8", { summary: "Done.", urgency: "green", effect: "confetti" }, undefined, undefined, ux.ctx);
+check(
+	"an effect Telegram does not have is refused by name",
+	unknownEffect.isError === true && unknownEffect.content[0].text.includes('"confetti"'),
+);
+const orangeEffect = await ux.tools
+	.get("notify_status")
+	.execute("ux9", { summary: "Which design?", urgency: "orange", effect: "party" }, undefined, undefined, ux.ctx);
+check(
+	"an effect on a status that is not green is refused",
+	orangeEffect.isError === true && orangeEffect.content[0].text.includes("green"),
+);
+const refusedStop = await ux.fire("session_stop");
+check(
+	"a refused effect records no status",
+	refusedStop.some((r) => r?.decision === "block"),
+);
 
 // A resume carries the badge the agent chose, so the emoji under test is not the luck of the palette.
 const iconicId = "01a04900-0000-0000-0000-000000000000";
@@ -2904,7 +2973,9 @@ await fx.fire("message_end", {
 	},
 });
 await fx.fire("agent_end");
-await fx.tools.get("notify_status").execute("f1", { summary: "Done.", urgency: "green" }, undefined, undefined, fx.ctx);
+await fx.tools
+	.get("notify_status")
+	.execute("f1", { summary: "Done.", urgency: "green", effect: "none" }, undefined, undefined, fx.ctx);
 await fx.fire("session_stop");
 await settle(150);
 const footerMsg = lastCall("sendMessage").body.text;
@@ -2940,7 +3011,13 @@ await fx.fire("message_end", {
 await fx.fire("agent_end");
 await fx.tools
 	.get("notify_status")
-	.execute("usage-fallback", { summary: "Fallback done.", urgency: "green" }, undefined, undefined, fx.ctx);
+	.execute(
+		"usage-fallback",
+		{ summary: "Fallback done.", urgency: "green", effect: "none" },
+		undefined,
+		undefined,
+		fx.ctx,
+	);
 await fx.fire("session_stop");
 await settle(150);
 const fallbackFooter = lastCall("sendMessage").body.text;
@@ -2974,7 +3051,7 @@ await fx.fire("message_end", {
 await fx.fire("agent_end");
 await fx.tools
 	.get("notify_status")
-	.execute("usage-reset", { summary: "Next turn.", urgency: "green" }, undefined, undefined, fx.ctx);
+	.execute("usage-reset", { summary: "Next turn.", urgency: "green", effect: "none" }, undefined, undefined, fx.ctx);
 await fx.fire("session_stop");
 await settle(150);
 const resetFooter = lastCall("sendMessage").body.text;
@@ -3205,7 +3282,7 @@ await fx.tools
 	.get("notify_status")
 	.execute(
 		"f2",
-		{ summary: "Results:\n\n| step | state |\n| --- | --- |\n| build | ok |", urgency: "green" },
+		{ summary: "Results:\n\n| step | state |\n| --- | --- |\n| build | ok |", urgency: "green", effect: "none" },
 		undefined,
 		undefined,
 		fx.ctx,
@@ -3221,7 +3298,13 @@ api.failMethods = ["sendRichMessage"];
 await fx.fire("input");
 await fx.tools
 	.get("notify_status")
-	.execute("f3", { summary: "Again:\n\n| a | b |\n| - | - |", urgency: "green" }, undefined, undefined, fx.ctx);
+	.execute(
+		"f3",
+		{ summary: "Again:\n\n| a | b |\n| - | - |", urgency: "green", effect: "none" },
+		undefined,
+		undefined,
+		fx.ctx,
+	);
 await fx.fire("session_stop");
 await settle(150);
 check("rich rejection falls back to the plain renderer", lastCall("sendMessage").body.text.includes("| a | b |"));
@@ -3392,7 +3475,9 @@ check(
 	lastCall("sendMessage").body.text.includes("Context is being compacted (overflow)"),
 );
 await rv.fire("agent_end");
-await rv.tools.get("notify_status").execute("r1", { summary: "One.", urgency: "green" }, undefined, undefined, rv.ctx);
+await rv.tools
+	.get("notify_status")
+	.execute("r1", { summary: "One.", urgency: "green", effect: "none" }, undefined, undefined, rv.ctx);
 await rv.fire("session_stop");
 await settle(150);
 check("first turn footer counts its own usage", lastCall("sendMessage").body.text.includes("200 in / 50 out"));
@@ -3406,7 +3491,9 @@ await rv.fire("auto_compaction_start", { reason: "overflow", action: "context-fu
 await settle(120);
 check("the notice dedupe resets with the new turn", called("sendMessage").length === secondNoticeBefore + 1);
 await rv.fire("agent_end");
-await rv.tools.get("notify_status").execute("r2", { summary: "Two.", urgency: "green" }, undefined, undefined, rv.ctx);
+await rv.tools
+	.get("notify_status")
+	.execute("r2", { summary: "Two.", urgency: "green", effect: "none" }, undefined, undefined, rv.ctx);
 await rv.fire("session_stop");
 await settle(150);
 const secondFooter = lastCall("sendMessage").body.text;
@@ -3420,7 +3507,13 @@ await rv.fire("input");
 const richBefore = called("sendRichMessage").length;
 await rv.tools
 	.get("notify_status")
-	.execute("r3", { summary: "Plain sentence, nothing structured.", urgency: "green" }, undefined, undefined, rv.ctx);
+	.execute(
+		"r3",
+		{ summary: "Plain sentence, nothing structured.", urgency: "green", effect: "none" },
+		undefined,
+		undefined,
+		rv.ctx,
+	);
 await rv.fire("session_stop");
 await settle(150);
 check("plain prose never touches the rich endpoint", called("sendRichMessage").length === richBefore);
@@ -3550,7 +3643,7 @@ await rvB.fire("session_start");
 await rvB.fire("input");
 await rvB.tools
 	.get("notify_status")
-	.execute("rvb1", { summary: "Arrow round done.", urgency: "green" }, undefined, undefined, rvB.ctx);
+	.execute("rvb1", { summary: "Arrow round done.", urgency: "green", effect: "none" }, undefined, undefined, rvB.ctx);
 await rvB.fire("session_stop");
 await settle(150);
 const rvBMessage = record(rvB.id).recent.at(-1);
@@ -3603,7 +3696,7 @@ await nbSess.tools
 	.get("notify_status")
 	.execute(
 		"nb1",
-		{ summary: 'See [the docs](https://example.com/"quoted"/path).', urgency: "green" },
+		{ summary: 'See [the docs](https://example.com/"quoted"/path).', urgency: "green", effect: "none" },
 		undefined,
 		undefined,
 		nbSess.ctx,
@@ -3624,7 +3717,7 @@ await nbSess.tools
 	.get("notify_status")
 	.execute(
 		"nb2",
-		{ summary: "Before \u00000\u0000 after and `real code` end.", urgency: "green" },
+		{ summary: "Before \u00000\u0000 after and `real code` end.", urgency: "green", effect: "none" },
 		undefined,
 		undefined,
 		nbSess.ctx,
@@ -3643,7 +3736,13 @@ check("NUL characters are absent from the rendered output", !nulMsg.text.include
 await nbSess.fire("input");
 await nbSess.tools
 	.get("notify_status")
-	.execute("nb3", { summary: "\uD83D\uDE00".repeat(2501), urgency: "green" }, undefined, undefined, nbSess.ctx);
+	.execute(
+		"nb3",
+		{ summary: "\uD83D\uDE00".repeat(2501), urgency: "green", effect: "none" },
+		undefined,
+		undefined,
+		nbSess.ctx,
+	);
 await nbSess.fire("session_stop");
 await settle(150);
 const surrogateText = lastCall("sendMessage").body.text;
@@ -3963,7 +4062,7 @@ await orphanSess.fire("session_start");
 	await cs.fire("input");
 	await cs.tools
 		.get("notify_status")
-		.execute("g1", { summary: "All done.", urgency: "green" }, undefined, undefined, cs.ctx);
+		.execute("g1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, cs.ctx);
 	await cs.fire("session_stop");
 	await settle(150);
 	const doneMsg = lastCall("sendMessage");
@@ -3988,7 +4087,7 @@ await orphanSess.fire("session_start");
 		.get("notify_status")
 		.execute(
 			"g3",
-			{ summary: "Done, pick.", urgency: "green", options: opts("Merge", "Wait") },
+			{ summary: "Done, pick.", urgency: "green", effect: "thumbs_up", options: opts("Merge", "Wait") },
 			undefined,
 			undefined,
 			cs.ctx,
@@ -4000,6 +4099,10 @@ await orphanSess.fire("session_start");
 		lastCall("sendMessage")
 			.body.reply_markup.inline_keyboard.flat()
 			.some((b) => b.callback_data?.startsWith("k:")),
+	);
+	check(
+		"a green standing question plays the chosen effect",
+		lastCall("sendMessage").body.message_effect_id === "5107584321108051014",
 	);
 	const tag = JSON.parse(readFileSync(join(sessionsDir, `${cs.id}.json`), "utf8")).tag;
 	writeFileSync(
@@ -4091,7 +4194,7 @@ await orphanSess.fire("session_start");
 	await kc.fire("input");
 	await kc.tools
 		.get("notify_status")
-		.execute("k1", { summary: "All done.", urgency: "green" }, undefined, undefined, kc.ctx);
+		.execute("k1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, kc.ctx);
 	await kc.fire("session_stop");
 	await settle(150);
 	const tag = JSON.parse(readFileSync(join(sessionsDir, `${kc.id}.json`), "utf8")).tag;
@@ -4132,7 +4235,7 @@ await orphanSess.fire("session_start");
 	await bp.fire("input");
 	await bp.tools
 		.get("notify_status")
-		.execute("b1", { summary: "All done.", urgency: "green" }, undefined, undefined, bp.ctx);
+		.execute("b1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, bp.ctx);
 	await bp.fire("session_stop");
 	await settle(150);
 	const tag = JSON.parse(readFileSync(join(sessionsDir, `${bp.id}.json`), "utf8")).tag;
@@ -4159,7 +4262,7 @@ await orphanSess.fire("session_start");
 	await rt.fire("input");
 	await rt.tools
 		.get("notify_status")
-		.execute("r1", { summary: "Everything done.", urgency: "green" }, undefined, undefined, rt.ctx);
+		.execute("r1", { summary: "Everything done.", urgency: "green", effect: "none" }, undefined, undefined, rt.ctx);
 	await rt.fire("session_stop");
 	await settle(150);
 	const offerId = JSON.parse(readFileSync(join(sessionsDir, `${rt.id}.json`), "utf8")).closeOffer;
@@ -4195,7 +4298,7 @@ heading("oversized message truncation");
 	await tr.fire("agent_end");
 	await tr.tools
 		.get("notify_status")
-		.execute("t1", { summary: "&".repeat(900), urgency: "green" }, undefined, undefined, tr.ctx);
+		.execute("t1", { summary: "&".repeat(900), urgency: "green", effect: "none" }, undefined, undefined, tr.ctx);
 	await tr.fire("session_stop");
 	await settle(150);
 	const whole = lastCall("sendMessage").body.text;
@@ -4276,7 +4379,7 @@ heading("status tool feedback");
 	await sf.fire("input");
 	const long = await sf.tools
 		.get("notify_status")
-		.execute("s2", { summary: "x".repeat(1200), urgency: "green" }, undefined, undefined, sf.ctx);
+		.execute("s2", { summary: "x".repeat(1200), urgency: "green", effect: "none" }, undefined, undefined, sf.ctx);
 	check("an over-long summary is still recorded", long.isError !== true);
 	check("an over-long summary reports its truncation", long.content[0].text.includes("truncated"));
 	await sf.fire("session_stop");
@@ -4308,7 +4411,13 @@ heading("surrogate-safe clipping");
 	await sg.fire("input");
 	await sg.tools
 		.get("notify_status")
-		.execute("sc1", { summary: half(900), urgency: "green", question: "Ok?" }, undefined, undefined, sg.ctx);
+		.execute(
+			"sc1",
+			{ summary: half(900), urgency: "green", effect: "none", question: "Ok?" },
+			undefined,
+			undefined,
+			sg.ctx,
+		);
 	await sg.fire("session_stop");
 	await settle(150);
 	check("a clipped summary holds no lone surrogate", lastCall("sendMessage").body.text.isWellFormed());
@@ -4449,7 +4558,7 @@ heading("media fetch failures");
 	await mf.fire("input");
 	await mf.tools
 		.get("notify_status")
-		.execute("mf0", { summary: "Ready for files.", urgency: "green" }, undefined, undefined, mf.ctx);
+		.execute("mf0", { summary: "Ready for files.", urgency: "green", effect: "none" }, undefined, undefined, mf.ctx);
 	await mf.fire("session_stop");
 	await settle(150);
 	const mfMessage = record(mf.id).recent.at(-1);
@@ -4632,7 +4741,13 @@ heading("aggregated status");
 		await s.fire("input");
 		await s.tools
 			.get("notify_status")
-			.execute(`agg${index}`, { summary: `${folder} is done.`, urgency: "green" }, undefined, undefined, s.ctx);
+			.execute(
+				`agg${index}`,
+				{ summary: `${folder} is done.`, urgency: "green", effect: "none" },
+				undefined,
+				undefined,
+				s.ctx,
+			);
 		await s.fire("session_stop");
 		await settle(150);
 		trio.push(s);
@@ -4822,7 +4937,7 @@ heading("turn duration in the footer");
 	await td.fire("agent_end");
 	await td.tools
 		.get("notify_status")
-		.execute("td1", { summary: "Timed turn.", urgency: "green" }, undefined, undefined, td.ctx);
+		.execute("td1", { summary: "Timed turn.", urgency: "green", effect: "none" }, undefined, undefined, td.ctx);
 	await td.fire("session_stop");
 	await settle(150);
 	// The footer is now one code line per model plus a final line for tools and wall time.
@@ -4837,7 +4952,7 @@ heading("turn duration in the footer");
 	await tdNone.fire("input");
 	await tdNone.tools
 		.get("notify_status")
-		.execute("td2", { summary: "No loop ran.", urgency: "green" }, undefined, undefined, tdNone.ctx);
+		.execute("td2", { summary: "No loop ran.", urgency: "green", effect: "none" }, undefined, undefined, tdNone.ctx);
 	await tdNone.fire("session_stop");
 	await settle(150);
 	check("a session with no agent loop reports no duration", !/<code>/u.test(lastCall("sendMessage").body.text ?? ""));
@@ -4855,7 +4970,7 @@ heading("replies reach an idle session");
 	await ir.fire("agent_end");
 	await ir.tools
 		.get("notify_status")
-		.execute("ir1", { summary: "Done, over to you.", urgency: "green" }, undefined, undefined, ir.ctx);
+		.execute("ir1", { summary: "Done, over to you.", urgency: "green", effect: "none" }, undefined, undefined, ir.ctx);
 	await ir.fire("session_stop");
 	await settle(150);
 	const summaryId = record(ir.id).recent.at(-1);
@@ -4923,6 +5038,7 @@ heading("a bad options list costs a retry, never the notification");
 	const allBad = await send("bo1", {
 		summary: "The work is done.",
 		urgency: "green",
+		effect: "none",
 		question: "What next?",
 		options: [{ note: "no label" }, 42],
 	});
@@ -5008,7 +5124,13 @@ heading("ambiguous plain messages ask which session");
 		await s.fire("input");
 		await s.tools
 			.get("notify_status")
-			.execute(`${folder}1`, { summary: `${folder} finished.`, urgency: "green" }, undefined, undefined, s.ctx);
+			.execute(
+				`${folder}1`,
+				{ summary: `${folder} finished.`, urgency: "green", effect: "none" },
+				undefined,
+				undefined,
+				s.ctx,
+			);
 		await s.fire("session_stop");
 		await settle(150);
 		return s;
@@ -5244,7 +5366,7 @@ heading("settings apply without a restart");
 	await cf.fire("input");
 	await cf.tools
 		.get("notify_status")
-		.execute("cf1", { summary: "Should stay quiet.", urgency: "green" }, undefined, undefined, cf.ctx);
+		.execute("cf1", { summary: "Should stay quiet.", urgency: "green", effect: "none" }, undefined, undefined, cf.ctx);
 	await cf.fire("session_stop");
 	await settle(150);
 	check("turn-end notices stop after the setting is turned off", called("sendMessage").length === sendsBefore);
@@ -5259,7 +5381,7 @@ heading("settings apply without a restart");
 	await cf.fire("input");
 	await cf.tools
 		.get("notify_status")
-		.execute("cf2", { summary: "Back on the air.", urgency: "green" }, undefined, undefined, cf.ctx);
+		.execute("cf2", { summary: "Back on the air.", urgency: "green", effect: "none" }, undefined, undefined, cf.ctx);
 	await cf.fire("session_stop");
 	await settle(150);
 	check(
@@ -5304,7 +5426,7 @@ heading("pinned fleet dashboard");
 	await owner.fire("input");
 	await owner.tools
 		.get("notify_status")
-		.execute("d1", { summary: "Owner is done.", urgency: "green" }, undefined, undefined, owner.ctx);
+		.execute("d1", { summary: "Owner is done.", urgency: "green", effect: "none" }, undefined, undefined, owner.ctx);
 	await owner.fire("session_stop");
 	await settle(150);
 
@@ -5636,7 +5758,7 @@ heading("one standard message head");
 	await hd.fire("input");
 	await hd.tools
 		.get("notify_status")
-		.execute("hd1", { summary: "The suite is green.", urgency: "green" }, undefined, undefined, hd.ctx);
+		.execute("hd1", { summary: "The suite is green.", urgency: "green", effect: "none" }, undefined, undefined, hd.ctx);
 	await hd.fire("session_stop");
 	await settle(150);
 	check(
@@ -6192,7 +6314,13 @@ const replyTo = (updateId, messageId, text) => ({
 await fb.fire("input");
 await fb.tools
 	.get("notify_status")
-	.execute("fb1", { summary: "Lexer rewritten; tests green.", urgency: "green" }, undefined, undefined, fb.ctx);
+	.execute(
+		"fb1",
+		{ summary: "Lexer rewritten; tests green.", urgency: "green", effect: "none" },
+		undefined,
+		undefined,
+		fb.ctx,
+	);
 await fb.fire("session_stop");
 await settle(150);
 const statusId = record(fb.id).recent.at(-1);
@@ -6407,7 +6535,7 @@ await gone.fire("session_start");
 await gone.fire("input");
 await gone.tools
 	.get("notify_status")
-	.execute("fb3", { summary: "Parser done.", urgency: "green" }, undefined, undefined, gone.ctx);
+	.execute("fb3", { summary: "Parser done.", urgency: "green", effect: "none" }, undefined, undefined, gone.ctx);
 await gone.fire("session_stop");
 await settle(150);
 const goneId = record(gone.id).recent.at(-1);
@@ -6735,7 +6863,7 @@ await fb.tools
 	.get("notify_status")
 	.execute(
 		"fb-plain-ledger",
-		{ summary: 'Clock <tg-time unix="1" format="r">then</tg-time>.', urgency: "green" },
+		{ summary: 'Clock <tg-time unix="1" format="r">then</tg-time>.', urgency: "green", effect: "none" },
 		undefined,
 		undefined,
 		fb.ctx,
@@ -7012,7 +7140,7 @@ await metadataSession.tools
 	.get("notify_status")
 	.execute(
 		"fb-metadata",
-		{ summary: "Metadata snapshot.", urgency: "green" },
+		{ summary: "Metadata snapshot.", urgency: "green", effect: "none" },
 		undefined,
 		undefined,
 		metadataSession.ctx,
@@ -7091,7 +7219,7 @@ await shutdownRedoSession.tools
 	.get("notify_status")
 	.execute(
 		"fb-shutdown-redo",
-		{ summary: "Ready to close after feedback.", urgency: "green" },
+		{ summary: "Ready to close after feedback.", urgency: "green", effect: "none" },
 		undefined,
 		undefined,
 		shutdownRedoSession.ctx,
@@ -7190,7 +7318,7 @@ await routeRaceSession.tools
 	.get("notify_status")
 	.execute(
 		"fb-route-race",
-		{ summary: "Race the shutdown boundary.", urgency: "green" },
+		{ summary: "Race the shutdown boundary.", urgency: "green", effect: "none" },
 		undefined,
 		undefined,
 		routeRaceSession.ctx,
