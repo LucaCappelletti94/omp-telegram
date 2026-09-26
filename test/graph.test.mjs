@@ -257,7 +257,11 @@ const list = statusList(
 	new Map([["a", pr("approved")]]),
 );
 check("the list names each node with its displayed status", list.includes("fix parser") && list.includes("approved"));
-check("the list links the PR", list.includes("https://github.com/o/r/pull/7"));
+const parserLine = list.split("\n").find((line) => line.includes("fix parser"));
+check(
+	"the list ends its node's line with the PR link",
+	parserLine?.split(" \u2014 ").at(-1) === "https://github.com/o/r/pull/7",
+);
 check("nodes needing Luca come first", list.indexOf("port") < list.indexOf("fix parser"));
 check("an empty list says so", statusList([], new Map()).length > 0);
 
