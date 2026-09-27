@@ -9106,6 +9106,17 @@ heading("sessions that died without shutting down");
 	crashed(frozenId, { cwd: folder("frozen"), label: "Suspended", boot: bootId });
 	crashed(cleanId, { cwd: folder("clean"), label: "Closed cleanly", heartbeat: 0 });
 	crashed(loudId, { cwd: loudDir, label: "Half applied", state: "waiting on a question" });
+	const spareId = "0c2a0009-0000-7000-8000-000000000009";
+	const spareDir = folder("spare");
+	crashed(spareId, { cwd: spareDir, label: "Never came back" });
+	const pinnedId = "0c2a000a-0000-7000-8000-00000000000a";
+	crashed(pinnedId, {
+		cwd: join(root, "crash-work", "also-removed"),
+		label: "Pinned and gone",
+		standing: { id: "st-pinned", messageId: 601, labels: ["Go"], head: "pinned head" },
+		closeOffer: 602,
+		pinned: 603,
+	});
 
 	const crashCalls = () => called("sendMessage").filter((c) => String(c.body.text).includes("\u{1F691}"));
 	const cardButtons = (body) => (body?.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.callback_data);
@@ -9271,11 +9282,54 @@ heading("sessions that died without shutting down");
 		lastCall("sendMessage").body.text.includes("Continue the fix?"),
 	);
 
-	const dismissToast = await tap(first, 9505, `kd:${batch}`, cardId);
-	check("dismiss answers the tap", dismissToast.length > 0);
+	// Restore all opens what can be opened and names what cannot.
+	writeFileSync(tmuxLog, "");
+	const allToast = await tap(first, 9507, `ka:${batch}`, cardId);
+	const allOpened = readFileSync(tmuxLog, "utf8");
+	check(
+		"restore all opens every waiting session into a tmux session that still exists",
+		allOpened.includes(`new-window -d -t work: -n Never came back -c ${spareDir}`) &&
+			allOpened.includes(`--resume ${spareId}`) &&
+			!allOpened.includes(pinnedId),
+	);
+	check(
+		"the restore all toast counts what opened and names what could not",
+		allToast.startsWith("Restoring 1 session.") &&
+			allToast.includes("Folder removed") &&
+			allToast.includes("Pinned and gone"),
+	);
+	// A window that opened but whose omp never came live is offered again after a minute.
+	jump(61_000);
+	first.heartbeat();
+	await settle(150);
+	check(
+		"a restore that never came back is offered again",
+		(lastCard()?.text ?? "").includes("did not come back") && cardButtons(lastCard()).includes(`kr:${spareId}`),
+	);
+
+	const stripsBefore = called("editMessageReplyMarkup").length;
+	await tap(first, 9505, `kd:${batch}`, cardId);
+	await settle(100);
+	const stripped = called("editMessageReplyMarkup")
+		.slice(stripsBefore)
+		.map((c) => c.body.message_id);
+	check(
+		"dismiss takes the buttons off what the dead session left open and unpins its red status",
+		stripped.includes(601) &&
+			stripped.includes(602) &&
+			called("unpinChatMessage").some((c) => c.body.message_id === 603),
+	);
+	check(
+		"dismiss leaves the questions of a restored session alone",
+		!stripped.includes(502) && !called("unpinChatMessage").some((c) => c.body.message_id === 504),
+	);
 	check(
 		"after dismiss no session is waiting and the card has no buttons",
 		/dismissed/i.test(lastCard()?.text ?? "") && cardButtons(lastCard()).length === 0,
+	);
+	check(
+		"a dismissed session is not restored by a stale button",
+		(await tap(first, 9508, `kr:${spareId}`, cardId)).includes("dismissed"),
 	);
 
 	// A lone omp that dies while the poller runs is found on the heartbeat, without a machine restart.
@@ -9336,6 +9390,10 @@ heading("sessions that died without shutting down");
 		"a tap on an expired card says so and strips its buttons",
 		expiredToast.includes("no longer") &&
 			called("editMessageReplyMarkup").some((c) => c.body.message_id === loneCardId),
+	);
+	check(
+		"restore all on an expired card says so",
+		(await tap(first, 9509, `ka:${batch}`, cardId)).includes("no longer"),
 	);
 
 	for (const s of [first, idleBack, workingBack, loudBack]) await s.fire("session_shutdown");
