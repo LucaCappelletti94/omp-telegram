@@ -89,6 +89,20 @@ const EXTERNAL_ANSWERS_DIR = join(EXTERNAL_DIR, "answers");
 const EXTERNAL_KEY = /^[A-Za-z0-9._-]{1,64}$/u;
 /** Held only across a badge validate-and-persist, which is two file writes long. */
 const BADGE_LOCK_FILE = join(STATE_DIR, "badge.lock");
+/** Sessions that died without shutting down, kept until restored, dismissed or a week old. */
+const CRASH_DIR = join(STATE_DIR, "crashed");
+/** One file per card: the sessions one reap found dead together. */
+const CRASH_BATCH_DIR = join(CRASH_DIR, "batches");
+const CRASH_KEEP_MS = 7 * 24 * 3_600_000;
+const CRASH_MESSAGE_TYPE = "omp-telegram.crash";
+/** Differs from a record's `boot` exactly when the machine restarted since that record was written. */
+const BOOT_ID = (() => {
+	try {
+		return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+	} catch {
+		return "";
+	}
+})();
 
 const REACTION_ROUTE_WAIT_MS = 5_000;
 const HEARTBEAT_MS = 15_000;
@@ -340,6 +354,12 @@ interface SessionRecord {
 	summary: string;
 	summaryAt: number;
 	heartbeat: number;
+	/** Boot the record was written on, empty where the platform has no boot id. */
+	boot: string;
+	/** The `resumeArgs` subset of the command line, repeated when the session is restored. */
+	argv: string[];
+	/** tmux session the process ran in, empty outside tmux. */
+	tmux: string;
 }
 
 interface TelegramMessage {
@@ -700,6 +720,29 @@ interface LaunchSpec {
 
 interface LedgerNode extends GraphNode {
 	launch?: LaunchSpec;
+}
+
+interface CrashRecord {
+	/** The registry record as the dead process last wrote it. */
+	record: SessionRecord;
+	batch: string;
+	/** The machine restarted since the record was written, rather than one process dying. */
+	machine: boolean;
+	/** When a Restore tap last opened a window for it, 0 before any. */
+	restoringAt: number;
+	/** Why the last restore opened nothing, shown on the card until one succeeds. */
+	error: string;
+	dismissed: boolean;
+}
+
+interface CrashBatch {
+	at: number;
+	ids: string[];
+	machine: boolean;
+	/** The card, once the poller sent it. */
+	messageId: number | null;
+	/** Text and buttons the card last showed, so an unchanged card is not edited. */
+	shown: string;
 }
 
 interface LaunchRecord {
@@ -1613,6 +1656,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastNotifiedAt = 0;
 	let turnActive = false;
 	let sessionAlive = true;
+	/** What a session restored after a crash is told on its first drain, when it died with work in hand. */
+	let crashNote: string | null = null;
+	/** The turn that note started: it reaches Telegram only if the agent asks to continue. */
+	let recoveryTurn = false;
 	let typingSentAt = 0;
 	/** When a delivered Telegram entry reached the agent; 0 once the turn carrying its answer ended. */
 	let replyOwedAt = 0;
@@ -1910,6 +1957,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			summaryAt: lastSummaryAt,
 			heartbeat: sessionAlive ? Date.now() : 0,
 			messaging: AGENT_PROTOCOL,
+			boot: BOOT_ID,
+			argv: launchSpec.argv,
+			tmux: launchSpec.tmuxSession,
 		};
 		writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(record), 0o600);
 	}
@@ -1936,47 +1986,64 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		noteState();
 	}
 
+	function readSessionRecord(id: string): SessionRecord | null {
+		const path = join(SESSIONS_DIR, `${id}.json`);
+		if (!existsSync(path)) return null;
+		return sessionRecordFrom(readJsonFile(path));
+	}
+
 	/**
 	 * A record on disk was written by whatever code that session started with, and omp loads this
 	 * extension from a working tree, so a fleet routinely mixes versions. Every field is therefore
 	 * filled in here rather than asserted by a cast: one record missing `state` used to throw on
 	 * every drain tick, which killed the board and the poll along with it.
 	 */
-	function readSessionRecord(id: string): SessionRecord | null {
-		const path = join(SESSIONS_DIR, `${id}.json`);
-		if (!existsSync(path)) return null;
-		try {
-			const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-			if (parsed === null || typeof parsed !== "object") return null;
-			const raw = parsed as Partial<SessionRecord>;
-			const text = (value: unknown): string => (typeof value === "string" ? value : "");
-			const count = (value: unknown): number => (typeof value === "number" ? value : 0);
-			const messageId = (value: unknown): number | null => (typeof value === "number" ? value : null);
-			return {
-				pid: count(raw.pid),
-				tag: text(raw.tag),
-				name: text(raw.name),
-				cwd: text(raw.cwd),
-				emoji: text(raw.emoji),
-				emojiChosen: raw.emojiChosen === true,
-				label: text(raw.label),
-				lastNotified: count(raw.lastNotified),
-				recent: Array.isArray(raw.recent) ? raw.recent.filter((m) => typeof m === "number") : [],
-				question: messageId(raw.question),
-				replyQuestion: messageId(raw.replyQuestion),
-				standing: typeof raw.standing === "object" && raw.standing !== null ? raw.standing : null,
-				closeOffer: messageId(raw.closeOffer),
-				pinned: messageId(raw.pinned),
-				state: text(raw.state),
-				health: text(raw.health),
-				summary: text(raw.summary),
-				summaryAt: count(raw.summaryAt),
-				heartbeat: count(raw.heartbeat),
-				messaging: count(raw.messaging),
-			};
-		} catch {
-			return null;
-		}
+	function sessionRecordFrom(parsed: unknown): SessionRecord | null {
+		if (parsed === null || typeof parsed !== "object") return null;
+		const raw = parsed as Partial<SessionRecord>;
+		const text = (value: unknown): string => (typeof value === "string" ? value : "");
+		const count = (value: unknown): number => (typeof value === "number" ? value : 0);
+		const messageId = (value: unknown): number | null => (typeof value === "number" ? value : null);
+		return {
+			pid: count(raw.pid),
+			tag: text(raw.tag),
+			name: text(raw.name),
+			cwd: text(raw.cwd),
+			emoji: text(raw.emoji),
+			emojiChosen: raw.emojiChosen === true,
+			label: text(raw.label),
+			lastNotified: count(raw.lastNotified),
+			recent: Array.isArray(raw.recent) ? raw.recent.filter((m) => typeof m === "number") : [],
+			question: messageId(raw.question),
+			replyQuestion: messageId(raw.replyQuestion),
+			standing: typeof raw.standing === "object" && raw.standing !== null ? raw.standing : null,
+			closeOffer: messageId(raw.closeOffer),
+			pinned: messageId(raw.pinned),
+			state: text(raw.state),
+			health: text(raw.health),
+			summary: text(raw.summary),
+			summaryAt: count(raw.summaryAt),
+			heartbeat: count(raw.heartbeat),
+			messaging: count(raw.messaging),
+			boot: text(raw.boot),
+			argv: Array.isArray(raw.argv) ? raw.argv.filter((a) => typeof a === "string") : [],
+			tmux: text(raw.tmux),
+		};
+	}
+
+	function readCrash(id: string): CrashRecord | null {
+		if (!isStateToken(id)) return null;
+		const raw = readJsonFile(join(CRASH_DIR, `${id}.json`)) as Partial<Record<keyof CrashRecord, unknown>> | null;
+		const record = sessionRecordFrom(raw?.record);
+		if (raw === null || record === null || typeof raw.batch !== "string") return null;
+		return {
+			record,
+			batch: raw.batch,
+			machine: raw.machine === true,
+			restoringAt: typeof raw.restoringAt === "number" ? raw.restoringAt : 0,
+			error: typeof raw.error === "string" ? raw.error : "",
+			dismissed: raw.dismissed === true,
+		};
 	}
 
 	function allRecords(): Array<{ id: string; record: SessionRecord }> {
@@ -2140,8 +2207,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return Math.random().toString(36).slice(2, 7).padEnd(5, "0");
 	}
 
-	function reapDeadSessions(): void {
+	/**
+	 * A stale record whose heartbeat is 0 was shut down. One with a live heartbeat was not, and it
+	 * died unless its process still runs on this boot, which a suspended or frozen omp does. Offering
+	 * that one for restore would start a second omp on the same transcript. `crashesOnly` leaves a
+	 * shut-down record in place, because a resume reads its reply routing and standing question.
+	 */
+	function reapDeadSessions(crashesOnly: boolean): void {
 		if (!existsSync(SESSIONS_DIR)) return;
+		const crashed: string[] = [];
+		const batch = randomUUID();
+		let machine = false;
 		for (const entry of readdirSync(SESSIONS_DIR)) {
 			if (!entry.endsWith(".json")) continue;
 			const id = entry.slice(0, -5);
@@ -2149,6 +2225,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const record = readSessionRecord(id);
 			// A live session refreshes its heartbeat every 15 seconds, so a stale one is gone.
 			if (record !== null && Date.now() - record.heartbeat <= LOCK_STALE_MS) continue;
+			const crash = record !== null && record.heartbeat > 0;
+			if (crashesOnly && !crash) continue;
+			const restarted = crash && record.boot.length > 0 && BOOT_ID.length > 0 && record.boot !== BOOT_ID;
+			if (crash && !restarted && record.pid > 0) {
+				let running = true;
+				try {
+					process.kill(record.pid, 0);
+				} catch (error) {
+					running = (error as NodeJS.ErrnoException).code === "EPERM";
+				}
+				// A killed omp whose parent never reaped it is a zombie, which kill(pid, 0) still finds.
+				// A tmux server that lost the window leaves one behind.
+				try {
+					if (running) running = !/\) Z /u.test(readFileSync(`/proc/${record.pid}/stat`, "utf8"));
+				} catch {}
+				if (running) continue;
+			}
 			mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
 			const closing = reactionRouteClosingFile(id);
 			try {
@@ -2164,14 +2257,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						"dead-session redo notice",
 					);
 				}
+				if (crash) {
+					const kept: CrashRecord = { record, batch, machine: restarted, restoringAt: 0, error: "", dismissed: false };
+					writePrivateJson(CRASH_DIR, `${id}.json`, kept);
+					rmSync(join(CRASH_DIR, `${id}.restored`), { force: true });
+					crashed.push(id);
+					machine ||= restarted;
+					// The ask died with its process. The restored agent asks again if it still needs to.
+					if (record.question !== null) detach(stripKeyboard(record.question), "crashed ask close");
+				}
 				unlinkSync(join(SESSIONS_DIR, entry));
 				rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
-				if (listPending(id).items.length > 0) detach(raiseResumeCard(id), "resume card");
+				// The crash card counts held updates itself, and a restore delivers them.
+				if (!crash && listPending(id).items.length > 0) detach(raiseResumeCard(id), "resume card");
 				rmSync(reactionRouteLockFile(id), { force: true });
 			} finally {
 				rmSync(closing, { force: true });
 			}
 		}
+		if (crashed.length === 0) return;
+		const card: CrashBatch = { at: Date.now(), ids: crashed, machine, messageId: null, shown: "" };
+		writePrivateJson(CRASH_BATCH_DIR, `${batch}.json`, card);
 	}
 
 	let lastReap = 0;
@@ -3532,6 +3638,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await answerExternalQuestion(cfg, callback);
 				return;
 			}
+			if (/^k[rad]:/u.test(callback.data)) {
+				await answerCrashCallback(cfg, callback);
+				return;
+			}
 			if (callback.data.startsWith("r:") || callback.data.startsWith("l:")) {
 				await answerResumeCallback(cfg, callback);
 				return;
@@ -4884,6 +4994,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Delivers what was held for this session, in the order it happened. */
 	function drainPending(): void {
 		if (sessionCtx === null || !sessionAlive) return;
+		if (crashNote !== null) {
+			const content = crashNote;
+			crashNote = null;
+			recoveryTurn = true;
+			pi.sendMessage(
+				{ customType: CRASH_MESSAGE_TYPE, content, display: true },
+				{ deliverAs: "aside", triggerTurn: true },
+			);
+		}
 		const id = sessionCtx.sessionManager.getSessionId();
 		if (!existsSync(join(PENDING_DIR, id))) return;
 		const { items, bad } = listPending(id);
@@ -4990,27 +5109,33 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const node = readNode(id);
 		if (node === null) return { ok: false, error: "That session is not in the dependency graph." };
 		if (node.launch === undefined) return { ok: false, error: "That node has no omp session behind it to resume." };
-		if (!existsSync(node.cwd)) {
-			return { ok: false, error: `Its folder ${node.cwd} no longer exists, so omp would resume it somewhere else.` };
+		return openOmp(id, node.cwd, node.launch.argv, node.launch.tmuxSession, nodePlace(node));
+	}
+
+	/**
+	 * Opens `omp <argv> --resume <id>` in a detached window of the named tmux session, or in a new
+	 * detached tmux session of that name when a reboot took it, so the poller needs no tmux of its
+	 * own. Detached, because a tap on the phone must not pull the terminal away from whoever sits at it.
+	 */
+	async function openOmp(
+		id: string,
+		cwd: string,
+		argv: string[],
+		tmuxSession: string,
+		name: string,
+	): Promise<{ ok: true } | { ok: false; error: string }> {
+		if (!existsSync(cwd)) {
+			return { ok: false, error: `Its folder ${cwd} no longer exists, so omp would resume it somewhere else.` };
 		}
-		if (process.env.TMUX === undefined) {
-			return { ok: false, error: "The session handling Telegram runs outside tmux, so it cannot open a window." };
-		}
-		let target = node.launch?.tmuxSession ?? "";
-		if (target.length > 0 && !(await run("tmux", ["has-session", "-t", `=${target}`])).ok) target = "";
-		const opened = await run("tmux", [
-			"new-window",
-			...(target.length > 0 ? ["-t", `${target}:`] : []),
-			"-c",
-			node.cwd,
-			"-n",
-			clip(nodePlace(node), 30),
-			"omp",
-			...(node.launch?.argv ?? []),
-			"--resume",
-			id,
-		]);
-		return opened.ok ? { ok: true } : { ok: false, error: `tmux new-window failed: ${clip(opened.stderr, 150)}` };
+		const target = tmuxSession || launchSpec.tmuxSession || "omp";
+		const window = ["-n", clip(name, 30), "-c", cwd, "omp", ...argv, "--resume", id];
+		const exists = (await run("tmux", ["has-session", "-t", `=${target}`])).ok;
+		const opened = await run(
+			"tmux",
+			exists ? ["new-window", "-d", "-t", `${target}:`, ...window] : ["new-session", "-d", "-s", target, ...window],
+		);
+		if (opened.ok) return { ok: true };
+		return { ok: false, error: `tmux ${exists ? "new-window" : "new-session"} failed: ${clip(opened.stderr, 150)}` };
 	}
 
 	async function answerResumeCallback(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
@@ -5072,6 +5197,174 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			},
 			15_000,
 		);
+	}
+
+	function crashTitle(record: SessionRecord): string {
+		const name = record.label || record.name || record.cwd.split("/").filter(Boolean).pop() || record.tag;
+		return record.emoji.length > 0 ? `${record.emoji} ${name}` : name;
+	}
+
+	function readCrashBatch(id: string): CrashBatch | null {
+		if (!isStateToken(id)) return null;
+		const raw = readJsonFile(join(CRASH_BATCH_DIR, `${id}.json`)) as Partial<Record<keyof CrashBatch, unknown>> | null;
+		if (raw === null || typeof raw.at !== "number" || !Array.isArray(raw.ids)) return null;
+		return {
+			at: raw.at,
+			ids: raw.ids.filter((x): x is string => isStateToken(x)),
+			machine: raw.machine === true,
+			messageId: typeof raw.messageId === "number" ? raw.messageId : null,
+			shown: typeof raw.shown === "string" ? raw.shown : "",
+		};
+	}
+
+	/** A crashed session that came back, whether from the card or by hand, or died again onto a newer card. */
+	function crashRestored(id: string, kept: CrashRecord, batch: string): boolean {
+		return kept.batch !== batch || existsSync(join(CRASH_DIR, `${id}.restored`)) || isLiveSession(id);
+	}
+
+	function crashWaiting(id: string, kept: CrashRecord, batch: string): boolean {
+		return !kept.dismissed && !crashRestored(id, kept, batch) && Date.now() - kept.restoringAt >= RESUME_START_MS;
+	}
+
+	/**
+	 * Only the poller sends and edits crash cards. Ten sessions restored at once would otherwise
+	 * race their edits and leave the card showing whichever view landed last.
+	 */
+	async function renderCrashCards(): Promise<void> {
+		if (config === null || !existsSync(CRASH_BATCH_DIR)) return;
+		const cfg = config;
+		for (const entry of readdirSync(CRASH_BATCH_DIR)) {
+			if (!entry.endsWith(".json")) continue;
+			const batchId = entry.slice(0, -5);
+			const batch = readCrashBatch(batchId);
+			if (batch === null) continue;
+			if (Date.now() - batch.at > CRASH_KEEP_MS) {
+				for (const id of batch.ids) {
+					if (readCrash(id)?.batch !== batchId) continue;
+					rmSync(join(CRASH_DIR, `${id}.json`), { force: true });
+					rmSync(join(CRASH_DIR, `${id}.restored`), { force: true });
+				}
+				rmSync(join(CRASH_BATCH_DIR, entry), { force: true });
+				continue;
+			}
+			const lines: string[] = [];
+			const rows: InlineButton[][] = [];
+			let lastBeat = 0;
+			for (const id of batch.ids) {
+				const kept = readCrash(id);
+				if (kept === null) continue;
+				const { record } = kept;
+				lastBeat = Math.max(lastBeat, record.heartbeat);
+				const held = listPending(id).items.length;
+				const outcome = crashRestored(id, kept, batchId)
+					? "\u2705 restored"
+					: kept.dismissed
+						? "dismissed"
+						: Date.now() - kept.restoringAt < RESUME_START_MS
+							? "\u25B6\uFE0F restoring"
+							: kept.restoringAt > 0
+								? "\u26A0\uFE0F did not come back within a minute"
+								: kept.error.length > 0
+									? `\u26A0\uFE0F ${kept.error}`
+									: "";
+				const place = record.cwd.startsWith(homedir()) ? `~${record.cwd.slice(homedir().length)}` : record.cwd;
+				lines.push(
+					`- ${crashTitle(record)} \u00B7 \`${place}\` \u00B7 was ${record.state || "idle"}${held > 0 ? ` \u00B7 ${updates(held)} waiting` : ""}${outcome.length > 0 ? ` \u00B7 ${outcome}` : ""}`,
+				);
+				// Telegram caps callback data at 64 bytes.
+				if (crashWaiting(id, kept, batchId) && id.length <= 61) {
+					rows.push([{ text: buttonText(`Restore ${crashTitle(record)}`), callback_data: `kr:${id}` }]);
+				}
+			}
+			if (rows.length > 1) rows.push([{ text: "Restore all", callback_data: `ka:${batchId}`, style: "success" }]);
+			if (rows.length > 0) rows.push([{ text: "Dismiss", callback_data: `kd:${batchId}` }]);
+			const count = batch.ids.length === 1 ? "1 session" : `${batch.ids.length} sessions`;
+			const head = batch.machine
+				? `\u{1F691} **The machine restarted**, and ${count} died without shutting down.`
+				: `\u{1F691} ${count} died without shutting down.`;
+			const foot = rows.length > 0 ? "\n\nRestore reopens a session with `omp --resume` in its tmux session." : "";
+			const text = `${head} Last heartbeat ${relativeTime(lastBeat)}.\n${lines.join("\n")}${foot}`;
+			const shown = JSON.stringify({ text, rows });
+			if (shown === batch.shown) continue;
+			const body = {
+				chat_id: cfg.chatId,
+				text: toTelegramHtml(fitToTelegram(text, "")),
+				parse_mode: "HTML",
+				reply_markup: { inline_keyboard: rows },
+			};
+			const sent =
+				batch.messageId === null
+					? await callTelegram<TelegramMessage>(cfg, "sendMessage", body, 15_000)
+					: await callTelegram(cfg, "editMessageText", { ...body, message_id: batch.messageId }, 15_000);
+			if (sent === null) continue;
+			const messageId = batch.messageId ?? (sent as TelegramMessage).message_id;
+			writePrivateJson(CRASH_BATCH_DIR, entry, { ...batch, messageId, shown });
+		}
+	}
+
+	/** The toast for one Restore tap, or null when the crash is no longer on record. */
+	async function restoreCrashed(id: string): Promise<string | null> {
+		const kept = readCrash(id);
+		if (kept === null) return null;
+		if (crashRestored(id, kept, kept.batch)) return "That session is already running.";
+		if (kept.dismissed) return "That session was dismissed. omp --resume still reopens it by hand.";
+		if (Date.now() - kept.restoringAt < RESUME_START_MS) return "That session is already starting.";
+		const { record } = kept;
+		const opened = await openOmp(id, record.cwd, record.argv, record.tmux, crashTitle(record));
+		const next: CrashRecord = opened.ok
+			? { ...kept, restoringAt: Date.now(), error: "" }
+			: { ...kept, restoringAt: 0, error: opened.error };
+		writePrivateJson(CRASH_DIR, `${id}.json`, next);
+		return opened.ok ? `Restoring ${crashTitle(record)} in tmux.` : clip(opened.error, 190);
+	}
+
+	async function answerCrashCallback(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
+		const data = callback.data ?? "";
+		const arg = data.slice(3);
+		let toast: string | null;
+		if (data.startsWith("kr:")) {
+			toast = await restoreCrashed(arg);
+		} else {
+			const batch = readCrashBatch(arg);
+			if (batch === null) {
+				toast = null;
+			} else if (data.startsWith("ka:")) {
+				let opened = 0;
+				const failed: string[] = [];
+				for (const id of batch.ids) {
+					const kept = readCrash(id);
+					if (kept === null || !crashWaiting(id, kept, arg)) continue;
+					await restoreCrashed(id);
+					if (readCrash(id)?.error) failed.push(crashTitle(kept.record));
+					else opened += 1;
+				}
+				toast = `Restoring ${opened === 1 ? "1 session" : `${opened} sessions`}.${failed.length > 0 ? ` Could not open ${failed.join(", ")}.` : ""}`;
+			} else {
+				for (const id of batch.ids) {
+					const kept = readCrash(id);
+					if (kept === null || kept.dismissed || crashRestored(id, kept, arg)) continue;
+					writePrivateJson(CRASH_DIR, `${id}.json`, { ...kept, dismissed: true });
+					// What a restore would have adopted is dead now, so its buttons go and its pin comes down.
+					const { standing, closeOffer, pinned } = kept.record;
+					if (typeof standing?.messageId === "number") detach(stripKeyboard(standing.messageId), "crash dismiss");
+					if (closeOffer !== null) detach(stripKeyboard(closeOffer), "crash dismiss");
+					if (pinned !== null) {
+						detach(
+							callTelegram(cfg, "unpinChatMessage", { chat_id: cfg.chatId, message_id: pinned }, 10_000),
+							"crash dismiss unpin",
+						);
+					}
+				}
+				toast = "Dismissed. omp --resume still reopens any of them by hand.";
+			}
+		}
+		if (toast === null) {
+			const messageId = callback.message?.message_id;
+			if (typeof messageId === "number") await stripKeyboard(messageId);
+			toast = "That crash is no longer on record.";
+		}
+		await renderCrashCards();
+		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callback.id, text: toast }, 10_000);
 	}
 
 	async function sendDependencyGraph(cfg: Config, filter: string): Promise<void> {
@@ -6039,7 +6332,28 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		resetReactionRouteForStartup(sessionId);
 		sessionAlive = true;
 		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true, mode: 0o700 });
-		reapDeadSessions();
+		reapDeadSessions(false);
+		// A session restored after a crash takes back the record the reaper set aside, tag and open
+		// questions included, so everything below reads it as an ordinary resume.
+		const restoredMarker = join(CRASH_DIR, `${sessionId}.restored`);
+		const crash =
+			existsSync(join(SESSIONS_DIR, `${sessionId}.json`)) || existsSync(restoredMarker) ? null : readCrash(sessionId);
+		if (crash !== null) {
+			const adopted: SessionRecord = { ...crash.record, pid: process.pid, heartbeat: Date.now() };
+			writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(adopted), 0o600);
+			writeFileAtomic(restoredMarker, "", 0o600);
+			const { state, heartbeat } = crash.record;
+			if (state.length > 0 && state !== "idle") {
+				crashNote = [
+					`This session died without shutting down around ${new Date(heartbeat).toLocaleString("sv-SE")}, because ${crash.machine ? "the machine restarted" : "its omp process ended unexpectedly"}.`,
+					`It was ${state} at that moment, so that turn was cut off and any command it was running was killed. It has just been restored from its saved transcript, and the user has not yet said whether to go on.`,
+					"No user message has arrived since the crash, and the last one in this transcript predates it, so it is no instruction to go on.",
+					"In this turn, do not continue, retry or redo any of the work, not even a command that was cut off. Only look at what tells where the work stands.",
+					"If work remains, call notify_status with urgency orange, a brief summary of where the work stands, and options that include continuing it, then end the turn with one sentence saying you are waiting for the answer.",
+					"If no work remains, end the turn with one sentence saying so, without calling notify_status, and nothing reaches Telegram.",
+				].join(" ");
+			}
+		}
 		reapOldFiles();
 		sessionTag = claimTag();
 		// Base-36 tag as a number: stable across resumes, unique across live sessions.
@@ -6125,7 +6439,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (ownsLock()) refreshLock();
 				else acquireLock();
 				syncOwnNode(ctx);
-				if (ownsLock()) graphTick();
+				if (ownsLock()) {
+					graphTick();
+					reapDeadSessions(true);
+					detach(renderCrashCards(), "crash cards");
+				}
 			} catch (error) {
 				pi.logger.warn("notify-telegram: heartbeat failed", {
 					error: error instanceof Error ? error.message : String(error),
@@ -6164,6 +6482,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnSummary = null;
 		chainHop = null;
 		statusBlockUsed = false;
+		recoveryTurn = false;
 		unpinRed(ctx);
 		closeReplyQuestion();
 		const standing = standingQuestion;
@@ -6370,6 +6689,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnActive = false;
 		replyOwedAt = 0;
 		approvalWaiting = false;
+		if (recoveryTurn) {
+			recoveryTurn = false;
+			// Nothing left to do after a crash is not news. Only a request to continue reaches Telegram.
+			if (turnSummary === null || turnSummary.urgency === "green") {
+				turnSummary = null;
+				return;
+			}
+		}
 		if (config === null || !config.notifyOnTurnEnd) return;
 		const quiet = Date.now() - lastLocalInput < config.quietSeconds * 1000;
 
