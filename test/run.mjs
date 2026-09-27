@@ -9035,6 +9035,9 @@ heading("sessions that died without shutting down");
 	delete process.env.TMUX_PANE;
 	rmSync(join(stateDir, "poller.lock"), { force: true });
 	rmSync(crashDir, { recursive: true, force: true });
+	// Crash records expire by file age, and the files are written now, so the year the graph
+	// section walked the clock forward would expire them the moment they exist.
+	clockSkew = 0;
 
 	const folder = (name) => {
 		const path = join(root, "crash-work", name);

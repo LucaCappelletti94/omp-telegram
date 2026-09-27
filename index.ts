@@ -1989,7 +1989,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function readSessionRecord(id: string): SessionRecord | null {
 		const path = join(SESSIONS_DIR, `${id}.json`);
 		if (!existsSync(path)) return null;
-		return sessionRecordFrom(readJsonFile(path));
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+			return sessionRecordFrom(parsed);
+		} catch {
+			return null;
+		}
 	}
 
 	/**
@@ -2260,7 +2265,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (crash) {
 					const kept: CrashRecord = { record, batch, machine: restarted, restoringAt: 0, error: "", dismissed: false };
 					writePrivateJson(CRASH_DIR, `${id}.json`, kept);
-					rmSync(join(CRASH_DIR, `${id}.restored`), { force: true });
 					crashed.push(id);
 					machine ||= restarted;
 					// The ask died with its process. The restored agent asks again if it still needs to.
@@ -2289,6 +2293,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		for (const [dir, keepMs] of [
 			[MEDIA_DIR, MEDIA_KEEP_MS],
 			[SENT_DIR, SENT_KEEP_MS],
+			// A crash card nobody touched for a week is not coming back.
+			[CRASH_DIR, CRASH_KEEP_MS],
+			[CRASH_BATCH_DIR, CRASH_KEEP_MS],
 		] as const) {
 			if (!existsSync(dir)) continue;
 			for (const entry of readdirSync(dir)) {
@@ -5219,7 +5226,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** A crashed session that came back, whether from the card or by hand, or died again onto a newer card. */
 	function crashRestored(id: string, kept: CrashRecord, batch: string): boolean {
-		return kept.batch !== batch || existsSync(join(CRASH_DIR, `${id}.restored`)) || isLiveSession(id);
+		const marker = readJsonFile(join(CRASH_DIR, `${id}.restored`)) as { batch?: unknown } | null;
+		return kept.batch !== batch || marker?.batch === kept.batch || isLiveSession(id);
 	}
 
 	function crashWaiting(id: string, kept: CrashRecord, batch: string): boolean {
@@ -5231,22 +5239,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * race their edits and leave the card showing whichever view landed last.
 	 */
 	async function renderCrashCards(): Promise<void> {
-		if (config === null || !existsSync(CRASH_BATCH_DIR)) return;
+		if (config === null) return;
 		const cfg = config;
-		for (const entry of readdirSync(CRASH_BATCH_DIR)) {
-			if (!entry.endsWith(".json")) continue;
+		for (const entry of listJson(CRASH_BATCH_DIR)) {
 			const batchId = entry.slice(0, -5);
 			const batch = readCrashBatch(batchId);
 			if (batch === null) continue;
-			if (Date.now() - batch.at > CRASH_KEEP_MS) {
-				for (const id of batch.ids) {
-					if (readCrash(id)?.batch !== batchId) continue;
-					rmSync(join(CRASH_DIR, `${id}.json`), { force: true });
-					rmSync(join(CRASH_DIR, `${id}.restored`), { force: true });
-				}
-				rmSync(join(CRASH_BATCH_DIR, entry), { force: true });
-				continue;
-			}
 			const lines: string[] = [];
 			const rows: InlineButton[][] = [];
 			let lastBeat = 0;
@@ -6335,13 +6333,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		reapDeadSessions(false);
 		// A session restored after a crash takes back the record the reaper set aside, tag and open
 		// questions included, so everything below reads it as an ordinary resume.
-		const restoredMarker = join(CRASH_DIR, `${sessionId}.restored`);
-		const crash =
-			existsSync(join(SESSIONS_DIR, `${sessionId}.json`)) || existsSync(restoredMarker) ? null : readCrash(sessionId);
-		if (crash !== null) {
+		const crash = readSessionRecord(sessionId) === null ? readCrash(sessionId) : null;
+		const marker = readJsonFile(join(CRASH_DIR, `${sessionId}.restored`)) as { batch?: unknown } | null;
+		if (crash !== null && marker?.batch !== crash.batch) {
 			const adopted: SessionRecord = { ...crash.record, pid: process.pid, heartbeat: Date.now() };
 			writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(adopted), 0o600);
-			writeFileAtomic(restoredMarker, "", 0o600);
+			writePrivateJson(CRASH_DIR, `${sessionId}.restored`, { batch: crash.batch });
 			const { state, heartbeat } = crash.record;
 			if (state.length > 0 && state !== "idle") {
 				crashNote = [
