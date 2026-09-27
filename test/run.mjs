@@ -1,5 +1,6 @@
 // Full suite against a stubbed Telegram API; sends nothing.
 
+import { spawn as startProcess } from "node:child_process";
 import fs, {
 	chmodSync,
 	existsSync,
@@ -9005,6 +9006,399 @@ heading("dependency graph across sessions");
 	delete process.env.TMUX;
 	delete process.env.TMUX_PANE;
 	delete process.env.GRAPH_PR_LIST;
+}
+
+heading("sessions that died without shutting down");
+{
+	const stateDir = join(root, "notify-telegram");
+	const crashDir = join(stateDir, "crashed");
+	const bootId = (() => {
+		try {
+			return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+		} catch {
+			return "";
+		}
+	})();
+	const kBin = join(root, "crash-bin");
+	mkdirSync(kBin, { recursive: true });
+	const tmuxLog = join(root, "crash-tmux.log");
+	writeFileSync(tmuxLog, "");
+	// Only the tmux session `work` survived; any other name has to be created.
+	writeFileSync(
+		join(kBin, "tmux"),
+		`#!/bin/sh\necho "$*" >> ${tmuxLog}\ncase "$1" in\n  has-session) [ "$3" = "=work" ] ;;\n  *) exit 0 ;;\nesac\n`,
+		{ mode: 0o755 },
+	);
+	const savedPath = process.env.PATH;
+	process.env.PATH = `${kBin}:${savedPath}`;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	rmSync(crashDir, { recursive: true, force: true });
+	// Crash records expire by file age, and the files are written now, so the year the graph
+	// section walked the clock forward would expire them the moment they exist.
+	clockSkew = 0;
+
+	const folder = (name) => {
+		const path = join(root, "crash-work", name);
+		mkdirSync(path, { recursive: true });
+		return path;
+	};
+	const died = Date.now() - 10 * 60_000;
+	const crashed = (id, fields) =>
+		writeFileSync(
+			join(sessionsDir, `${id}.json`),
+			JSON.stringify({
+				pid: process.pid,
+				tag: id.slice(0, 5),
+				name: "",
+				cwd: "/nowhere",
+				emoji: "",
+				emojiChosen: false,
+				label: "",
+				lastNotified: died,
+				recent: [],
+				question: null,
+				replyQuestion: null,
+				standing: null,
+				closeOffer: null,
+				pinned: null,
+				state: "idle",
+				health: "",
+				summary: "",
+				summaryAt: 0,
+				messaging: 1,
+				heartbeat: died,
+				boot: "boot-before-the-crash",
+				argv: ["--model", "opus"],
+				tmux: "work",
+				...fields,
+			}),
+		);
+	const workingId = "0c2a0001-0000-7000-8000-000000000001";
+	const idleId = "0c2a0002-0000-7000-8000-000000000002";
+	const goneId = "0c2a0003-0000-7000-8000-000000000003";
+	const frozenId = "0c2a0004-0000-7000-8000-000000000004";
+	const cleanId = "0c2a0005-0000-7000-8000-000000000005";
+	const loudId = "0c2a0007-0000-7000-8000-000000000007";
+	const loudDir = folder("asking");
+	const workingDir = folder("parser");
+	const idleDir = folder("docs");
+	const goneDir = join(root, "crash-work", "removed");
+	crashed(workingId, {
+		cwd: workingDir,
+		emoji: "\u{1F9EA}",
+		label: "Fix the parser",
+		state: "working (bash)",
+		question: 501,
+	});
+	crashed(idleId, {
+		cwd: idleDir,
+		emoji: "\u{1F4DA}",
+		label: "Write the docs",
+		tmux: "gone",
+		recent: [502],
+		standing: { id: "st-crash", messageId: 502, labels: ["Merge", "Wait"], head: "docs head" },
+		closeOffer: 503,
+		pinned: 504,
+	});
+	crashed(goneId, { cwd: goneDir, label: "Folder removed", state: "working" });
+	crashed(frozenId, { cwd: folder("frozen"), label: "Suspended", boot: bootId });
+	crashed(cleanId, { cwd: folder("clean"), label: "Closed cleanly", heartbeat: 0 });
+	crashed(loudId, { cwd: loudDir, label: "Half applied", state: "waiting on a question" });
+	const spareId = "0c2a0009-0000-7000-8000-000000000009";
+	const spareDir = folder("spare");
+	crashed(spareId, { cwd: spareDir, label: "Never came back" });
+	const pinnedId = "0c2a000a-0000-7000-8000-00000000000a";
+	crashed(pinnedId, {
+		cwd: join(root, "crash-work", "also-removed"),
+		label: "Pinned and gone",
+		standing: { id: "st-pinned", messageId: 601, labels: ["Go"], head: "pinned head" },
+		closeOffer: 602,
+		pinned: 603,
+	});
+
+	const crashCalls = () => called("sendMessage").filter((c) => String(c.body.text).includes("\u{1F691}"));
+	const cardButtons = (body) => (body?.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.callback_data);
+	const lastCard = () => {
+		const sends = crashCalls();
+		const edits = called("editMessageText").filter((c) => String(c.body.text).includes("\u{1F691}"));
+		return [...sends, ...edits].sort((a, b) => api.calls.indexOf(a) - api.calls.indexOf(b)).at(-1)?.body;
+	};
+	const tap = async (who, updateId, data, messageId) => {
+		api.queued = [
+			{
+				update_id: updateId,
+				callback_query: {
+					id: `cb-${updateId}`,
+					from: { id: CHAT },
+					message: { message_id: messageId, chat: { id: CHAT } },
+					data,
+				},
+			},
+		];
+		await who.pump(300);
+		return lastCall("answerCallbackQuery")?.body.text ?? "";
+	};
+
+	const cardsBefore = crashCalls().length;
+	const first = spawn("0c2a0010-0000-7000-8000-000000000010", folder("first"));
+	await first.fire("session_start");
+	await settle(100);
+	check(
+		"a crashed record leaves the registry and is kept for restore",
+		!existsSync(join(sessionsDir, `${workingId}.json`)) && existsSync(join(crashDir, `${workingId}.json`)),
+	);
+	check(
+		"a record whose process still runs on this boot is left alone",
+		existsSync(join(sessionsDir, `${frozenId}.json`)) && !existsSync(join(crashDir, `${frozenId}.json`)),
+	);
+	check(
+		"a record its session shut down cleanly is deleted and never offered",
+		!existsSync(join(sessionsDir, `${cleanId}.json`)) && !existsSync(join(crashDir, `${cleanId}.json`)),
+	);
+	check(
+		"the open ask of a crashed session loses its buttons",
+		called("editMessageReplyMarkup").some((c) => c.body.message_id === 501),
+	);
+	first.heartbeat();
+	await settle(150);
+	const card = crashCalls().at(-1)?.body;
+	check("the poller posts one card for the whole batch", crashCalls().length === cardsBefore + 1);
+	check(
+		"the card says the machine restarted and lists every crashed session",
+		/machine restarted/i.test(card?.text ?? "") &&
+			card.text.includes("Fix the parser") &&
+			card.text.includes("Write the docs") &&
+			card.text.includes("Folder removed") &&
+			!card.text.includes("Suspended") &&
+			!card.text.includes("Closed cleanly"),
+	);
+	check("the card names the state each session died in", card?.text.includes("working (bash)") === true);
+	const cardId = api.nextMessage - 1;
+	const buttons = cardButtons(card);
+	const batch = buttons.find((b) => b.startsWith("ka:"))?.slice(3) ?? "";
+	check(
+		"the card offers restore per session, restore all and dismiss",
+		[workingId, idleId, goneId].every((id) => buttons.includes(`kr:${id}`)) &&
+			batch.length > 0 &&
+			buttons.includes(`kd:${batch}`),
+	);
+	first.heartbeat();
+	await settle(100);
+	check("an unchanged card is not sent again", crashCalls().length === cardsBefore + 1);
+
+	writeFileSync(tmuxLog, "");
+	const restoredToast = await tap(first, 9501, `kr:${idleId}`, cardId);
+	const opened = readFileSync(tmuxLog, "utf8");
+	check(
+		"restore recreates a tmux session the reboot took, resuming the session in its folder with its flags",
+		opened.includes("new-session -d -s gone") &&
+			opened.includes(`-c ${idleDir}`) &&
+			opened.includes(`omp --model opus --resume ${idleId}`),
+	);
+	check("the restore toast says it is reopening", /restor/i.test(restoredToast));
+	check("the card marks it as restoring", /restoring/i.test(lastCard()?.text ?? ""));
+	writeFileSync(tmuxLog, "");
+	const twiceToast = await tap(first, 9502, `kr:${idleId}`, cardId);
+	check(
+		"a second tap while it starts opens nothing",
+		!readFileSync(tmuxLog, "utf8").includes("omp") && twiceToast.includes("already starting"),
+	);
+	const goneToast = await tap(first, 9503, `kr:${goneId}`, cardId);
+	check(
+		"restoring a session whose folder is gone opens nothing and names the folder",
+		!readFileSync(tmuxLog, "utf8").includes("omp") && goneToast.includes(goneDir),
+	);
+	check(
+		"the card shows why it failed and keeps its button",
+		(lastCard()?.text ?? "").includes(goneDir) && cardButtons(lastCard()).includes(`kr:${goneId}`),
+	);
+
+	// The tapped session comes back: it adopts what the crash left and has no work to report.
+	const idleBack = spawn(idleId, idleDir);
+	await idleBack.fire("session_start");
+	await idleBack.pump(150);
+	check(
+		"a restored session adopts its label, standing question and reply routing",
+		record(idleId).label === "Write the docs" &&
+			record(idleId).standing?.id === "st-crash" &&
+			record(idleId).recent.includes(502),
+	);
+	check("a session that died idle is not woken", idleBack.customs.length === 0);
+	first.heartbeat();
+	await settle(150);
+	check(
+		"the card marks it restored and drops its button",
+		/restored/i.test(lastCard()?.text ?? "") && !cardButtons(lastCard()).includes(`kr:${idleId}`),
+	);
+	check("a live session is not offered again", (await tap(first, 9504, `kr:${idleId}`, cardId)).includes("running"));
+
+	// Resumed by hand rather than from the card, a session that died mid-turn is told what happened.
+	const workingBack = spawn(workingId, workingDir);
+	await workingBack.fire("session_start");
+	await workingBack.pump(150);
+	const note = workingBack.customs.at(-1);
+	check(
+		"a session that died mid-turn is woken with what happened",
+		workingBack.customs.length === 1 &&
+			note.options?.triggerTurn === true &&
+			/machine restarted/i.test(note.message.content) &&
+			note.message.content.includes("working (bash)") &&
+			note.message.content.includes("notify_status"),
+	);
+	const quietSends = called("sendMessage").length;
+	const quietStop = await workingBack.fire("session_stop");
+	await settle(150);
+	check(
+		"a recovery turn with nothing left to do sends nothing and is not blocked",
+		!quietStop.some((r) => r?.decision === "block") && called("sendMessage").length === quietSends,
+	);
+	const laterStop = await workingBack.fire("session_stop");
+	check(
+		"only the recovery turn is exempt",
+		laterStop.some((r) => r?.decision === "block"),
+	);
+
+	const loudBack = spawn(loudId, loudDir);
+	await loudBack.fire("session_start");
+	await loudBack.pump(150);
+	await loudBack.tools.get("notify_status").execute(
+		"crash-orange",
+		{
+			summary: "The parser fix was half applied when the machine went down.",
+			urgency: "orange",
+			question: "Continue the fix?",
+			options: opts("Continue", "Stop here"),
+		},
+		undefined,
+		undefined,
+		loudBack.ctx,
+	);
+	await loudBack.fire("session_stop");
+	await settle(150);
+	check(
+		"a recovery turn that found work asks on Telegram",
+		lastCall("sendMessage").body.text.includes("Continue the fix?"),
+	);
+
+	// Restore all opens what can be opened and names what cannot.
+	writeFileSync(tmuxLog, "");
+	const allToast = await tap(first, 9507, `ka:${batch}`, cardId);
+	const allOpened = readFileSync(tmuxLog, "utf8");
+	check(
+		"restore all opens every waiting session into a tmux session that still exists",
+		allOpened.includes(`new-window -d -t work: -n Never came back -c ${spareDir}`) &&
+			allOpened.includes(`--resume ${spareId}`) &&
+			!allOpened.includes(pinnedId),
+	);
+	check(
+		"the restore all toast counts what opened and names what could not",
+		allToast.startsWith("Restoring 1 session.") &&
+			allToast.includes("Folder removed") &&
+			allToast.includes("Pinned and gone"),
+	);
+	// A window that opened but whose omp never came live is offered again after a minute.
+	jump(61_000);
+	first.heartbeat();
+	await settle(150);
+	check(
+		"a restore that never came back is offered again",
+		(lastCard()?.text ?? "").includes("did not come back") && cardButtons(lastCard()).includes(`kr:${spareId}`),
+	);
+
+	const stripsBefore = called("editMessageReplyMarkup").length;
+	await tap(first, 9505, `kd:${batch}`, cardId);
+	await settle(100);
+	const stripped = called("editMessageReplyMarkup")
+		.slice(stripsBefore)
+		.map((c) => c.body.message_id);
+	check(
+		"dismiss takes the buttons off what the dead session left open and unpins its red status",
+		stripped.includes(601) &&
+			stripped.includes(602) &&
+			called("unpinChatMessage").some((c) => c.body.message_id === 603),
+	);
+	check(
+		"dismiss leaves the questions of a restored session alone",
+		!stripped.includes(502) && !called("unpinChatMessage").some((c) => c.body.message_id === 504),
+	);
+	check(
+		"after dismiss no session is waiting and the card has no buttons",
+		/dismissed/i.test(lastCard()?.text ?? "") && cardButtons(lastCard()).length === 0,
+	);
+	check(
+		"a dismissed session is not restored by a stale button",
+		(await tap(first, 9508, `kr:${spareId}`, cardId)).includes("dismissed"),
+	);
+
+	// A lone omp that dies while the poller runs is found on the heartbeat, without a machine restart.
+	const loneId = "0c2a0006-0000-7000-8000-000000000006";
+	crashed(loneId, {
+		cwd: folder("lone"),
+		label: "Lone crash",
+		boot: bootId,
+		pid: 999_999,
+		heartbeat: Date.now() - 60_000,
+	});
+	const lonely = crashCalls().length;
+	first.heartbeat();
+	await settle(150);
+	first.heartbeat();
+	await settle(150);
+	const loneCard = crashCalls().at(-1)?.body;
+	check(
+		"a process that died on this boot is offered on its own card without claiming a restart",
+		crashCalls().length === lonely + 1 &&
+			loneCard.text.includes("Lone crash") &&
+			!/machine restarted/i.test(loneCard.text) &&
+			cardButtons(loneCard).includes(`kr:${loneId}`),
+	);
+	const loneCardId = api.nextMessage - 1;
+
+	// omp killed under tmux can linger as a zombie its parent never reaps, which kill(pid, 0) still finds.
+	const holder = startProcess("sh", ["-c", "sleep 0 & echo $!; exec sleep 30"], {
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	const zombiePid = Number(
+		await new Promise((done) => holder.stdout.once("data", (chunk) => done(String(chunk).trim()))),
+	);
+	await settle(200);
+	const zombieId = "0c2a0008-0000-7000-8000-000000000008";
+	crashed(zombieId, {
+		cwd: folder("zombie"),
+		label: "Killed under tmux",
+		boot: bootId,
+		pid: zombiePid,
+		heartbeat: Date.now() - 60_000,
+	});
+	first.heartbeat();
+	await settle(150);
+	check(
+		"a zombie process counts as dead",
+		existsSync(join(crashDir, `${zombieId}.json`)) && !existsSync(join(sessionsDir, `${zombieId}.json`)),
+	);
+	holder.kill();
+
+	// A week on, the card's records are gone and a tap says so.
+	jump(8 * 24 * 3_600_000);
+	first.heartbeat();
+	await settle(150);
+	check("a week-old crash record expires", !existsSync(join(crashDir, `${loneId}.json`)));
+	const expiredToast = await tap(first, 9506, `kr:${loneId}`, loneCardId);
+	check(
+		"a tap on an expired card says so and strips its buttons",
+		expiredToast.includes("no longer") &&
+			called("editMessageReplyMarkup").some((c) => c.body.message_id === loneCardId),
+	);
+	check(
+		"restore all on an expired card says so",
+		(await tap(first, 9509, `ka:${batch}`, cardId)).includes("no longer"),
+	);
+
+	for (const s of [first, idleBack, workingBack, loudBack]) await s.fire("session_shutdown");
+	rmSync(join(sessionsDir, `${frozenId}.json`), { force: true });
+	process.env.PATH = savedPath;
 }
 
 rmSync(root, { recursive: true, force: true });
