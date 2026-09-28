@@ -716,6 +716,8 @@ interface LaunchSpec {
 	/** Flags the session started with that a resume repeats, filtered by `resumeArgs`. */
 	argv: string[];
 	tmuxSession: string;
+	/** Where the session last ran, as `session:window.pane`, empty outside tmux. */
+	pane: string;
 }
 
 interface LedgerNode extends GraphNode {
@@ -816,7 +818,11 @@ function parseNode(raw: unknown): LedgerNode | null {
 		updatedAt: n.updatedAt,
 		launch:
 			launch !== undefined && Array.isArray(launch.argv) && typeof launch.tmuxSession === "string"
-				? { argv: launch.argv.filter((a): a is string => typeof a === "string"), tmuxSession: launch.tmuxSession }
+				? {
+						argv: launch.argv.filter((a): a is string => typeof a === "string"),
+						tmuxSession: launch.tmuxSession,
+						pane: typeof launch.pane === "string" ? launch.pane : "",
+					}
 				: undefined,
 	};
 }
@@ -4839,7 +4845,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------------ dependency graph
 
-	const launchSpec: LaunchSpec = { argv: resumeArgs(process.argv.slice(2)), tmuxSession: "" };
+	const launchSpec: LaunchSpec = { argv: resumeArgs(process.argv.slice(2)), tmuxSession: "", pane: "" };
 	let lastGraphPoll = 0;
 	let lastGraphPrune = 0;
 	let graphPollInFlight = false;
@@ -4896,7 +4902,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const node = readNode(ctx.sessionManager.getSessionId());
 		if (node === null) return;
 		const relabel = badgeOverride.length > 0 && node.label !== badgeOverride;
-		if (relabel || node.emoji !== badgeEmoji || node.tag !== sessionTag || node.cwd !== ctx.cwd) saveOwnNode(ctx);
+		const moved = node.launch?.pane !== launchSpec.pane;
+		if (relabel || moved || node.emoji !== badgeEmoji || node.tag !== sessionTag || node.cwd !== ctx.cwd)
+			saveOwnNode(ctx);
+	}
+
+	/** ` in tmux `session:window.pane``, or nothing when the place is unknown. */
+	function inTmux(pane: string | null | undefined): string {
+		return pane ? ` in tmux \`${pane}\`` : "";
 	}
 
 	/** Ledger nodes, unclaimed launches, and edge ends that only the live registry knows. */
@@ -5031,7 +5044,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		rmSync(join(PENDING_DIR, id, "resuming.json"), { force: true });
 		if (items.length > 0) {
 			detach(
-				settleResumeCard(id, `\u2705 Delivered ${updates(items.length)} to **${titleOf(id)}**.`, false),
+				settleResumeCard(
+					id,
+					`\u2705 Delivered ${updates(items.length)} to **${titleOf(id)}**${inTmux(tmuxLocation())}.`,
+					false,
+				),
 				"resume card settle",
 			);
 		}
@@ -5069,7 +5086,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					? `- ${outcomeSummary(item)}`
 					: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
 			);
-		const text = `\u23F8\uFE0F **${titleOf(id)}** has ended with ${updates(items.length)} waiting:\n${lines.join("\n")}\n\nResume it to deliver them?`;
+		const text = `\u23F8\uFE0F **${titleOf(id)}**${inTmux(readNode(id)?.launch?.pane)} has ended with ${updates(items.length)} waiting:\n${lines.join("\n")}\n\nResume it to deliver them?`;
 		const body = {
 			chat_id: config.chatId,
 			text: toTelegramHtml(fitToTelegram(text, "")),
@@ -5112,7 +5129,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	async function resumeSession(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
+	async function resumeSession(id: string): Promise<{ ok: true; pane: string } | { ok: false; error: string }> {
 		const node = readNode(id);
 		if (node === null) return { ok: false, error: "That session is not in the dependency graph." };
 		if (node.launch === undefined) return { ok: false, error: "That node has no omp session behind it to resume." };
@@ -5123,6 +5140,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * Opens `omp <argv> --resume <id>` in a detached window of the named tmux session, or in a new
 	 * detached tmux session of that name when a reboot took it, so the poller needs no tmux of its
 	 * own. Detached, because a tap on the phone must not pull the terminal away from whoever sits at it.
+	 * `pane` is where the window opened, as `session:window.pane`.
 	 */
 	async function openOmp(
 		id: string,
@@ -5130,18 +5148,30 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		argv: string[],
 		tmuxSession: string,
 		name: string,
-	): Promise<{ ok: true } | { ok: false; error: string }> {
+	): Promise<{ ok: true; pane: string } | { ok: false; error: string }> {
 		if (!existsSync(cwd)) {
 			return { ok: false, error: `Its folder ${cwd} no longer exists, so omp would resume it somewhere else.` };
 		}
 		const target = tmuxSession || launchSpec.tmuxSession || "omp";
-		const window = ["-n", clip(name, 30), "-c", cwd, "omp", ...argv, "--resume", id];
+		const window = [
+			"-n",
+			clip(name, 30),
+			"-c",
+			cwd,
+			"-P",
+			"-F",
+			"#{session_name}:#{window_index}.#{pane_index}",
+			"omp",
+			...argv,
+			"--resume",
+			id,
+		];
 		const exists = (await run("tmux", ["has-session", "-t", `=${target}`])).ok;
 		const opened = await run(
 			"tmux",
 			exists ? ["new-window", "-d", "-t", `${target}:`, ...window] : ["new-session", "-d", "-s", target, ...window],
 		);
-		if (opened.ok) return { ok: true };
+		if (opened.ok) return { ok: true, pane: opened.stdout.trim() };
 		return { ok: false, error: `tmux ${exists ? "new-window" : "new-session"} failed: ${clip(opened.stderr, 150)}` };
 	}
 
@@ -5157,7 +5187,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const count = listPending(id).items.length;
 			await settleResumeCard(
 				id,
-				`\u23F8\uFE0F ${updates(count)} for **${titleOf(id)}** ${count === 1 ? "is" : "are"} held until you resume it. /resume lists it.`,
+				`\u23F8\uFE0F ${updates(count)} for **${titleOf(id)}**${inTmux(readNode(id)?.launch?.pane)} ${count === 1 ? "is" : "are"} held until you resume it. /resume lists it.`,
 				true,
 			);
 			toast = "Held until you resume it.";
@@ -5167,8 +5197,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const resumed = await resumeSession(id);
 			if (resumed.ok) {
 				writePrivateJson(join(PENDING_DIR, id), "resuming.json", { at: Date.now() });
-				await settleResumeCard(id, `\u25B6\uFE0F Resuming **${titleOf(id)}** in a new tmux window.`, true);
-				toast = "Resuming in a new tmux window.";
+				const where = resumed.pane ? `tmux \`${resumed.pane}\`` : "a new tmux window";
+				await settleResumeCard(id, `\u25B6\uFE0F Resuming **${titleOf(id)}** in ${where}.`, true);
+				toast = `Resuming in ${where.replaceAll("`", "")}.`;
 			} else {
 				toast = clip(resumed.error, 190);
 			}
@@ -5313,7 +5344,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			? { ...kept, restoringAt: Date.now(), error: "" }
 			: { ...kept, restoringAt: 0, error: opened.error };
 		writePrivateJson(CRASH_DIR, `${id}.json`, next);
-		return opened.ok ? `Restoring ${crashTitle(record)} in tmux.` : clip(opened.error, 190);
+		return opened.ok
+			? `Restoring ${crashTitle(record)} in ${opened.pane ? `tmux ${opened.pane}` : "tmux"}.`
+			: clip(opened.error, 190);
 	}
 
 	async function answerCrashCallback(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
@@ -6468,6 +6501,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const pane = process.env.TMUX_PANE;
 			const shown = await run("tmux", ["display-message", "-p", ...(pane === undefined ? [] : ["-t", pane]), "#S"]);
 			if (shown.ok) launchSpec.tmuxSession = shown.stdout.trim();
+			launchSpec.pane = tmuxLocation() ?? "";
 		}
 		claimLaunch(ctx);
 		syncOwnNode(ctx);
@@ -6844,6 +6878,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		if (sessionCtx !== null) unpinRed(sessionCtx);
 		closeReplyQuestion();
+		if (sessionCtx !== null && process.env.TMUX !== undefined) {
+			// The resume card names the pane, and the window may have moved since the start.
+			launchSpec.pane = tmuxLocation() ?? launchSpec.pane;
+			syncOwnNode(sessionCtx);
+		}
 		sessionAlive = false;
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		releaseLock();

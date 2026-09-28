@@ -67,7 +67,7 @@ Agents in different live sessions write to each other with `session_message`, ad
 
 ## Dependencies between sessions
 
-Sessions record what they wait on with `session_graph`, and `upstream_launch` links a child to the session that launched it, so the graph keeps a year of dependency chains across restarts. Agents report their own status, and the session holding the Telegram connection polls each pull request on GitHub every ten minutes. An outcome such as a push, a merge or a fix found not needed wakes every session waiting on it, or, when that session has ended, is held and raises a Telegram card offering to resume it. `/deps` sends the graph as a Mermaid diagram rendered by [`mmdc`](https://github.com/mermaid-js/mermaid-cli) with the status of every node, and `/resume` lists the ended sessions with updates waiting.
+Sessions record what they wait on with `session_graph`, and `upstream_launch` links a child to the session that launched it, so the graph keeps a year of dependency chains across restarts. Agents report their own status, and the session holding the Telegram connection polls each pull request on GitHub every ten minutes. An outcome such as a push, a merge or a fix found not needed wakes every session waiting on it, or, when that session has ended, is held and raises a Telegram card offering to resume it. The card names the tmux pane the session ended in as `session:window.pane`, then the pane Resume opened, then the pane that took the delivery. `/deps` sends the graph as a Mermaid diagram rendered by [`mmdc`](https://github.com/mermaid-js/mermaid-cli) with the status of every node, and `/resume` lists the ended sessions with updates waiting.
 
 ## Restoring after a crash
 

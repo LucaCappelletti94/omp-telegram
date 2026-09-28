@@ -8450,7 +8450,7 @@ heading("dependency graph across sessions");
 	);
 	writeFileSync(
 		join(gBin, "tmux"),
-		`#!/bin/sh\necho "$*" >> ${tmuxLog}\ncase "$1" in\n  display-message) echo work ;;\n  has-session) exit 0 ;;\n  new-window) echo @77 ;;\nesac\n`,
+		`#!/bin/sh\necho "$*" >> ${tmuxLog}\ncase "$1" in\n  display-message) case "$*" in *window_index*) printf 'work\\t4\\t1\\n' ;; *) echo work ;; esac ;;\n  has-session) exit 0 ;;\n  new-window) echo work:5.0 ;;\nesac\n`,
 		{ mode: 0o755 },
 	);
 	const onePixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -8657,6 +8657,7 @@ heading("dependency graph across sessions");
 		card?.body.reply_markup.inline_keyboard.flat().some((b) => b.callback_data === `l:${parentId}`) === true,
 	);
 	check("the card names what is waiting", card?.body.text.includes("merged") === true);
+	check("the card names the tmux pane the session ended in", card?.body.text.includes("work:4.1") === true);
 	jump(10 * 60_000 + 1_000);
 	beatAll(waiter, follower, child);
 	await settle(400);
@@ -8690,6 +8691,7 @@ heading("dependency graph across sessions");
 		"Later keeps the items and marks the card held",
 		pendingOf(parentId).length === 2 && lastCall("editMessageText").body.text.includes("held"),
 	);
+	check("the held card still names the tmux pane", lastCall("editMessageText").body.text.includes("work:4.1"));
 
 	api.queued = [{ update_id: 9102, message: { message_id: 902, date: 1, chat: { id: CHAT }, text: "/resume" } }];
 	await waiter.pump(250);
@@ -8740,6 +8742,11 @@ heading("dependency graph across sessions");
 	);
 	check("Resume targets the tmux session the node started in", resumed.includes("-t work:"));
 	check("the card says the session is resuming", lastCall("editMessageText").body.text.includes("Resuming"));
+	check(
+		"the card and the toast name the tmux pane the session resumes in",
+		lastCall("editMessageText").body.text.includes("work:5.0") &&
+			lastCall("answerCallbackQuery").body.text.includes("work:5.0"),
+	);
 	writeFileSync(tmuxLog, "");
 	api.queued = [
 		{
@@ -8829,6 +8836,10 @@ heading("dependency graph across sessions");
 	check("a held agent message keeps its agent attribution", back.customs[1].message.attribution === "agent");
 	check("a malformed held item is discarded with a warning", back.warns.length > 0 && pendingOf(parentId).length === 0);
 	check("the card says the items were delivered", lastCall("editMessageText").body.text.includes("Delivered"));
+	check(
+		"the delivered card names the tmux pane of the resumed session",
+		lastCall("editMessageText").body.text.includes("work:4.1"),
+	);
 
 	// A launch nobody claimed shows as never started.
 	writeFileSync(
