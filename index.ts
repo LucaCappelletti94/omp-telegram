@@ -3649,7 +3649,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await answerCrashCallback(cfg, callback);
 				return;
 			}
-			if (callback.data.startsWith("r:") || callback.data.startsWith("l:")) {
+			if (/^[rln]:/u.test(callback.data)) {
 				await answerResumeCallback(cfg, callback);
 				return;
 			}
@@ -5054,7 +5054,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	function resumeButtons(id: string, withLater: boolean): InlineButton[][] {
 		const resume: InlineButton = { text: "Resume", callback_data: `r:${id}`, style: "success" };
-		return [withLater ? [resume, { text: "Later", callback_data: `l:${id}` }] : [resume]];
+		const no: InlineButton = { text: "No", callback_data: `n:${id}` };
+		return [withLater ? [resume, { text: "Later", callback_data: `l:${id}` }, no] : [resume, no]];
 	}
 
 	/** One card per ended session: the first held item sends it, later ones edit it. */
@@ -5092,7 +5093,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		writeFileAtomic(cardFile(id), JSON.stringify({ messageId: sent.message_id }), 0o600);
 	}
 
-	/** `keep` leaves the card open with a Resume button, for Later and for a resume still starting. */
+	/** `keep` leaves the resume offer open after Later or while a resume is starting. */
 	async function settleResumeCard(id: string, text: string, keep: boolean): Promise<void> {
 		if (config === null) return;
 		const messageId = readCardId(id);
@@ -5151,6 +5152,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		let toast: string;
 		if (!isStateToken(id)) {
 			toast = "That session is unknown.";
+		} else if (data.startsWith("n:")) {
+			if (readCardId(id) !== callback.message?.message_id) {
+				toast = "That resume card is already closed.";
+			} else {
+				await settleResumeCard(
+					id,
+					`Dismissed the resume offer for **${titleOf(id)}**. Updates remain available through /resume.`,
+					false,
+				);
+				toast = "Resume offer dismissed.";
+			}
 		} else if (isLiveSession(id)) {
 			toast = "That session is already running, so its updates reach it directly.";
 		} else if (data.startsWith("l:")) {

@@ -8656,6 +8656,12 @@ heading("dependency graph across sessions");
 		"the card offers Later beside Resume",
 		card?.body.reply_markup.inline_keyboard.flat().some((b) => b.callback_data === `l:${parentId}`) === true,
 	);
+	check(
+		"the card offers No to dismiss it",
+		card?.body.reply_markup.inline_keyboard
+			.flat()
+			.some((b) => b.text === "No" && b.callback_data === `n:${parentId}`) === true,
+	);
 	check("the card names what is waiting", card?.body.text.includes("merged") === true);
 	jump(10 * 60_000 + 1_000);
 	beatAll(waiter, follower, child);
@@ -8689,6 +8695,12 @@ heading("dependency graph across sessions");
 	check(
 		"Later keeps the items and marks the card held",
 		pendingOf(parentId).length === 2 && lastCall("editMessageText").body.text.includes("held"),
+	);
+	check(
+		"the held card can still be dismissed",
+		lastCall("editMessageText")
+			.body.reply_markup.inline_keyboard.flat()
+			.some((b) => b.callback_data === `n:${parentId}`),
 	);
 
 	api.queued = [{ update_id: 9102, message: { message_id: 902, date: 1, chat: { id: CHAT }, text: "/resume" } }];
@@ -8954,6 +8966,70 @@ heading("dependency graph across sessions");
 	check(
 		"a resume card Telegram refused is sent with the next held item",
 		quietCards() === cardsAfterFailure + 1 && pendingOf(quietId).length === 2,
+	);
+	const quietCardFile = join(graphDir, "pending", quietId, "card.json");
+	const quietCardId = JSON.parse(readFileSync(quietCardFile, "utf8")).messageId;
+	const heldItems = pendingOf(quietId).map((file) => readFileSync(join(graphDir, "pending", quietId, file)));
+	writeFileSync(tmuxLog, "");
+	api.queued = [
+		{
+			update_id: 9120,
+			callback_query: {
+				id: "dismiss-quiet",
+				data: `n:${quietId}`,
+				from: { id: CHAT },
+				message: { message_id: quietCardId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await waiter.pump(250);
+	check(
+		"No closes the resume card without opening a session",
+		lastCall("editMessageText").body.message_id === quietCardId &&
+			lastCall("editMessageText").body.reply_markup.inline_keyboard.length === 0 &&
+			!existsSync(quietCardFile) &&
+			!readFileSync(tmuxLog, "utf8").includes("new-window"),
+	);
+	check(
+		"No keeps the held updates intact",
+		pendingOf(quietId).length === heldItems.length &&
+			pendingOf(quietId).every((file, i) =>
+				readFileSync(join(graphDir, "pending", quietId, file)).equals(heldItems[i]),
+			),
+	);
+	api.queued = [{ update_id: 9121, message: { message_id: 906, date: 1, chat: { id: CHAT }, text: "/resume" } }];
+	await waiter.pump(250);
+	check(
+		"/resume still offers a dismissed session's held updates",
+		lastCall("sendMessage")
+			.body.reply_markup?.inline_keyboard?.flat()
+			.some((b) => b.callback_data === `r:${quietId}`),
+	);
+	const cardsAfterDismissal = quietCards();
+	await sendQuiet("another update");
+	await settle(150);
+	check(
+		"a new update raises a fresh card after dismissal",
+		quietCards() === cardsAfterDismissal + 1 && pendingOf(quietId).length === 3,
+	);
+	const newQuietCardId = JSON.parse(readFileSync(quietCardFile, "utf8")).messageId;
+	const editsBeforeStaleNo = called("editMessageText").length;
+	api.queued = [
+		{
+			update_id: 9122,
+			callback_query: {
+				id: "dismiss-old-quiet",
+				data: `n:${quietId}`,
+				from: { id: CHAT },
+				message: { message_id: quietCardId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await waiter.pump(250);
+	check(
+		"a stale No tap cannot close a newer resume card",
+		called("editMessageText").length === editsBeforeStaleNo &&
+			JSON.parse(readFileSync(quietCardFile, "utf8")).messageId === newQuietCardId,
 	);
 	rmSync(nodeFile(quietId));
 	rmSync(join(graphDir, "pending", quietId), { recursive: true, force: true });
