@@ -78,6 +78,8 @@ const MEDIA_DIR = join(STATE_DIR, "media");
 /** Every session message as sent, keyed by message id: a reaction names only the id. */
 const SENT_DIR = join(STATE_DIR, "sent");
 const SENT_IN_FLIGHT_DIR = join(STATE_DIR, "sent-in-flight");
+/** Uniquely routed user messages eligible for session cleanup. */
+const INCOMING_DIR = join(STATE_DIR, "incoming");
 const REACTION_PENDING_DIR = join(STATE_DIR, "reaction-pending");
 const REACTION_ROUTE_LOCK_DIR = join(STATE_DIR, "reaction-route-locks");
 /** One line per reaction change, holding the grade and the message it graded. */
@@ -164,6 +166,8 @@ const QUESTION_STOP_REASON =
 const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;
 const SENT_KEEP_MS = 90 * 24 * 3600 * 1000;
+/** Retained past Telegram's 48-hour deletion window to report refusals. */
+const INCOMING_KEEP_MS = 72 * 3_600_000;
 /** User-approved Telegram reactions, normalised without the optional U+FE0F selector. */
 const REACTION_SCALE: ReadonlyArray<readonly [number, readonly string[]]> = [
 	[3, ["\u{1F3C6}", "\u{1F4AF}", "\u{1F929}", "\u2764\u200D\u{1F525}", "\u{1F389}", "\u{1F525}"]],
@@ -205,6 +209,13 @@ interface SentRecord {
 	session: { id: string; tag: string; emoji: string; name: string; cwd: string };
 	/** The structured call behind the message, where there was one. */
 	payload?: unknown;
+}
+interface IncomingRecord {
+	version: 1;
+	id: number;
+	/** Receipt time in milliseconds. */
+	at: number;
+	session: { id: string };
 }
 
 interface TelegramReaction {
@@ -1641,6 +1652,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let standingSeq = 0;
 	let standingQuestion: StandingQuestion | null = null;
 	let closeOfferMessageId: number | null = null;
+	let closeOfferGeneration = 0;
+	/** Set once a validated close tap is running, so a queued duplicate cannot run it twice. */
+	let closing = false;
 	let replyQuestionMessageId: number | null = null;
 	let replyQuestionGeneration = 0;
 	let statusBlockUsed = false;
@@ -1741,6 +1755,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return null;
 		}
 	}
+	function parseIncomingRecord(parsed: unknown, id: number): IncomingRecord | null {
+		if (parsed === null || typeof parsed !== "object") return null;
+		const candidate = parsed as Partial<IncomingRecord>;
+		const session = candidate.session as Partial<IncomingRecord["session"]> | undefined;
+		if (
+			candidate.version !== 1 ||
+			candidate.id !== id ||
+			typeof candidate.at !== "number" ||
+			session === undefined ||
+			session === null ||
+			!isStateToken(session.id)
+		) {
+			return null;
+		}
+		return candidate as IncomingRecord;
+	}
+
 	async function withSentRecordMarker<T>(work: (acceptEdit: () => void) => Promise<T>, messageId?: number): Promise<T> {
 		mkdirSync(SENT_IN_FLIGHT_DIR, { recursive: true, mode: 0o700 });
 		const prefix = messageId === undefined ? "new" : `edit-${messageId}`;
@@ -2293,6 +2324,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		for (const [dir, keepMs] of [
 			[MEDIA_DIR, MEDIA_KEEP_MS],
 			[SENT_DIR, SENT_KEEP_MS],
+			[INCOMING_DIR, INCOMING_KEEP_MS],
 			// A crash card nobody touched for a week is not coming back.
 			[CRASH_DIR, CRASH_KEEP_MS],
 			[CRASH_BATCH_DIR, CRASH_KEEP_MS],
@@ -2359,10 +2391,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {}
 	}
 
-	/** Offered on green summaries: everything is done, so the session may be shut down from the phone. */
-	function closeSessionButton(): InlineButton {
+	function closeSessionButtons(): InlineButton[][] {
 		const label = process.env.TMUX === undefined ? "Close this session" : "Close this session and its tmux pane";
-		return { text: label, callback_data: `k:${sessionTag}`, style: "danger" };
+		return [
+			[{ text: label, callback_data: `k:${sessionTag}`, style: "danger" }],
+			[{ text: "Close this session and clear its messages", callback_data: `x:${sessionTag}`, style: "danger" }],
+		];
 	}
 
 	/** A detached shell outlives omp, so the pane dies only after the process has exited. Killing the pane, not
@@ -2401,8 +2435,63 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		sessionCtx?.shutdown();
 	}
 
+	/** Removes this session's outgoing and routed incoming messages, reports the refusals, and shuts the pane down. */
+	async function closeAndClearFromTelegram(): Promise<void> {
+		if (config === null) {
+			scheduleTmuxPaneKill();
+			sessionCtx?.shutdown();
+			return;
+		}
+		const cfg = config;
+		const outgoing = new Set<number>();
+		for (const name of listJson(SENT_DIR)) {
+			const id = Number(name.slice(0, -5));
+			const record = readSentRecord(id);
+			if (record !== null && record.session.id === sessionId) outgoing.add(id);
+		}
+		for (const id of recentMessages) outgoing.add(id);
+		const incoming = new Set<number>();
+		for (const name of listJson(INCOMING_DIR)) {
+			const id = Number(name.slice(0, -5));
+			if (!isTelegramMessageId(id)) continue;
+			const record = parseIncomingRecord(readJsonFile(join(INCOMING_DIR, name)), id);
+			if (record !== null && record.session.id === sessionId) incoming.add(id);
+		}
+		const messages = [...new Set([...outgoing, ...incoming])];
+		let refused = 0;
+		for (let offset = 0; offset < messages.length; offset += 100) {
+			const batch = messages.slice(offset, offset + 100);
+			const accepted = await callTelegram<boolean>(
+				cfg,
+				"deleteMessages",
+				{ chat_id: cfg.chatId, message_ids: batch },
+				15_000,
+			);
+			for (const id of batch) {
+				const deleted =
+					accepted === true ||
+					(await callTelegram<boolean>(cfg, "deleteMessage", { chat_id: cfg.chatId, message_id: id }, 10_000)) === true;
+				if (!deleted) {
+					refused += 1;
+					continue;
+				}
+				if (outgoing.has(id)) forgetSentMessage(id);
+				if (incoming.has(id)) writePrivateJson(INCOMING_DIR, `${id}.json`, null);
+			}
+		}
+		if (refused > 0 && sessionCtx !== null) {
+			await serviceNotice(
+				`${messageHead(sessionCtx)}\n\nCould not remove ${refused} of ${messages.length} tracked messages. Telegram's deletion limit is 48 hours. The session will close with those messages left in the chat.`,
+				false,
+			);
+		}
+		scheduleTmuxPaneKill();
+		sessionCtx?.shutdown();
+	}
+
 	/** The close offer dies the moment new work starts; a stale destructive button invites accidents. */
 	function retireCloseOffer(withEdit: boolean): void {
+		closeOfferGeneration += 1;
 		const messageId = closeOfferMessageId;
 		if (messageId === null) return;
 		closeOfferMessageId = null;
@@ -3022,6 +3111,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		writeFileAtomic(join(dir, `${updateId}.json`), JSON.stringify(entry), 0o600);
 	}
 
+	/** Keeps the user's half of one uniquely routed exchange so a close-and-clear can clear it too. */
+	function trackIncoming(messageId: number, target: string): void {
+		if (!isTelegramMessageId(messageId)) return;
+		writePrivateJson(INCOMING_DIR, `${messageId}.json`, {
+			version: 1,
+			id: messageId,
+			at: Date.now(),
+			session: { id: target },
+		});
+	}
+
 	/**
 	 * Bot API refuses getFile beyond 20 MB; larger uploads get a notice instead of silence. Every
 	 * abandoned path logs its own reason: the user-facing notice is necessarily generic, so without
@@ -3193,22 +3293,36 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			: `\u{1F535} ${stopping ? "Stopping" : "Sent to"} ${badgeOf(owner.record)}.`;
 		if (!gone) {
 			deliver(owner.id, Number.parseInt(rawUpdate, 10), held);
+			// The tap attributes the held message to one session, so it is uniquely routed now.
+			if (typeof held.messageId === "number") trackIncoming(held.messageId, owner.id);
 			try {
 				unlinkSync(heldMessagePath(rawUpdate));
 			} catch {}
 		}
 		if (typeof callback.message?.message_id !== "number") return;
-		await callTelegram(
+		const sentSession = gone
+			? readSentRecord(callback.message.message_id)?.session
+			: {
+					id: owner.id,
+					tag: owner.record.tag,
+					emoji: owner.record.emoji,
+					name: owner.record.label || owner.record.name,
+					cwd: owner.record.cwd,
+				};
+		await sendOrEdit(
 			cfg,
 			"editMessageText",
 			{
 				chat_id: cfg.chatId,
 				message_id: callback.message.message_id,
-				text: toTelegramHtml(closing),
-				parse_mode: "HTML",
 				reply_markup: { inline_keyboard: [] },
 			},
-			10_000,
+			closing,
+			"",
+			sentSession === undefined ? null : "notice",
+			undefined,
+			undefined,
+			sentSession,
 		);
 	}
 
@@ -3684,11 +3798,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							? "That question's session is gone."
 							: callback.data.startsWith("k:")
 								? "Closing the session."
-								: callback.data.startsWith("c:")
-									? "Starting the next turn."
-									: // Whether the press still fits the open question is decided in the session, which
-										// discards a tap the ask has moved past. The poller reports only what it did.
-										"Sent to that session.",
+								: callback.data.startsWith("x:")
+									? "Closing the session and clearing its messages."
+									: callback.data.startsWith("c:")
+										? "Starting the next turn."
+										: // Whether the press still fits the open question is decided in the session, which
+											// discards a tap the ask has moved past. The poller reports only what it did.
+											"Sent to that session.",
 				},
 				10_000,
 			);
@@ -3756,6 +3872,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					return;
 				}
 				deliver(target, update.update_id, { kind: "command", value: command });
+				trackIncoming(message.message_id, target);
 				return;
 			}
 			const running = allRecords().filter(
@@ -3768,12 +3885,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			if (running.length === 1 && running[0] !== undefined) {
 				deliver(running[0].id, update.update_id, { kind: "command", value: command });
+				trackIncoming(message.message_id, running[0].id);
 				return;
 			}
 			await askWhichSession(
 				cfg,
 				update,
-				{ kind: "command", value: command },
+				{ kind: "command", value: command, messageId: message.message_id },
 				`\u{1F535} ${running.length} sessions are running a turn. Which one should stop?`,
 				running,
 			);
@@ -3789,6 +3907,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							.map(({ id }) => id);
 			for (const target of targets) {
 				deliver(target, update.update_id, { kind: "command", value: command });
+			}
+			// A command delivered to exactly one session is a uniquely routed exchange, while the rest are fleet-wide.
+			if (targets.length === 1) {
+				const target = targets[0];
+				if (target !== undefined) trackIncoming(message.message_id, target);
 			}
 			return;
 		}
@@ -3815,6 +3938,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				messageId: message.message_id,
 				replyTo,
 			});
+			trackIncoming(message.message_id, target);
 			return;
 		}
 
@@ -3861,6 +3985,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			messageId: message.message_id,
 			replyTo,
 		});
+		trackIncoming(message.message_id, routed);
 	}
 
 	/**
@@ -4032,6 +4157,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		keep = "",
 	): Promise<void> {
 		if (config === null || recorded.options === undefined) return;
+		const closeGeneration = closeOfferGeneration;
 		const superseded = standingQuestion;
 		standingSeq += 1;
 		const id = `${sessionTag}-n${standingSeq.toString(36)}`;
@@ -4057,10 +4183,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				return button;
 			}),
 		);
-		if (recorded.urgency === "green") keyboard.push([closeSessionButton()]);
+		if (recorded.urgency === "green") keyboard.push(...closeSessionButtons());
 		const labels = recorded.options.map((option) => option.label);
 		const publishStanding = (messageId: number): void => {
 			standingQuestion = { id, messageId, labels, head: settlementHead };
+			if (recorded.urgency === "green") {
+				if (closeGeneration === closeOfferGeneration && !turnActive && !closing) {
+					closeOfferMessageId = messageId;
+					writeSessionRecord(ctx);
+				} else {
+					detach(stripKeyboard(messageId), "late close-offer retire");
+				}
+			}
 		};
 		const sent = await sendStructured(
 			config,
@@ -4226,7 +4360,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** Sequential: two taps in one poll batch must see each other's state. */
 	async function drainInbox(): Promise<void> {
-		if (drainInFlight) return;
+		if (drainInFlight || closing) return;
 		drainInFlight = true;
 		try {
 			const dir = join(INBOX_DIR, sessionId);
@@ -4292,12 +4426,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						pi.logger.warn("notify-telegram: discarded a malformed agent message", { name, raw: clip(raw, 200) });
 						continue;
 					}
+					// An agent message steers or starts a turn, so the completion offer is stale on arrival.
+					retireCloseOffer(true);
 					deliverAgentMessage(message);
 					continue;
 				}
 				if (entry.kind !== "redo") rmSync(processing, { force: true });
+				// New work voids the close offer, so a tap queued behind it cannot close a session about to start a turn.
+				if (
+					entry.kind === "text" ||
+					entry.kind === "file" ||
+					entry.kind === "redo" ||
+					(entry.kind === "callback" && !entry.value.startsWith("k:") && !entry.value.startsWith("x:"))
+				) {
+					retireCloseOffer(true);
+				}
 				// A reply or an answer means attention is on this session: put its window in front for the return.
-				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
+				if (
+					entry.kind === "text" ||
+					(entry.kind === "callback" && !entry.value.startsWith("k:") && !entry.value.startsWith("x:"))
+				) {
 					focusTmuxWindow();
 				}
 				// `replyOwedAt` is stamped where the entry reaches the agent, never before: an entry answered
@@ -4341,9 +4489,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					}
 					continue;
 				}
-				if (entry.kind === "callback" && entry.value.startsWith("k:")) {
-					await closeSessionFromTelegram(entry.messageId);
-					continue;
+				if (entry.kind === "callback" && (entry.value.startsWith("k:") || entry.value.startsWith("x:"))) {
+					const clears = entry.value.startsWith("x:");
+					if (
+						closing ||
+						turnActive ||
+						pendingAsk !== null ||
+						entry.messageId === undefined ||
+						closeOfferMessageId !== entry.messageId
+					) {
+						// A destructive press from an old or duplicated keyboard is an accident waiting to happen.
+						const text = "That close offer is no longer current, so the session stayed open.";
+						if (sessionCtx !== null) await sessionNotice(sessionCtx, text);
+						else await serviceNotice(text, false);
+						continue;
+					}
+					closing = true;
+					if (clears) await closeAndClearFromTelegram();
+					else await closeSessionFromTelegram(entry.messageId);
+					return;
 				}
 				if (entry.kind === "callback" && entry.value.startsWith("c:")) {
 					const [, choiceId, rawIndex] = entry.value.split(":");
@@ -6081,6 +6245,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
+	function forgetSentMessage(messageId: number): void {
+		writePrivateJson(SENT_DIR, `${messageId}.json`, null);
+		const index = recentMessages.indexOf(messageId);
+		if (index !== -1) recentMessages.splice(index, 1);
+		if (closeOfferMessageId === messageId) closeOfferMessageId = null;
+		if (standingQuestion?.messageId === messageId) standingQuestion = null;
+		if (pinnedMessageId === messageId) pinnedMessageId = null;
+		if (approvalNotice?.messageId === messageId) approvalNotice = null;
+		closeReplyQuestion(messageId);
+		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+	}
+
 	/**
 	 * Text the user has to paste somewhere else. The message ends on a single fenced block holding
 	 * the payload verbatim, so the copy control Telegram draws on that block yields exactly the
@@ -6721,8 +6897,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			lastSummary = clip(recorded.text.split("\n")[0]?.trim() ?? "", STATUS_SUMMARY_MAX);
 			lastSummaryAt = Date.now();
 			if (recorded.options === undefined) {
+				const closeGeneration = closeOfferGeneration;
 				const extra: Record<string, unknown> = { ...urgencyExtras(recorded, quiet) };
-				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
+				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: closeSessionButtons() };
 				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
 				const replyQuestionToken = recorded.question === undefined ? null : ++replyQuestionGeneration;
@@ -6741,8 +6918,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				).then((sent) => {
 					const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
 					if (recorded.urgency === "green") {
-						closeOfferMessageId = messageId;
-						writeSessionRecord(ctx);
+						if (closeGeneration === closeOfferGeneration && !turnActive && !closing) {
+							closeOfferMessageId = messageId;
+							writeSessionRecord(ctx);
+						} else if (messageId !== null) {
+							detach(stripKeyboard(messageId), "late close-offer retire");
+						}
 					}
 					if (recorded.urgency === "red") return pinRed(ctx, sent);
 					return undefined;
