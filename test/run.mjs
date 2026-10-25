@@ -4782,6 +4782,13 @@ for (const withChoices of [false, true]) {
 	await in1.pump(250);
 	check("a chosen held message is tracked under the chosen session", incomingRecordFile(6504).session.id === in2.id);
 	check("the held message reached the chosen session", inboxCount(in2.id) === 1);
+	const assignedMessages = await in2.tools
+		.get("notify_message")
+		.execute("assigned-picker", { action: "list" }, undefined, undefined, in2.ctx);
+	check(
+		"a settled picker belongs to the selected session's message history",
+		assignedMessages.details.messages.some((message) => message.id === pickerId),
+	);
 }
 
 // A restarted session clears from the ledgers on disk, not from memory.
@@ -6705,6 +6712,200 @@ heading("a snippet arrives ready to copy");
 		.get("notify_snippet")
 		.execute("sn10", { purpose: "nowhere", text: "orphaned" }, undefined, undefined, off.ctx);
 	check("a snippet from an unconfigured session is refused", unconfigured.isError === true);
+}
+
+heading("agents manage their own sent messages");
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const owner = spawn("01a06102-0000-0000-0000-000000000000", "/home/dev/work/messages");
+	const peer = spawn("01a06103-0000-0000-0000-000000000000", "/home/dev/work/other-messages");
+	await owner.fire("session_start");
+	await peer.fire("session_start");
+	const manage = owner.tools.get("notify_message");
+	check("agents can manage sent messages", manage !== undefined);
+	if (manage !== undefined) {
+		const call = (params) => manage.execute("message-operation", params, undefined, undefined, owner.ctx);
+		const post = async (session, text) =>
+			(
+				await session.tools
+					.get("notify_snippet")
+					.execute("message-source", { purpose: "copyable note", text }, undefined, undefined, session.ctx)
+			).details.messageId;
+		const sentPath = (id) => join(root, "notify-telegram/sent", `${id}.json`);
+		const ownId = await post(owner, "Original note");
+		const peerId = await post(peer, "Other session's note");
+		const newerId = await post(owner, "Newer note");
+		const listed = await call({ action: "list" });
+		check(
+			"listing returns own message IDs and source text",
+			listed.details.messages.some((m) => m.id === ownId && m.text.includes("Original note")) &&
+				listed.details.messages.every((m) => m.id !== peerId),
+		);
+		const first = await call({ action: "list", limit: 1 });
+		const older = await call({ action: "list", before: first.details.messages[0].id });
+		check(
+			"message pages return older messages without repeating the boundary",
+			first.details.messages[0].id === newerId &&
+				older.details.messages.some((m) => m.id === ownId) &&
+				older.details.messages.every((m) => m.id < newerId),
+		);
+		const foreignCalls = api.calls.length;
+		for (const action of ["edit", "delete"]) {
+			const refused = await call({ action, message_id: peerId, text: "Wrong owner" });
+			check(`agents cannot ${action} another session's message`, refused.isError === true);
+		}
+		check("foreign message refusals never reach Telegram", api.calls.length === foreignCalls);
+		for (const params of [
+			{ action: "edit", message_id: -1, text: "Invalid" },
+			{ action: "edit", message_id: 987654321, text: "Unknown" },
+			{ action: "edit", message_id: ownId, text: " " },
+			{ action: "edit", message_id: ownId, text: "x".repeat(4097) },
+			{ action: "list", limit: 0 },
+			{ action: "list", before: "../invalid" },
+			{ action: "unknown" },
+		]) {
+			check("invalid message operations are refused", (await call(params)).isError === true);
+		}
+		const edited = await call({ action: "edit", message_id: ownId, text: "**Corrected** note" });
+		const wire = lastCall("editMessageText").body;
+		const snapshot = JSON.parse(readFileSync(sentPath(ownId), "utf8"));
+		check(
+			"editing replaces the owned message and keeps its session head",
+			edited.isError !== true &&
+				wire.message_id === ownId &&
+				wire.text.startsWith(badgeLineOf(owner.id)) &&
+				wire.text.includes("<b>Corrected</b> note") &&
+				snapshot.text.includes("**Corrected** note") &&
+				!snapshot.text.includes("Original note"),
+		);
+		api.rejectHtml = true;
+		await call({ action: "edit", message_id: ownId, text: "Markup fallback" });
+		api.rejectHtml = false;
+		check(
+			"message edits retry rejected markup as plain text",
+			lastCall("editMessageText").body.parse_mode === undefined &&
+				JSON.parse(readFileSync(sentPath(ownId), "utf8")).text.includes("Markup fallback"),
+		);
+		api.failMethods = ["editMessageText"];
+		api.failDescription = "Bad Request: message is not modified";
+		const unchanged = await call({ action: "edit", message_id: ownId, text: "Markup fallback" });
+		api.failMethods = [];
+		delete api.failDescription;
+		check("repeating an accepted edit succeeds", unchanged.isError !== true);
+		api.failMethods = ["editMessageText"];
+		const rejectedEdit = await call({ action: "edit", message_id: ownId, text: "Rejected edit" });
+		api.failMethods = [];
+		check(
+			"a rejected edit preserves the reaction snapshot",
+			rejectedEdit.isError === true &&
+				!JSON.parse(readFileSync(sentPath(ownId), "utf8")).text.includes("Rejected edit"),
+		);
+		const filePath = join(root, "message-caption.txt");
+		writeFileSync(filePath, "Attachment");
+		const file = await owner.tools
+			.get("notify_file")
+			.execute("message-file", { paths: [filePath] }, undefined, undefined, owner.ctx);
+		const fileId = file.details.messageIds[0];
+		const caption = await call({ action: "edit", message_id: fileId, text: "**Updated** attachment" });
+		check(
+			"file edits replace the caption without reuploading",
+			caption.isError !== true &&
+				lastCall("editMessageCaption").body.message_id === fileId &&
+				lastCall("editMessageCaption").body.caption.includes("<b>Updated</b> attachment") &&
+				JSON.parse(readFileSync(sentPath(fileId), "utf8")).text.includes("Updated"),
+		);
+		const beforeLongCaption = called("editMessageCaption").length;
+		check(
+			"oversized captions are refused whole",
+			(await call({ action: "edit", message_id: fileId, text: "x".repeat(1025) })).isError === true &&
+				called("editMessageCaption").length === beforeLongCaption,
+		);
+		const cancelQuestion = new AbortController();
+		const active = owner.tools
+			.get("ask")
+			.execute(
+				"message-question",
+				{ questions: [{ id: "pending", question: "Which path?", options: askOpts("Proceed", "Wait") }] },
+				cancelQuestion.signal,
+				undefined,
+				stubbornCtx(owner.ctx, {}),
+			)
+			.catch((error) => error);
+		await settle(150);
+		const questionId = record(owner.id).question;
+		for (const action of ["edit", "delete"]) {
+			check(
+				`an active native question cannot be ${action}d`,
+				(await call({ action, message_id: questionId, text: "Unreachable question" })).isError === true,
+			);
+		}
+		cancelQuestion.abort();
+		await active;
+		api.failMethods = ["deleteMessage"];
+		const rejectedDelete = await call({ action: "delete", message_id: ownId });
+		api.failMethods = [];
+		check(
+			"a rejected deletion preserves ownership and reply routing",
+			rejectedDelete.isError === true &&
+				record(owner.id).recent.includes(ownId) &&
+				JSON.parse(readFileSync(sentPath(ownId), "utf8")) !== null,
+		);
+		const deleted = await call({ action: "delete", message_id: ownId });
+		check(
+			"deleting an owned message clears its record and reply routing",
+			deleted.isError !== true &&
+				lastCall("deleteMessage").body.message_id === ownId &&
+				!record(owner.id).recent.includes(ownId) &&
+				!(await call({ action: "list" })).details.messages.some((m) => m.id === ownId),
+		);
+		check(
+			"a deleted message cannot be edited again",
+			(await call({ action: "edit", message_id: ownId, text: "Resurrected" })).isError === true,
+		);
+		await owner.tools
+			.get("notify_status")
+			.execute(
+				"message-standing",
+				{ summary: "Choose a next step.", urgency: "green", effect: "none", options: opts("Proceed", "Wait") },
+				undefined,
+				undefined,
+				owner.ctx,
+			);
+		await owner.fire("session_stop");
+		await settle(150);
+		const standingId = record(owner.id).standing.messageId;
+		await call({ action: "edit", message_id: standingId, text: "Choose the verified next step." });
+		const preservedButtons = lastCall("editMessageText").body.reply_markup?.inline_keyboard.flat() ?? [];
+		check(
+			"editing a standing question keeps its choices and completion actions",
+			preservedButtons.some((button) => button.text === "Proceed" && button.callback_data.startsWith("c:")) &&
+				preservedButtons.some((button) => button.callback_data.startsWith("k:")) &&
+				preservedButtons.some((button) => button.callback_data.startsWith("x:")),
+		);
+		check(
+			"deleting a standing question clears the live choices",
+			(await call({ action: "delete", message_id: standingId })).isError !== true && record(owner.id).standing === null,
+		);
+		await owner.fire("input");
+		await owner.tools
+			.get("notify_status")
+			.execute(
+				"message-close-offer",
+				{ summary: "Complete.", urgency: "green", effect: "none" },
+				undefined,
+				undefined,
+				owner.ctx,
+			);
+		await owner.fire("session_stop");
+		await settle(150);
+		const offerId = record(owner.id).closeOffer;
+		check(
+			"deleting a completion summary retires its close offer",
+			(await call({ action: "delete", message_id: offerId })).isError !== true && record(owner.id).closeOffer === null,
+		);
+		await owner.fire("session_shutdown");
+		await peer.fire("session_shutdown");
+	}
 }
 
 heading("caller text kept whole inside its own quote");
