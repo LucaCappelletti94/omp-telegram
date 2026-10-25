@@ -6167,7 +6167,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		context: string,
 		signal: AbortSignal | undefined,
 	): Promise<{ action: "launch" | "cancel" | "already-started" | "unavailable" } | { action: "reply"; text: string }> {
-		if (config === null) return { action: "unavailable" };
 		askSequence += 1;
 		const remote = Promise.withResolvers<AskResult[]>();
 		const ask: PendingAsk = {
