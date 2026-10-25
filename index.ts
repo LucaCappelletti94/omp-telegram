@@ -6160,18 +6160,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
-	/**
-	 * The hard gate before anything is forked or opened. Reuses the same `pendingAsk` path the ask tool
-	 * uses, so the Launch/Cancel card is answerable from the phone and an abort or a Cancel leaves nothing
-	 * behind. Returns true only for an explicit Launch.
-	 */
+	/** Only the explicit Launch button authorizes upstream work. */
 	async function confirmUpstreamLaunch(
 		ctx: ExtensionContext,
 		question: string,
 		context: string,
 		signal: AbortSignal | undefined,
-	): Promise<{ confirmed: boolean; delivered: boolean }> {
-		if (config === null) return { confirmed: false, delivered: false };
+	): Promise<{ action: "launch" | "cancel" | "already-started" | "unavailable" } | { action: "reply"; text: string }> {
+		if (config === null) return { action: "unavailable" };
 		askSequence += 1;
 		const remote = Promise.withResolvers<AskResult[]>();
 		const ask: PendingAsk = {
@@ -6189,6 +6185,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								"Fork or reuse the repository, open a new omp session in a tmux tab, and start the upstream work.",
 						},
 						{ label: "Cancel", description: "Do nothing. Stay in this session and drop the upstream launch." },
+						{
+							label: "Upstreaming has already started",
+							description:
+								"Agent will skip launching a duplicate because another session is already handling the upstream work.",
+						},
 					],
 					recommended: 0,
 				},
@@ -6210,13 +6211,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pi.logger.warn("upstream: the launch confirmation card failed to send", {
 				error: error instanceof Error ? error.message : String(error),
 			});
-			return { confirmed: false, delivered: false };
+			return { action: "unavailable" };
 		}
 		if (ask.messageId === null) {
 			// The card never reached Telegram, so there is nothing for the user to answer; do not block.
 			if (pendingAsk === ask) pendingAsk = previous;
 			noteState();
-			return { confirmed: false, delivered: false };
+			return { action: "unavailable" };
 		}
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
@@ -6226,8 +6227,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (signal?.aborted) onAbort();
 		try {
 			const results = await remote.promise;
-			const answer = (results[0]?.selectedOptions[0] ?? results[0]?.customInput ?? "").trim().toLowerCase();
-			return { confirmed: answer === "launch", delivered: true };
+			const answer = results[0];
+			if (answer?.customInput !== undefined) return { action: "reply", text: answer.customInput };
+			const choice = answer?.selectedOptions[0];
+			if (choice === "Launch") return { action: "launch" };
+			if (choice === "Upstreaming has already started") return { action: "already-started" };
+			return { action: "cancel" };
 		} finally {
 			signal?.removeEventListener("abort", onAbort);
 			if (pendingAsk === ask) {
@@ -6243,7 +6248,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "upstream_launch",
 		label: "Upstream Launch",
 		description:
-			"Start the upstream procedure for a fix that belongs in a repository this one depends on. Call it only after you have written the upstream request document (per the upstream-finding-as-document rule) and the user has agreed an upstream fix is wanted. It opens a Telegram Launch/Cancel card and does nothing until Launch is tapped. On Launch it sends the branch to the target itself when the user owns it or has push permission on it, and otherwise to the user's fork of it, found by its parent whatever the fork is named, or created when none exists. It uses the clone at `~/github/<name>` with whatever remote names it already has, adding a missing remote only under a free name and never re-pointing one, or clones there when nothing exists, cuts a worktree on a new `upstream/<slug>` branch off the target's latest default branch so it never disturbs work already open there, carries the request document into that worktree, and opens a new omp session in a fresh tmux tab told which remote to push to. It writes only to repositories the user may push to and under `~/github`, never in this repository, and the spawned session does the upstream work from there. `repo`: the uphill repository as `owner/name`. `document`: path to the request document you wrote, resolved against this session's working directory. `problem`: one sentence naming what the dependency does wrong, shown on the card and given to the new session. `slug`: optional short kebab identifier for the branch and worktree, derived from `problem` when omitted.",
+			"Start an upstream fix after writing the request document and obtaining the user's agreement that it is needed. The Telegram card offers Launch, Cancel and Upstreaming has already started. Only tapping Launch starts work. Text replies return verbatim to the requesting model without starting a session, and choosing existing work reports that outcome without starting a duplicate. Launch uses the target repository when the user can push there, otherwise finds or creates the user's fork by its parent. It preserves existing remotes in `~/github/<name>`, creates a worktree on `upstream/<slug>` from the target's default branch, carries the request document and opens an `omp` session in its own `tmux` tab with the push remote. It operates under `~/github` and leaves this repository untouched. `repo` names the upstream repository as `owner/name`, `document` is the request path relative to this session's working directory, `problem` is the one-sentence defect shown on the card, and optional `slug` names the branch and worktree, defaulting from `problem`.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -6277,15 +6282,34 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				context,
 				signal,
 			);
-			if (!decision.delivered) {
+			if (decision.action === "unavailable") {
 				return fail(
 					"could not send the Launch confirmation to Telegram, so nothing was launched; check the bot connection and retry",
 				);
 			}
-			if (!decision.confirmed) {
+			if (decision.action !== "launch") {
+				if (decision.action === "reply") {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `The user replied to the upstream launch confirmation. No upstream session was launched.\n\n${decision.text}`,
+							},
+						],
+						details: { launched: false, reason: "reply", reply: decision.text },
+					};
+				}
+				const alreadyStarted = decision.action === "already-started";
 				return {
-					content: [{ type: "text", text: "Upstream launch cancelled; nothing was forked, cloned, or opened." }],
-					details: { launched: false },
+					content: [
+						{
+							type: "text",
+							text: alreadyStarted
+								? "Upstreaming has already started in another session. No duplicate session was launched."
+								: "Upstream launch cancelled. Nothing was forked, cloned or opened.",
+						},
+					],
+					details: { launched: false, reason: alreadyStarted ? "already-started" : "cancelled" },
 				};
 			}
 

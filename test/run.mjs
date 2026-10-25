@@ -7813,6 +7813,107 @@ esac
 	const cancelResult = await cancelRun;
 	check("Cancel launches nothing", cancelResult.details?.launched === false);
 
+	const replyPeer = spawn("cc010001-0000-0000-0000-000000000000", workK);
+	await replyPeer.fire("session_start");
+	for (const [index, reply] of ["Another session is already fixing this.\nUse its result.", "Launch"].entries()) {
+		freshLogs();
+		const requestId = `u-reply-${index}`;
+		const replyRun = up.tools
+			.get("upstream_launch")
+			.execute(
+				requestId,
+				{ repo: "someorg/reply-only", document: "req.md", problem: "The parser rejects X." },
+				AbortSignal.timeout(3000),
+				undefined,
+				up.ctx,
+			);
+		await settle(90);
+		const questionId = record(up.id).question;
+		await replyPeer.tools
+			.get("notify_status")
+			.execute(
+				"u-peer-note",
+				{ summary: "Other work is waiting.", urgency: "orange" },
+				undefined,
+				undefined,
+				replyPeer.ctx,
+			);
+		await replyPeer.fire("session_stop");
+		await settle(90);
+		const peerSteers = replyPeer.steers.length;
+		const parentSteers = up.steers.length;
+		api.queued = [
+			{
+				update_id: 17000 + index,
+				message: {
+					message_id: 17000 + index,
+					date: 1,
+					chat: { id: CHAT },
+					text: reply,
+					reply_to_message: { message_id: questionId },
+				},
+			},
+		];
+		await up.pump(200);
+		await up.pump(200);
+		const replied = await replyRun;
+		check(
+			"a launch-confirmation reply reaches the model verbatim",
+			replied.details?.reason === "reply" &&
+				replied.details.reply === reply &&
+				replied.content.some((part) => part.text.includes(reply)),
+		);
+		check(
+			"free text never authorizes upstream work, including the word Launch",
+			replied.details?.launched === false &&
+				readFileSync(ghLog, "utf8") === "" &&
+				readFileSync(gitLog, "utf8") === "" &&
+				!readFileSync(tmuxLog, "utf8").includes("new-window"),
+		);
+		check(
+			"the reply stays with its requesting tool without a duplicate or foreign steer",
+			replyPeer.steers.length === peerSteers && up.steers.length === parentSteers,
+		);
+	}
+	await replyPeer.fire("session_shutdown");
+
+	freshLogs();
+	const launchesBeforeExisting = launchFiles().sort().join(",");
+	const existingAbort = new AbortController();
+	const existingTimeout = setTimeout(() => existingAbort.abort(), 1500);
+	const existingRun = up.tools
+		.get("upstream_launch")
+		.execute(
+			"u-already-started",
+			{ repo: "someorg/existing-work", document: "req.md", problem: "This upstream fix is already underway." },
+			existingAbort.signal,
+			undefined,
+			up.ctx,
+		);
+	await settle(90);
+	check(
+		"the confirmation offers existing upstream work",
+		lastCall("sendMessage")
+			.body.reply_markup.inline_keyboard.flat()
+			.some((button) => button.text === "Upstreaming has already started"),
+	);
+	await answerLaunch(up, 2);
+	const existingResult = await existingRun;
+	clearTimeout(existingTimeout);
+	check(
+		"existing upstream work is reported distinctly to the model",
+		existingResult.details?.launched === false &&
+			existingResult.details.reason === "already-started" &&
+			existingResult.content.some((part) => part.text.includes("already started")),
+	);
+	check(
+		"choosing existing work creates no duplicate upstream session",
+		readFileSync(ghLog, "utf8") === "" &&
+			readFileSync(gitLog, "utf8") === "" &&
+			!readFileSync(tmuxLog, "utf8").includes("new-window") &&
+			launchFiles().sort().join(",") === launchesBeforeExisting,
+	);
+
 	// e. Validation refuses before any confirmation is even shown.
 	const badRepo = await up.tools
 		.get("upstream_launch")
