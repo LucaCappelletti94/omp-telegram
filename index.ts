@@ -78,6 +78,8 @@ const MEDIA_DIR = join(STATE_DIR, "media");
 /** Every session message as sent, keyed by message id: a reaction names only the id. */
 const SENT_DIR = join(STATE_DIR, "sent");
 const SENT_IN_FLIGHT_DIR = join(STATE_DIR, "sent-in-flight");
+/** Uniquely routed user messages eligible for session cleanup. */
+const INCOMING_DIR = join(STATE_DIR, "incoming");
 const REACTION_PENDING_DIR = join(STATE_DIR, "reaction-pending");
 const REACTION_ROUTE_LOCK_DIR = join(STATE_DIR, "reaction-route-locks");
 /** One line per reaction change, holding the grade and the message it graded. */
@@ -164,6 +166,8 @@ const QUESTION_STOP_REASON =
 const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const MEDIA_KEEP_MS = 7 * 24 * 3600 * 1000;
 const SENT_KEEP_MS = 90 * 24 * 3600 * 1000;
+/** Retained past Telegram's 48-hour deletion window to report refusals. */
+const INCOMING_KEEP_MS = 72 * 3_600_000;
 /** User-approved Telegram reactions, normalised without the optional U+FE0F selector. */
 const REACTION_SCALE: ReadonlyArray<readonly [number, readonly string[]]> = [
 	[3, ["\u{1F3C6}", "\u{1F4AF}", "\u{1F929}", "\u2764\u200D\u{1F525}", "\u{1F389}", "\u{1F525}"]],
@@ -205,6 +209,14 @@ interface SentRecord {
 	session: { id: string; tag: string; emoji: string; name: string; cwd: string };
 	/** The structured call behind the message, where there was one. */
 	payload?: unknown;
+	replyMarkup?: unknown;
+}
+interface IncomingRecord {
+	version: 1;
+	id: number;
+	/** Receipt time in milliseconds. */
+	at: number;
+	session: { id: string };
 }
 
 interface TelegramReaction {
@@ -1641,6 +1653,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let standingSeq = 0;
 	let standingQuestion: StandingQuestion | null = null;
 	let closeOfferMessageId: number | null = null;
+	let closeOfferGeneration = 0;
+	/** Set once a validated close tap is running, so a queued duplicate cannot run it twice. */
+	let closing = false;
 	let replyQuestionMessageId: number | null = null;
 	let replyQuestionGeneration = 0;
 	let statusBlockUsed = false;
@@ -1741,6 +1756,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return null;
 		}
 	}
+	function parseIncomingRecord(parsed: unknown, id: number): IncomingRecord | null {
+		if (parsed === null || typeof parsed !== "object") return null;
+		const candidate = parsed as Partial<IncomingRecord>;
+		const session = candidate.session as Partial<IncomingRecord["session"]> | undefined;
+		if (
+			candidate.version !== 1 ||
+			candidate.id !== id ||
+			typeof candidate.at !== "number" ||
+			session === undefined ||
+			session === null ||
+			!isStateToken(session.id)
+		) {
+			return null;
+		}
+		return candidate as IncomingRecord;
+	}
+
 	async function withSentRecordMarker<T>(work: (acceptEdit: () => void) => Promise<T>, messageId?: number): Promise<T> {
 		mkdirSync(SENT_IN_FLIGHT_DIR, { recursive: true, mode: 0o700 });
 		const prefix = messageId === undefined ? "new" : `edit-${messageId}`;
@@ -1818,6 +1850,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		text: string,
 		sentSession: SentRecord["session"],
 		payload?: unknown,
+		replyMarkup?: unknown,
 	): void {
 		if (!isTelegramMessageId(id)) return;
 		const record: SentRecord = {
@@ -1829,6 +1862,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			session: sentSession,
 		};
 		if (payload !== undefined) record.payload = payload;
+		if (replyMarkup !== undefined) record.replyMarkup = replyMarkup;
 		mkdirSync(SENT_DIR, { recursive: true, mode: 0o700 });
 		writeFileAtomic(join(SENT_DIR, `${id}.json`), JSON.stringify(record), 0o600);
 	}
@@ -1841,6 +1875,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		sentSession: SentRecord["session"],
 		payload?: unknown,
 		beforeRecord?: (messageId: number) => void,
+		replyMarkup?: unknown,
 	): void {
 		if (!isTelegramMessageId(sent?.message_id)) return;
 		recentMessages.push(sent.message_id);
@@ -1849,7 +1884,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		beforeRecord?.(sent.message_id);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-		recordSent(sent.message_id, kind, text, sentSession, payload);
+		recordSent(sent.message_id, kind, text, sentSession, payload, replyMarkup);
 	}
 
 	/** Marks a message the user is waiting on, which is the one window where typing is not a lie. */
@@ -1865,7 +1900,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Retries markup failures as plain text and records only messages with a non-null `kind`. */
 	async function sendOrEdit(
 		cfg: Config,
-		method: "sendMessage" | "editMessageText",
+		method: "sendMessage" | "editMessageText" | "editMessageCaption",
 		body: Record<string, unknown>,
 		plain: string,
 		keep = "",
@@ -1874,40 +1909,47 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		beforeRecord?: (messageId: number) => void,
 		sentSession = snapshotSentSession(),
 	): Promise<TelegramMessage | null> {
+		const previousRecord = method === "sendMessage" ? null : readSentRecord(Number(body.message_id));
+		const replyMarkup = body.reply_markup ?? previousRecord?.replyMarkup;
+		const wireBody = replyMarkup === undefined ? body : { ...body, reply_markup: replyMarkup };
 		const deliver = async (acceptEdit: () => void): Promise<TelegramMessage | null> => {
-			const quiet = { link_preview_options: { is_disabled: true } };
+			const textField = method === "editMessageCaption" ? "caption" : "text";
+			const quiet = method === "editMessageCaption" ? {} : { link_preview_options: { is_disabled: true } };
 			const source = fitToTelegram(plain, keep);
 			let sentText = source;
 			let refusal = "";
 			let sent = await callTelegramRaw<TelegramMessage>(
 				cfg,
 				method,
-				{ ...quiet, ...body, text: toTelegramHtml(source), parse_mode: "HTML" },
+				{ ...quiet, ...wireBody, [textField]: toTelegramHtml(source), parse_mode: "HTML" },
 				15_000,
 				(failure) => {
 					refusal = failure.description;
 				},
 			);
+			if (method !== "sendMessage" && sent === null && refusal.includes("message is not modified")) {
+				sent = { message_id: body.message_id } as TelegramMessage;
+			}
 			if (sent === null && isMarkupFailure(refusal)) {
 				pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method, description: refusal });
-				const { message_effect_id: _effect, ...safe } = body;
+				const { message_effect_id: _effect, ...safe } = wireBody;
 				const fallback = plainStamps(source);
-				sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: fallback }, 15_000);
+				sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, [textField]: fallback }, 15_000);
 				sentText = fallback;
 			} else if (sent === null) {
 				pi.logger.warn("telegram: send refused", { method, description: refusal });
 			}
 			if (sent !== null) {
-				if (method === "editMessageText") acceptEdit();
+				if (method !== "sendMessage") acceptEdit();
 				if (method === "sendMessage" && kind !== null) {
-					trackSent(sent, kind, sentText, sentSession, payload, beforeRecord);
-				} else if (method === "editMessageText" && isTelegramMessageId(body.message_id)) {
+					trackSent(sent, kind, sentText, sentSession, payload, beforeRecord, replyMarkup);
+				} else if (method !== "sendMessage" && isTelegramMessageId(body.message_id)) {
 					const previous = readSentRecord(body.message_id);
 					const editedKind = kind ?? previous?.kind;
 					if (editedKind !== undefined) {
 						beforeRecord?.(body.message_id);
 						if (beforeRecord !== undefined && sessionCtx !== null) writeSessionRecord(sessionCtx);
-						recordSent(body.message_id, editedKind, sentText, sentSession, payload ?? previous?.payload);
+						recordSent(body.message_id, editedKind, sentText, sentSession, payload ?? previous?.payload, replyMarkup);
 					}
 				}
 			}
@@ -1917,7 +1959,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			method === "sendMessage" ? await whileSending(() => deliver(acceptEdit)) : await deliver(acceptEdit);
 		if (method === "sendMessage" && kind !== null) return await withSentRecordMarker(work);
 		const editedMessageId =
-			method === "editMessageText" &&
+			method !== "sendMessage" &&
 			isTelegramMessageId(body.message_id) &&
 			(kind !== null || readSentRecord(body.message_id) !== null)
 				? body.message_id
@@ -2293,6 +2335,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		for (const [dir, keepMs] of [
 			[MEDIA_DIR, MEDIA_KEEP_MS],
 			[SENT_DIR, SENT_KEEP_MS],
+			[INCOMING_DIR, INCOMING_KEEP_MS],
 			// A crash card nobody touched for a week is not coming back.
 			[CRASH_DIR, CRASH_KEEP_MS],
 			[CRASH_BATCH_DIR, CRASH_KEEP_MS],
@@ -2359,10 +2402,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {}
 	}
 
-	/** Offered on green summaries: everything is done, so the session may be shut down from the phone. */
-	function closeSessionButton(): InlineButton {
+	function closeSessionButtons(): InlineButton[][] {
 		const label = process.env.TMUX === undefined ? "Close this session" : "Close this session and its tmux pane";
-		return { text: label, callback_data: `k:${sessionTag}`, style: "danger" };
+		return [
+			[{ text: label, callback_data: `k:${sessionTag}`, style: "danger" }],
+			[{ text: "Close this session and clear its messages", callback_data: `x:${sessionTag}`, style: "danger" }],
+		];
 	}
 
 	/** A detached shell outlives omp, so the pane dies only after the process has exited. Killing the pane, not
@@ -2382,12 +2427,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Drops every button from a message and leaves its text standing. */
 	async function stripKeyboard(messageId: number): Promise<void> {
 		if (config === null) return;
-		await callTelegram(
+		const stripped = await callTelegram(
 			config,
 			"editMessageReplyMarkup",
 			{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } },
 			10_000,
 		);
+		if (stripped === null) return;
+		// The record carries the emptied keyboard, so a later edit cannot resurrect the retired buttons.
+		const previous = readSentRecord(messageId);
+		if (previous !== null) {
+			recordSent(messageId, previous.kind, previous.text, previous.session, previous.payload, {
+				inline_keyboard: [],
+			});
+		}
 	}
 
 	/** The green-summary close button: strip the button, then let the ordinary shutdown path run. */
@@ -2401,8 +2454,63 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		sessionCtx?.shutdown();
 	}
 
+	/** Removes this session's outgoing and routed incoming messages, reports the refusals, and shuts the pane down. */
+	async function closeAndClearFromTelegram(): Promise<void> {
+		if (config === null) {
+			scheduleTmuxPaneKill();
+			sessionCtx?.shutdown();
+			return;
+		}
+		const cfg = config;
+		const outgoing = new Set<number>();
+		for (const name of listJson(SENT_DIR)) {
+			const id = Number(name.slice(0, -5));
+			const record = readSentRecord(id);
+			if (record !== null && record.session.id === sessionId) outgoing.add(id);
+		}
+		for (const id of recentMessages) outgoing.add(id);
+		const incoming = new Set<number>();
+		for (const name of listJson(INCOMING_DIR)) {
+			const id = Number(name.slice(0, -5));
+			if (!isTelegramMessageId(id)) continue;
+			const record = parseIncomingRecord(readJsonFile(join(INCOMING_DIR, name)), id);
+			if (record !== null && record.session.id === sessionId) incoming.add(id);
+		}
+		const messages = [...new Set([...outgoing, ...incoming])];
+		let refused = 0;
+		for (let offset = 0; offset < messages.length; offset += 100) {
+			const batch = messages.slice(offset, offset + 100);
+			const accepted = await callTelegram<boolean>(
+				cfg,
+				"deleteMessages",
+				{ chat_id: cfg.chatId, message_ids: batch },
+				15_000,
+			);
+			for (const id of batch) {
+				const deleted =
+					accepted === true ||
+					(await callTelegram<boolean>(cfg, "deleteMessage", { chat_id: cfg.chatId, message_id: id }, 10_000)) === true;
+				if (!deleted) {
+					refused += 1;
+					continue;
+				}
+				if (outgoing.has(id)) forgetSentMessage(id);
+				if (incoming.has(id)) writePrivateJson(INCOMING_DIR, `${id}.json`, null);
+			}
+		}
+		if (refused > 0 && sessionCtx !== null) {
+			await serviceNotice(
+				`${messageHead(sessionCtx)}\n\nCould not remove ${refused} of ${messages.length} tracked messages. Telegram's deletion limit is 48 hours. The session will close with those messages left in the chat.`,
+				false,
+			);
+		}
+		scheduleTmuxPaneKill();
+		sessionCtx?.shutdown();
+	}
+
 	/** The close offer dies the moment new work starts; a stale destructive button invites accidents. */
 	function retireCloseOffer(withEdit: boolean): void {
+		closeOfferGeneration += 1;
 		const messageId = closeOfferMessageId;
 		if (messageId === null) return;
 		closeOfferMessageId = null;
@@ -2575,7 +2683,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						{ ...body, rich_message: { markdown: plain + keep } },
 						15_000,
 					);
-					if (accepted !== null) trackSent(accepted, kind, plain + keep, sentSession, payload, beforeRecord);
+					if (accepted !== null) {
+						trackSent(accepted, kind, plain + keep, sentSession, payload, beforeRecord, body.reply_markup);
+					}
 					return accepted;
 				}),
 			);
@@ -3022,6 +3132,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		writeFileAtomic(join(dir, `${updateId}.json`), JSON.stringify(entry), 0o600);
 	}
 
+	/** Keeps the user's half of one uniquely routed exchange so a close-and-clear can clear it too. */
+	function trackIncoming(messageId: number, target: string): void {
+		if (!isTelegramMessageId(messageId)) return;
+		writePrivateJson(INCOMING_DIR, `${messageId}.json`, {
+			version: 1,
+			id: messageId,
+			at: Date.now(),
+			session: { id: target },
+		});
+	}
+
 	/**
 	 * Bot API refuses getFile beyond 20 MB; larger uploads get a notice instead of silence. Every
 	 * abandoned path logs its own reason: the user-facing notice is necessarily generic, so without
@@ -3193,22 +3314,36 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			: `\u{1F535} ${stopping ? "Stopping" : "Sent to"} ${badgeOf(owner.record)}.`;
 		if (!gone) {
 			deliver(owner.id, Number.parseInt(rawUpdate, 10), held);
+			// The tap attributes the held message to one session, so it is uniquely routed now.
+			if (typeof held.messageId === "number") trackIncoming(held.messageId, owner.id);
 			try {
 				unlinkSync(heldMessagePath(rawUpdate));
 			} catch {}
 		}
 		if (typeof callback.message?.message_id !== "number") return;
-		await callTelegram(
+		const sentSession = gone
+			? readSentRecord(callback.message.message_id)?.session
+			: {
+					id: owner.id,
+					tag: owner.record.tag,
+					emoji: owner.record.emoji,
+					name: owner.record.label || owner.record.name,
+					cwd: owner.record.cwd,
+				};
+		await sendOrEdit(
 			cfg,
 			"editMessageText",
 			{
 				chat_id: cfg.chatId,
 				message_id: callback.message.message_id,
-				text: toTelegramHtml(closing),
-				parse_mode: "HTML",
 				reply_markup: { inline_keyboard: [] },
 			},
-			10_000,
+			closing,
+			"",
+			sentSession === undefined ? null : "notice",
+			undefined,
+			undefined,
+			sentSession,
 		);
 	}
 
@@ -3684,11 +3819,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							? "That question's session is gone."
 							: callback.data.startsWith("k:")
 								? "Closing the session."
-								: callback.data.startsWith("c:")
-									? "Starting the next turn."
-									: // Whether the press still fits the open question is decided in the session, which
-										// discards a tap the ask has moved past. The poller reports only what it did.
-										"Sent to that session.",
+								: callback.data.startsWith("x:")
+									? "Closing the session and clearing its messages."
+									: callback.data.startsWith("c:")
+										? "Starting the next turn."
+										: // Whether the press still fits the open question is decided in the session, which
+											// discards a tap the ask has moved past. The poller reports only what it did.
+											"Sent to that session.",
 				},
 				10_000,
 			);
@@ -3756,6 +3893,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					return;
 				}
 				deliver(target, update.update_id, { kind: "command", value: command });
+				trackIncoming(message.message_id, target);
 				return;
 			}
 			const running = allRecords().filter(
@@ -3768,12 +3906,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			if (running.length === 1 && running[0] !== undefined) {
 				deliver(running[0].id, update.update_id, { kind: "command", value: command });
+				trackIncoming(message.message_id, running[0].id);
 				return;
 			}
 			await askWhichSession(
 				cfg,
 				update,
-				{ kind: "command", value: command },
+				{ kind: "command", value: command, messageId: message.message_id },
 				`\u{1F535} ${running.length} sessions are running a turn. Which one should stop?`,
 				running,
 			);
@@ -3789,6 +3928,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							.map(({ id }) => id);
 			for (const target of targets) {
 				deliver(target, update.update_id, { kind: "command", value: command });
+			}
+			// A command delivered to exactly one session is a uniquely routed exchange, while the rest are fleet-wide.
+			if (targets.length === 1) {
+				const target = targets[0];
+				if (target !== undefined) trackIncoming(message.message_id, target);
 			}
 			return;
 		}
@@ -3815,6 +3959,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				messageId: message.message_id,
 				replyTo,
 			});
+			trackIncoming(message.message_id, target);
 			return;
 		}
 
@@ -3861,6 +4006,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			messageId: message.message_id,
 			replyTo,
 		});
+		trackIncoming(message.message_id, routed);
 	}
 
 	/**
@@ -4032,6 +4178,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		keep = "",
 	): Promise<void> {
 		if (config === null || recorded.options === undefined) return;
+		const closeGeneration = closeOfferGeneration;
 		const superseded = standingQuestion;
 		standingSeq += 1;
 		const id = `${sessionTag}-n${standingSeq.toString(36)}`;
@@ -4057,10 +4204,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				return button;
 			}),
 		);
-		if (recorded.urgency === "green") keyboard.push([closeSessionButton()]);
+		if (recorded.urgency === "green") keyboard.push(...closeSessionButtons());
 		const labels = recorded.options.map((option) => option.label);
 		const publishStanding = (messageId: number): void => {
 			standingQuestion = { id, messageId, labels, head: settlementHead };
+			if (recorded.urgency === "green") {
+				if (closeGeneration === closeOfferGeneration && !turnActive && !closing) {
+					closeOfferMessageId = messageId;
+					writeSessionRecord(ctx);
+				} else {
+					detach(stripKeyboard(messageId), "late close-offer retire");
+				}
+			}
 		};
 		const sent = await sendStructured(
 			config,
@@ -4226,7 +4381,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** Sequential: two taps in one poll batch must see each other's state. */
 	async function drainInbox(): Promise<void> {
-		if (drainInFlight) return;
+		if (drainInFlight || closing) return;
 		drainInFlight = true;
 		try {
 			const dir = join(INBOX_DIR, sessionId);
@@ -4292,12 +4447,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						pi.logger.warn("notify-telegram: discarded a malformed agent message", { name, raw: clip(raw, 200) });
 						continue;
 					}
+					// An agent message steers or starts a turn, so the completion offer is stale on arrival.
+					retireCloseOffer(true);
 					deliverAgentMessage(message);
 					continue;
 				}
 				if (entry.kind !== "redo") rmSync(processing, { force: true });
+				// New work voids the close offer, so a tap queued behind it cannot close a session about to start a turn.
+				if (
+					entry.kind === "text" ||
+					entry.kind === "file" ||
+					entry.kind === "redo" ||
+					(entry.kind === "callback" && !entry.value.startsWith("k:") && !entry.value.startsWith("x:"))
+				) {
+					retireCloseOffer(true);
+				}
 				// A reply or an answer means attention is on this session: put its window in front for the return.
-				if (entry.kind === "text" || (entry.kind === "callback" && !entry.value.startsWith("k:"))) {
+				if (
+					entry.kind === "text" ||
+					(entry.kind === "callback" && !entry.value.startsWith("k:") && !entry.value.startsWith("x:"))
+				) {
 					focusTmuxWindow();
 				}
 				// `replyOwedAt` is stamped where the entry reaches the agent, never before: an entry answered
@@ -4341,9 +4510,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					}
 					continue;
 				}
-				if (entry.kind === "callback" && entry.value.startsWith("k:")) {
-					await closeSessionFromTelegram(entry.messageId);
-					continue;
+				if (entry.kind === "callback" && (entry.value.startsWith("k:") || entry.value.startsWith("x:"))) {
+					const clears = entry.value.startsWith("x:");
+					if (
+						closing ||
+						turnActive ||
+						pendingAsk !== null ||
+						entry.messageId === undefined ||
+						closeOfferMessageId !== entry.messageId
+					) {
+						// A destructive press from an old or duplicated keyboard is an accident waiting to happen.
+						const text = "That close offer is no longer current, so the session stayed open.";
+						if (sessionCtx !== null) await sessionNotice(sessionCtx, text);
+						else await serviceNotice(text, false);
+						continue;
+					}
+					closing = true;
+					if (clears) await closeAndClearFromTelegram();
+					else await closeSessionFromTelegram(entry.messageId);
+					return;
 				}
 				if (entry.kind === "callback" && entry.value.startsWith("c:")) {
 					const [, choiceId, rawIndex] = entry.value.split(":");
@@ -6081,6 +6266,127 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
+	function forgetSentMessage(messageId: number): void {
+		writePrivateJson(SENT_DIR, `${messageId}.json`, null);
+		const index = recentMessages.indexOf(messageId);
+		if (index !== -1) recentMessages.splice(index, 1);
+		if (closeOfferMessageId === messageId) closeOfferMessageId = null;
+		if (standingQuestion?.messageId === messageId) standingQuestion = null;
+		if (pinnedMessageId === messageId) pinnedMessageId = null;
+		if (approvalNotice?.messageId === messageId) approvalNotice = null;
+		closeReplyQuestion(messageId);
+		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+	}
+
+	pi.registerTool({
+		name: "notify_message",
+		label: "Manage Telegram Message",
+		description:
+			"List, edit or delete Telegram messages sent by this session. `action` defaults to `list`, returning message IDs and source text, newest first. `limit` is 1–50, default 20, and `before` pages through older IDs. For `edit` or `delete`, pass `message_id` from this list or a send tool's result. Editing takes `text` as the complete replacement body without the session head, which is added automatically. Markdown is supported, and a file edit changes its caption without reuploading. Existing buttons are preserved. Include the fenced payload when replacing a copyable snippet. Active native questions cannot be edited or deleted. Only messages owned by this session are accepted. Telegram can refuse deletion of messages older than 48 hours.",
+		approval: "read",
+		strict: true,
+		parameters: z.object({
+			action: z.enum(["list", "edit", "delete"]).optional(),
+			message_id: z.number().int().positive().optional(),
+			text: z.string().optional(),
+			before: z.number().int().positive().optional(),
+			limit: z.number().int().min(1).max(50).optional(),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const p = params as {
+				action?: unknown;
+				message_id?: unknown;
+				text?: unknown;
+				before?: unknown;
+				limit?: unknown;
+			};
+			const fail = (text: string) => ({ content: [{ type: "text" as const, text }], isError: true });
+			if (config === null) return fail("Telegram is not configured.");
+			if (signal?.aborted === true) return fail("Message operation cancelled.");
+			const action = p.action ?? "list";
+			if (action === "list") {
+				const limit = p.limit ?? 20;
+				if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 50) {
+					return fail("`limit` must be an integer from 1 to 50.");
+				}
+				if (p.before !== undefined && !isTelegramMessageId(p.before)) {
+					return fail("`before` must be a positive message ID.");
+				}
+				const before = p.before;
+				const owned = listJson(SENT_DIR)
+					.map((entry) => readSentRecord(Number(entry.slice(0, -5))))
+					.filter(
+						(record): record is SentRecord =>
+							record !== null && record.session.id === sessionId && (before === undefined || record.id < before),
+					)
+					.sort((a, b) => b.id - a.id);
+				const messages = owned.slice(0, limit).map(({ id, kind, text }) => ({ id, kind, text }));
+				const nextBefore = owned.length > limit ? messages.at(-1)?.id : undefined;
+				return {
+					content: [{ type: "text", text: JSON.stringify({ messages, nextBefore }) }],
+					details: { messages, nextBefore },
+				};
+			}
+			if (action !== "edit" && action !== "delete") return fail("`action` must be `list`, `edit` or `delete`.");
+			if (!isTelegramMessageId(p.message_id)) return fail("`message_id` must be a positive message ID.");
+			const messageId = p.message_id;
+			const previous = readSentRecord(messageId);
+			if (previous?.session.id !== sessionId) {
+				return fail("No retained message owned by this session has that ID.");
+			}
+			if (pendingAsk?.messageId === messageId) {
+				return fail("This native question is still active. Answer or cancel it before changing its message.");
+			}
+			if (sentRecordInFlight(messageId, false)) return fail("Another operation is changing this message.");
+			const cfg = config;
+			if (action === "delete") {
+				let refusal = "";
+				const deleted = await withSentRecordMarker(async (acceptEdit) => {
+					const accepted = await callTelegramRaw<boolean>(
+						cfg,
+						"deleteMessage",
+						{ chat_id: cfg.chatId, message_id: messageId },
+						15_000,
+						(failure) => {
+							refusal = failure.description;
+						},
+					);
+					if (accepted === true) {
+						acceptEdit();
+						forgetSentMessage(messageId);
+					}
+					return accepted === true;
+				}, messageId);
+				if (!deleted) return fail(`Telegram refused deletion. ${refusal}`);
+			} else {
+				const text = typeof p.text === "string" ? p.text.trim() : "";
+				if (text.length === 0) return fail("`text` must contain the replacement message body.");
+				const source = `${messageHead(ctx)}\n\n${text}`;
+				const caption = previous.kind === "file";
+				const max = caption ? CAPTION_MAX : TELEGRAM_TEXT_MAX;
+				if (source.length > max) return fail(`The replacement including the session head exceeds ${max} characters.`);
+				const edited = await sendOrEdit(
+					cfg,
+					caption ? "editMessageCaption" : "editMessageText",
+					{ chat_id: cfg.chatId, message_id: messageId },
+					source,
+					"",
+					previous.kind,
+					{ text },
+				);
+				if (edited === null) return fail("Telegram refused the edit.");
+				if (standingQuestion?.messageId === messageId) {
+					standingQuestion.head = source;
+					writeSessionRecord(ctx);
+				}
+			}
+			return {
+				content: [{ type: "text", text: `${action === "edit" ? "Edited" : "Deleted"} message ${messageId}.` }],
+				details: { messageId },
+			};
+		},
+	});
+
 	/**
 	 * Text the user has to paste somewhere else. The message ends on a single fenced block holding
 	 * the payload verbatim, so the copy control Telegram draws on that block yields exactly the
@@ -6160,18 +6466,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
-	/**
-	 * The hard gate before anything is forked or opened. Reuses the same `pendingAsk` path the ask tool
-	 * uses, so the Launch/Cancel card is answerable from the phone and an abort or a Cancel leaves nothing
-	 * behind. Returns true only for an explicit Launch.
-	 */
+	/** Only the explicit Launch button authorizes upstream work. */
 	async function confirmUpstreamLaunch(
 		ctx: ExtensionContext,
 		question: string,
 		context: string,
 		signal: AbortSignal | undefined,
-	): Promise<{ confirmed: boolean; delivered: boolean }> {
-		if (config === null) return { confirmed: false, delivered: false };
+	): Promise<{ action: "launch" | "cancel" | "already-started" | "unavailable" } | { action: "reply"; text: string }> {
 		askSequence += 1;
 		const remote = Promise.withResolvers<AskResult[]>();
 		const ask: PendingAsk = {
@@ -6189,6 +6490,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								"Fork or reuse the repository, open a new omp session in a tmux tab, and start the upstream work.",
 						},
 						{ label: "Cancel", description: "Do nothing. Stay in this session and drop the upstream launch." },
+						{
+							label: "Upstreaming has already started",
+							description:
+								"Agent will skip launching a duplicate because another session is already handling the upstream work.",
+						},
 					],
 					recommended: 0,
 				},
@@ -6210,13 +6516,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pi.logger.warn("upstream: the launch confirmation card failed to send", {
 				error: error instanceof Error ? error.message : String(error),
 			});
-			return { confirmed: false, delivered: false };
+			return { action: "unavailable" };
 		}
 		if (ask.messageId === null) {
 			// The card never reached Telegram, so there is nothing for the user to answer; do not block.
 			if (pendingAsk === ask) pendingAsk = previous;
 			noteState();
-			return { confirmed: false, delivered: false };
+			return { action: "unavailable" };
 		}
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
@@ -6226,8 +6532,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (signal?.aborted) onAbort();
 		try {
 			const results = await remote.promise;
-			const answer = (results[0]?.selectedOptions[0] ?? results[0]?.customInput ?? "").trim().toLowerCase();
-			return { confirmed: answer === "launch", delivered: true };
+			const answer = results[0];
+			if (answer?.customInput !== undefined) return { action: "reply", text: answer.customInput };
+			const choice = answer?.selectedOptions[0];
+			if (choice === "Launch") return { action: "launch" };
+			if (choice === "Upstreaming has already started") return { action: "already-started" };
+			return { action: "cancel" };
 		} finally {
 			signal?.removeEventListener("abort", onAbort);
 			if (pendingAsk === ask) {
@@ -6243,7 +6553,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "upstream_launch",
 		label: "Upstream Launch",
 		description:
-			"Start the upstream procedure for a fix that belongs in a repository this one depends on. Call it only after you have written the upstream request document (per the upstream-finding-as-document rule) and the user has agreed an upstream fix is wanted. It opens a Telegram Launch/Cancel card and does nothing until Launch is tapped. On Launch it sends the branch to the target itself when the user owns it or has push permission on it, and otherwise to the user's fork of it, found by its parent whatever the fork is named, or created when none exists. It uses the clone at `~/github/<name>` with whatever remote names it already has, adding a missing remote only under a free name and never re-pointing one, or clones there when nothing exists, cuts a worktree on a new `upstream/<slug>` branch off the target's latest default branch so it never disturbs work already open there, carries the request document into that worktree, and opens a new omp session in a fresh tmux tab told which remote to push to. It writes only to repositories the user may push to and under `~/github`, never in this repository, and the spawned session does the upstream work from there. `repo`: the uphill repository as `owner/name`. `document`: path to the request document you wrote, resolved against this session's working directory. `problem`: one sentence naming what the dependency does wrong, shown on the card and given to the new session. `slug`: optional short kebab identifier for the branch and worktree, derived from `problem` when omitted.",
+			"Start an upstream fix after writing the request document and obtaining the user's agreement that it is needed. The Telegram card offers Launch, Cancel and Upstreaming has already started. Only tapping Launch starts work. Text replies return verbatim to the requesting model without starting a session, and choosing existing work reports that outcome without starting a duplicate. Launch uses the target repository when the user can push there, otherwise finds or creates the user's fork by its parent. It preserves existing remotes in `~/github/<name>`, creates a worktree on `upstream/<slug>` from the target's default branch, carries the request document and opens an `omp` session in its own `tmux` tab with the push remote. It operates under `~/github` and leaves this repository untouched. `repo` names the upstream repository as `owner/name`, `document` is the request path relative to this session's working directory, `problem` is the one-sentence defect shown on the card, and optional `slug` names the branch and worktree, defaulting from `problem`.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -6277,15 +6587,34 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				context,
 				signal,
 			);
-			if (!decision.delivered) {
+			if (decision.action === "unavailable") {
 				return fail(
 					"could not send the Launch confirmation to Telegram, so nothing was launched; check the bot connection and retry",
 				);
 			}
-			if (!decision.confirmed) {
+			if (decision.action !== "launch") {
+				if (decision.action === "reply") {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `The user replied to the upstream launch confirmation. No upstream session was launched.\n\n${decision.text}`,
+							},
+						],
+						details: { launched: false, reason: "reply", reply: decision.text },
+					};
+				}
+				const alreadyStarted = decision.action === "already-started";
 				return {
-					content: [{ type: "text", text: "Upstream launch cancelled; nothing was forked, cloned, or opened." }],
-					details: { launched: false },
+					content: [
+						{
+							type: "text",
+							text: alreadyStarted
+								? "Upstreaming has already started in another session. No duplicate session was launched."
+								: "Upstream launch cancelled. Nothing was forked, cloned or opened.",
+						},
+					],
+					details: { launched: false, reason: alreadyStarted ? "already-started" : "cancelled" },
 				};
 			}
 
@@ -6721,8 +7050,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			lastSummary = clip(recorded.text.split("\n")[0]?.trim() ?? "", STATUS_SUMMARY_MAX);
 			lastSummaryAt = Date.now();
 			if (recorded.options === undefined) {
+				const closeGeneration = closeOfferGeneration;
 				const extra: Record<string, unknown> = { ...urgencyExtras(recorded, quiet) };
-				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: [[closeSessionButton()]] };
+				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: closeSessionButtons() };
 				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
 				const replyQuestionToken = recorded.question === undefined ? null : ++replyQuestionGeneration;
@@ -6741,8 +7071,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				).then((sent) => {
 					const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
 					if (recorded.urgency === "green") {
-						closeOfferMessageId = messageId;
-						writeSessionRecord(ctx);
+						if (closeGeneration === closeOfferGeneration && !turnActive && !closing) {
+							closeOfferMessageId = messageId;
+							writeSessionRecord(ctx);
+						} else if (messageId !== null) {
+							detach(stripKeyboard(messageId), "late close-offer retire");
+						}
 					}
 					if (recorded.urgency === "red") return pinRed(ctx, sent);
 					return undefined;
