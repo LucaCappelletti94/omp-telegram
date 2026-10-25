@@ -209,6 +209,7 @@ interface SentRecord {
 	session: { id: string; tag: string; emoji: string; name: string; cwd: string };
 	/** The structured call behind the message, where there was one. */
 	payload?: unknown;
+	replyMarkup?: unknown;
 }
 interface IncomingRecord {
 	version: 1;
@@ -1849,6 +1850,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		text: string,
 		sentSession: SentRecord["session"],
 		payload?: unknown,
+		replyMarkup?: unknown,
 	): void {
 		if (!isTelegramMessageId(id)) return;
 		const record: SentRecord = {
@@ -1860,6 +1862,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			session: sentSession,
 		};
 		if (payload !== undefined) record.payload = payload;
+		if (replyMarkup !== undefined) record.replyMarkup = replyMarkup;
 		mkdirSync(SENT_DIR, { recursive: true, mode: 0o700 });
 		writeFileAtomic(join(SENT_DIR, `${id}.json`), JSON.stringify(record), 0o600);
 	}
@@ -1872,6 +1875,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		sentSession: SentRecord["session"],
 		payload?: unknown,
 		beforeRecord?: (messageId: number) => void,
+		replyMarkup?: unknown,
 	): void {
 		if (!isTelegramMessageId(sent?.message_id)) return;
 		recentMessages.push(sent.message_id);
@@ -1880,7 +1884,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		beforeRecord?.(sent.message_id);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-		recordSent(sent.message_id, kind, text, sentSession, payload);
+		recordSent(sent.message_id, kind, text, sentSession, payload, replyMarkup);
 	}
 
 	/** Marks a message the user is waiting on, which is the one window where typing is not a lie. */
@@ -1896,7 +1900,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Retries markup failures as plain text and records only messages with a non-null `kind`. */
 	async function sendOrEdit(
 		cfg: Config,
-		method: "sendMessage" | "editMessageText",
+		method: "sendMessage" | "editMessageText" | "editMessageCaption",
 		body: Record<string, unknown>,
 		plain: string,
 		keep = "",
@@ -1905,40 +1909,47 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		beforeRecord?: (messageId: number) => void,
 		sentSession = snapshotSentSession(),
 	): Promise<TelegramMessage | null> {
+		const previousRecord = method === "sendMessage" ? null : readSentRecord(Number(body.message_id));
+		const replyMarkup = body.reply_markup ?? previousRecord?.replyMarkup;
+		const wireBody = replyMarkup === undefined ? body : { ...body, reply_markup: replyMarkup };
 		const deliver = async (acceptEdit: () => void): Promise<TelegramMessage | null> => {
-			const quiet = { link_preview_options: { is_disabled: true } };
+			const textField = method === "editMessageCaption" ? "caption" : "text";
+			const quiet = method === "editMessageCaption" ? {} : { link_preview_options: { is_disabled: true } };
 			const source = fitToTelegram(plain, keep);
 			let sentText = source;
 			let refusal = "";
 			let sent = await callTelegramRaw<TelegramMessage>(
 				cfg,
 				method,
-				{ ...quiet, ...body, text: toTelegramHtml(source), parse_mode: "HTML" },
+				{ ...quiet, ...wireBody, [textField]: toTelegramHtml(source), parse_mode: "HTML" },
 				15_000,
 				(failure) => {
 					refusal = failure.description;
 				},
 			);
+			if (method !== "sendMessage" && sent === null && refusal.includes("message is not modified")) {
+				sent = { message_id: body.message_id } as TelegramMessage;
+			}
 			if (sent === null && isMarkupFailure(refusal)) {
 				pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method, description: refusal });
-				const { message_effect_id: _effect, ...safe } = body;
+				const { message_effect_id: _effect, ...safe } = wireBody;
 				const fallback = plainStamps(source);
-				sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, text: fallback }, 15_000);
+				sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, [textField]: fallback }, 15_000);
 				sentText = fallback;
 			} else if (sent === null) {
 				pi.logger.warn("telegram: send refused", { method, description: refusal });
 			}
 			if (sent !== null) {
-				if (method === "editMessageText") acceptEdit();
+				if (method !== "sendMessage") acceptEdit();
 				if (method === "sendMessage" && kind !== null) {
-					trackSent(sent, kind, sentText, sentSession, payload, beforeRecord);
-				} else if (method === "editMessageText" && isTelegramMessageId(body.message_id)) {
+					trackSent(sent, kind, sentText, sentSession, payload, beforeRecord, replyMarkup);
+				} else if (method !== "sendMessage" && isTelegramMessageId(body.message_id)) {
 					const previous = readSentRecord(body.message_id);
 					const editedKind = kind ?? previous?.kind;
 					if (editedKind !== undefined) {
 						beforeRecord?.(body.message_id);
 						if (beforeRecord !== undefined && sessionCtx !== null) writeSessionRecord(sessionCtx);
-						recordSent(body.message_id, editedKind, sentText, sentSession, payload ?? previous?.payload);
+						recordSent(body.message_id, editedKind, sentText, sentSession, payload ?? previous?.payload, replyMarkup);
 					}
 				}
 			}
@@ -1948,7 +1959,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			method === "sendMessage" ? await whileSending(() => deliver(acceptEdit)) : await deliver(acceptEdit);
 		if (method === "sendMessage" && kind !== null) return await withSentRecordMarker(work);
 		const editedMessageId =
-			method === "editMessageText" &&
+			method !== "sendMessage" &&
 			isTelegramMessageId(body.message_id) &&
 			(kind !== null || readSentRecord(body.message_id) !== null)
 				? body.message_id
@@ -2416,12 +2427,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Drops every button from a message and leaves its text standing. */
 	async function stripKeyboard(messageId: number): Promise<void> {
 		if (config === null) return;
-		await callTelegram(
+		const stripped = await callTelegram(
 			config,
 			"editMessageReplyMarkup",
 			{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } },
 			10_000,
 		);
+		if (stripped === null) return;
+		// The record carries the emptied keyboard, so a later edit cannot resurrect the retired buttons.
+		const previous = readSentRecord(messageId);
+		if (previous !== null) {
+			recordSent(messageId, previous.kind, previous.text, previous.session, previous.payload, {
+				inline_keyboard: [],
+			});
+		}
 	}
 
 	/** The green-summary close button: strip the button, then let the ordinary shutdown path run. */
@@ -2664,7 +2683,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						{ ...body, rich_message: { markdown: plain + keep } },
 						15_000,
 					);
-					if (accepted !== null) trackSent(accepted, kind, plain + keep, sentSession, payload, beforeRecord);
+					if (accepted !== null) {
+						trackSent(accepted, kind, plain + keep, sentSession, payload, beforeRecord, body.reply_markup);
+					}
 					return accepted;
 				}),
 			);
@@ -6256,6 +6277,115 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		closeReplyQuestion(messageId);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 	}
+
+	pi.registerTool({
+		name: "notify_message",
+		label: "Manage Telegram Message",
+		description:
+			"List, edit or delete Telegram messages sent by this session. `action` defaults to `list`, returning message IDs and source text, newest first. `limit` is 1–50, default 20, and `before` pages through older IDs. For `edit` or `delete`, pass `message_id` from this list or a send tool's result. Editing takes `text` as the complete replacement body without the session head, which is added automatically. Markdown is supported, and a file edit changes its caption without reuploading. Existing buttons are preserved. Include the fenced payload when replacing a copyable snippet. Active native questions cannot be edited or deleted. Only messages owned by this session are accepted. Telegram can refuse deletion of messages older than 48 hours.",
+		approval: "read",
+		strict: true,
+		parameters: z.object({
+			action: z.enum(["list", "edit", "delete"]).optional(),
+			message_id: z.number().int().positive().optional(),
+			text: z.string().optional(),
+			before: z.number().int().positive().optional(),
+			limit: z.number().int().min(1).max(50).optional(),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const p = params as {
+				action?: unknown;
+				message_id?: unknown;
+				text?: unknown;
+				before?: unknown;
+				limit?: unknown;
+			};
+			const fail = (text: string) => ({ content: [{ type: "text" as const, text }], isError: true });
+			if (config === null) return fail("Telegram is not configured.");
+			if (signal?.aborted === true) return fail("Message operation cancelled.");
+			const action = p.action ?? "list";
+			if (action === "list") {
+				const limit = p.limit ?? 20;
+				if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 50) {
+					return fail("`limit` must be an integer from 1 to 50.");
+				}
+				if (p.before !== undefined && !isTelegramMessageId(p.before)) {
+					return fail("`before` must be a positive message ID.");
+				}
+				const before = p.before;
+				const owned = listJson(SENT_DIR)
+					.map((entry) => readSentRecord(Number(entry.slice(0, -5))))
+					.filter(
+						(record): record is SentRecord =>
+							record !== null && record.session.id === sessionId && (before === undefined || record.id < before),
+					)
+					.sort((a, b) => b.id - a.id);
+				const messages = owned.slice(0, limit).map(({ id, kind, text }) => ({ id, kind, text }));
+				const nextBefore = owned.length > limit ? messages.at(-1)?.id : undefined;
+				return {
+					content: [{ type: "text", text: JSON.stringify({ messages, nextBefore }) }],
+					details: { messages, nextBefore },
+				};
+			}
+			if (action !== "edit" && action !== "delete") return fail("`action` must be `list`, `edit` or `delete`.");
+			if (!isTelegramMessageId(p.message_id)) return fail("`message_id` must be a positive message ID.");
+			const messageId = p.message_id;
+			const previous = readSentRecord(messageId);
+			if (previous === null || previous.session.id !== sessionId) {
+				return fail("No retained message owned by this session has that ID.");
+			}
+			if (pendingAsk?.messageId === messageId) {
+				return fail("This native question is still active. Answer or cancel it before changing its message.");
+			}
+			if (sentRecordInFlight(messageId, false)) return fail("Another operation is changing this message.");
+			const cfg = config;
+			if (action === "delete") {
+				let refusal = "";
+				const deleted = await withSentRecordMarker(async (acceptEdit) => {
+					const accepted = await callTelegramRaw<boolean>(
+						cfg,
+						"deleteMessage",
+						{ chat_id: cfg.chatId, message_id: messageId },
+						15_000,
+						(failure) => {
+							refusal = failure.description;
+						},
+					);
+					if (accepted === true) {
+						acceptEdit();
+						forgetSentMessage(messageId);
+					}
+					return accepted === true;
+				}, messageId);
+				if (!deleted) return fail(`Telegram refused deletion. ${refusal}`);
+			} else {
+				const text = typeof p.text === "string" ? p.text.trim() : "";
+				if (text.length === 0) return fail("`text` must contain the replacement message body.");
+				const source = `${messageHead(ctx)}\n\n${text}`;
+				const caption = previous.kind === "file";
+				const max = caption ? CAPTION_MAX : TELEGRAM_TEXT_MAX;
+				if (source.length > max) return fail(`The replacement including the session head exceeds ${max} characters.`);
+				const edited = await sendOrEdit(
+					cfg,
+					caption ? "editMessageCaption" : "editMessageText",
+					{ chat_id: cfg.chatId, message_id: messageId },
+					source,
+					"",
+					previous.kind,
+					{ text },
+				);
+				if (edited === null) return fail("Telegram refused the edit.");
+				if (standingQuestion?.messageId === messageId) {
+					standingQuestion.head = source;
+					writeSessionRecord(ctx);
+				}
+			}
+			return {
+				content: [{ type: "text", text: `${action === "edit" ? "Edited" : "Deleted"} message ${messageId}.` }],
+				details: { messageId },
+			};
+		},
+	});
 
 	/**
 	 * Text the user has to paste somewhere else. The message ends on a single fenced block holding
