@@ -90,6 +90,13 @@ globalThis.fetch = async (url, init) => {
 			}),
 		};
 	}
+	// A per-message refusal for deletions, so a partial clear can be proven without failing every delete.
+	if (
+		(method === "deleteMessage" && (api.deleteRefusals ?? []).includes(body.message_id)) ||
+		(method === "deleteMessages" && body.message_ids.some((id) => (api.deleteRefusals ?? []).includes(id)))
+	) {
+		return { ok: false, status: 400, json: async () => ({ ok: false, description: "message can't be deleted" }) };
+	}
 	if (api.rejectHtml && body.parse_mode === "HTML") {
 		return { ok: false, status: 400, json: async () => ({ ok: false, description: "can't parse entities" }) };
 	}
@@ -179,6 +186,8 @@ const askOpt = (label) => ({ label, description: `what "${label}" does` });
 const askOpts = (...labels) => labels.map(askOpt);
 const inboxCount = (id) =>
 	existsSync(inboxOf(id)) ? readdirSync(inboxOf(id)).filter((f) => f.endsWith(".json")).length : 0;
+const sentRecordFile = (id) => JSON.parse(readFileSync(join(root, `notify-telegram/sent/${id}.json`), "utf8"));
+const incomingRecordFile = (id) => JSON.parse(readFileSync(join(root, `notify-telegram/incoming/${id}.json`), "utf8"));
 
 const spawn = (id, cwd, title = "") => {
 	const handlers = new Map();
@@ -4105,17 +4114,17 @@ await orphanSess.fire("session_start");
 		"a green standing question plays the chosen effect",
 		lastCall("sendMessage").body.message_effect_id === "5107584321108051014",
 	);
-	const tag = JSON.parse(readFileSync(join(sessionsDir, `${cs.id}.json`), "utf8")).tag;
+	const offer = record(cs.id).closeOffer;
+	check("a green standing question is itself the live close offer", offer !== null);
 	writeFileSync(
 		join(inboxOf(cs.id), "3001.json"),
-		JSON.stringify({ kind: "callback", value: `k:${tag}`, messageId: 5555 }),
+		JSON.stringify({ kind: "callback", value: `k:${record(cs.id).tag}`, messageId: offer }),
 	);
 	await cs.pump(250);
-	check("a close press shuts the session down", shutdowns === 1);
-	const strip = called("editMessageReplyMarkup").find((c) => c.body.message_id === 5555);
+	check("a close press on the live offer shuts the session down", shutdowns === 1);
 	check(
-		"a close press strips the button from a plain summary",
-		strip !== undefined && strip.body.reply_markup.inline_keyboard.length === 0,
+		"close-only keeps the chat history",
+		sentRecordFile(offer) !== null && sentRecordFile(offer).session.id === cs.id,
 	);
 }
 
@@ -4198,10 +4207,10 @@ await orphanSess.fire("session_start");
 		.execute("k1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, kc.ctx);
 	await kc.fire("session_stop");
 	await settle(150);
-	const tag = JSON.parse(readFileSync(join(sessionsDir, `${kc.id}.json`), "utf8")).tag;
+	const kcOffer = record(kc.id).closeOffer;
 	writeFileSync(
 		join(inboxOf(kc.id), "3201.json"),
-		JSON.stringify({ kind: "callback", value: `k:${tag}`, messageId: 5757 }),
+		JSON.stringify({ kind: "callback", value: `k:${record(kc.id).tag}`, messageId: kcOffer }),
 	);
 	await kc.pump(250);
 	await settle(2300);
@@ -4239,10 +4248,10 @@ await orphanSess.fire("session_start");
 		.execute("b1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, bp.ctx);
 	await bp.fire("session_stop");
 	await settle(150);
-	const tag = JSON.parse(readFileSync(join(sessionsDir, `${bp.id}.json`), "utf8")).tag;
+	const bpOffer = record(bp.id).closeOffer;
 	writeFileSync(
 		join(inboxOf(bp.id), "3301.json"),
-		JSON.stringify({ kind: "callback", value: `k:${tag}`, messageId: 5858 }),
+		JSON.stringify({ kind: "callback", value: `k:${record(bp.id).tag}`, messageId: bpOffer }),
 	);
 	await bp.pump(250);
 	await settle(2300);
@@ -4280,6 +4289,649 @@ await orphanSess.fire("session_start");
 		JSON.parse(readFileSync(join(sessionsDir, `${rt.id}.json`), "utf8")).closeOffer === null,
 	);
 	await rt.fire("agent_end");
+}
+
+// The green close offer also carries the close-and-clear button beside the plain close.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const cl = spawn("c1ea000a-0000-0000-0000-000000000000", "/home/dev/work/clearboth");
+	await cl.fire("session_start");
+	await cl.fire("input");
+	await cl.tools
+		.get("notify_status")
+		.execute("cb1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, cl.ctx);
+	await cl.fire("session_stop");
+	await settle(150);
+	const plainRow = (lastCall("sendMessage").body.reply_markup?.inline_keyboard ?? []).flat();
+	check(
+		"a plain green summary offers the close button and the clear button",
+		plainRow.some((b) => b.callback_data?.startsWith("k:")) &&
+			plainRow.some((b) => b.callback_data?.startsWith("x:") && b.style === "danger"),
+	);
+	await cl.fire("input");
+	await cl.tools
+		.get("notify_status")
+		.execute(
+			"cb2",
+			{ summary: "Pick one.", urgency: "orange", options: opts("Go", "Wait") },
+			undefined,
+			undefined,
+			cl.ctx,
+		);
+	await cl.fire("session_stop");
+	await settle(150);
+	check(
+		"an orange standing question offers neither close button",
+		(lastCall("sendMessage").body.reply_markup?.inline_keyboard ?? [])
+			.flat()
+			.every((b) => b.callback_data?.startsWith("k:") !== true && b.callback_data?.startsWith("x:") !== true),
+	);
+	await cl.fire("input");
+	await cl.tools
+		.get("notify_status")
+		.execute(
+			"cb3",
+			{ summary: "Done, pick.", urgency: "green", effect: "none", options: opts("Merge", "Wait") },
+			undefined,
+			undefined,
+			cl.ctx,
+		);
+	await cl.fire("session_stop");
+	await settle(150);
+	const standingRow = lastCall("sendMessage").body.reply_markup.inline_keyboard.flat();
+	check(
+		"a green standing question offers the close button and the clear button",
+		standingRow.some((b) => b.callback_data?.startsWith("k:")) &&
+			standingRow.some((b) => b.callback_data?.startsWith("x:")),
+	);
+}
+
+// Close and clear removes this session's outgoing records and its uniquely routed replies, then closes.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const cc = spawn("c1ea000b-0000-0000-0000-000000000000", "/home/dev/work/clearchat");
+	const other = spawn("c1ea000c-0000-0000-0000-000000000000", "/home/dev/work/otherkeep");
+	let shutdowns = 0;
+	cc.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await cc.fire("session_start");
+	await other.fire("session_start");
+	await cc.fire("input");
+	await cc.tools
+		.get("notify_status")
+		.execute("cl1", { summary: "First note.", urgency: "orange" }, undefined, undefined, cc.ctx);
+	await cc.fire("session_stop");
+	await settle(150);
+	const first = record(cc.id).recent.at(-1);
+	api.queued = [
+		{
+			update_id: 6100,
+			message: {
+				message_id: 6100,
+				date: 1,
+				chat: { id: CHAT },
+				text: "keep going",
+				reply_to_message: { message_id: first },
+			},
+		},
+	];
+	await cc.pump(250);
+	await cc.pump(250);
+	check(
+		"a reply routed to a session is kept as a routed incoming record",
+		incomingRecordFile(6100).session.id === cc.id,
+	);
+	await other.fire("input");
+	await other.tools
+		.get("notify_status")
+		.execute("cl2", { summary: "Other note.", urgency: "orange" }, undefined, undefined, other.ctx);
+	await other.fire("session_stop");
+	await settle(150);
+	const otherMsg = record(other.id).recent.at(-1);
+	api.queued = [
+		{
+			update_id: 6101,
+			message: {
+				message_id: 6101,
+				date: 1,
+				chat: { id: CHAT },
+				text: "over to you",
+				reply_to_message: { message_id: otherMsg },
+			},
+		},
+	];
+	await cc.pump(250);
+	await other.pump(250);
+	await cc.fire("input");
+	await cc.tools
+		.get("notify_status")
+		.execute("cl3", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, cc.ctx);
+	await cc.fire("session_stop");
+	await settle(150);
+	const offer = record(cc.id).closeOffer;
+	const deletesBefore = called("deleteMessages").length;
+	writeFileSync(
+		join(inboxOf(cc.id), "6102.json"),
+		JSON.stringify({ kind: "callback", value: `x:${record(cc.id).tag}`, messageId: offer }),
+	);
+	await cc.pump(500);
+	check("close and clear shuts the session down once", shutdowns === 1);
+	const deleted = called("deleteMessages")
+		.slice(deletesBefore)
+		.flatMap((c) => c.body.message_ids);
+	check(
+		"close and clear asks Telegram to delete every owned message",
+		[first, offer, 6100].every((id) => deleted.includes(id)),
+	);
+	check(
+		"close and clear leaves the other session's messages untouched",
+		[otherMsg, 6101].every((id) => !deleted.includes(id)),
+	);
+	check("cleared outgoing records are tombstoned", sentRecordFile(first) === null && sentRecordFile(offer) === null);
+	check("cleared incoming records are tombstoned", incomingRecordFile(6100) === null);
+	check(
+		"the other session's records survive the clear",
+		sentRecordFile(otherMsg).session.id === other.id && incomingRecordFile(6101).session.id === other.id,
+	);
+	check("a successful clear leaves no extra chat message", lastCall("sendMessage").body.text.includes("All done."));
+	check("the close offer is gone from the record", record(cc.id).closeOffer === null);
+	const callsBeforeShutdown = api.calls.length;
+	await cc.fire("session_shutdown");
+	await settle(150);
+	check(
+		"shutdown rewrites nothing the clear already removed",
+		api.calls
+			.slice(callsBeforeShutdown)
+			.every((c) => c.body.message_id !== first && c.body.message_id !== offer && c.body.message_id !== 6100),
+	);
+}
+
+// Telegram refuses some deletions, and the clear reports the remainder and still closes.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const pr = spawn("c1ea000d-0000-0000-0000-000000000000", "/home/dev/work/partialclear");
+	let shutdowns = 0;
+	pr.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await pr.fire("session_start");
+	await pr.fire("input");
+	await pr.tools
+		.get("notify_status")
+		.execute("pc1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, pr.ctx);
+	await pr.fire("session_stop");
+	await settle(150);
+	const firstOffer = record(pr.id).closeOffer;
+	api.queued = [
+		{
+			update_id: 6200,
+			message: {
+				message_id: 6200,
+				date: 1,
+				chat: { id: CHAT },
+				text: "a reply",
+				reply_to_message: { message_id: firstOffer },
+			},
+		},
+	];
+	await pr.pump(250);
+	await pr.pump(250);
+	await pr.tools
+		.get("notify_status")
+		.execute("pc2", { summary: "Complete.", urgency: "green", effect: "none" }, undefined, undefined, pr.ctx);
+	await pr.fire("session_stop");
+	await settle(150);
+	const offer = record(pr.id).closeOffer;
+	api.deleteRefusals = [6200];
+	writeFileSync(
+		join(inboxOf(pr.id), "6201.json"),
+		JSON.stringify({ kind: "callback", value: `x:${record(pr.id).tag}`, messageId: offer }),
+	);
+	await pr.pump(500);
+	api.deleteRefusals = [];
+	check("a refused deletion still closes the session", shutdowns === 1);
+	check("accepted outgoing deletions are forgotten despite an incoming refusal", sentRecordFile(offer) === null);
+	check("a refused incoming record stays on file", incomingRecordFile(6200).session.id === pr.id);
+	const report = lastCall("sendMessage").body.text ?? "";
+	check(
+		"the refusal is reported with the 48h horizon",
+		report.includes("Could not remove") && report.includes("48 hours"),
+	);
+	check("a partial clear never claims a full one", !report.includes("Cleared all"));
+}
+
+// A clear tapped on a green standing question deletes the question and never rewrites it at shutdown.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const sg = spawn("c1ea000e-0000-0000-0000-000000000000", "/home/dev/work/standclear");
+	let shutdowns = 0;
+	sg.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await sg.fire("session_start");
+	await sg.fire("input");
+	await sg.tools
+		.get("notify_status")
+		.execute(
+			"sg1",
+			{ summary: "Done, pick.", urgency: "green", effect: "none", options: opts("Merge", "Wait") },
+			undefined,
+			undefined,
+			sg.ctx,
+		);
+	await sg.fire("session_stop");
+	await settle(150);
+	const standing = record(sg.id).standing.messageId;
+	writeFileSync(
+		join(inboxOf(sg.id), "6250.json"),
+		JSON.stringify({ kind: "callback", value: `x:${record(sg.id).tag}`, messageId: standing }),
+	);
+	await sg.pump(500);
+	check("a clear on the standing question closes the session", shutdowns === 1);
+	check(
+		"the standing question message was deleted",
+		called("deleteMessages").some((c) => c.body.message_ids.includes(standing)) && sentRecordFile(standing) === null,
+	);
+	await sg.fire("session_shutdown");
+	await settle(150);
+	check(
+		"shutdown never rewrites the deleted standing question",
+		!called("editMessageText").some((c) => c.body.message_id === standing),
+	);
+}
+
+// Only the live offer answers a close or clear tap. Stale, queued and duplicated taps are ignored.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const st = spawn("c1ea000f-0000-0000-0000-000000000000", "/home/dev/work/staleclear");
+	let shutdowns = 0;
+	st.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await st.fire("session_start");
+	await st.fire("input");
+	await st.tools
+		.get("notify_status")
+		.execute("sc1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, st.ctx);
+	await st.fire("session_stop");
+	await settle(150);
+	const offer = record(st.id).closeOffer;
+	const deletesBefore = called("deleteMessages").length;
+	await st.fire("agent_start");
+	await settle(150);
+	writeFileSync(
+		join(inboxOf(st.id), "6301.json"),
+		JSON.stringify({ kind: "callback", value: `x:${record(st.id).tag}`, messageId: offer }),
+	);
+	await st.pump(250);
+	check("a clear tap queued behind new work does not shut the session down", shutdowns === 0);
+	check("a stale clear tap deletes nothing", called("deleteMessages").length === deletesBefore);
+	check(
+		"a stale tap gets an explanation instead",
+		(lastCall("sendMessage").body.text ?? "").includes("no longer current"),
+	);
+	await st.fire("agent_end");
+	await st.fire("input");
+	await st.tools
+		.get("notify_status")
+		.execute("sc2", { summary: "Again done.", urgency: "green", effect: "none" }, undefined, undefined, st.ctx);
+	await st.fire("session_stop");
+	await settle(150);
+	const offer2 = record(st.id).closeOffer;
+	writeFileSync(
+		join(inboxOf(st.id), "6302.json"),
+		JSON.stringify({ kind: "callback", value: `k:${record(st.id).tag}`, messageId: offer2 }),
+	);
+	await st.pump(250);
+	writeFileSync(
+		join(inboxOf(st.id), "6303.json"),
+		JSON.stringify({ kind: "callback", value: `x:${record(st.id).tag}`, messageId: offer2 }),
+	);
+	await st.pump(250);
+	check("the first close tap wins and the duplicate is ignored", shutdowns === 1);
+}
+
+for (const withChoices of [false, true]) {
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const late = spawn(`c1ea002${withChoices ? "1" : "0"}-0000-0000-0000-000000000000`, "/home/dev/work/late-summary");
+	let shutdowns = 0;
+	late.ctx.shutdown = () => shutdowns++;
+	await late.fire("session_start");
+	await late.fire("input");
+	await late.tools.get("notify_status").execute(
+		"late-summary",
+		{
+			summary: "Completed before new work.",
+			urgency: "green",
+			effect: "none",
+			...(withChoices ? { options: opts("Proceed", "Wait") } : {}),
+		},
+		undefined,
+		undefined,
+		late.ctx,
+	);
+	const release = Promise.withResolvers();
+	api.sendMessageGate = release.promise;
+	await late.fire("session_stop");
+	await late.fire("agent_start");
+	release.resolve();
+	api.sendMessageGate = null;
+	await settle(150);
+	const sentId = record(late.id).recent.at(-1);
+	check("a completion delivered during new work has no live close offer", record(late.id).closeOffer === null);
+	writeFileSync(
+		join(inboxOf(late.id), "6350.json"),
+		JSON.stringify({ kind: "callback", value: `x:${record(late.id).tag}`, messageId: sentId }),
+	);
+	await late.pump(250);
+	check("a delayed completion cannot close a running turn", shutdowns === 0);
+	await late.fire("agent_end");
+	await late.fire("session_shutdown");
+}
+
+// An answer to a standing question queued before a clear tap retires the offer the tap would act on.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const qx = spawn("c1ea0011-0000-0000-0000-000000000000", "/home/dev/work/queuedclear");
+	let shutdowns = 0;
+	qx.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await qx.fire("session_start");
+	await qx.fire("input");
+	await qx.tools
+		.get("notify_status")
+		.execute(
+			"qx1",
+			{ summary: "Done, pick.", urgency: "green", effect: "none", options: opts("Merge", "Wait") },
+			undefined,
+			undefined,
+			qx.ctx,
+		);
+	await qx.fire("session_stop");
+	await settle(150);
+	const standing = record(qx.id).standing.messageId;
+	const deletesBefore = called("deleteMessages").length;
+	writeFileSync(
+		join(inboxOf(qx.id), "6401.json"),
+		JSON.stringify({ kind: "callback", value: `c:${record(qx.id).tag}-n1:0`, messageId: standing }),
+	);
+	await qx.pump(250);
+	writeFileSync(
+		join(inboxOf(qx.id), "6402.json"),
+		JSON.stringify({ kind: "callback", value: `x:${record(qx.id).tag}`, messageId: standing }),
+	);
+	await qx.pump(250);
+	check("an answer queued before a clear tap retires the offer", shutdowns === 0);
+	check("the queued clear tap deleted nothing", called("deleteMessages").length === deletesBefore);
+	check(
+		"the queued clear tap gets the stale explanation",
+		(lastCall("sendMessage").body.text ?? "").includes("no longer current"),
+	);
+	check(
+		"the standing answer was delivered as new work",
+		qx.steers.some((s) => s.text === "Merge"),
+	);
+}
+
+// Only uniquely routed replies, media and commands are kept for a later clear.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const in1 = spawn("c1ea0012-0000-0000-0000-000000000000", "/home/dev/work/inone");
+	const in2 = spawn("c1ea0013-0000-0000-0000-000000000000", "/home/dev/work/intwo");
+	await in1.fire("session_start");
+	await in2.fire("session_start");
+	await in1.fire("input");
+	await in1.tools
+		.get("notify_status")
+		.execute("it1", { summary: "A note.", urgency: "orange" }, undefined, undefined, in1.ctx);
+	await in1.fire("session_stop");
+	await settle(150);
+	const note = record(in1.id).recent.at(-1);
+	api.queued = [
+		{
+			update_id: 6500,
+			message: {
+				message_id: 6500,
+				date: 1,
+				chat: { id: CHAT },
+				text: "a reply",
+				reply_to_message: { message_id: note },
+			},
+		},
+	];
+	await in1.pump(250);
+	await in1.pump(250);
+	check("a text reply is tracked under the session it answered", incomingRecordFile(6500).session.id === in1.id);
+	api.queued = [
+		{
+			update_id: 6501,
+			message: {
+				message_id: 6501,
+				date: 1,
+				chat: { id: CHAT },
+				photo: [{ file_id: "p1", file_size: 10 }],
+				reply_to_message: { message_id: note },
+			},
+		},
+	];
+	await in1.pump(250);
+	await in1.pump(250);
+	check("a photo reply is tracked under the same session", incomingRecordFile(6501).session.id === in1.id);
+	// A bare /stop goes to the one session mid-turn, so every earlier session has to read as idle.
+	for (const entry of readdirSync(sessionsDir)) {
+		const path = join(sessionsDir, entry);
+		try {
+			const parsed = JSON.parse(readFileSync(path, "utf8"));
+			writeFileSync(path, JSON.stringify({ ...parsed, state: "idle" }));
+		} catch {}
+	}
+	await in2.fire("agent_start");
+	api.queued = [{ update_id: 6502, message: { message_id: 6502, date: 1, chat: { id: CHAT }, text: "/stop" } }];
+	await in1.pump(250);
+	check("a bare stop to the one running session is tracked under it", incomingRecordFile(6502).session.id === in2.id);
+	await in2.pump(250);
+	api.queued = [
+		{ update_id: 6503, message: { message_id: 6503, date: 1, chat: { id: CHAT }, text: "/hidequestions" } },
+	];
+	await in1.pump(250);
+	await in2.pump(250);
+	check(
+		"a fleet-wide command is not tracked under any session",
+		!existsSync(join(root, "notify-telegram/incoming/6503.json")),
+	);
+	await in2.tools
+		.get("notify_status")
+		.execute("it2", { summary: "Another note.", urgency: "orange" }, undefined, undefined, in2.ctx);
+	await in2.fire("session_stop");
+	await settle(150);
+	for (const entry of readdirSync(sessionsDir)) {
+		const path = join(sessionsDir, entry);
+		try {
+			const parsed = JSON.parse(readFileSync(path, "utf8"));
+			const mine = entry.startsWith(in1.id) || entry.startsWith(in2.id);
+			writeFileSync(
+				path,
+				JSON.stringify({ ...parsed, lastNotified: mine ? Date.now() : 0, heartbeat: mine ? Date.now() : 0 }),
+			);
+		} catch {}
+	}
+	api.queued = [
+		{ update_id: 6504, message: { message_id: 6504, date: 1, chat: { id: CHAT }, text: "who is this for" } },
+	];
+	await in1.pump(250);
+	check("an ambiguous message is held, not tracked", !existsSync(join(root, "notify-telegram/incoming/6504.json")));
+	const pickerRow = (lastCall("sendMessage").body.reply_markup?.inline_keyboard ?? []).flat();
+	const pickerId = api.nextMessage - 1;
+	check(
+		"the picker offers a press for the second session",
+		pickerRow.some((b) => b.callback_data === `m:6504:${record(in2.id).tag}`),
+	);
+	api.queued = [
+		{
+			update_id: 6505,
+			callback_query: {
+				id: "cbhold",
+				data: `m:6504:${record(in2.id).tag}`,
+				from: { id: CHAT },
+				message: { message_id: pickerId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await in1.pump(250);
+	check("a chosen held message is tracked under the chosen session", incomingRecordFile(6504).session.id === in2.id);
+	check("the held message reached the chosen session", inboxCount(in2.id) === 1);
+}
+
+// A restarted session clears from the ledgers on disk, not from memory.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const rs = "c1ea0014-0000-0000-0000-000000000000";
+	const r1 = spawn(rs, "/home/dev/work/restart");
+	await r1.fire("session_start");
+	await r1.fire("input");
+	await r1.tools
+		.get("notify_status")
+		.execute("rs1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, r1.ctx);
+	await r1.fire("session_stop");
+	await settle(150);
+	const oldOffer = record(r1.id).closeOffer;
+	api.queued = [
+		{
+			update_id: 6600,
+			message: {
+				message_id: 6600,
+				date: 1,
+				chat: { id: CHAT },
+				text: "a reply",
+				reply_to_message: { message_id: oldOffer },
+			},
+		},
+	];
+	await r1.pump(250);
+	await r1.pump(250);
+	await r1.tools
+		.get("notify_status")
+		.execute("rs2", { summary: "Complete.", urgency: "green", effect: "none" }, undefined, undefined, r1.ctx);
+	await r1.fire("session_stop");
+	await settle(150);
+	const resumedOffer = record(r1.id).closeOffer;
+	const r2 = spawn(rs, "/home/dev/work/restart");
+	let shutdowns = 0;
+	r2.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await r2.fire("session_start");
+	check("a restart keeps the close offer it can act on", record(rs).closeOffer === resumedOffer);
+	const deletesBefore = called("deleteMessages").length;
+	writeFileSync(
+		join(inboxOf(rs), "6601.json"),
+		JSON.stringify({ kind: "callback", value: `x:${record(rs).tag}`, messageId: resumedOffer }),
+	);
+	await r2.pump(500);
+	check(
+		"a restarted session still clears its history from disk",
+		shutdowns === 1 &&
+			called("deleteMessages")
+				.slice(deletesBefore)
+				.flatMap((c) => c.body.message_ids)
+				.includes(oldOffer),
+	);
+	check(
+		"a restarted clear tombstones the resumed records",
+		sentRecordFile(oldOffer) === null && incomingRecordFile(6600) === null,
+	);
+}
+
+// The clear walks the on-disk ledger, so a long-lived session loses nothing to the recent cap.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const bs = spawn("c1ea0015-0000-0000-0000-000000000000", "/home/dev/work/bulkclear");
+	let shutdowns = 0;
+	bs.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await bs.fire("session_start");
+	await bs.fire("input");
+	await bs.tools
+		.get("notify_status")
+		.execute("bs1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, bs.ctx);
+	await bs.fire("session_stop");
+	await settle(150);
+	const bsRec = record(bs.id);
+	for (let i = 0; i < 120; i++) {
+		writeFileSync(
+			join(root, `notify-telegram/sent/${70000 + i}.json`),
+			JSON.stringify({
+				version: 1,
+				id: 70000 + i,
+				at: Date.now() - (i + 1) * 1000,
+				kind: "status",
+				text: `old note ${i}`,
+				session: { id: bs.id, tag: bsRec.tag, emoji: bsRec.emoji, name: "bulk", cwd: "/home/dev/work/bulkclear" },
+			}),
+			{ mode: 0o600 },
+		);
+	}
+	const offer = record(bs.id).closeOffer;
+	const deletesBefore = called("deleteMessages").length;
+	writeFileSync(
+		join(inboxOf(bs.id), "6701.json"),
+		JSON.stringify({ kind: "callback", value: `x:${bsRec.tag}`, messageId: offer }),
+	);
+	await bs.pump(700);
+	const batches = called("deleteMessages").slice(deletesBefore);
+	check(
+		"deletion spans multiple Telegram batches without losing ledger history",
+		batches.length === 2 &&
+			batches.every((batch) => batch.body.message_ids.length <= 100) &&
+			batches.flatMap((batch) => batch.body.message_ids).length === 121 &&
+			sentRecordFile(70000) === null &&
+			sentRecordFile(70119) === null,
+	);
+	check("a bulk clear still closes the session", shutdowns === 1);
+}
+
+// A clear press routed through the poller names its own action and reaches the session.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const rp = spawn("c1ea0016-0000-0000-0000-000000000000", "/home/dev/work/routedclear");
+	let shutdowns = 0;
+	rp.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await rp.fire("session_start");
+	await rp.fire("input");
+	await rp.tools
+		.get("notify_status")
+		.execute("rp1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, rp.ctx);
+	await rp.fire("session_stop");
+	await settle(150);
+	const offer = record(rp.id).closeOffer;
+	const toastsBefore = called("answerCallbackQuery").length;
+	api.queued = [
+		{
+			update_id: 6800,
+			callback_query: {
+				id: "cbx1",
+				data: `x:${record(rp.id).tag}`,
+				from: { id: CHAT },
+				message: { message_id: offer, chat: { id: CHAT } },
+			},
+		},
+	];
+	await rp.pump(250);
+	await rp.pump(500);
+	check(
+		"a routed clear press toasts its own action",
+		(called("answerCallbackQuery").slice(toastsBefore).at(-1)?.body.text ?? "") ===
+			"Closing the session and clearing its messages.",
+	);
+	check(
+		"a routed clear press closes and clears",
+		shutdowns === 1 && called("deleteMessages").some((c) => c.body.message_ids.includes(offer)),
+	);
 }
 
 heading("oversized message truncation");
