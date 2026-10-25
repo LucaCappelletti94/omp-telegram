@@ -6331,7 +6331,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (!isTelegramMessageId(p.message_id)) return fail("`message_id` must be a positive message ID.");
 			const messageId = p.message_id;
 			const previous = readSentRecord(messageId);
-			if (previous === null || previous.session.id !== sessionId) {
+			if (previous?.session.id !== sessionId) {
 				return fail("No retained message owned by this session has that ID.");
 			}
 			if (pendingAsk?.messageId === messageId) {
