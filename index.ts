@@ -15,7 +15,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -68,6 +68,7 @@ const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "ag
 const CONFIG_PATH = join(AGENT_DIR, "notify-telegram.json");
 const STATE_DIR = join(AGENT_DIR, "notify-telegram");
 const PENDING_MESSAGES_DIR = join(STATE_DIR, "pending-messages");
+const PENDING_UNPINS_DIR = join(STATE_DIR, "pending-unpins");
 const LOCK_FILE = join(STATE_DIR, "poller.lock");
 const LEGACY_LOCK_DIR = join(STATE_DIR, "poller.lock.d");
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
@@ -110,6 +111,8 @@ const REACTION_ROUTE_WAIT_MS = 5_000;
 const HEARTBEAT_MS = 15_000;
 const LOCK_STALE_MS = 45_000;
 const DRAIN_MS = 1_000;
+/** Two pin attempts and the maximum retry-after, rounded up. */
+const PIN_SETTLE_MS = 60_000;
 /** A chain of agent messages ends here unless a user prompt starts a new one. */
 const AGENT_MAX_HOPS = 6;
 /** How long a sender waits for the peer's drain, a few ticks of `DRAIN_MS`. */
@@ -356,6 +359,7 @@ interface SessionRecord {
 	closeOffer: number | null;
 	/** Message pinned for a red status; unpinned when the next turn starts. */
 	pinned: number | null;
+	pinPendingUntil: number;
 	/** What this session is doing, so one session can answer `/status` for the whole fleet. */
 	state: string;
 	/** Agent message protocol this session drains, 0 for a version that reads one as user text. */
@@ -1684,9 +1688,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let sendsInFlight = 0;
 	let sendingTicks = 0;
 	let dashboardPublishedAt = 0;
+	// A publish in flight in this instance; further ticks must not queue a second one.
+	let dashboardInFlight = false;
 	let approvalWaiting = false;
 	let approvalNotice: ApprovalNotice | null = null;
 	let pinnedMessageId: number | null = null;
+	let pinPendingUntil = 0;
+	let redPinGeneration = 0;
+	const redPinOperations = new Set<Promise<unknown>>();
+	const unpinsInFlight = new Map<string, Promise<void>>();
+	let unpinSweepInFlight = false;
 	/** The live session context, for record writes outside event handlers. */
 	let sessionCtx: ExtensionContext | null = null;
 	let draftId = 0;
@@ -1993,6 +2004,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			standing: standingQuestion,
 			closeOffer: closeOfferMessageId,
 			pinned: pinnedMessageId,
+			pinPendingUntil,
 			state: lastState,
 			health: lastHealth,
 			summary: lastSummary,
@@ -2066,6 +2078,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			standing: typeof raw.standing === "object" && raw.standing !== null ? raw.standing : null,
 			closeOffer: messageId(raw.closeOffer),
 			pinned: messageId(raw.pinned),
+			pinPendingUntil: count(raw.pinPendingUntil),
 			state: text(raw.state),
 			health: text(raw.health),
 			summary: text(raw.summary),
@@ -2312,6 +2325,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					// The ask died with its process. The restored agent asks again if it still needs to.
 					if (record.question !== null) detach(stripKeyboard(record.question), "crashed ask close");
 				}
+				if (!crash && record !== null) retireRecordedPin(record);
 				unlinkSync(join(SESSIONS_DIR, entry));
 				rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
 				// The crash card counts held updates itself, and a restore delivers them.
@@ -2332,6 +2346,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function reapOldFiles(): void {
 		if (Date.now() - lastReap < 3_600_000) return;
 		lastReap = Date.now();
+		const root = `${resolve(STATE_DIR)}${sep}`;
 		for (const [dir, keepMs] of [
 			[MEDIA_DIR, MEDIA_KEEP_MS],
 			[SENT_DIR, SENT_KEEP_MS],
@@ -2339,12 +2354,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			// A crash card nobody touched for a week is not coming back.
 			[CRASH_DIR, CRASH_KEEP_MS],
 			[CRASH_BATCH_DIR, CRASH_KEEP_MS],
+			[PENDING_UNPINS_DIR, 3_600_000],
 		] as const) {
 			if (!existsSync(dir)) continue;
 			for (const entry of readdirSync(dir)) {
-				const path = join(dir, entry);
+				const path = resolve(dir, entry);
+				if (!path.startsWith(root)) continue;
 				try {
-					if (Date.now() - statSync(path).mtimeMs > keepMs) unlinkSync(path);
+					if (Date.now() - statSync(path).mtimeMs <= keepMs) continue;
+					if (dir === PENDING_UNPINS_DIR && readJsonFile(path) !== null) continue;
+					if (dir === CRASH_DIR && entry.endsWith(".json")) {
+						const id = entry.slice(0, -5);
+						const kept = readCrash(id);
+						if (kept !== null && !crashRestored(id, kept, kept.batch)) retireRecordedPin(kept.record);
+					}
+					unlinkSync(path);
 				} catch {}
 			}
 		}
@@ -2782,14 +2806,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return fitToTelegram(`\u{1F39B} Fleet\n${lines.join("\n")}`, "");
 	}
 
-	function readDashboard(): { messageId: number; text: string } | null {
+	function readDashboard(): { messageId: number; text: string; pinned: boolean } | null {
 		if (!existsSync(DASHBOARD_FILE)) return null;
 		try {
 			const parsed: unknown = JSON.parse(readFileSync(DASHBOARD_FILE, "utf8"));
 			if (parsed === null || typeof parsed !== "object") return null;
-			const shown = parsed as { messageId?: unknown; text?: unknown };
+			const shown = parsed as { messageId?: unknown; text?: unknown; pinned?: unknown };
 			if (typeof shown.messageId !== "number" || typeof shown.text !== "string") return null;
-			return { messageId: shown.messageId, text: shown.text };
+			// A record written before the field existed may owe a pin, so only an explicit true reads as confirmed.
+			return { messageId: shown.messageId, text: shown.text, pinned: shown.pinned === true };
 		} catch {
 			return null;
 		}
@@ -2811,10 +2836,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function maybeDashboard(): void {
-		if (config === null || !config.pinnedDashboard || !claimsBoard()) return;
+		if (config === null || !config.pinnedDashboard || dashboardInFlight || !claimsBoard()) return;
 		if (Date.now() - dashboardPublishedAt < config.dashboardSeconds * 1000) return;
 		let text: string;
-		let shown: { messageId: number; text: string } | null;
+		let shown: { messageId: number; text: string; pinned: boolean } | null;
 		try {
 			text = dashboardReport();
 			shown = readDashboard();
@@ -2827,8 +2852,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			});
 			return;
 		}
-		// The rate limit is the scarce resource, and Telegram rejects an edit that changes nothing.
-		if (shown !== null && shown.text === text) return;
+		// Nothing is owed while the board already shows this text with its pin confirmed.
+		if (shown !== null && shown.text === text && shown.pinned) return;
+		dashboardInFlight = true;
 		dashboardPublishedAt = Date.now();
 		detach(publishDashboard(config, text, shown), "fleet dashboard");
 	}
@@ -2849,51 +2875,81 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	async function publishDashboard(
 		cfg: Config,
 		text: string,
-		shown: { messageId: number; text: string } | null,
+		shown: { messageId: number; text: string; pinned: boolean } | null,
 	): Promise<void> {
-		const rendered = {
-			text: toTelegramHtml(text),
-			parse_mode: "HTML",
-			link_preview_options: { is_disabled: true },
-		};
-		const remember = (messageId: number): void =>
-			writeFileAtomic(DASHBOARD_FILE, JSON.stringify({ messageId, text }), 0o600);
-		if (shown !== null) {
-			let refusal = "";
-			const edited = await callTelegramRaw<TelegramMessage>(
+		try {
+			const rendered = {
+				text: toTelegramHtml(text),
+				parse_mode: "HTML",
+				link_preview_options: { is_disabled: true },
+			};
+			const remember = (messageId: number, pinned: boolean): void =>
+				writeFileAtomic(DASHBOARD_FILE, JSON.stringify({ messageId, text, pinned }), 0o600);
+			// A refused pin leaves the message owed; only a missing message earns a replacement.
+			const tryPin = async (messageId: number): Promise<"confirmed" | "owed" | "gone"> => {
+				let refusal = "";
+				const pinned = await callTelegramRaw<TelegramMessage>(
+					cfg,
+					"pinChatMessage",
+					{ chat_id: cfg.chatId, message_id: messageId, disable_notification: true },
+					10_000,
+					(failure) => {
+						refusal = failure.description;
+					},
+				);
+				if (pinned !== null) return "confirmed";
+				const verdict = boardVerdict(refusal);
+				pi.logger.warn("notify-telegram: the fleet board pin was refused", { description: refusal, verdict });
+				return verdict === "gone" ? "gone" : "owed";
+			};
+			if (shown !== null) {
+				if (shown.text === text) {
+					if (shown.pinned) return;
+					// The text is already shown; only a missing pin is owed.
+					const pin = await tryPin(shown.messageId);
+					if (pin === "confirmed") return remember(shown.messageId, true);
+					if (pin === "owed") return;
+					// A message the pin says is gone earns a replacement.
+				} else {
+					let refusal = "";
+					const edited = await callTelegramRaw<TelegramMessage>(
+						cfg,
+						"editMessageText",
+						{ chat_id: cfg.chatId, message_id: shown.messageId, ...rendered },
+						10_000,
+						(failure) => {
+							refusal = failure.description;
+						},
+					);
+					if (edited !== null) {
+						const pin = shown.pinned || (await tryPin(shown.messageId)) === "confirmed";
+						return remember(shown.messageId, pin);
+					}
+					const verdict = boardVerdict(refusal);
+					pi.logger.warn("notify-telegram: the fleet board edit was refused", { description: refusal, verdict });
+					if (verdict === "current") {
+						const pin = shown.pinned || (await tryPin(shown.messageId)) === "confirmed";
+						return remember(shown.messageId, pin);
+					}
+					// Keeping the board leaves the recorded text stale, which is what makes the next tick retry.
+					// The owed pin rides the record through the refusal.
+					if (verdict === "keep") return;
+				}
+			}
+			const sent = await callTelegram<TelegramMessage>(
 				cfg,
-				"editMessageText",
-				{ chat_id: cfg.chatId, message_id: shown.messageId, ...rendered },
-				10_000,
-				(failure) => {
-					refusal = failure.description;
-				},
+				"sendMessage",
+				{ chat_id: cfg.chatId, ...rendered },
+				15_000,
 			);
-			if (edited !== null) {
-				remember(shown.messageId);
+			if (typeof sent?.message_id !== "number") {
+				pi.logger.warn("notify-telegram: the fleet board could not be posted", { chatId: cfg.chatId });
 				return;
 			}
-			const verdict = boardVerdict(refusal);
-			pi.logger.warn("notify-telegram: the fleet board edit was refused", { description: refusal, verdict });
-			if (verdict === "current") {
-				remember(shown.messageId);
-				return;
-			}
-			// Keeping the board leaves the recorded text stale, which is what makes the next tick retry.
-			if (verdict === "keep") return;
+			remember(sent.message_id, (await tryPin(sent.message_id)) === "confirmed");
+		} finally {
+			dashboardInFlight = false;
 		}
-		const sent = await callTelegram<TelegramMessage>(cfg, "sendMessage", { chat_id: cfg.chatId, ...rendered }, 15_000);
-		if (typeof sent?.message_id !== "number") {
-			pi.logger.warn("notify-telegram: the fleet board could not be posted", { chatId: cfg.chatId });
-			return;
-		}
-		remember(sent.message_id);
-		await callTelegram(
-			cfg,
-			"pinChatMessage",
-			{ chat_id: cfg.chatId, message_id: sent.message_id, disable_notification: true },
-			10_000,
-		);
 	}
 
 	/**
@@ -3030,29 +3086,127 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return { message_effect_id: TURN_EFFECTS[status.effect].id };
 	}
 
-	/** A red status stays pinned until the next turn touches the session. */
-	async function pinRed(ctx: ExtensionContext, sent: TelegramMessage | null): Promise<void> {
-		if (config === null || typeof sent?.message_id !== "number") return;
-		unpinRed(ctx);
-		await callTelegram(
-			config,
-			"pinChatMessage",
-			{ chat_id: config.chatId, message_id: sent.message_id, disable_notification: true },
-			10_000,
-		);
-		pinnedMessageId = sent.message_id;
-		writeSessionRecord(ctx);
+	function queueUnpin(cfg: Config, messageId: number, notBefore = 0): string {
+		const name = `${cfg.chatId}_${messageId}.json`;
+		writePrivateJson(PENDING_UNPINS_DIR, name, {
+			chatId: cfg.chatId,
+			messageId,
+			notBefore,
+			token: randomUUID(),
+		});
+		return name;
 	}
 
-	function unpinRed(ctx: ExtensionContext): void {
-		if (config === null || pinnedMessageId === null) return;
-		const messageId = pinnedMessageId;
-		pinnedMessageId = null;
+	async function attemptUnpin(cfg: Config, name: string): Promise<void> {
+		const existing = unpinsInFlight.get(name);
+		if (existing !== undefined) return await existing;
+		const raw = readJsonFile(join(PENDING_UNPINS_DIR, name)) as {
+			chatId?: unknown;
+			messageId?: unknown;
+			notBefore?: unknown;
+			token?: unknown;
+		} | null;
+		if (
+			raw === null ||
+			raw.chatId !== cfg.chatId ||
+			!isTelegramMessageId(raw.messageId) ||
+			typeof raw.notBefore !== "number" ||
+			raw.notBefore > Date.now() ||
+			typeof raw.token !== "string"
+		) {
+			return;
+		}
+		const work = (async () => {
+			let refusal = "";
+			const removed = await callTelegramRaw<boolean>(
+				cfg,
+				"unpinChatMessage",
+				{ chat_id: cfg.chatId, message_id: raw.messageId },
+				10_000,
+				(failure) => {
+					refusal = failure.description.toLowerCase();
+					pi.logger.warn("telegram call failed", { ...failure });
+				},
+			);
+			const gone = refusal.includes("message to unpin not found") || refusal.includes("message_id_invalid");
+			if (removed !== true && !gone) return;
+			const current = readJsonFile(join(PENDING_UNPINS_DIR, name)) as { token?: unknown } | null;
+			if (current?.token === raw.token) writePrivateJson(PENDING_UNPINS_DIR, name, null);
+		})();
+		unpinsInFlight.set(name, work);
+		redPinOperations.add(work);
+		try {
+			await work;
+		} finally {
+			unpinsInFlight.delete(name);
+			redPinOperations.delete(work);
+		}
+	}
+
+	async function retryPendingUnpins(): Promise<void> {
+		if (config === null || unpinSweepInFlight) return;
+		const cfg = config;
+		unpinSweepInFlight = true;
+		try {
+			for (const name of listJson(PENDING_UNPINS_DIR)) await attemptUnpin(cfg, name);
+		} finally {
+			unpinSweepInFlight = false;
+		}
+	}
+
+	function retireRecordedPin(record: SessionRecord): void {
+		if (config === null || record.pinned === null) return;
+		const name = queueUnpin(config, record.pinned, record.pinPendingUntil);
+		detach(attemptUnpin(config, name), "recorded pin retire");
+	}
+
+	/** A red status stays pinned until the next turn touches the session. */
+	async function pinRed(ctx: ExtensionContext, sent: TelegramMessage | null, generation: number): Promise<void> {
+		if (config === null || typeof sent?.message_id !== "number" || generation !== redPinGeneration || !sessionAlive) {
+			return;
+		}
+		const cfg = config;
+		const messageId = sent.message_id;
+		pinnedMessageId = messageId;
+		pinPendingUntil = Date.now() + PIN_SETTLE_MS;
 		writeSessionRecord(ctx);
-		detach(
-			callTelegram(config, "unpinChatMessage", { chat_id: config.chatId, message_id: messageId }, 10_000),
-			"unpin",
-		);
+		const work = (async () => {
+			try {
+				const pinned = await callTelegram<boolean>(
+					cfg,
+					"pinChatMessage",
+					{ chat_id: cfg.chatId, message_id: messageId, disable_notification: true },
+					10_000,
+				);
+				if (generation === redPinGeneration) {
+					pinPendingUntil = 0;
+					if (pinned !== true) pinnedMessageId = null;
+					writeSessionRecord(ctx);
+				}
+			} finally {
+				if (generation !== redPinGeneration) {
+					const name = queueUnpin(cfg, messageId);
+					await attemptUnpin(cfg, name);
+				}
+			}
+		})();
+		redPinOperations.add(work);
+		try {
+			await work;
+		} finally {
+			redPinOperations.delete(work);
+		}
+	}
+
+	async function unpinRed(ctx: ExtensionContext): Promise<void> {
+		redPinGeneration += 1;
+		if (config === null) return;
+		if (pinnedMessageId === null) return await retryPendingUnpins();
+		const name = queueUnpin(config, pinnedMessageId, pinPendingUntil);
+		pinnedMessageId = null;
+		pinPendingUntil = 0;
+		writeSessionRecord(ctx);
+		await attemptUnpin(config, name);
 	}
 
 	/** One poller only, or Telegram 409s. Atomic `wx` create; ownership re-read, never cached. */
@@ -4134,6 +4288,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		beforeRecord?: (messageId: number) => void,
 	): Promise<void> {
 		if (config === null || messageId === null) return;
+		if (pinnedMessageId === messageId && sessionCtx !== null) {
+			detach(unpinRed(sessionCtx), "settled pin cleanup");
+		}
 		const inline_keyboard =
 			settled === undefined
 				? []
@@ -4175,6 +4332,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		title: string,
 		recorded: TurnStatus,
 		quiet: boolean,
+		pinGeneration: number,
 		keep = "",
 	): Promise<void> {
 		if (config === null || recorded.options === undefined) return;
@@ -4206,7 +4364,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 		if (recorded.urgency === "green") keyboard.push(...closeSessionButtons());
 		const labels = recorded.options.map((option) => option.label);
+		// A newer input, agent start, turn end, or shutdown moves the pin generation. Only the
+		// newest turn end may still publish or settle the standing slot.
+		const ownsSlot = (): boolean => pinGeneration === redPinGeneration;
 		const publishStanding = (messageId: number): void => {
+			if (!ownsSlot()) return;
 			standingQuestion = { id, messageId, labels, head: settlementHead };
 			if (recorded.urgency === "green") {
 				if (closeGeneration === closeOfferGeneration && !turnActive && !closing) {
@@ -4230,11 +4392,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			recorded,
 			publishStanding,
 		);
-		if (sent === null) standingQuestion = { id, messageId: null, labels, head: settlementHead };
+		if (ownsSlot()) {
+			if (sent === null) standingQuestion = { id, messageId: null, labels, head: settlementHead };
+		} else if (sent !== null) {
+			// A late message may only close its own buttons, never republish the standing slot.
+			await settleQuestionMessage(
+				sent.message_id,
+				settlementHead,
+				standingQuestion !== null ? "Superseded by a newer question." : "This question is no longer active.",
+			);
+		}
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
-		if (recorded.urgency === "red") await pinRed(ctx, sent);
-		if (superseded !== null) {
+		if (recorded.urgency === "red") await pinRed(ctx, sent, pinGeneration);
+		if (superseded !== null && ownsSlot()) {
 			await settleQuestionMessage(superseded.messageId, superseded.head, "Superseded by a newer question.");
 		}
 	}
@@ -5538,17 +5709,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				for (const id of batch.ids) {
 					const kept = readCrash(id);
 					if (kept === null || kept.dismissed || crashRestored(id, kept, arg)) continue;
+					retireRecordedPin(kept.record);
 					writePrivateJson(CRASH_DIR, `${id}.json`, { ...kept, dismissed: true });
 					// What a restore would have adopted is dead now, so its buttons go and its pin comes down.
-					const { standing, closeOffer, pinned } = kept.record;
+					const { standing, closeOffer } = kept.record;
 					if (typeof standing?.messageId === "number") detach(stripKeyboard(standing.messageId), "crash dismiss");
 					if (closeOffer !== null) detach(stripKeyboard(closeOffer), "crash dismiss");
-					if (pinned !== null) {
-						detach(
-							callTelegram(cfg, "unpinChatMessage", { chat_id: cfg.chatId, message_id: pinned }, 10_000),
-							"crash dismiss unpin",
-						);
-					}
 				}
 				toast = "Dismissed. omp --resume still reopens any of them by hand.";
 			}
@@ -6272,7 +6438,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (index !== -1) recentMessages.splice(index, 1);
 		if (closeOfferMessageId === messageId) closeOfferMessageId = null;
 		if (standingQuestion?.messageId === messageId) standingQuestion = null;
-		if (pinnedMessageId === messageId) pinnedMessageId = null;
+		if (pinnedMessageId === messageId) {
+			redPinGeneration += 1;
+			pinnedMessageId = null;
+			pinPendingUntil = 0;
+		}
 		if (approvalNotice?.messageId === messageId) approvalNotice = null;
 		closeReplyQuestion(messageId);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
@@ -6709,6 +6879,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		lastNotifiedAt = typeof previous?.lastNotified === "number" ? previous.lastNotified : 0;
 		pinnedMessageId = typeof previous?.pinned === "number" ? previous.pinned : null;
+		pinPendingUntil = previous?.pinPendingUntil ?? 0;
 		closeOfferMessageId = typeof previous?.closeOffer === "number" ? previous.closeOffer : null;
 		replyQuestionMessageId = previous?.replyQuestion ?? null;
 		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
@@ -6780,6 +6951,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (ownsLock()) {
 					graphTick();
 					reapDeadSessions(true);
+					detach(retryPendingUnpins(), "pending pin cleanup");
 					detach(renderCrashCards(), "crash cards");
 				}
 			} catch (error) {
@@ -6814,6 +6986,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		syncOwnNode(ctx);
 
 		writeSessionRecord(ctx);
+		detach(retryPendingUnpins(), "startup pin cleanup");
 	});
 
 	pi.on("input", async (_event, ctx) => {
@@ -6821,7 +6994,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		chainHop = null;
 		statusBlockUsed = false;
 		recoveryTurn = false;
-		unpinRed(ctx);
+		detach(unpinRed(ctx), "input unpin");
 		closeReplyQuestion();
 		const standing = standingQuestion;
 		if (standing !== null) {
@@ -6839,7 +7012,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	pi.on("agent_start", async (_event, ctx) => {
 		turnActive = true;
 		statusBlockUsed = false;
-		unpinRed(ctx);
+		detach(unpinRed(ctx), "new-work unpin");
 		retireCloseOffer(true);
 		closeReplyQuestion();
 		const standing = standingQuestion;
@@ -7045,6 +7218,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				red: "\u{1F534} Action required",
 			};
 			const recorded = turnSummary;
+			detach(unpinRed(ctx), "status unpin");
+			const pinGeneration = redPinGeneration;
 			turnSummary = null;
 			// The record keeps the headline only: `/status` lists it beside every other session.
 			lastSummary = clip(recorded.text.split("\n")[0]?.trim() ?? "", STATUS_SUMMARY_MAX);
@@ -7078,13 +7253,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							detach(stripKeyboard(messageId), "late close-offer retire");
 						}
 					}
-					if (recorded.urgency === "red") return pinRed(ctx, sent);
+					if (recorded.urgency === "red") return pinRed(ctx, sent, pinGeneration);
 					return undefined;
 				});
 				detach(work, "turn-end notice");
 				return;
 			}
-			detach(sendStandingQuestion(ctx, heads[recorded.urgency], recorded, quiet, usageFooter()), "turn-end question");
+			detach(
+				sendStandingQuestion(ctx, heads[recorded.urgency], recorded, quiet, pinGeneration, usageFooter()),
+				"turn-end question",
+			);
 			return;
 		}
 
@@ -7188,7 +7366,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				);
 			}
 		}
-		if (sessionCtx !== null) unpinRed(sessionCtx);
+		if (sessionCtx !== null) detach(unpinRed(sessionCtx), "shutdown unpin");
+		await Promise.allSettled(redPinOperations);
 		closeReplyQuestion();
 		sessionAlive = false;
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);

@@ -45,6 +45,9 @@ const api = {
 	sendMessageGate: null,
 	editMessageGate: null,
 	uploadGate: null,
+	pinMessageGate: null,
+	unpinMessageGate: null,
+	pinned: new Set(),
 };
 globalThis.fetch = async (url, init) => {
 	if (String(url).includes("/file/bot")) {
@@ -102,6 +105,14 @@ globalThis.fetch = async (url, init) => {
 	}
 	if (method === "sendMessage" && api.sendMessageGate !== null) await api.sendMessageGate;
 	if (method === "editMessageText" && api.editMessageGate !== null) await api.editMessageGate;
+	if (method === "pinChatMessage") {
+		if (api.pinMessageGate !== null) await api.pinMessageGate;
+		api.pinned.add(body.message_id);
+	}
+	if (method === "unpinChatMessage") {
+		if (api.unpinMessageGate !== null) await api.unpinMessageGate;
+		api.pinned.delete(body.message_id);
+	}
 	const result =
 		method === "getUpdates"
 			? api.queued.splice(0, api.queued.length)
@@ -2430,6 +2441,190 @@ check("a stale record does not win recency routing", inboxCount(staleId) === 0);
 check("routing does not delete the stale record", existsSync(join(sessionsDir, `${staleId}.json`)));
 unlinkSync(join(sessionsDir, `${staleId}.json`));
 
+heading("durable pin retirement");
+{
+	const stateDir = join(root, "notify-telegram");
+	const crashDir = join(stateDir, "crashed");
+	const start = async () => {
+		rmSync(join(stateDir, "poller.lock"), { force: true });
+		const session = spawn(crypto.randomUUID(), "/home/dev/work/durable-pin");
+		await session.fire("session_start");
+		return session;
+	};
+	const red = async (session) => {
+		await session.tools
+			.get("notify_status")
+			.execute(
+				"durable-red",
+				{ summary: "Decision needed.", urgency: "red", options: opts("Agent will proceed", "Agent will wait") },
+				undefined,
+				undefined,
+				session.ctx,
+			);
+		await session.fire("session_stop");
+		await settle();
+		return record(session.id).pinned;
+	};
+	const abandon = (session, heartbeat) =>
+		writeFileSync(
+			join(sessionsDir, `${session.id}.json`),
+			JSON.stringify({ ...record(session.id), heartbeat, boot: "previous-machine-boot" }),
+		);
+	for (const recovery of ["replacement", "restart"]) {
+		const session = await start();
+		const oldId = await red(session);
+		api.failMethods = ["unpinChatMessage"];
+		await session.fire("agent_start");
+		await settle();
+		if (recovery === "restart") await session.fire("session_shutdown");
+		api.failMethods = [];
+		const owner = recovery === "restart" ? await start() : session;
+		const currentId = await red(owner);
+		owner.heartbeat();
+		await settle(150);
+		check(
+			`a refused status unpin recovers across ${recovery} without unpinning current work`,
+			!api.pinned.has(oldId) && api.pinned.has(currentId),
+		);
+		await owner.fire("session_shutdown");
+	}
+	{
+		const session = await start();
+		const id = await red(session);
+		abandon(session, 0);
+		const owner = await start();
+		await settle(150);
+		check(
+			"reaping interrupted shutdown retires its pin before losing ownership",
+			!existsSync(join(sessionsDir, `${session.id}.json`)) && !api.pinned.has(id),
+		);
+		await owner.fire("session_shutdown");
+	}
+	{
+		const session = await start();
+		const id = await red(session);
+		abandon(session, Date.now() - 60_000);
+		const owner = await start();
+		const crashPath = join(crashDir, `${session.id}.json`);
+		const crash = JSON.parse(readFileSync(crashPath, "utf8"));
+		owner.heartbeat();
+		await settle();
+		const batch = JSON.parse(readFileSync(join(crashDir, "batches", `${crash.batch}.json`), "utf8"));
+		api.failMethods = ["unpinChatMessage"];
+		api.queued = [
+			{
+				update_id: 88001,
+				callback_query: {
+					id: "durable-dismiss",
+					from: { id: CHAT },
+					message: { message_id: batch.messageId, chat: { id: CHAT } },
+					data: `kd:${crash.batch}`,
+				},
+			},
+		];
+		await owner.pump(150);
+		await owner.fire("session_shutdown");
+		api.failMethods = [];
+		const successor = await start();
+		successor.heartbeat();
+		await settle(150);
+		check(
+			"a refused crash-dismissal unpin recovers after owner replacement",
+			JSON.parse(readFileSync(crashPath, "utf8")).dismissed && !api.pinned.has(id),
+		);
+		await successor.fire("session_shutdown");
+	}
+	{
+		const session = await start();
+		const gate = Promise.withResolvers();
+		api.pinMessageGate = gate.promise;
+		await session.tools
+			.get("notify_status")
+			.execute("delayed-pin", { summary: "Delayed decision.", urgency: "red" }, undefined, undefined, session.ctx);
+		await session.fire("session_stop");
+		await settle();
+		const id = record(session.id).pinned;
+		await session.fire("agent_start");
+		api.failMethods = ["unpinChatMessage"];
+		api.pinMessageGate = null;
+		gate.resolve();
+		await settle();
+		await session.fire("session_shutdown");
+		api.failMethods = [];
+		const successor = await start();
+		await settle(150);
+		check("a refused stale-pin compensation survives shutdown", !api.pinned.has(id));
+		await successor.fire("session_shutdown");
+	}
+	{
+		const fixtureClock = clockSkew;
+		const session = await start();
+		const id = await red(session);
+		abandon(session, 0);
+		writeFileSync(
+			join(sessionsDir, `${session.id}.json`),
+			JSON.stringify({ ...record(session.id), pinPendingUntil: Date.now() + 60_000 }),
+		);
+		const owner = await start();
+		await settle();
+		check("an unsettled pin request fences recovered retirement", api.pinned.has(id));
+		jump(61_000);
+		owner.heartbeat();
+		await settle(150);
+		check("the recovered retirement runs after the pin request deadline", !api.pinned.has(id));
+		await owner.fire("session_shutdown");
+		clockSkew = fixtureClock;
+	}
+	{
+		const session = await start();
+		const id = await red(session);
+		const callback = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data;
+		const fetchBefore = globalThis.fetch;
+		globalThis.fetch = async (url, init) => {
+			if (String(url).endsWith("/unpinChatMessage")) throw new TypeError("fetch failed");
+			return await fetchBefore(url, init);
+		};
+		writeFileSync(
+			join(inboxOf(session.id), "transport-answer.json"),
+			JSON.stringify({ kind: "callback", value: callback }),
+		);
+		await session.pump(150);
+		globalThis.fetch = fetchBefore;
+		check(
+			"an unpin transport error does not swallow the chosen answer",
+			session.steers.some((entry) => entry.text === "Agent will proceed") &&
+				called("editMessageText").some((entry) => entry.body.message_id === id && entry.body.text.includes("Chosen:")),
+		);
+		session.heartbeat();
+		await settle(150);
+		check("cleanup recovers after the unpin transport error", !api.pinned.has(id));
+		await session.fire("session_shutdown");
+	}
+	for (const restored of [false, true]) {
+		const session = await start();
+		const id = await red(session);
+		abandon(session, Date.now() - 60_000);
+		const owner = await start();
+		await owner.fire("session_shutdown");
+		let adopted = null;
+		if (restored) {
+			adopted = spawn(session.id, session.ctx.cwd);
+			await adopted.fire("session_start");
+		}
+		const crashPath = join(crashDir, `${session.id}.json`);
+		const expired = new Date(Date.now() - 8 * 24 * 3_600_000);
+		utimesSync(crashPath, expired, expired);
+		const successor = await start();
+		await settle(150);
+		check(
+			`crash expiry ${restored ? "preserves an adopted" : "retires an abandoned"} pin`,
+			!existsSync(crashPath) && api.pinned.has(id) === restored,
+		);
+		if (adopted !== null) await adopted.fire("session_shutdown");
+		await successor.fire("session_shutdown");
+	}
+}
+
 heading("remote interaction upgrades");
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 const ux = spawn("01a04800-0000-0000-0000-000000000000", "/home/dev/work/pgvector");
@@ -2842,6 +3037,345 @@ await ux.fire("agent_start");
 await settle(150);
 check("a Telegram-started turn unpins it", lastCall("unpinChatMessage").body.message_id === pinnedCall.body.message_id);
 check("the record clears", record(ux.id).pinned === null);
+
+heading("standing publication generations");
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+// A late standing send may only retire its own message. The standing slot and the red pin belong to the newest turn end.
+{
+	const session = spawn(crypto.randomUUID(), "/home/dev/work/standing-late-success");
+	await session.fire("session_start");
+	const gate = Promise.withResolvers();
+	api.sendMessageGate = gate.promise;
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"stand-late-success",
+			{ summary: "First decision.", urgency: "red", options: opts("Agent will continue", "Agent will wait") },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	await session.fire("session_stop");
+	await settle();
+	await session.fire("agent_start");
+	api.sendMessageGate = null;
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"stand-late-success-new",
+			{ summary: "Latest decision.", urgency: "red", options: opts("Agent will proceed", "Agent will pause") },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	const q2 = api.nextMessage;
+	await session.fire("session_stop");
+	await settle();
+	const press = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data;
+	const q1 = api.nextMessage;
+	gate.resolve();
+	await settle(150);
+	check("a late standing send leaves the newer question standing", record(session.id).standing?.messageId === q2);
+	check(
+		"a late standing send leaves the newer red pin in place",
+		api.pinned.has(q2) && !api.pinned.has(q1) && record(session.id).pinned === q2,
+	);
+	const retired = called("editMessageText").findLast((c) => c.body.message_id === q1);
+	check(
+		"a late standing message is retired under its own head without buttons",
+		retired?.body.text.includes("Superseded by a newer question.") &&
+			retired.body.reply_markup.inline_keyboard.length === 0,
+	);
+	writeFileSync(join(inboxOf(session.id), "1101.json"), JSON.stringify({ kind: "callback", value: press }));
+	await session.pump(250);
+	check(
+		"the newer question is answerable and its answer unpins its own message",
+		!api.pinned.has(q2) &&
+			record(session.id).pinned === null &&
+			record(session.id).standing === null &&
+			session.steers.some((s) => s.text === "Agent will proceed"),
+	);
+	await session.fire("session_shutdown");
+}
+{
+	const session = spawn(crypto.randomUUID(), "/home/dev/work/standing-late-refusal");
+	await session.fire("session_start");
+	api.failMethods = ["sendMessage"];
+	api.failStatus = 429;
+	api.failRetryAfter = 1;
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"stand-late-refusal",
+			{ summary: "First decision.", urgency: "red", options: opts("Agent will continue", "Agent will wait") },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	await session.fire("session_stop");
+	await settle();
+	// The older send waits out its rate-limit retry while the replacement turn lands first.
+	api.failMethods = [];
+	api.failStatus = undefined;
+	api.failRetryAfter = undefined;
+	await session.fire("agent_start");
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"stand-late-refusal-new",
+			{ summary: "Latest decision.", urgency: "red", options: opts("Agent will proceed", "Agent will pause") },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	const q2 = api.nextMessage;
+	await session.fire("session_stop");
+	await settle();
+	const press = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data;
+	check(
+		"a replacement question is published while the older send retries",
+		record(session.id).standing?.messageId === q2 && api.pinned.has(q2),
+	);
+	api.failMethods = ["sendMessage"];
+	await settle(1600);
+	api.failMethods = [];
+	await settle(50);
+	check(
+		"a late standing refusal leaves the newer question standing",
+		record(session.id).standing?.messageId === q2 && record(session.id).pinned === q2 && api.pinned.has(q2),
+	);
+	writeFileSync(join(inboxOf(session.id), "1102.json"), JSON.stringify({ kind: "callback", value: press }));
+	await session.pump(250);
+	check(
+		"the newer question is answerable after the late refusal",
+		!api.pinned.has(q2) &&
+			record(session.id).pinned === null &&
+			record(session.id).standing === null &&
+			session.steers.some((s) => s.text === "Agent will proceed"),
+	);
+	await session.fire("session_shutdown");
+}
+{
+	const session = spawn(crypto.randomUUID(), "/home/dev/work/standing-late-input");
+	await session.fire("session_start");
+	const gate = Promise.withResolvers();
+	api.sendMessageGate = gate.promise;
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"stand-late-input",
+			{ summary: "Decision needed.", urgency: "red", options: opts("Agent will continue", "Agent will wait") },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	const q1 = api.nextMessage;
+	await session.fire("session_stop");
+	await settle();
+	await session.fire("input");
+	await settle();
+	gate.resolve();
+	await settle(150);
+	check("input while the standing send is pending leaves no standing question", record(session.id).standing === null);
+	const retired = called("editMessageText").findLast((c) => c.body.message_id === q1);
+	check(
+		"the late standing message is retired as no longer active",
+		retired?.body.text.includes("This question is no longer active.") &&
+			retired.body.reply_markup.inline_keyboard.length === 0,
+	);
+	check("a lifecycle retirement pins nothing", !api.pinned.has(q1) && record(session.id).pinned === null);
+	await session.fire("session_shutdown");
+}
+{
+	const session = spawn(crypto.randomUUID(), "/home/dev/work/standing-late-shutdown");
+	await session.fire("session_start");
+	const gate = Promise.withResolvers();
+	api.sendMessageGate = gate.promise;
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"stand-late-shutdown",
+			{ summary: "Decision needed.", urgency: "red", options: opts("Agent will continue", "Agent will wait") },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	const q1 = api.nextMessage;
+	await session.fire("session_stop");
+	await settle();
+	let shutdownFinished = false;
+	const shutdown = session.fire("session_shutdown").then(() => {
+		shutdownFinished = true;
+	});
+	await settle();
+	check("shutdown is not held by a standing send that is still in flight", shutdownFinished === true);
+	gate.resolve();
+	await shutdown;
+	await settle(150);
+	check(
+		"shutdown while the standing send is pending leaves no standing question",
+		record(session.id).standing === null,
+	);
+	const retired = called("editMessageText").findLast((c) => c.body.message_id === q1);
+	check(
+		"the late standing message is retired as no longer active",
+		retired?.body.text.includes("This question is no longer active.") &&
+			retired.body.reply_markup.inline_keyboard.length === 0,
+	);
+	check("a shutdown retirement pins nothing", !api.pinned.has(q1) && record(session.id).pinned === null);
+}
+
+heading("retired status pins");
+for (const withOptions of [false, true]) {
+	for (const delay of ["send", "pin"]) {
+		for (const event of ["input", "agent_start", "session_shutdown"]) {
+			const session = spawn(crypto.randomUUID(), "/home/dev/work/pin-retirement");
+			await session.fire("session_start");
+			const gate = Promise.withResolvers();
+			if (delay === "send") api.sendMessageGate = gate.promise;
+			else api.pinMessageGate = gate.promise;
+			const firstMessage = api.nextMessage;
+			await session.tools.get("notify_status").execute(
+				`pin-${event}-${delay}`,
+				{
+					summary: "Waiting for a decision.",
+					urgency: "red",
+					...(withOptions ? { options: opts("Agent will continue", "Agent will wait") } : {}),
+				},
+				undefined,
+				undefined,
+				session.ctx,
+			);
+			await session.fire("session_stop");
+			await settle();
+			let retirementFinished = false;
+			const retirement = session.fire(event).then(() => {
+				retirementFinished = true;
+			});
+			await settle();
+			if (event === "session_shutdown" && delay === "pin") {
+				check(
+					`shutdown waits for the pending ${withOptions ? "standing" : "plain"} pin to be retired`,
+					!retirementFinished,
+				);
+			}
+			api.sendMessageGate = null;
+			api.pinMessageGate = null;
+			gate.resolve();
+			await retirement;
+			await settle(150);
+			check(
+				`${event} leaves no ${withOptions ? "standing" : "plain"} red pin after a delayed ${delay}`,
+				!api.pinned.has(firstMessage) && record(session.id).pinned === null,
+			);
+			if (event !== "session_shutdown") await session.fire("session_shutdown");
+		}
+	}
+}
+
+for (const urgency of ["orange", "red"]) {
+	const session = spawn(crypto.randomUUID(), "/home/dev/work/pin-replacement");
+	await session.fire("session_start");
+	const gate = Promise.withResolvers();
+	api.pinMessageGate = gate.promise;
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"old-pin",
+			{ summary: "First decision.", urgency: "red", options: opts("Agent will continue", "Agent will wait") },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	await session.fire("session_stop");
+	await settle();
+	const oldMessage = record(session.id).standing.messageId;
+	api.pinMessageGate = null;
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"replacement-pin",
+			{ summary: "Latest decision.", urgency, options: opts("Agent will proceed", "Agent will pause") },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	await session.fire("session_stop");
+	await settle();
+	const latestMessage = record(session.id).standing.messageId;
+	gate.resolve();
+	await settle(150);
+	check(
+		`${urgency} replacement retires the older pin even when its request finishes last`,
+		!api.pinned.has(oldMessage) &&
+			api.pinned.has(latestMessage) === (urgency === "red") &&
+			record(session.id).pinned === (urgency === "red" ? latestMessage : null),
+	);
+	await session.fire("session_shutdown");
+}
+
+{
+	const session = spawn(crypto.randomUUID(), "/home/dev/work/pin-answer");
+	await session.fire("session_start");
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"answered-pin",
+			{ summary: "Decision needed.", urgency: "red", options: opts("Agent will continue", "Agent will wait") },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	await session.fire("session_stop");
+	await settle();
+	const messageId = record(session.id).pinned;
+	const callback = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data;
+	writeFileSync(join(inboxOf(session.id), "pin-answer.json"), JSON.stringify({ kind: "callback", value: callback }));
+	await session.pump(150);
+	check(
+		"answering a red standing question unpins its settled message",
+		!api.pinned.has(messageId) && record(session.id).pinned === null,
+	);
+	await session.fire("session_shutdown");
+}
+
+for (const withOptions of [false, true]) {
+	const session = spawn(crypto.randomUUID(), "/home/dev/work/shutdown-unpin");
+	await session.fire("session_start");
+	await session.tools.get("notify_status").execute(
+		"shutdown-unpin",
+		{
+			summary: "Decision needed.",
+			urgency: "red",
+			...(withOptions ? { options: opts("Agent will continue", "Agent will wait") } : {}),
+		},
+		undefined,
+		undefined,
+		session.ctx,
+	);
+	await session.fire("session_stop");
+	await settle();
+	const messageId = record(session.id).pinned;
+	const gate = Promise.withResolvers();
+	api.unpinMessageGate = gate.promise;
+	let shutdownFinished = false;
+	const shutdown = session.fire("session_shutdown").then(() => {
+		shutdownFinished = true;
+	});
+	await settle();
+	check(
+		`shutdown waits for the ${withOptions ? "standing" : "plain"} status to be unpinned`,
+		!shutdownFinished && api.pinned.has(messageId),
+	);
+	api.unpinMessageGate = null;
+	gate.resolve();
+	await shutdown;
+	await settle();
+	check(
+		`shutdown finishes with the ${withOptions ? "standing" : "plain"} status unpinned`,
+		!api.pinned.has(messageId) && record(session.id).pinned === null,
+	);
+}
 
 // A green status plays the effect the agent chose for how the turn went, or none at all.
 await ux.tools
@@ -6064,6 +6598,178 @@ heading("settings apply without a restart");
 	await settle(60);
 	await cf.pump(250);
 	check("a reload adopts an offset another process advanced", lastCall("getUpdates")?.body.offset === 99_000);
+	writeConfig();
+}
+
+heading("dashboard pin recovery");
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
+	rmSync(join(root, "notify-telegram/dashboard.lock"), { force: true });
+	// The fleet is fixed for the duration, so only the pin work under test can rewrite the board.
+	mkdirSync(sessionsDir, { recursive: true });
+	for (const stale of readdirSync(sessionsDir)) {
+		rmSync(join(sessionsDir, stale), { force: true });
+	}
+	writeConfig({ pinnedDashboard: true, dashboardSeconds: 0 });
+	const dash = spawn("01a07d00-0000-0000-0000-000000000000", "/home/dev/work/dash-pin");
+	await dash.fire("session_start");
+	const boardFile = () => JSON.parse(readFileSync(join(root, "notify-telegram/dashboard.json"), "utf8"));
+	const boardSends = () =>
+		api.calls.filter(
+			(c) => c.method === "sendMessage" && typeof c.body.text === "string" && c.body.text.includes("Fleet"),
+		);
+	const boardEdits = () =>
+		api.calls.filter(
+			(c) => c.method === "editMessageText" && typeof c.body.text === "string" && c.body.text.includes("Fleet"),
+		);
+	const boardPins = (id) => called("pinChatMessage").filter((c) => c.body.message_id === id);
+
+	// a. A red status pin must survive the board's own pin work.
+	await dash.fire("input");
+	await dash.tools
+		.get("notify_status")
+		.execute("dr-red", { summary: "Red and pinned.", urgency: "red" }, undefined, undefined, dash.ctx);
+	await dash.fire("session_stop");
+	await settle(150);
+	const redId = record(dash.id).pinned;
+
+	// b. A refused first pin is retried on the recorded message, never by a second post.
+	const preB = boardSends().length;
+	api.failMethods = ["pinChatMessage"];
+	api.failDescription = "Too Many Requests: retry after 2";
+	await dash.pump(250);
+	api.failMethods = [];
+	api.failDescription = undefined;
+	const firstId = boardFile().messageId;
+	const pinB = called("pinChatMessage").length;
+	await dash.pump(250);
+	await dash.pump(250);
+	check(
+		"a refused first pin is retried on the same message",
+		called("pinChatMessage").at(-1)?.body.message_id === firstId && called("pinChatMessage").length === pinB + 1,
+	);
+	check("the retry lands the pin", api.pinned.has(firstId) === true);
+	check("a refused first pin posts no duplicate board", boardSends().length === preB + 1);
+	check(
+		"the recovery leaves the red status pin alone",
+		api.pinned.has(redId) === true && called("unpinChatMessage").every((c) => c.body.message_id !== redId),
+	);
+
+	// c. A refused edit must not lose the pin the board still owes.
+	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
+	api.failMethods = ["pinChatMessage"];
+	api.failDescription = "Too Many Requests: retry after 2";
+	await dash.pump(250);
+	api.failMethods = [];
+	api.failDescription = undefined;
+	const owedId = boardFile().messageId;
+	const owedSends = boardSends().length;
+	api.failMethods = ["editMessageText"];
+	api.failDescription = "Too Many Requests: retry after 3";
+	await dash.fire("agent_start");
+	await dash.fire("tool_execution_start", { toolName: "bash", intent: "Owing a pin" });
+	await settle(60);
+	await dash.pump(250);
+	api.failMethods = [];
+	api.failDescription = undefined;
+	check("a refused edit posts no duplicate", boardSends().length === owedSends);
+	await dash.fire("tool_execution_end", {});
+	await dash.fire("tool_execution_start", { toolName: "bash", intent: "Settling it" });
+	await settle(60);
+	await dash.pump(250);
+	check(
+		"a settled edit pins the message it still owes",
+		boardPins(owedId).length === 2 && api.pinned.has(owedId) === true,
+	);
+	check("a settled edit posts no duplicate board", boardSends().length === owedSends);
+	await dash.fire("tool_execution_end", {});
+	await dash.fire("agent_end");
+	await settle(60);
+
+	// d. The confirmation lives in the shared record, so a new owner adopts it without a second post.
+	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
+	api.failMethods = ["pinChatMessage"];
+	api.failDescription = "Too Many Requests: retry after 2";
+	dash.heartbeat();
+	await settle(60);
+	await dash.pump(250);
+	api.failMethods = [];
+	api.failDescription = undefined;
+	const handedId = boardFile().messageId;
+	writeFileSync(
+		join(root, "notify-telegram/dashboard.lock"),
+		JSON.stringify({
+			sessionId: "01a07d99-0000-0000-0000-000000000000",
+			pid: process.pid,
+			heartbeat: Date.now() - 120_000,
+		}),
+	);
+	const successor = spawn("01a07d01-0000-0000-0000-000000000000", "/home/dev/work/dash-pin-two");
+	await successor.fire("session_start");
+	// A stale successor stays out of the fleet view, so the board text is what the previous owner drew.
+	writeFileSync(
+		join(sessionsDir, `${successor.id}.json`),
+		JSON.stringify({
+			pid: process.pid,
+			tag: "dashx",
+			cwd: "/home/dev/work/dash-pin-two",
+			heartbeat: Date.now() - 120_000,
+		}),
+	);
+	const handSends = boardSends().length;
+	const handEdits = boardEdits().length;
+	const handPins = called("pinChatMessage").length;
+	await successor.pump(250);
+	check(
+		"the successor takes the stale board claim",
+		JSON.parse(readFileSync(join(root, "notify-telegram/dashboard.lock"), "utf8")).sessionId === successor.id,
+	);
+	check(
+		"the successor pins the adopted board",
+		called("pinChatMessage").at(-1)?.body.message_id === handedId &&
+			called("pinChatMessage").length === handPins + 1 &&
+			api.pinned.has(handedId) === true,
+	);
+	check("the successor posts no duplicate board", boardSends().length === handSends);
+	check("the successor edits nothing when only the pin is owed", boardEdits().length === handEdits);
+
+	// e. A record older than the confirmation field owes an idempotent re-pin, never a repost.
+	const legacyText = boardFile().text;
+	writeFileSync(
+		join(root, "notify-telegram/dashboard.json"),
+		JSON.stringify({ messageId: handedId, text: legacyText }),
+	);
+	const legacyPins = called("pinChatMessage").length;
+	const legacySends = boardSends().length;
+	await successor.pump(250);
+	check(
+		"a legacy board record is re-pinned, not reposted",
+		called("pinChatMessage").at(-1)?.body.message_id === handedId && called("pinChatMessage").length === legacyPins + 1,
+	);
+	check(
+		"the re-pin lands quietly",
+		api.pinned.has(handedId) === true && lastCall("pinChatMessage").body.disable_notification === true,
+	);
+	check("a legacy board record posts no duplicate board", boardSends().length === legacySends);
+
+	// f. A first post still in flight is the only one the owner owes.
+	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
+	rmSync(join(root, "notify-telegram/dashboard.lock"), { force: true });
+	const gate = Promise.withResolvers();
+	api.sendMessageGate = gate.promise;
+	const inflightSends = boardSends().length;
+	dash.heartbeat();
+	await settle(60);
+	await dash.pump(250);
+	await dash.pump(250);
+	await dash.pump(250);
+	gate.resolve();
+	await settle(300);
+	api.sendMessageGate = null;
+	check("an in-flight first post is not followed by a second", boardSends().length === inflightSends + 1);
+	check("the in-flight post lands pinned", api.pinned.has(boardFile().messageId) === true);
+
 	writeConfig();
 }
 
