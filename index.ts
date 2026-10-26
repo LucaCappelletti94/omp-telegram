@@ -15,7 +15,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -2346,6 +2346,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function reapOldFiles(): void {
 		if (Date.now() - lastReap < 3_600_000) return;
 		lastReap = Date.now();
+		const root = `${resolve(STATE_DIR)}${sep}`;
 		for (const [dir, keepMs] of [
 			[MEDIA_DIR, MEDIA_KEEP_MS],
 			[SENT_DIR, SENT_KEEP_MS],
@@ -2357,7 +2358,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		] as const) {
 			if (!existsSync(dir)) continue;
 			for (const entry of readdirSync(dir)) {
-				const path = join(dir, entry);
+				const path = resolve(dir, entry);
+				if (!path.startsWith(root)) continue;
 				try {
 					if (Date.now() - statSync(path).mtimeMs <= keepMs) continue;
 					if (dir === PENDING_UNPINS_DIR && readJsonFile(path) !== null) continue;
