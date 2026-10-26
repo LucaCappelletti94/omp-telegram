@@ -31,7 +31,7 @@ JSON config (`~/.omp/agent/notify-telegram.json`):
 - `quietSeconds` (default 45): turn-end notices arrive without sound while you are typing at the terminal.
 - `notifyOnTurnEnd: false`: disables turn-end notices.
 - `streamDrafts: false`: turns off live draft streaming.
-- `pinnedDashboard: true`: a pinned message showing every live session, rewritten in place at most every `dashboardSeconds` (default 30) when the text changed.
+- `pinnedDashboard: true`: a pinned message showing every live session, rewritten in place at most every `dashboardSeconds` (default 30) when the text changed. Failed pin attempts retry without reposting the board.
 - `userName`: what `ask` options call you, as in "Luca will review the diff". Learned from your Telegram first name on your first message or button press, and a name written here by hand is kept.
 
 Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops omp's bell from flagging tmux windows. Edits apply to running sessions within about fifteen seconds, so no restart is needed.
@@ -41,7 +41,7 @@ Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops om
 - Tap a button, reply to a session's message, or send a bare message to the last session that notified you; while a question is open, any text to that session answers it.
 - Photos reach the agent as images; voice notes, audio files, and documents are saved to disk and handed over as file paths.
 - Files are named `<UTC stamp>__<kind>__<session>__<original name>`, incoming ones carrying the Telegram update id; a photo repeats the name in its caption because Telegram drops photo filenames.
-- The chat shows a typing status while the session works your answer and an upload status while a file goes up; delivered messages get a thumbs-up reaction; red statuses stay pinned until the next turn; `/hidequestions` clears open question buttons.
+- The chat shows a typing status while the session works your answer and an upload status while a file goes up. Delivered messages get a thumbs-up reaction. Red statuses are unpinned when answered, superseded, or closed, with failed cleanup retried across session restarts, and `/hidequestions` clears open question buttons.
 - Unroutable messages are refused with an explanation; presses on settled questions get a closure notice.
 - Question text renders a Markdown subset: code, fences, bold, italic, strikethrough, spoilers, quotes, links.
 - Question options and turn-end buttons name who acts, "Agent will …" or your name, and one saying I, me, you, your, we or us is refused, because a tapped option reads as your own reply and a pronoun there could mean either side.
