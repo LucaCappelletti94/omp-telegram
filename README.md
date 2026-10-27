@@ -63,7 +63,7 @@ Every change of reaction appends one line to `~/.omp/agent/notify-telegram/feedb
 
 ## Messaging between sessions
 
-Agents in different live sessions write to each other with `session_message`, addressing a peer by its badge emoji, or by its tag when it has none, and a bare call lists the live sessions. A message reaches a busy peer at its next step without interrupting its tool calls, wakes an idle one, carries an id that an answer quotes in `reply_to`, and appears only in the two transcripts. A chain stops after six hops unless the user prompts one of the sessions in between.
+Agents in different live sessions write to each other with `session_message`, addressing a peer by its badge emoji, or by its tag when it has none, and a bare call lists the live sessions. A message reaches a busy peer at its next step without interrupting its tool calls, wakes an idle one, carries an id that an answer quotes in `reply_to`, and appears only in the two transcripts. A chain stops after twenty hops unless the user prompts one of the sessions in between.
 
 ## Dependencies between sessions
 
