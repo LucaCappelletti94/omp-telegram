@@ -9952,17 +9952,24 @@ heading("session_message between live sessions");
 	);
 
 	let last = reply;
-	for (let hop = 3; hop <= 6; hop++) {
+	for (let hop = 3; hop <= 20; hop++) {
 		const [from, to, target] = hop % 2 === 1 ? [a, b, hedgehog] : [b, a, parrot];
 		last = await exchange(from, to, { to: target, text: `step ${hop}`, reply_to: last.details.id });
+		if (hop === 19) {
+			const content = b.customs.at(-1).message.content;
+			check(
+				"hop 19 still invites an answer",
+				content.includes("Hop 19 of 20") && content.includes("To answer, call session_message"),
+			);
+		}
 	}
-	check("the chain reaches hop 6", last.details?.delivered === true && last.details.hop === 6);
+	check("the chain reaches hop 20", last.details?.delivered === true && last.details.hop === 20);
 	check(
 		"the final hop tells the recipient to stop relaying",
 		a.customs.at(-1).message.content.includes("do not answer"),
 	);
-	const beyond = await message(a, { to: hedgehog, text: "step 7", reply_to: last.details.id });
-	check("hop 7 is refused", beyond.isError === true && beyond.details.sent === false);
+	const beyond = await message(a, { to: hedgehog, text: "step 21", reply_to: last.details.id });
+	check("hop 21 is refused", beyond.isError === true && beyond.details.sent === false);
 	check("a refused message never reaches the inbox", inboxCount(b.id) === 0);
 
 	await a.fire("input", {});

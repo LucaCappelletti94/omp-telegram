@@ -114,7 +114,7 @@ const DRAIN_MS = 1_000;
 /** Two pin attempts and the maximum retry-after, rounded up. */
 const PIN_SETTLE_MS = 60_000;
 /** A chain of agent messages ends here unless a user prompt starts a new one. */
-const AGENT_MAX_HOPS = 6;
+const AGENT_MAX_HOPS = 20;
 /** How long a sender waits for the peer's drain, a few ticks of `DRAIN_MS`. */
 const AGENT_DELIVERY_WAIT_MS = 3_000;
 const AGENT_DELIVERY_POLL_MS = 100;
