@@ -67,7 +67,8 @@ export function stanceOf(question: AskQuestion, option: AskOption, index: number
 
 /**
  * Emoji, then the working folder, then whatever names the work. A session past the placeholder
- * palette carries no emoji rather than a duplicate, so the leading space goes with it.
+ * palette carries no emoji rather than a duplicate, so the leading space goes with it. An omp
+ * session name that already opens with the badge emoji does not repeat it.
  */
 export function badgeLine(emoji: string, cwd: string, detail: string, fallback: string): string {
 	const folder =
@@ -76,7 +77,8 @@ export function badgeLine(emoji: string, cwd: string, detail: string, fallback: 
 			.filter((part) => part.length > 0)
 			.pop() ?? cwd;
 	const head = emoji.length > 0 ? `${emoji} ` : "";
-	return `${head}${folder} \u00B7 ${detail.length > 0 ? clip(detail, 60) : fallback}`;
+	const named = head.length > 0 && detail.startsWith(head) ? detail.slice(head.length) : detail;
+	return `${head}${folder} \u00B7 ${named.length > 0 ? clip(named, 60) : fallback}`;
 }
 
 /** Compact elapsed time for the usage footer. */

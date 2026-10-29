@@ -187,7 +187,12 @@ const badgeLineOf = (id) => {
 		.split("/")
 		.filter((part) => part.length > 0)
 		.pop();
-	const detail = own.label.length > 0 ? own.label : own.name.length > 0 ? own.name : own.tag;
+	const named = own.label.length > 0 ? own.label : own.name;
+	const detail = named.startsWith(`${own.emoji} `)
+		? named.slice(own.emoji.length + 1)
+		: named.length > 0
+			? named
+			: own.tag;
 	return `${own.emoji.length > 0 ? `${own.emoji} ` : ""}${folder} \u00B7 ${detail}`;
 };
 /** notify_status refuses an option with no description; most tests do not care what it says. */
@@ -208,6 +213,8 @@ const spawn = (id, cwd, title = "") => {
 	const steers = [];
 	const customs = [];
 	let name = title;
+	const renames = [];
+	let renameFailure = null;
 	const pi = {
 		zod: chain,
 		logger: { debug() {}, info() {}, warn: (m, meta) => warns.push({ m, meta }), error() {} },
@@ -215,6 +222,11 @@ const spawn = (id, cwd, title = "") => {
 		registerTool: (def) => tools.set(def.name, def),
 		sendUserMessage: (text, options) => steers.push({ text, options }),
 		sendMessage: (message, options) => customs.push({ message, options }),
+		setSessionName: async (value) => {
+			if (renameFailure !== null) throw renameFailure;
+			renames.push(value);
+			name = value;
+		},
 	};
 	let aborts = 0;
 	const ctx = {
@@ -239,6 +251,10 @@ const spawn = (id, cwd, title = "") => {
 		warns,
 		steers,
 		customs,
+		renames,
+		failRenames: (error) => {
+			renameFailure = error;
+		},
 		get aborts() {
 			return aborts;
 		},
@@ -772,6 +788,88 @@ check(
 await crowded.tools.get("session_badge").execute("x1", { emoji: "\u{1F9F1}" }, undefined, undefined, crowded.ctx);
 check("it can still claim a contextual emoji", record(crowded.id).emoji === "\u{1F9F1}");
 for (const path of crowd) rmSync(path, { force: true });
+
+heading("the omp session name follows the badge");
+{
+	const freezing = "\u{1F976}";
+	const flamingo = "\u{1F9A9}";
+	const jellyfish = "\u{1FABC}";
+	const badgeOn = (s, args) => s.tools.get("session_badge").execute("nb", args, undefined, undefined, s.ctx);
+
+	const titled = spawn(
+		"01a034a0-0000-0000-0000-000000000000",
+		"/home/dev/work/titled",
+		"\u26D3\uFE0F CHAIN: Raise message chain length limit",
+	);
+	await titled.fire("session_start");
+	await titled.fire("agent_end");
+	check("a placeholder badge never renames the omp session", titled.renames.length === 0);
+	const labelled = await badgeOn(titled, { emoji: freezing, label: "tmux freeze and emoji mismatch" });
+	check(
+		"a badge with a label renames the omp session to that emoji and label",
+		titled.renames.at(-1) === `${freezing} tmux freeze and emoji mismatch`,
+	);
+	check(
+		"the session record carries the new name",
+		record(titled.id).name === `${freezing} tmux freeze and emoji mismatch`,
+	);
+	check(
+		"the Telegram badge line shows the emoji once",
+		labelled.details.badge === `${freezing} titled \u00B7 tmux freeze and emoji mismatch`,
+	);
+	const renamedOnce = titled.renames.length;
+	await titled.fire("agent_end");
+	check("a turn end leaves a name that already shows the badge", titled.renames.length === renamedOnce);
+
+	const iconOnly = spawn(
+		"01a034a1-0000-0000-0000-000000000000",
+		"/home/dev/work/icononly",
+		"\u{1F522} SEQ: Track CREATE SEQUENCE",
+	);
+	await iconOnly.fire("session_start");
+	const swapped = await badgeOn(iconOnly, { emoji: flamingo });
+	check(
+		"a badge without a label swaps only the omp title's icon",
+		iconOnly.renames.at(-1) === `${flamingo} SEQ: Track CREATE SEQUENCE`,
+	);
+	check(
+		"a badge without a label still shows its emoji once in Telegram",
+		swapped.details.badge === `${flamingo} icononly \u00B7 SEQ: Track CREATE SEQUENCE`,
+	);
+
+	const untitled = spawn("01a034a2-0000-0000-0000-000000000000", "/home/dev/work/untitled");
+	await untitled.fire("session_start");
+	await badgeOn(untitled, { emoji: jellyfish });
+	check("an unnamed session is not given a bare emoji, so omp can still title it", untitled.renames.length === 0);
+	untitled.setTitle("\u{1F4C2} POST: Open PRs for each remaining phase");
+	await untitled.fire("agent_end");
+	check(
+		"omp's later auto-title takes the badge at the turn end",
+		untitled.renames.at(-1) === `${jellyfish} POST: Open PRs for each remaining phase`,
+	);
+	untitled.setTitle("My own name for it");
+	await untitled.fire("agent_end");
+	check(
+		"a name the user typed keeps its words behind the badge",
+		untitled.renames.at(-1) === `${jellyfish} My own name for it`,
+	);
+
+	const before = titled.renames.length;
+	await badgeOn(titled, { emoji: jellyfish, label: "stolen" });
+	check("a refused badge renames nothing", titled.renames.length === before);
+
+	titled.failRenames(new Error("session released"));
+	const failed = await badgeOn(titled, { emoji: "\u{1F9CA}", label: "ice" });
+	check(
+		"a failed rename still applies the badge",
+		failed.details.applied === true && record(titled.id).emoji === "\u{1F9CA}",
+	);
+	check(
+		"a failed rename is logged",
+		titled.warns.some((w) => /rename/.test(w.m)),
+	);
+	for (const s of [titled, iconOnly, untitled]) await s.fire("session_shutdown");
+}
 
 // ---------------------------------------------------------------------- reaper
 heading("stale session reaping");

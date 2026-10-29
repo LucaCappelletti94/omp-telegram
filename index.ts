@@ -323,6 +323,18 @@ function isBadgeEmoji(value: string): boolean {
 	return [...GRAPHEMES.segment(value)].length === 1 && BADGE_PICTURE.test(value);
 }
 
+/**
+ * The omp session name carrying a chosen badge: its emoji, then the label, or else the current name
+ * without the icon omp's title generator put in front. Empty when there are no words to carry, so
+ * a bare emoji never blocks omp from titling the session itself.
+ */
+function badgedSessionName(emoji: string, label: string, current: string): string {
+	const space = current.indexOf(" ");
+	const words = space > 0 && isBadgeEmoji(current.slice(0, space)) ? current.slice(space + 1) : current;
+	const base = (label.length > 0 ? label : words).trim();
+	return base.length === 0 ? "" : `${emoji} ${base}`;
+}
+
 interface Config {
 	token: string;
 	chatId: number;
@@ -5114,7 +5126,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "session_badge",
 		label: "Session Badge",
 		description:
-			"Name this session in Telegram, where every running session competes for the same chat. `emoji` is one emoji depicting the work as closely as a single glyph can: a rat for a rat's metabolism, a lock for an auth bug, a broom for a cleanup. `label` is up to 60 characters naming the work. Call it as soon as the task is clear, and again when the work becomes something else. The emoji must be unique among live sessions: one already in use is refused, along with the list of what is taken, so choose the next-best depiction rather than a near-duplicate. A palette emoji is assigned at startup and describes nothing, so leaving it in place is the one wrong answer.",
+			"Name this session in Telegram, where every running session competes for the same chat. `emoji` is one emoji depicting the work as closely as a single glyph can: a rat for a rat's metabolism, a lock for an auth bug, a broom for a cleanup. `label` is up to 60 characters naming the work. Call it as soon as the task is clear, and again when the work becomes something else. The emoji must be unique among live sessions: one already in use is refused, along with the list of what is taken, so choose the next-best depiction rather than a near-duplicate. A palette emoji is assigned at startup and describes nothing, so leaving it in place is the one wrong answer. The omp session is renamed to the emoji and label, so tmux and the terminal title show the same badge.",
 		approval: "read",
 		parameters: z.object({
 			emoji: z.string().optional(),
@@ -5162,12 +5174,34 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					`${wanted} is already in use by ${badgeOf(claimed.value)}, so the badge is unchanged. In use: ${taken}. Pick another emoji that depicts this work.`,
 				);
 			}
+			await syncSessionName(ctx, label ?? "");
 			return {
 				content: [{ type: "text", text: `Badge is now: ${badge(ctx)}` }],
 				details: { badge: badge(ctx), applied: true },
 			};
 		},
 	});
+
+	/**
+	 * omp shows the session name in the tmux pane title, the terminal title and its resume list, so
+	 * a chosen badge renames the session to match Telegram. omp marks an extension's rename as the
+	 * user's, which keeps its auto-titler from writing over it.
+	 */
+	async function syncSessionName(ctx: ExtensionContext, label: string): Promise<void> {
+		if (!badgeChosen) return;
+		const current = ctx.sessionManager.getSessionName() ?? "";
+		const wanted = badgedSessionName(badgeEmoji, label, current);
+		if (wanted.length === 0 || wanted === current) return;
+		try {
+			await pi.setSessionName(wanted);
+		} catch (error) {
+			pi.logger.warn("notify-telegram: could not rename the omp session after its badge", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return;
+		}
+		writeSessionRecord(ctx);
+	}
 
 	/**
 	 * The startup badge comes from a fixed palette and says nothing about the work, and only the
@@ -7042,7 +7076,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		noteState();
 	});
 
-	pi.on("agent_end", async () => {
+	pi.on("agent_end", async (_event, ctx) => {
 		turnActive = false;
 		replyOwedAt = 0;
 		turnEndedAt = Date.now();
@@ -7053,6 +7087,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		askStream = null;
 		askPreview = "";
 		noteState();
+		// omp titles a session during its first turn, after a badge may already have been chosen.
+		await syncSessionName(ctx, "");
 	});
 
 	pi.on("message_update", async (event) => {
