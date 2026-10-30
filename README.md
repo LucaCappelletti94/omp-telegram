@@ -6,7 +6,7 @@
 
 Telegram notifications and remote control for [Oh My Pi](https://github.com/can1357/oh-my-pi) sessions. Turn ends arrive as a short agent-written summary with an urgency light and optional tappable choices whose label starts the next turn; every choice carries a line saying what it does. `ask` questions appear at the terminal and on Telegram at once, and the first answer wins.
 
-Parallel sessions share one bot. Every message opens with the session's badge and then its task, model, and tmux `session:window.pane` when attached, so a phone notification identifies itself and keeps replies routed. The badge emoji is chosen by the session's own agent and is unique among live sessions. Choosing it renames the omp session to the badge emoji and label, so the tmux pane title, the terminal title and omp's resume list show the same badge as Telegram.
+Parallel sessions share one bot. Every message opens with the session's badge and then its task, model, and tmux `session:window.pane` when attached, so a phone notification identifies itself and keeps replies routed. The session's own agent chooses the badge: an emoji, a code of 1 to 6 capitals or digits naming the phase or key aspect of the work (`R89`, `FREEZE`), and a label. Emoji and code are each unique among live sessions, and a session is asked every turn until it has both. The omp session is renamed to `emoji CODE: label`, omp's own title card form, so the tmux window label, which shows only about a dozen characters, opens with the code, and the terminal title and omp's resume list show the same badge as Telegram.
 
 ## Setup
 
