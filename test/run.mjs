@@ -10957,10 +10957,19 @@ heading("sessions that died without shutting down");
 	mkdirSync(kBin, { recursive: true });
 	const tmuxLog = join(root, "crash-tmux.log");
 	writeFileSync(tmuxLog, "");
-	// Only the tmux session `work` survived; any other name has to be created.
+	const tmuxWhere = join(root, "crash-tmux-where");
+	writeFileSync(tmuxWhere, "work\t3\n");
+	// Only the tmux session `work` survived; any other name has to be created. Its window 2 is taken.
 	writeFileSync(
 		join(kBin, "tmux"),
-		`#!/bin/sh\necho "$*" >> ${tmuxLog}\ncase "$1" in\n  has-session) [ "$3" = "=work" ] ;;\n  *) exit 0 ;;\nesac\n`,
+		`#!/bin/sh\necho "$*" >> ${tmuxLog}\ncase "$1" in\n  has-session) [ "$3" = "=work" ] ;;\n  new-session) echo 0 ;;\n  new-window) [ "$4" != "work:2" ] || { echo "create window failed: index 2 in use" >&2; exit 1; } ;;\n  display-message) cat ${tmuxWhere} ;;\n  *) exit 0 ;;\nesac\n`,
+		{ mode: 0o755 },
+	);
+	const systemState = join(root, "crash-system-state");
+	writeFileSync(systemState, "running\n");
+	writeFileSync(
+		join(kBin, "systemctl"),
+		`#!/bin/sh\nstate=$(cat ${systemState})\necho "$state"\n[ "$state" = running ]\n`,
 		{ mode: 0o755 },
 	);
 	const savedPath = process.env.PATH;
@@ -11031,6 +11040,7 @@ heading("sessions that died without shutting down");
 		emoji: "\u{1F4DA}",
 		label: "Write the docs",
 		tmux: "gone",
+		tmuxWindow: 4,
 		recent: [502],
 		standing: { id: "st-crash", messageId: 502, labels: ["Merge", "Wait"], head: "docs head" },
 		closeOffer: 503,
@@ -11042,7 +11052,7 @@ heading("sessions that died without shutting down");
 	crashed(loudId, { cwd: loudDir, label: "Half applied", state: "waiting on a question" });
 	const spareId = "0c2a0009-0000-7000-8000-000000000009";
 	const spareDir = folder("spare");
-	crashed(spareId, { cwd: spareDir, label: "Never came back" });
+	crashed(spareId, { cwd: spareDir, label: "Never came back", tmuxWindow: 6 });
 	const pinnedId = "0c2a000a-0000-7000-8000-00000000000a";
 	crashed(pinnedId, {
 		cwd: join(root, "crash-work", "also-removed"),
@@ -11130,6 +11140,10 @@ heading("sessions that died without shutting down");
 		opened.includes("new-session -d -s gone") &&
 			opened.includes(`-c ${idleDir}`) &&
 			opened.includes(`omp --model opus --resume ${idleId}`),
+	);
+	check(
+		"restore moves the first window of a recreated tmux session to the recorded index",
+		opened.includes("move-window -d -s gone:0 -t gone:4"),
 	);
 	check("the restore toast says it is reopening", /restor/i.test(restoredToast));
 	check("the card marks it as restoring", /restoring/i.test(lastCard()?.text ?? ""));
@@ -11221,8 +11235,8 @@ heading("sessions that died without shutting down");
 	const allToast = await tap(first, 9507, `ka:${batch}`, cardId);
 	const allOpened = readFileSync(tmuxLog, "utf8");
 	check(
-		"restore all opens every waiting session into a tmux session that still exists",
-		allOpened.includes(`new-window -d -t work: -n Never came back -c ${spareDir}`) &&
+		"restore all opens every waiting session at its recorded window index in a tmux session that still exists",
+		allOpened.includes(`new-window -d -t work:6 -n Never came back -c ${spareDir}`) &&
 			allOpened.includes(`--resume ${spareId}`) &&
 			!allOpened.includes(pinnedId),
 	);
@@ -11314,6 +11328,125 @@ heading("sessions that died without shutting down");
 	);
 	holder.kill();
 
+	// A reboot or poweroff ends each session through a clean shutdown, which has to stay restorable.
+	const haltedId = "0c2a000b-0000-7000-8000-00000000000b";
+	const cutId = "0c2a000c-0000-7000-8000-00000000000c";
+	const exitedId = "0c2a000d-0000-7000-8000-00000000000d";
+	const diedTooId = "0c2a000e-0000-7000-8000-00000000000e";
+	const haltedDir = folder("halted");
+	const cutDir = folder("cut");
+	process.env.TMUX = "/tmp/tmux-crash,1,0";
+	process.env.TMUX_PANE = "%1";
+	const halted = spawn(haltedId, haltedDir);
+	await halted.fire("session_start");
+	check("a session in tmux records its window index", record(haltedId).tmuxWindow === 3);
+	writeFileSync(tmuxWhere, "work\t2\n");
+	halted.heartbeat();
+	await settle(100);
+	halted.heartbeat();
+	check("the heartbeat follows a window moved to another index", record(haltedId).tmuxWindow === 2);
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+	await halted.tools
+		.get("notify_status")
+		.execute(
+			"halted-red",
+			{ summary: "Pick a branch.", urgency: "red", options: opts("Agent will merge", "Agent will wait") },
+			undefined,
+			undefined,
+			halted.ctx,
+		);
+	await halted.fire("session_stop");
+	await settle();
+	const haltedPin = record(haltedId).pinned;
+	const haltedStanding = record(haltedId).standing;
+	const haltedEmoji = record(haltedId).emoji;
+	const cut = spawn(cutId, cutDir);
+	await cut.fire("session_start");
+	await cut.fire("agent_start");
+	const exited = spawn(exitedId, folder("exited"));
+	await exited.fire("session_start");
+	await exited.fire("session_shutdown");
+	writeFileSync(systemState, "stopping\n");
+	const editsBefore = called("editMessageText").length;
+	await halted.fire("session_shutdown");
+	await cut.fire("session_shutdown");
+	await settle(100);
+	writeFileSync(systemState, "running\n");
+	check(
+		"a system shutdown leaves the record marked as ended by it",
+		record(haltedId).heartbeat === 0 && record(haltedId).systemShutdownAt > 0,
+	);
+	check("a user exit leaves no system shutdown mark", record(exitedId).systemShutdownAt === 0);
+	check(
+		"a system shutdown keeps the red pin and the standing question for the restore",
+		haltedPin !== null &&
+			api.pinned.has(haltedPin) &&
+			record(haltedId).standing?.id === haltedStanding?.id &&
+			!called("editMessageText")
+				.slice(editsBefore)
+				.some((c) => c.body.message_id === haltedStanding?.messageId),
+	);
+	first.heartbeat();
+	await settle(150);
+	check(
+		"a session ended by a system shutdown waits for the reboot rather than being offered on the same boot",
+		existsSync(join(sessionsDir, `${haltedId}.json`)) && !existsSync(join(crashDir, `${haltedId}.json`)),
+	);
+	// The reboot: every record now predates the current boot.
+	for (const id of [haltedId, cutId, exitedId]) {
+		writeFileSync(join(sessionsDir, `${id}.json`), JSON.stringify({ ...record(id), boot: "boot-before-the-crash" }));
+	}
+	crashed(diedTooId, { cwd: folder("died-too"), label: "Too slow to stop" });
+	const rebootCards = crashCalls().length;
+	first.heartbeat();
+	await settle(150);
+	first.heartbeat();
+	await settle(150);
+	const rebootCard = crashCalls().at(-1)?.body;
+	const rebootCardId = api.nextMessage - 1;
+	check(
+		"after the reboot one card lists the sessions the shutdown ended alongside the one that died",
+		crashCalls().length === rebootCards + 1 &&
+			/machine restarted/i.test(rebootCard?.text ?? "") &&
+			rebootCard.text.includes("2 sessions shut down with it") &&
+			rebootCard.text.includes("1 session died without shutting down") &&
+			[haltedId, cutId, diedTooId].every((id) => cardButtons(rebootCard).includes(`kr:${id}`)),
+	);
+	check(
+		"a session the user closed before the reboot is not offered",
+		!existsSync(join(crashDir, `${exitedId}.json`)) && !cardButtons(rebootCard).includes(`kr:${exitedId}`),
+	);
+	writeFileSync(tmuxLog, "");
+	const haltedToast = await tap(first, 9510, `kr:${haltedId}`, rebootCardId);
+	const haltedOpened = readFileSync(tmuxLog, "utf8");
+	check(
+		"restore asks for the recorded window index and appends the window when that index is taken",
+		haltedOpened.includes("new-window -d -t work:2 -n") &&
+			haltedOpened.includes(`new-window -d -t work: -n`) &&
+			haltedOpened.includes(`--resume ${haltedId}`) &&
+			/restor/i.test(haltedToast),
+	);
+	const haltedBack = spawn(haltedId, haltedDir);
+	await haltedBack.fire("session_start");
+	await haltedBack.pump(150);
+	check(
+		"a session restored after a system shutdown adopts its badge, pin and standing question",
+		haltedEmoji.length > 0 &&
+			record(haltedId).emoji === haltedEmoji &&
+			record(haltedId).pinned === haltedPin &&
+			record(haltedId).standing?.id === haltedStanding?.id &&
+			record(haltedId).systemShutdownAt === 0,
+	);
+	const cutBack = spawn(cutId, cutDir);
+	await cutBack.fire("session_start");
+	await cutBack.pump(150);
+	const cutNote = cutBack.customs.at(-1)?.message.content ?? "";
+	check(
+		"a session the shutdown cut off mid-turn is told it was shut down by the restart",
+		/was shut down/i.test(cutNote) && /machine restarted/i.test(cutNote) && !/died/i.test(cutNote),
+	);
+
 	// A week on, the card's records are gone and a tap says so.
 	jump(8 * 24 * 3_600_000);
 	first.heartbeat();
@@ -11330,7 +11463,7 @@ heading("sessions that died without shutting down");
 		(await tap(first, 9509, `ka:${batch}`, cardId)).includes("no longer"),
 	);
 
-	for (const s of [first, idleBack, workingBack, loudBack]) await s.fire("session_shutdown");
+	for (const s of [first, idleBack, workingBack, loudBack, haltedBack, cutBack]) await s.fire("session_shutdown");
 	rmSync(join(sessionsDir, `${frozenId}.json`), { force: true });
 	process.env.PATH = savedPath;
 }
