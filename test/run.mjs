@@ -234,7 +234,8 @@ const spawn = (id, cwd, title = "") => {
 	const ctx = {
 		hasUI: false,
 		cwd,
-		sessionManager: { getSessionId: () => id, getSessionName: () => name },
+		// omp reports an unnamed session as undefined, never as an empty string.
+		sessionManager: { getSessionId: () => id, getSessionName: () => (name === "" ? undefined : name) },
 		model: { provider: "openai", id: "gpt-5.6-sol" },
 		ui: { onTerminalInput: () => () => {} },
 		setInterval: (fn) => timers.push(fn) - 1,
@@ -936,8 +937,14 @@ heading("the omp session name follows the badge");
 		failed.details.applied === true && record(titled.id).emoji === "\u{1F9CA}",
 	);
 	check(
-		"a failed rename is logged",
-		titled.warns.some((w) => /rename/.test(w.m)),
+		"a failed rename is logged with its error",
+		titled.warns.some((w) => /rename/.test(w.m) && w.meta?.error === "session released"),
+	);
+	titled.failRenames("handle closed");
+	await badgeOn(titled, { label: "melting" });
+	check(
+		"a rename refused with a bare value logs that value",
+		titled.warns.some((w) => /rename/.test(w.m) && w.meta?.error === "handle closed"),
 	);
 	for (const s of [titled, iconOnly, untitled]) await s.fire("session_shutdown");
 }
@@ -10320,6 +10327,21 @@ heading("dependency graph across sessions");
 	check("session_graph is registered", parent.tools.has("session_graph"));
 	const parentStatus = await graph(parent, { action: "status", status: "waiting", note: "on the widget fix" });
 	check("a session records its own status", parentStatus.isError !== true && nodeOf(parentId).status === "waiting");
+	await parent.tools
+		.get("session_badge")
+		.execute("gb", { code: "WIDGET", label: "wait on the widget fix" }, undefined, undefined, parent.ctx);
+	parent.heartbeat();
+	await settle(50);
+	check(
+		"the heartbeat relabels the node with the badge code and label",
+		nodeOf(parentId).label === "WIDGET: wait on the widget fix",
+	);
+	await parent.tools.get("session_badge").execute("gb2", { code: "WDG" }, undefined, undefined, parent.ctx);
+	await graph(parent, { action: "status", status: "waiting", note: "still on the widget fix" });
+	check(
+		"a status update writes the current code into the node label",
+		nodeOf(parentId).label === "WDG: wait on the widget fix",
+	);
 
 	const launchId = "0c1a1a00-0000-7000-8000-000000000001";
 	mkdirSync(join(graphDir, "launches"), { recursive: true });
