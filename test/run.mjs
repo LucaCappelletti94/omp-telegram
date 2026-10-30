@@ -884,6 +884,12 @@ heading("the omp session name follows the badge");
 	);
 	await badgeOn(untitled, { code: "OWN" });
 	check("a code heads a name the user typed", untitled.renames.at(-1) === `${jellyfish} OWN: My own name for it`);
+	untitled.setTitle("Plan R2: the next phase");
+	await untitled.fire("agent_end");
+	check(
+		"a typed name with a word before its colon keeps every word behind the code",
+		untitled.renames.at(-1) === `${jellyfish} OWN: Plan R2: the next phase`,
+	);
 
 	const held = await badgeOn(untitled, { code: "FREEZE" });
 	check(
