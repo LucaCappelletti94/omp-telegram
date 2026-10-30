@@ -187,7 +187,9 @@ const badgeLineOf = (id) => {
 		.split("/")
 		.filter((part) => part.length > 0)
 		.pop();
-	const named = own.label.length > 0 ? own.label : own.name;
+	const code = own.code ?? "";
+	const coded = code.length > 0 ? `${code}: ${own.label}` : own.label;
+	const named = own.label.length > 0 ? coded : own.name.length > 0 ? own.name : code;
 	const detail = named.startsWith(`${own.emoji} `)
 		? named.slice(own.emoji.length + 1)
 		: named.length > 0
@@ -675,9 +677,16 @@ await two.tools
 check("emoji override persisted", record(two.id).emoji === "\u{1F400}");
 check("label override persisted", record(two.id).label === "rat metabolism");
 check("a deliberate choice is recorded as one", record(two.id).emojiChosen === true);
+const codeless = await two.fire("before_agent_start", { prompt: "onwards" });
+check(
+	"a chosen emoji without a code is still asked for the code",
+	codeless.some((r) => /\bcode\b/.test(r?.message?.content ?? "") && /tmux/.test(r?.message?.content ?? "")),
+);
+await two.tools.get("session_badge").execute("c8b", { code: "rat" }, undefined, undefined, two.ctx);
+check("a lowercase code is stored in capitals", record(two.id).code === "RAT");
 const afterChoice = await two.fire("before_agent_start", { prompt: "onwards" });
 check(
-	"a chosen badge ends the asking",
+	"a chosen emoji and code end the asking",
 	afterChoice.every((r) => r?.message === undefined),
 );
 
@@ -737,6 +746,7 @@ const rebadgedAsk = await rebadged
 	.fire("session_start")
 	.then(() => rebadged.fire("before_agent_start", { prompt: "x" }));
 check("a resume keeps the chosen emoji", record(two.id).emoji === "\u{1F430}");
+check("a resume keeps the chosen code", record(two.id).code === "RAT");
 check(
 	"a resume with a chosen badge is not asked again",
 	rebadgedAsk.every((r) => r?.message === undefined),
@@ -857,6 +867,61 @@ heading("the omp session name follows the badge");
 	const before = titled.renames.length;
 	await badgeOn(titled, { emoji: jellyfish, label: "stolen" });
 	check("a refused badge renames nothing", titled.renames.length === before);
+
+	const coded = await badgeOn(titled, { code: "FREEZE" });
+	check(
+		"a code heads the omp session name in omp's card form",
+		titled.renames.at(-1) === `${freezing} FREEZE: tmux freeze and emoji mismatch`,
+	);
+	check(
+		"the code heads the Telegram badge line too",
+		coded.details.badge === `${freezing} titled \u00B7 FREEZE: tmux freeze and emoji mismatch`,
+	);
+	await badgeOn(iconOnly, { code: "SEQ2" });
+	check(
+		"a code replaces the code omp's card carried and keeps its words",
+		iconOnly.renames.at(-1) === `${flamingo} SEQ2: Track CREATE SEQUENCE`,
+	);
+	await badgeOn(untitled, { code: "OWN" });
+	check("a code heads a name the user typed", untitled.renames.at(-1) === `${jellyfish} OWN: My own name for it`);
+
+	const held = await badgeOn(untitled, { code: "FREEZE" });
+	check(
+		"a code another live session's badge holds is refused",
+		held.details.applied === false && record(untitled.id).code === "OWN",
+	);
+	check(
+		"the code refusal lists the codes in use",
+		/FREEZE/.test(held.content[0].text) && /in use/i.test(held.content[0].text),
+	);
+	const carded = spawn(
+		"01a034a3-0000-0000-0000-000000000000",
+		"/home/dev/work/carded",
+		"\u{1F9EA} FLAKY: Fix flaky park tests",
+	);
+	await carded.fire("session_start");
+	const echoed = await badgeOn(untitled, { code: "FLAKY" });
+	check("a code heading another live session's omp title is refused", echoed.details.applied === false);
+	for (const bad of ["TOOLONG", "R-89", "TWO WORDS"]) {
+		const refused = await badgeOn(untitled, { code: bad });
+		check(
+			`a malformed code (${bad}) is refused with the rule`,
+			refused.details.applied === false && /1 to 6/.test(refused.content[0].text) && record(untitled.id).code === "OWN",
+		);
+	}
+
+	const thread = "\u{1F9F5}";
+	const blank = spawn("01a034a4-0000-0000-0000-000000000000", "/home/dev/work/blank");
+	await blank.fire("session_start");
+	await badgeOn(blank, { emoji: thread, code: "BLANK" });
+	check("a code alone does not name a session omp has not titled yet", blank.renames.length === 0);
+	blank.setTitle("\u{1F4C2} POST: Open PRs for each remaining phase");
+	await blank.fire("agent_end");
+	check(
+		"the badge code replaces omp's code once omp titles the session",
+		blank.renames.at(-1) === `${thread} BLANK: Open PRs for each remaining phase`,
+	);
+	for (const s of [carded, blank]) await s.fire("session_shutdown");
 
 	titled.failRenames(new Error("session released"));
 	const failed = await badgeOn(titled, { emoji: "\u{1F9CA}", label: "ice" });

@@ -323,16 +323,36 @@ function isBadgeEmoji(value: string): boolean {
 	return [...GRAPHEMES.segment(value)].length === 1 && BADGE_PICTURE.test(value);
 }
 
+/** A badge code: what omp's title card calls `CODE`, the phase or key aspect read at a glance. */
+const BADGE_CODE = /^[A-Z0-9]{1,6}$/;
+
+/** The pieces of a name in omp's card form `<icon> <CODE>: <title>`, its icon an emoji. */
+function cardOf(name: string): { code: string; words: string } | null {
+	const parts = /^(?<icon>\S+) (?<code>[A-Z0-9]{1,6}): (?<words>\S.*)$/u.exec(name)?.groups;
+	if (parts?.icon === undefined || parts.code === undefined || parts.words === undefined) return null;
+	return isBadgeEmoji(parts.icon) ? { code: parts.code, words: parts.words } : null;
+}
+
+/** What names a session's work: its label headed by its code, else its omp session name. */
+function workNameOf(code: string, label: string, sessionName: string): string {
+	if (label.length > 0) return code.length > 0 ? `${code}: ${label}` : label;
+	return sessionName.length > 0 ? sessionName : code;
+}
+
 /**
- * The omp session name carrying a chosen badge: its emoji, then the label, or else the current name
- * without the icon omp's title generator put in front. Empty when there are no words to carry, so
- * a bare emoji never blocks omp from titling the session itself.
+ * The omp session name carrying a chosen badge, in omp's card form when there is a code: the
+ * emoji, the code, then the label or else the words of the current name. A label with no badge
+ * code drops the code omp's card carried, which named the earlier work. Empty when there are no
+ * words to carry, so a bare emoji never blocks omp from titling the session itself.
  */
-function badgedSessionName(emoji: string, label: string, current: string): string {
+function badgedSessionName(emoji: string, code: string, label: string, current: string): string {
+	const card = cardOf(current);
 	const space = current.indexOf(" ");
-	const words = space > 0 && isBadgeEmoji(current.slice(0, space)) ? current.slice(space + 1) : current;
-	const base = (label.length > 0 ? label : words).trim();
-	return base.length === 0 ? "" : `${emoji} ${base}`;
+	const plain = space > 0 && isBadgeEmoji(current.slice(0, space)) ? current.slice(space + 1) : current;
+	const base = (label.length > 0 ? label : (card?.words ?? plain)).trim();
+	if (base.length === 0) return "";
+	const shown = code.length > 0 ? code : label.length === 0 ? (card?.code ?? "") : "";
+	return shown.length > 0 ? `${emoji} ${shown}: ${base}` : `${emoji} ${base}`;
 }
 
 interface Config {
@@ -358,6 +378,8 @@ interface SessionRecord {
 	/** True once an agent picked the emoji for its task; a palette placeholder is not a choice. */
 	emojiChosen: boolean;
 	label: string;
+	/** The badge code heading the session name, empty until the agent picks one. */
+	code: string;
 	lastNotified: number;
 	/** Replying to one of these routes back here. */
 	recent: number[];
@@ -1682,6 +1704,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastSummaryAt = 0;
 	let badgeEmoji = "";
 	let badgeOverride = "";
+	let badgeCode = "";
 	let badgeChosen = false;
 	const recentMessages: number[] = [];
 	let lastNotifiedAt = 0;
@@ -1862,7 +1885,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function snapshotSentSession(): SentRecord["session"] {
-		const name = badgeOverride.length > 0 ? badgeOverride : (sessionCtx?.sessionManager.getSessionName() ?? "");
+		const name = workNameOf(badgeCode, badgeOverride, sessionCtx?.sessionManager.getSessionName() ?? "");
 		return { id: sessionId, tag: sessionTag, emoji: badgeEmoji, name, cwd: sessionCtx?.cwd ?? "" };
 	}
 
@@ -2009,6 +2032,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			emoji: badgeEmoji,
 			emojiChosen: badgeChosen,
 			label: badgeOverride,
+			code: badgeCode,
 			lastNotified: lastNotifiedAt,
 			recent: [...recentMessages],
 			question: pendingAsk?.messageId ?? null,
@@ -2083,6 +2107,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			emoji: text(raw.emoji),
 			emojiChosen: raw.emojiChosen === true,
 			label: text(raw.label),
+			code: text(raw.code),
 			lastNotified: count(raw.lastNotified),
 			recent: Array.isArray(raw.recent) ? raw.recent.filter((m) => typeof m === "number") : [],
 			question: messageId(raw.question),
@@ -2140,6 +2165,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const held = new Map<string, SessionRecord>();
 		for (const record of otherLiveRecords()) {
 			if (record.emoji.length > 0) held.set(record.emoji, record);
+		}
+		return held;
+	}
+
+	/** Codes heading another live session's name, its badge code or else its omp title card's. */
+	function codesInUse(): Map<string, SessionRecord> {
+		const held = new Map<string, SessionRecord>();
+		for (const record of otherLiveRecords()) {
+			const code = record.code.length > 0 ? record.code : (cardOf(record.name)?.code ?? "");
+			if (code.length > 0) held.set(code, record);
 		}
 		return held;
 	}
@@ -2387,16 +2422,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function badge(ctx: ExtensionContext): string {
-		const detail = badgeOverride.length > 0 ? badgeOverride : (ctx.sessionManager.getSessionName() ?? "");
+		const detail = workNameOf(badgeCode, badgeOverride, ctx.sessionManager.getSessionName() ?? "");
 		return badgeLine(badgeEmoji, ctx.cwd, detail, sessionTag);
 	}
 
 	/** The same badge for a session this process does not own, rebuilt from its record. */
 	function badgeOf(record: SessionRecord): string {
-		return badgeLine(record.emoji, record.cwd, record.label.length > 0 ? record.label : record.name, record.tag);
+		return badgeLine(record.emoji, record.cwd, workNameOf(record.code, record.label, record.name), record.tag);
 	}
 	function taskName(ctx: ExtensionContext): string {
-		const named = badgeOverride.length > 0 ? badgeOverride : (ctx.sessionManager.getSessionName() ?? "");
+		const named = workNameOf(badgeCode, badgeOverride, ctx.sessionManager.getSessionName() ?? "");
 		if (named.length > 0) return clip(named, 60);
 		const folder =
 			ctx.cwd
@@ -5126,15 +5161,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "session_badge",
 		label: "Session Badge",
 		description:
-			"Name this session in Telegram, where every running session competes for the same chat. `emoji` is one emoji depicting the work as closely as a single glyph can: a rat for a rat's metabolism, a lock for an auth bug, a broom for a cleanup. `label` is up to 60 characters naming the work. Call it as soon as the task is clear, and again when the work becomes something else. The emoji must be unique among live sessions: one already in use is refused, along with the list of what is taken, so choose the next-best depiction rather than a near-duplicate. A palette emoji is assigned at startup and describes nothing, so leaving it in place is the one wrong answer. The omp session is renamed to the emoji and label, so tmux and the terminal title show the same badge.",
+			"Name this session in Telegram, where every running session competes for the same chat, and in tmux, where the session name heads its window label. `emoji` is one emoji depicting the work as closely as a single glyph can: a rat for a rat's metabolism, a lock for an auth bug, a broom for a cleanup. `code` is 1 to 6 capital letters or digits naming the phase or the key aspect of the work at a glance: the plan phase, issue or pull request when the work has one (R89, PR311, ISS42), else one word cut to its first syllable or leading consonants (FREEZE, CHAIN, FLBK), never the repository name. tmux shows only about a dozen characters of each window label, so the code is what tells this session apart there. `label` is up to 60 characters naming the work, its distinctive words first, never the repository or folder name, which Telegram already shows. The omp session is renamed to `emoji CODE: label`, so tmux and the terminal title show the same badge. Call it as soon as the task is clear, and again when the work becomes something else. The emoji and the code must each be unique among live sessions: one already in use is refused, along with the list of what is taken, so choose the next-best rather than a near-duplicate. A palette emoji is assigned at startup and describes nothing, so leaving it in place is the one wrong answer.",
 		approval: "read",
 		parameters: z.object({
 			emoji: z.string().optional(),
+			code: z.string().optional(),
 			label: z.string().optional(),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const p = params as { emoji?: unknown; label?: unknown };
+			const p = params as { emoji?: unknown; code?: unknown; label?: unknown };
 			const wanted = typeof p.emoji === "string" ? p.emoji.trim() : "";
+			const code = typeof p.code === "string" ? p.code.trim().toUpperCase() : null;
 			const label = typeof p.label === "string" ? clip(p.label.trim(), 60) : null;
 			const refuse = (text: string) => ({
 				content: [{ type: "text" as const, text }],
@@ -5145,15 +5182,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					`"${wanted}" is not a single emoji, so the badge is unchanged. Pass one emoji that depicts the work.`,
 				);
 			}
-			const before = { emoji: badgeEmoji, chosen: badgeChosen, label: badgeOverride };
+			if (code !== null && code.length > 0 && !BADGE_CODE.test(code)) {
+				return refuse(
+					`"${code}" is not 1 to 6 capital letters or digits, so the badge is unchanged. Pass one short code naming the phase or the key aspect, such as R89, PR311 or FREEZE.`,
+				);
+			}
+			const before = { emoji: badgeEmoji, chosen: badgeChosen, label: badgeOverride, code: badgeCode };
 			const claimed = await withBadgeClaim(
-				() => {
+				(): { what: "emoji" | "code"; holder: SessionRecord } | null => {
 					const rival = wanted.length === 0 ? undefined : badgesInUse().get(wanted);
-					if (rival !== undefined) return rival;
+					if (rival !== undefined) return { what: "emoji", holder: rival };
+					const codeRival = code === null || code.length === 0 ? undefined : codesInUse().get(code);
+					if (codeRival !== undefined) return { what: "code", holder: codeRival };
 					if (wanted.length > 0) {
 						badgeEmoji = wanted;
 						badgeChosen = true;
 					}
+					if (code !== null) badgeCode = code;
 					if (label !== null) badgeOverride = label;
 					writeSessionRecord(ctx);
 					return null;
@@ -5162,16 +5207,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					badgeEmoji = before.emoji;
 					badgeChosen = before.chosen;
 					badgeOverride = before.label;
+					badgeCode = before.code;
 					writeSessionRecord(ctx);
 				},
 			);
 			if (!claimed.ok) {
 				return refuse("Another session is claiming a badge right now, so nothing changed. Call this again.");
 			}
-			if (claimed.value !== null) {
+			if (claimed.value?.what === "emoji") {
 				const taken = [...badgesInUse().keys()].join(" ");
 				return refuse(
-					`${wanted} is already in use by ${badgeOf(claimed.value)}, so the badge is unchanged. In use: ${taken}. Pick another emoji that depicts this work.`,
+					`${wanted} is already in use by ${badgeOf(claimed.value.holder)}, so the badge is unchanged. In use: ${taken}. Pick another emoji that depicts this work.`,
+				);
+			}
+			if (claimed.value?.what === "code") {
+				const taken = [...codesInUse().keys()].sort().join(" ");
+				return refuse(
+					`${code} is already in use by ${badgeOf(claimed.value.holder)}, so the badge is unchanged. In use: ${taken}. Pick another code that names this work.`,
 				);
 			}
 			await syncSessionName(ctx, label ?? "");
@@ -5190,7 +5242,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	async function syncSessionName(ctx: ExtensionContext, label: string): Promise<void> {
 		if (!badgeChosen) return;
 		const current = ctx.sessionManager.getSessionName() ?? "";
-		const wanted = badgedSessionName(badgeEmoji, label, current);
+		const wanted = badgedSessionName(badgeEmoji, badgeCode, label, current);
 		if (wanted.length === 0 || wanted === current) return;
 		try {
 			await pi.setSessionName(wanted);
@@ -5206,23 +5258,33 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/**
 	 * The startup badge comes from a fixed palette and says nothing about the work, and only the
 	 * model knows what the work is. The request rides the turn as hidden context and stops the
-	 * moment a badge is chosen: a session that complies never sees it twice, one that ignores it is
-	 * asked again next turn.
+	 * moment an emoji and a code are chosen: a session that complies never sees it twice, one that
+	 * ignores it is asked again next turn.
 	 */
 	pi.on("before_agent_start", async () => {
-		if (config === null || badgeChosen) return undefined;
-		const taken = [...badgesInUse().keys()].join(" ");
-		const standing =
-			badgeEmoji.length === 0
-				? "This session carries no emoji in Telegram: every placeholder is already held by another session."
-				: `This session shows ${badgeEmoji} in Telegram, a placeholder from a fixed palette that describes nothing.`;
+		if (config === null || (badgeChosen && badgeCode.length > 0)) return undefined;
+		const emojis = [...badgesInUse().keys()].join(" ");
+		const codes = [...codesInUse().keys()].sort().join(" ");
+		const codeAsk =
+			"`code` is 1 to 6 capital letters or digits naming the phase or the key aspect of the work (R89, PR311, FREEZE). It opens the tmux window label, where only about a dozen characters show, so it is what tells this session apart there.";
+		const held = [
+			...(emojis.length === 0 || badgeChosen
+				? []
+				: [`Emoji held by other live sessions and therefore refused: ${emojis}.`]),
+			...(codes.length === 0 ? [] : [`Codes held by other live sessions and therefore refused: ${codes}.`]),
+		].join(" ");
+		const standing = badgeChosen
+			? `This session's badge ${badgeEmoji} has no code. Call session_badge with a code for this task. ${codeAsk}`
+			: `${
+					badgeEmoji.length === 0
+						? "This session carries no emoji in Telegram: every placeholder is already held by another session."
+						: `This session shows ${badgeEmoji} in Telegram, a placeholder from a fixed palette that describes nothing.`
+				} Call session_badge with an emoji that depicts this task as closely as one glyph can, a code, and a short label naming it, so its notifications and its tmux window are recognisable among the other sessions. ${codeAsk}`;
 		return {
 			message: {
 				customType: "telegram-badge",
 				display: false,
-				content:
-					`${standing} Call session_badge with an emoji that depicts this task as closely as one glyph can, plus a short label naming it, so its notifications are recognisable among the other sessions.` +
-					(taken.length === 0 ? "" : ` Held by other live sessions and therefore refused: ${taken}.`),
+				content: held.length === 0 ? standing : `${standing} ${held}`,
 			},
 		};
 	});
@@ -5272,7 +5334,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			updatedAt: now,
 		};
 		change(node);
-		if (badgeOverride.length > 0) node.label = badgeOverride;
+		if (badgeOverride.length > 0) node.label = workNameOf(badgeCode, badgeOverride, "");
 		node.emoji = badgeEmoji;
 		node.tag = sessionTag;
 		node.cwd = ctx.cwd;
@@ -5285,7 +5347,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function syncOwnNode(ctx: ExtensionContext): void {
 		const node = readNode(ctx.sessionManager.getSessionId());
 		if (node === null) return;
-		const relabel = badgeOverride.length > 0 && node.label !== badgeOverride;
+		const relabel = badgeOverride.length > 0 && node.label !== workNameOf(badgeCode, badgeOverride, "");
 		if (relabel || node.emoji !== badgeEmoji || node.tag !== sessionTag || node.cwd !== ctx.cwd) saveOwnNode(ctx);
 	}
 
@@ -6902,6 +6964,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		draftId = Number.parseInt(sessionTag, 36) + 1;
 		const previous = readSessionRecord(sessionId);
 		badgeOverride = previous?.label ?? "";
+		badgeCode = previous?.code ?? "";
 		if (previous?.standing != null && typeof previous.standing.id === "string") {
 			standingQuestion = {
 				...previous.standing,
