@@ -10960,9 +10960,12 @@ heading("sessions that died without shutting down");
 	const tmuxWhere = join(root, "crash-tmux-where");
 	writeFileSync(tmuxWhere, "work\t3\n");
 	// Only the tmux session `work` survived; any other name has to be created. Its window 2 is taken.
+	// A command named in tmuxFail is refused, as a broken tmux server would.
+	const tmuxFail = join(root, "crash-tmux-fail");
+	writeFileSync(tmuxFail, "");
 	writeFileSync(
 		join(kBin, "tmux"),
-		`#!/bin/sh\necho "$*" >> ${tmuxLog}\ncase "$1" in\n  has-session) [ "$3" = "=work" ] ;;\n  new-session) echo 0 ;;\n  new-window) [ "$4" != "work:2" ] || { echo "create window failed: index 2 in use" >&2; exit 1; } ;;\n  display-message) cat ${tmuxWhere} ;;\n  *) exit 0 ;;\nesac\n`,
+		`#!/bin/sh\necho "$*" >> ${tmuxLog}\n[ "$1" = "$(cat ${tmuxFail})" ] && { echo "$1 refused by test" >&2; exit 1; }\ncase "$1" in\n  has-session) [ "$3" = "=work" ] ;;\n  new-session) echo 0 ;;\n  new-window) [ "$4" != "work:2" ] || { echo "create window failed: index 2 in use" >&2; exit 1; } ;;\n  display-message) cat ${tmuxWhere} ;;\n  *) exit 0 ;;\nesac\n`,
 		{ mode: 0o755 },
 	);
 	const systemState = join(root, "crash-system-state");
@@ -11447,6 +11450,128 @@ heading("sessions that died without shutting down");
 		/was shut down/i.test(cutNote) && /machine restarted/i.test(cutNote) && !/died/i.test(cutNote),
 	);
 
+	// Outside a pane the tab is read from the current client, and a tmux that cannot answer keeps the tab last read.
+	const placedId = "0c2a000f-0000-7000-8000-00000000000f";
+	process.env.TMUX = "/tmp/tmux-crash,1,0";
+	writeFileSync(tmuxWhere, "work\t5\n");
+	writeFileSync(tmuxLog, "");
+	const placed = spawn(placedId, folder("placed"));
+	await placed.fire("session_start");
+	check(
+		"without a pane id the tab is read from the current client",
+		record(placedId).tmuxWindow === 5 &&
+			readFileSync(tmuxLog, "utf8")
+				.split("\n")
+				.some((line) => line.startsWith("display-message -p #{session_name}")),
+	);
+	writeFileSync(tmuxFail, "display-message");
+	writeFileSync(tmuxWhere, "work\t7\n");
+	placed.heartbeat();
+	await settle(100);
+	placed.heartbeat();
+	check(
+		"a tmux that cannot say where the pane is leaves the last known tab",
+		record(placedId).tmuxWindow === 5 && record(placedId).tmux === "work",
+	);
+	writeFileSync(tmuxFail, "");
+	delete process.env.TMUX;
+	await placed.fire("session_shutdown");
+
+	// A session closed by hand that has held updates raises its resume card, never a restore offer.
+	const closedId = "0c2a0013-0000-7000-8000-000000000013";
+	crashed(closedId, { cwd: folder("closed-held"), label: "Closed with news", heartbeat: 0 });
+	const heldDir = join(stateDir, "graph", "pending", closedId);
+	mkdirSync(heldDir, { recursive: true });
+	writeFileSync(
+		join(heldDir, "o-0c2a0099-merged.json"),
+		JSON.stringify({
+			kind: "outcome",
+			at: Date.now(),
+			source: "0c2a0099-0000-7000-8000-000000000099",
+			outcome: "merged",
+			title: "\u{1F9EA} widget fix",
+			place: "widget",
+			edge: "waits-on",
+		}),
+	);
+	// The heartbeat reaps only deaths, so the closed record goes when the next session starts.
+	const cardsBeforeClosed = crashCalls().length;
+	const starter = spawn("0c2a0015-0000-7000-8000-000000000015", folder("starter"));
+	await starter.fire("session_start");
+	await settle(150);
+	first.heartbeat();
+	await settle(150);
+	check(
+		"a session closed by hand with held updates raises its resume card and no restore card",
+		crashCalls().length === cardsBeforeClosed &&
+			!existsSync(join(sessionsDir, `${closedId}.json`)) &&
+			!existsSync(join(crashDir, `${closedId}.json`)) &&
+			called("sendMessage").some((c) =>
+				c.body.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data === `r:${closedId}`),
+			),
+	);
+	await starter.fire("session_shutdown");
+
+	// Sessions that all shut down with the machine, and restores that tmux refuses.
+	const offLostId = "0c2a0011-0000-7000-8000-000000000011";
+	const offWorkId = "0c2a0012-0000-7000-8000-000000000012";
+	crashed(offLostId, {
+		cwd: folder("off-lost"),
+		label: "Off with its tmux gone",
+		tmux: "lost",
+		heartbeat: 0,
+		systemShutdownAt: died,
+	});
+	crashed(offWorkId, {
+		cwd: folder("off-work"),
+		label: "Off in work",
+		tmux: "work",
+		tmuxWindow: 9,
+		heartbeat: 0,
+		systemShutdownAt: died,
+	});
+	const offCards = crashCalls().length;
+	first.heartbeat();
+	await settle(150);
+	first.heartbeat();
+	await settle(150);
+	const offCard = crashCalls().at(-1)?.body;
+	const offCardId = api.nextMessage - 1;
+	check(
+		"a card for sessions that all shut down with the machine names no deaths",
+		crashCalls().length === offCards + 1 &&
+			offCard.text.includes("2 sessions shut down with it.") &&
+			!/died/.test(offCard.text),
+	);
+	writeFileSync(tmuxFail, "new-session");
+	check(
+		"a restore whose tmux session cannot be created says why",
+		(await tap(first, 9511, `kr:${offLostId}`, offCardId)).includes("tmux new-session failed"),
+	);
+	writeFileSync(tmuxFail, "new-window");
+	check(
+		"a restore whose window cannot be opened at its tab or appended says why",
+		(await tap(first, 9512, `kr:${offWorkId}`, offCardId)).includes("tmux new-window failed"),
+	);
+	writeFileSync(tmuxFail, "");
+
+	// An omp that ended unexpectedly while the machine kept running is told exactly that.
+	const lostId = "0c2a0014-0000-7000-8000-000000000014";
+	const lostDir = folder("lost-process");
+	const gone = startProcess(process.execPath, ["-e", ""]);
+	await new Promise((resolve) => gone.on("exit", resolve));
+	crashed(lostId, { cwd: lostDir, label: "Process vanished", state: "working", boot: bootId, pid: gone.pid });
+	first.heartbeat();
+	await settle(150);
+	const lostBack = spawn(lostId, lostDir);
+	await lostBack.fire("session_start");
+	await lostBack.pump(150);
+	const lostNote = lostBack.customs.at(-1)?.message.content ?? "";
+	check(
+		"a session whose omp ended unexpectedly on a running machine is told so",
+		/died without shutting down/i.test(lostNote) && /ended unexpectedly/i.test(lostNote),
+	);
+
 	// A week on, the card's records are gone and a tap says so.
 	jump(8 * 24 * 3_600_000);
 	first.heartbeat();
@@ -11463,7 +11588,8 @@ heading("sessions that died without shutting down");
 		(await tap(first, 9509, `ka:${batch}`, cardId)).includes("no longer"),
 	);
 
-	for (const s of [first, idleBack, workingBack, loudBack, haltedBack, cutBack]) await s.fire("session_shutdown");
+	for (const s of [first, idleBack, workingBack, loudBack, haltedBack, cutBack, lostBack])
+		await s.fire("session_shutdown");
 	rmSync(join(sessionsDir, `${frozenId}.json`), { force: true });
 	process.env.PATH = savedPath;
 }
