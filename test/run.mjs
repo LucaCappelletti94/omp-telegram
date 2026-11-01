@@ -206,6 +206,17 @@ const inboxCount = (id) =>
 	existsSync(inboxOf(id)) ? readdirSync(inboxOf(id)).filter((f) => f.endsWith(".json")).length : 0;
 const sentRecordFile = (id) => JSON.parse(readFileSync(join(root, `notify-telegram/sent/${id}.json`), "utf8"));
 const incomingRecordFile = (id) => JSON.parse(readFileSync(join(root, `notify-telegram/incoming/${id}.json`), "utf8"));
+/** A pid that no longer runs. */
+const deadPid = await new Promise((resolve) => {
+	const child = startProcess(process.execPath, ["-e", ""]);
+	child.on("exit", () => resolve(child.pid));
+});
+/**
+ * Every spawned session shares this process's pid, so a resume after a kill rewrites the record's pid. The
+ * heartbeat stays fresh and only the process is gone, which is what a killed omp leaves behind.
+ */
+const killProcessOf = (id) =>
+	writeFileSync(join(sessionsDir, `${id}.json`), JSON.stringify({ ...record(id), pid: deadPid }));
 
 const spawn = (id, cwd, title = "") => {
 	const handlers = new Map();
@@ -215,6 +226,8 @@ const spawn = (id, cwd, title = "") => {
 	const steers = [];
 	const customs = [];
 	let name = title;
+	// omp moves a session to a continuation id when its file is open in another process.
+	let current = id;
 	const renames = [];
 	let renameFailure = null;
 	const pi = {
@@ -235,7 +248,7 @@ const spawn = (id, cwd, title = "") => {
 		hasUI: false,
 		cwd,
 		// omp reports an unnamed session as undefined, never as an empty string.
-		sessionManager: { getSessionId: () => id, getSessionName: () => (name === "" ? undefined : name) },
+		sessionManager: { getSessionId: () => current, getSessionName: () => (name === "" ? undefined : name) },
 		model: { provider: "openai", id: "gpt-5.6-sol" },
 		ui: { onTerminalInput: () => () => {} },
 		setInterval: (fn) => timers.push(fn) - 1,
@@ -247,7 +260,12 @@ const spawn = (id, cwd, title = "") => {
 	};
 	mod.default(pi);
 	return {
-		id,
+		get id() {
+			return current;
+		},
+		move: (next) => {
+			current = next;
+		},
 		ctx,
 		tools,
 		timers,
@@ -741,7 +759,9 @@ await settle(700);
 check("the heartbeat does not replace a chosen badge", record(patient.id).emoji === "\u{1F40D}");
 check("the chosen badge stays deliberate", record(patient.id).emojiChosen === true);
 
-// A resumed session keeps the emoji its agent picked, and is not asked again.
+// A resumed session keeps the emoji its agent picked, and is not asked again. The resume follows the end
+// of the first process, because omp moves a second process to a continuation id while the first one runs.
+await two.fire("session_shutdown");
 const rebadged = spawn(two.id, "/home/dev/work/diesel");
 const rebadgedAsk = await rebadged
 	.fire("session_start")
@@ -1035,6 +1055,228 @@ const beforeDrop = called("sendMessage").length;
 await one.pump(250);
 check("a reply to an unknown message is refused, not misrouted", called("sendMessage").length === beforeDrop + 1);
 check("the refusal explains what to do", lastCall("sendMessage").body.text.includes("Reply to a message"));
+
+// omp gives a resumed session a continuation id on its first write when another omp process still has the
+// file open, and raises no extension event for it. Until then both processes report the same id.
+heading("a session resumed while another omp holds it");
+{
+	const lockFile = join(root, "notify-telegram/poller.lock");
+	const heldId = "01a03950-0000-0000-0000-000000000000";
+	const holder = spawn(heldId, "/home/dev/work/connetto");
+	await holder.fire("session_start");
+	// The holder has saved a turn since it started, so omp keeps the session file for it.
+	await holder.fire("message_end", { message: { role: "assistant", content: [] } });
+	await holder.fire("session_stop");
+	await settle();
+	const holderMessage = api.nextMessage - 1;
+	const holderTag = record(heldId).tag;
+	const holderEmoji = record(heldId).emoji;
+	const holderBytes = readFileSync(join(sessionsDir, `${heldId}.json`), "utf8");
+
+	const resumed = spawn(heldId, "/home/dev/work/connetto");
+	await resumed.fire("session_start");
+	resumed.heartbeat();
+	await resumed.pump(60);
+	check(
+		"a second instance on a held id leaves the holder's record alone",
+		readFileSync(join(sessionsDir, `${heldId}.json`), "utf8") === holderBytes,
+	);
+	writeFileSync(join(inboxOf(heldId), "3300.json"), JSON.stringify({ kind: "text", value: "for the holder" }));
+	await resumed.pump(120);
+	check(
+		"the waiting instance does not drain the holder's inbox",
+		inboxCount(heldId) === 1 && resumed.steers.length === 0,
+	);
+	await holder.pump(120);
+	check(
+		"the holder still drains its own inbox",
+		holder.steers.some((s) => s.text.includes("for the holder")),
+	);
+
+	rmSync(lockFile, { force: true });
+	holder.heartbeat();
+	const pollsBefore = called("getUpdates").length;
+	await resumed.pump(60);
+	check("the waiting instance does not poll on the holder's lock", called("getUpdates").length === pollsBefore);
+	const waitingSend = await resumed.tools
+		.get("session_message")
+		.execute("sm-wait", { to: record(heldId).tag, text: "hello" }, undefined, undefined, resumed.ctx);
+	check(
+		"a waiting instance refuses to message, since a reply would reach the holder",
+		waitingSend.isError === true && waitingSend.details.sent === false,
+	);
+
+	const continuationId = "01a03951-0000-0000-0000-000000000000";
+	resumed.move(continuationId);
+	await resumed.pump(150);
+	check("the continuation registers under its own id", existsSync(join(sessionsDir, `${continuationId}.json`)));
+	check(
+		"the continuation's tag and badge differ from the holder's",
+		record(continuationId).tag !== holderTag && record(continuationId).emoji !== holderEmoji,
+	);
+	await resumed.fire("session_stop");
+	await settle();
+	const resumedMessage = api.nextMessage - 1;
+	holder.heartbeat();
+	resumed.heartbeat();
+	check(
+		"each instance's record routes only its own messages",
+		record(heldId).recent.includes(holderMessage) &&
+			!record(heldId).recent.includes(resumedMessage) &&
+			record(continuationId).recent.includes(resumedMessage) &&
+			!record(continuationId).recent.includes(holderMessage),
+	);
+	api.queued = [
+		{
+			update_id: 3301,
+			message: {
+				message_id: 3301,
+				date: 1,
+				chat: { id: CHAT },
+				text: "for the continuation",
+				reply_to_message: { message_id: resumedMessage },
+			},
+		},
+	];
+	await holder.pump(250);
+	check("a reply to the continuation's message reaches the continuation", inboxCount(continuationId) === 1);
+	check("and not the holder", inboxCount(heldId) === 0);
+	await resumed.pump(120);
+	check(
+		"the continuation reads it",
+		resumed.steers.some((s) => s.text.includes("for the continuation")),
+	);
+	await resumed.fire("session_shutdown");
+	await holder.fire("session_shutdown");
+
+	// A waiting instance whose holder ends takes the session over as an ordinary resume.
+	const handedId = "01a03952-0000-0000-0000-000000000000";
+	const first = spawn(handedId, "/home/dev/work/connetto");
+	await first.fire("session_start");
+	await first.fire("message_end", { message: { role: "assistant", content: [] } });
+	await first.fire("session_stop");
+	await settle();
+	const firstMessage = api.nextMessage - 1;
+	const firstTag = record(handedId).tag;
+	const second = spawn(handedId, "/home/dev/work/connetto");
+	await second.fire("session_start");
+	await first.fire("session_shutdown");
+	second.heartbeat();
+	await second.pump(150);
+	check(
+		"once the holder ends, the waiting instance adopts its record",
+		record(handedId).heartbeat > 0 &&
+			record(handedId).tag === firstTag &&
+			record(handedId).recent.includes(firstMessage),
+	);
+	await second.fire("session_shutdown");
+
+	// omp keeps the session for the process that saves first and moves the other at its next save. A
+	// waiting instance whose turn saved without a move holds the lease and continues the conversation.
+	const racedId = "01a03955-0000-0000-0000-000000000000";
+	const idle = spawn(racedId, "/home/dev/work/connetto");
+	await idle.fire("session_start");
+	await idle.fire("session_stop");
+	await settle();
+	const idleMessage = api.nextMessage - 1;
+	const racedTag = record(racedId).tag;
+	const active = spawn(racedId, "/home/dev/work/connetto");
+	await active.fire("session_start");
+	await active.fire("message_end", { message: { role: "assistant", content: [] } });
+	idle.heartbeat();
+	await settle();
+	api.queued = [
+		{
+			update_id: 3303,
+			message: {
+				message_id: 3303,
+				date: 1,
+				chat: { id: CHAT },
+				text: "for the lease holder",
+				reply_to_message: { message_id: idleMessage },
+			},
+		},
+	];
+	rmSync(lockFile, { force: true });
+	active.heartbeat();
+	await active.pump(250);
+	await active.pump(120);
+	await idle.pump(120);
+	check(
+		"the instance that saved first takes over the conversation's routing",
+		active.steers.some((s) => s.text.includes("for the lease holder")) &&
+			!idle.steers.some((s) => s.text.includes("for the lease holder")),
+	);
+	check("it keeps the conversation's tag", record(racedId).tag === racedTag);
+	const forkedId = "01a03956-0000-0000-0000-000000000000";
+	idle.move(forkedId);
+	await idle.pump(150);
+	check(
+		"the instance omp moves later registers its continuation without the conversation's routing",
+		record(forkedId).tag !== racedTag && !record(forkedId).recent.includes(idleMessage),
+	);
+	await idle.fire("session_shutdown");
+	await active.fire("session_shutdown");
+
+	// A registered session that omp moves takes its routing to the new id.
+	const leftId = "01a03953-0000-0000-0000-000000000000";
+	const mover = spawn(leftId, "/home/dev/work/connetto");
+	await mover.fire("session_start");
+	await mover.fire("session_stop");
+	await settle();
+	const moverMessage = api.nextMessage - 1;
+	const moverTag = record(leftId).tag;
+	rmSync(lockFile, { force: true });
+	mover.heartbeat();
+	api.queued = [
+		{
+			update_id: 3302,
+			message: {
+				message_id: 3302,
+				date: 1,
+				chat: { id: CHAT },
+				text: "queued before the move",
+				reply_to_message: { message_id: moverMessage },
+			},
+		},
+	];
+	await mover.pump(250);
+	const heldForLeft = join(root, "notify-telegram/graph/pending", leftId);
+	mkdirSync(heldForLeft, { recursive: true });
+	writeFileSync(
+		join(heldForLeft, "o-01a03957-merged.json"),
+		JSON.stringify({
+			kind: "outcome",
+			at: Date.now(),
+			source: "01a03957-0000-0000-0000-000000000000",
+			outcome: "merged",
+			title: "held across the move",
+			place: "widget",
+			edge: "waits-on",
+		}),
+	);
+	const reachedId = "01a03954-0000-0000-0000-000000000000";
+	mover.move(reachedId);
+	await mover.pump(150);
+	check("the left id's record is gone", !existsSync(join(sessionsDir, `${leftId}.json`)));
+	check(
+		"the new record keeps the tag and the routing",
+		record(reachedId).tag === moverTag && record(reachedId).recent.includes(moverMessage),
+	);
+	check(
+		"an entry queued for the left id still arrives",
+		mover.steers.some((s) => s.text.includes("queued before the move")),
+	);
+	check(
+		"an update held for the left id still arrives",
+		mover.customs.some((c) => String(c.message.content).includes("held across the move")),
+	);
+	check("its sent messages belong to the new id", sentRecordFile(moverMessage).session.id === reachedId);
+	check("the reply it received belongs to the new id", incomingRecordFile(3302).session.id === reachedId);
+	await mover.fire("session_shutdown");
+	rmSync(lockFile, { force: true });
+	one.heartbeat();
+}
 
 // ------------------------------------------------- context reaches the terminal
 heading("context reaches both surfaces");
@@ -2435,6 +2677,7 @@ check(
 		typeof tqRecord.standing.head === "string" &&
 		tqRecord.standing.head.includes("Use the second choice?"),
 );
+killProcessOf(tq.id);
 const resumed = spawn(tq.id, "/home/dev/work/sqlitegis");
 await resumed.fire("session_start");
 const standingId = tqRecord.standing.id;
@@ -2454,6 +2697,7 @@ check(
 		resumedRetired.body.text.includes("Chosen:") &&
 		resumedRetired.body.text.includes("D"),
 );
+await resumed.fire("session_shutdown");
 
 // A terminal reply while a choice question stands on Telegram must close it.
 await tq.fire("input");
@@ -2571,6 +2815,7 @@ heading("review-pass fixes");
 // Refresh rr1's record heartbeat so a slow suite run cannot let reapDeadSessions
 // delete it before rrBack's session_start reads the previous record.
 rr1.heartbeat();
+killProcessOf(rr1.id);
 const rrBack = spawn(rr1.id, "/home/dev/work/subql");
 await rrBack.fire("session_start");
 const rrRecord = JSON.parse(readFileSync(join(sessionsDir, `${rr1.id}.json`), "utf8"));
@@ -5534,6 +5779,7 @@ for (const withChoices of [false, true]) {
 	await r1.fire("session_stop");
 	await settle(150);
 	const resumedOffer = record(r1.id).closeOffer;
+	killProcessOf(rs);
 	const r2 = spawn(rs, "/home/dev/work/restart");
 	let shutdowns = 0;
 	r2.ctx.shutdown = () => {
@@ -6963,7 +7209,7 @@ heading("pinned fleet dashboard");
 	// The real gap between rewrites is 30 seconds; 0 lets the suite tick freely and leaves the
 	// text comparison as the only thing standing between the board and the rate limit.
 	writeConfig({ pinnedDashboard: true, dashboardSeconds: 0 });
-	const owner = spawn("01a060c0-0000-0000-0000-000000000000", "/home/dev/work/dash-owner");
+	const owner = spawn("01a060e8-0000-0000-0000-000000000000", "/home/dev/work/dash-owner");
 	await owner.fire("session_start");
 	await owner.fire("input");
 	await owner.tools
@@ -7039,7 +7285,7 @@ heading("pinned fleet dashboard");
 	await owner.fire("agent_end");
 
 	// e. A session that does not hold the lock never touches the board.
-	const bystander = spawn("01a060c1-0000-0000-0000-000000000000", "/home/dev/work/dash-bystander");
+	const bystander = spawn("01a060e9-0000-0000-0000-000000000000", "/home/dev/work/dash-bystander");
 	await bystander.fire("session_start");
 	const untouchedFrom = called("editMessageText").length;
 	await bystander.pump(250);
@@ -9383,7 +9629,7 @@ esac
 	mkdirSync(workK, { recursive: true });
 	writeFileSync(join(workK, "req.md"), "# Problem\nThe parser rejects valid X.\n\n## Failure\nx\n\n## Corrected\ny\n");
 
-	const up = spawn("01a07000-0000-0000-0000-000000000000", workK);
+	const up = spawn("01a070f0-0000-0000-0000-000000000000", workK);
 	await up.fire("session_start");
 
 	const answerLaunch = async (session, choice) => {
@@ -9751,7 +9997,7 @@ esac
 	// h. A session with no Telegram config refuses before anything else.
 	const cfgBackup = readFileSync(join(root, "notify-telegram.json"), "utf8");
 	writeFileSync(join(root, "notify-telegram.json"), "");
-	const noCfg = spawn("01a07001-0000-0000-0000-000000000000", workK);
+	const noCfg = spawn("01a070f1-0000-0000-0000-000000000000", workK);
 	await noCfg.fire("session_start");
 	const noCfgResult = await noCfg.tools
 		.get("upstream_launch")

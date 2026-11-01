@@ -370,6 +370,13 @@ interface Config {
 }
 
 interface SessionRecord {
+	/** Extension instance that writes the record. Two omp processes resumed on one session id differ here. */
+	instance: string;
+	/**
+	 * The writer saved a turn under this id without omp moving it, so its process holds omp's write lease on
+	 * the session and outranks an instance that has not saved since it started.
+	 */
+	leased: boolean;
 	pid: number;
 	tag: string;
 	name: string;
@@ -1682,7 +1689,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	let config: Config | null = null;
 	let sessionTag = "";
+	/** The session id whose record, inbox and pending queue this instance owns while `registered`. */
 	let sessionId = "";
+	/** Owns locks and records. omp can run two processes under one session id until it moves one of them. */
+	const instance = randomUUID();
+	let registered = false;
+	let registering: Promise<void> | null = null;
+	/** The id this process saved a turn under without omp moving it, which proves it holds omp's lease on it. */
+	let leasedId = "";
+	/** Ids this instance left whose inbox, pending queue and message ownership move to the next registration. */
+	const leftIds: string[] = [];
 	let lastLocalInput = Date.now();
 	let pollInFlight = false;
 	let drainInFlight = false;
@@ -2028,9 +2044,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function writeSessionRecord(ctx: ExtensionContext): void {
+		releaseLostId(ctx);
+		if (!registered) return;
 		lastState = sessionState();
 		lastHealth = turnHealth;
 		const record: SessionRecord = {
+			instance,
+			leased: leasedId === sessionId,
 			pid: process.pid,
 			tag: sessionTag,
 			name: ctx.sessionManager.getSessionName() ?? "",
@@ -2108,6 +2128,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const count = (value: unknown): number => (typeof value === "number" ? value : 0);
 		const messageId = (value: unknown): number | null => (typeof value === "number" ? value : null);
 		return {
+			instance: text(raw.instance),
+			leased: raw.leased === true,
 			pid: count(raw.pid),
 			tag: text(raw.tag),
 			name: text(raw.name),
@@ -2311,11 +2333,41 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!claimed.ok) pi.logger.warn("notify-telegram: badge claim still unavailable, this session shows no emoji");
 	}
 
+	/** Whether `pid` still runs. A killed omp whose parent never reaped it is a zombie, which kill(pid, 0) still finds. */
+	function processRuns(pid: number): boolean {
+		if (pid <= 0) return false;
+		try {
+			process.kill(pid, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
+		}
+		// A tmux server that lost the window leaves a zombie behind.
+		try {
+			return !/\) Z /u.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
+		} catch {
+			return true;
+		}
+	}
+
+	/**
+	 * Another live instance writes the record of `id` and outranks this one. omp lets the first process to
+	 * save a session keep it and moves the other on its next save, so a proven lease wins. Between two
+	 * instances that have not saved since they started, the smaller instance id wins, so exactly one yields.
+	 */
+	function heldElsewhere(id: string): boolean {
+		const holder = readSessionRecord(id);
+		if (holder === null || holder.instance === instance) return false;
+		if (Date.now() - holder.heartbeat > LOCK_STALE_MS || !processRuns(holder.pid)) return false;
+		const leased = leasedId === id;
+		return holder.leased === leased ? holder.instance < instance : holder.leased;
+	}
+
 	/** Session id prefixes are timestamps and collide; routing needs a random token. */
 	function claimTag(): string {
 		const taken = new Set(otherLiveRecords().map((record) => record.tag));
-		const previous = readSessionRecord(sessionId)?.tag;
-		if (previous !== undefined && /^[a-z0-9]{5}$/u.test(previous) && !taken.has(previous)) return previous;
+		for (const kept of [readSessionRecord(sessionId)?.tag, sessionTag]) {
+			if (kept !== undefined && /^[a-z0-9]{5}$/u.test(kept) && !taken.has(kept)) return kept;
+		}
 		for (let attempt = 0; attempt < 128; attempt++) {
 			const candidate = Math.random().toString(36).slice(2, 7).padEnd(5, "0");
 			if (!taken.has(candidate)) return candidate;
@@ -2349,20 +2401,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const died = record !== null && record.heartbeat > 0;
 			const restorable = died || (halted && restarted);
 			if (crashesOnly && !restorable) continue;
-			if (died && !restarted && record.pid > 0) {
-				let running = true;
-				try {
-					process.kill(record.pid, 0);
-				} catch (error) {
-					running = (error as NodeJS.ErrnoException).code === "EPERM";
-				}
-				// A killed omp whose parent never reaped it is a zombie, which kill(pid, 0) still finds.
-				// A tmux server that lost the window leaves one behind.
-				try {
-					if (running) running = !/\) Z /u.test(readFileSync(`/proc/${record.pid}/stat`, "utf8"));
-				} catch {}
-				if (running) continue;
-			}
+			if (died && !restarted && processRuns(record.pid)) continue;
 			mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
 			const closing = reactionRouteClosingFile(id);
 			try {
@@ -2402,6 +2441,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	let lastReap = 0;
+
+	/** Removes `name` under `dir` only when it resolves inside the private state directory, since session ids name it. */
+	function removeStatePath(dir: string, name: string): void {
+		const path = resolve(dir, name);
+		if (path.startsWith(`${resolve(STATE_DIR)}${sep}`)) rmSync(path, { recursive: true, force: true });
+	}
 
 	/** Downloaded files are working input, and sent messages are grading records. Neither is an archive. */
 	function reapOldFiles(): void {
@@ -3270,22 +3315,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await attemptUnpin(config, name);
 	}
 
-	/** One poller only, or Telegram 409s. Atomic `wx` create; ownership re-read, never cached. */
-	function readLock(file: string = LOCK_FILE): { sessionId: string; pid: number; heartbeat: number } | null {
+	/**
+	 * One poller only, or Telegram 409s. Atomic `wx` create; ownership re-read, never cached. The owner is the
+	 * extension instance, because two omp processes can report one session id.
+	 */
+	function readLock(file: string = LOCK_FILE): { instance: string; heartbeat: number } | null {
 		if (!existsSync(file)) return null;
 		try {
 			const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
 			if (parsed === null || typeof parsed !== "object") return null;
-			const raw = parsed as { sessionId?: unknown; pid?: unknown; heartbeat?: unknown };
-			if (typeof raw.sessionId !== "string" || typeof raw.heartbeat !== "number") return null;
-			return { sessionId: raw.sessionId, pid: typeof raw.pid === "number" ? raw.pid : 0, heartbeat: raw.heartbeat };
+			const raw = parsed as { instance?: unknown; heartbeat?: unknown };
+			if (typeof raw.heartbeat !== "number") return null;
+			return { instance: typeof raw.instance === "string" ? raw.instance : "", heartbeat: raw.heartbeat };
 		} catch {
 			return null;
 		}
 	}
 
 	function acquireLock(file: string = LOCK_FILE): boolean {
-		const mine = JSON.stringify({ sessionId, pid: process.pid, heartbeat: Date.now() });
+		const mine = JSON.stringify({ instance, sessionId, pid: process.pid, heartbeat: Date.now() });
 		try {
 			writeFileSync(file, mine, { flag: "wx" });
 		} catch {
@@ -3300,16 +3348,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				return false;
 			}
 		}
-		return readLock(file)?.sessionId === sessionId;
+		return ownsLock(file);
 	}
 
 	function ownsLock(file: string = LOCK_FILE): boolean {
-		return readLock(file)?.sessionId === sessionId;
+		return readLock(file)?.instance === instance;
 	}
 
 	function refreshLock(file: string = LOCK_FILE): void {
 		if (!ownsLock(file)) return;
-		writeFileAtomic(file, JSON.stringify({ sessionId, pid: process.pid, heartbeat: Date.now() }));
+		writeFileAtomic(file, JSON.stringify({ instance, sessionId, pid: process.pid, heartbeat: Date.now() }));
 	}
 
 	function releaseLock(file: string = LOCK_FILE): void {
@@ -4552,6 +4600,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	async function closeReactionRouteForShutdown(): Promise<number> {
+		// A waiting instance never opened the route of the id it reports, which belongs to the holder.
+		if (!registered) return 0;
 		mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
 		const closing = reactionRouteClosingFile(sessionId);
 		writeFileSync(closing, randomUUID(), { flag: "wx", mode: 0o600 });
@@ -4613,7 +4663,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** Sequential: two taps in one poll batch must see each other's state. */
 	async function drainInbox(): Promise<void> {
-		if (drainInFlight || closing) return;
+		if (!registered || drainInFlight || closing) return;
 		drainInFlight = true;
 		try {
 			const dir = join(INBOX_DIR, sessionId);
@@ -5351,7 +5401,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** Writes this session's node, the only file this session writes in `nodes/`, refreshing its identity. */
 	function saveOwnNode(ctx: ExtensionContext, change: (node: LedgerNode) => void = () => {}): LedgerNode {
-		const id = ctx.sessionManager.getSessionId();
+		const id = sessionId;
 		const now = Date.now();
 		const node: LedgerNode = readNode(id) ?? {
 			session: id,
@@ -5377,7 +5427,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function syncOwnNode(ctx: ExtensionContext): void {
-		const node = readNode(ctx.sessionManager.getSessionId());
+		if (!registered) return;
+		const node = readNode(sessionId);
 		if (node === null) return;
 		const relabel = badgeOverride.length > 0 && node.label !== workNameOf(badgeCode, badgeOverride, "");
 		if (relabel || node.emoji !== badgeEmoji || node.tag !== sessionTag || node.cwd !== ctx.cwd) saveOwnNode(ctx);
@@ -5484,7 +5535,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** Delivers what was held for this session, in the order it happened. */
 	function drainPending(): void {
-		if (sessionCtx === null || !sessionAlive) return;
+		if (sessionCtx === null || !sessionAlive || !registered) return;
 		if (crashNote !== null) {
 			const content = crashNote;
 			crashNote = null;
@@ -5494,7 +5545,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				{ deliverAs: "aside", triggerTurn: true },
 			);
 		}
-		const id = sessionCtx.sessionManager.getSessionId();
+		const id = sessionId;
 		if (!existsSync(join(PENDING_DIR, id))) return;
 		const { items, bad } = listPending(id);
 		for (const file of bad) {
@@ -6050,7 +6101,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const file = join(LAUNCHES_DIR, `${id}.json`);
 		const launch = parseLaunch(readJsonFile(file));
 		if (launch === null) return;
-		const self = ctx.sessionManager.getSessionId();
+		const self = sessionId;
 		saveOwnNode(ctx, (node) => {
 			node.label = clip(launch.problem, 80);
 			node.repo = launch.repo;
@@ -6096,7 +6147,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					"The dependency graph rides the omp-telegram session registry, which starts only once the bot is paired with `node setup.mjs`.",
 				);
 			}
-			const self = ctx.sessionManager.getSessionId();
+			const self = sessionId;
 			const action = arg("action").length > 0 ? arg("action") : "show";
 			const { nodes, prs } = graphSnapshot();
 			const byId = new Map(nodes.map((node) => [node.session, node]));
@@ -6263,6 +6314,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
+			await followSession(ctx);
+			if (!registered) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: "Another omp process holds this session's id until this session saves a turn, so a reply would reach that process instead. Try again after this turn.",
+						},
+					],
+					details: { sent: false },
+					isError: true,
+				};
+			}
 			const p = params as { to?: unknown; text?: unknown; reply_to?: unknown };
 			const to = typeof p.to === "string" ? p.to.trim() : "";
 			const text = typeof p.text === "string" ? p.text.trim() : "";
@@ -6299,7 +6363,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					},
 				};
 			}
-			const self = ctx.sessionManager.getSessionId();
+			const self = sessionId;
 			const ownId = to.length >= 8 && self.startsWith(to.toLowerCase());
 			if ((badgeEmoji.length > 0 && to === badgeEmoji) || to === sessionTag || ownId) {
 				return refuse(`${to} is this session's own address. ${peers}`);
@@ -6934,7 +6998,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				};
 			}
 
-			const outcome = await performUpstreamLaunch(args, ctx.sessionManager.getSessionId());
+			const outcome = await performUpstreamLaunch(args, sessionId);
 			if (!outcome.ok) return fail(outcome.error);
 			saveOwnNode(ctx);
 			const where = {
@@ -6977,88 +7041,24 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 		sessionCtx = ctx;
-		sessionId = ctx.sessionManager.getSessionId();
 		mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
 		try {
 			// mkdir applies the mode only at creation; a dir inherited from an older version stays loose otherwise.
 			chmodSync(STATE_DIR, 0o700);
 		} catch {}
 		mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
-		resetReactionRouteForStartup(sessionId);
 		sessionAlive = true;
 		systemShutdownAt = 0;
-		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true, mode: 0o700 });
-		reapDeadSessions(false);
-		// A session restored after a crash takes back the record the reaper set aside, tag and open
-		// questions included, so everything below reads it as an ordinary resume.
-		const crash = readSessionRecord(sessionId) === null ? readCrash(sessionId) : null;
-		const marker = readJsonFile(join(CRASH_DIR, `${sessionId}.restored`)) as { batch?: unknown } | null;
-		if (crash !== null && marker?.batch !== crash.batch) {
-			const adopted: SessionRecord = { ...crash.record, pid: process.pid, heartbeat: Date.now(), systemShutdownAt: 0 };
-			writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(adopted), 0o600);
-			writePrivateJson(CRASH_DIR, `${sessionId}.restored`, { batch: crash.batch });
-			const { state, heartbeat, systemShutdownAt: shutAt } = crash.record;
-			if (state.length > 0 && state !== "idle") {
-				const when = new Date(Math.max(heartbeat, shutAt)).toLocaleString("sv-SE");
-				crashNote = [
-					shutAt > 0
-						? `This session was shut down around ${when}, because the machine restarted.`
-						: `This session died without shutting down around ${when}, because ${crash.machine ? "the machine restarted" : "its omp process ended unexpectedly"}.`,
-					`It was ${state} at that moment, so that turn was cut off and any command it was running was killed. It has just been restored from its saved transcript, and the user has not yet said whether to go on.`,
-					"No user message has arrived since it ended, and the last one in this transcript predates that, so it is no instruction to go on.",
-					"In this turn, do not continue, retry or redo any of the work, not even a command that was cut off. Only look at what tells where the work stands.",
-					"If work remains, call notify_status with urgency orange, a brief summary of where the work stands, and options that include continuing it, then end the turn with one sentence saying you are waiting for the answer.",
-					"If no work remains, end the turn with one sentence saying so, without calling notify_status, and nothing reaches Telegram.",
-				].join(" ");
-			}
+		await followSession(ctx);
+		if (!registered) {
+			pi.logger.info("notify-telegram: another omp process holds this session, waiting until one of them saves", {
+				sessionId,
+			});
 		}
-		reapOldFiles();
-		sessionTag = claimTag();
-		// Base-36 tag as a number: stable across resumes, unique across live sessions.
-		draftId = Number.parseInt(sessionTag, 36) + 1;
-		const previous = readSessionRecord(sessionId);
-		badgeOverride = previous?.label ?? "";
-		badgeCode = previous?.code ?? "";
-		if (previous?.standing != null && typeof previous.standing.id === "string") {
-			standingQuestion = {
-				...previous.standing,
-				head: typeof previous.standing.head === "string" ? previous.standing.head : "",
-			};
-		}
-		if (Array.isArray(previous?.recent)) {
-			recentMessages.push(...previous.recent.filter((n): n is number => typeof n === "number"));
-		}
-		lastNotifiedAt = typeof previous?.lastNotified === "number" ? previous.lastNotified : 0;
-		pinnedMessageId = typeof previous?.pinned === "number" ? previous.pinned : null;
-		pinPendingUntil = previous?.pinPendingUntil ?? 0;
-		closeOfferMessageId = typeof previous?.closeOffer === "number" ? previous.closeOffer : null;
-		replyQuestionMessageId = previous?.replyQuestion ?? null;
 		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
 			rmSync(LOCK_FILE, { recursive: true, force: true });
 		}
 		rmSync(LEGACY_LOCK_DIR, { recursive: true, force: true });
-		// The badge is claimed and persisted under one claim, so a session starting at the same moment
-		// cannot validate the same free emoji before this record exists.
-		const claimed = await withBadgeClaim(
-			() => {
-				const taken = new Set(badgesInUse().keys());
-				const keeps = previous !== null && previous.emoji.length > 0 && !taken.has(previous.emoji);
-				badgeEmoji = keeps ? previous.emoji : freeBadge(taken);
-				badgeChosen = keeps && previous.emojiChosen;
-				writeSessionRecord(ctx);
-			},
-			() => {
-				// Nothing about the badge survives outside the claim: a duplicate emoji defeats the point
-				// of having one, so the session starts badge-less and the heartbeat keeps trying. The
-				// record itself has to exist regardless, because routing a reply reads it.
-				badgeEmoji = "";
-				badgeChosen = false;
-				writeSessionRecord(ctx);
-			},
-		);
-		if (!claimed.ok) {
-			pi.logger.warn("notify-telegram: badge claim unavailable at startup, retrying on the heartbeat");
-		}
 		acquireLock();
 
 		detach(
@@ -7092,8 +7092,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		ctx.setInterval(() => {
 			try {
 				reloadConfig();
+				detach(followSession(ctx), "session follow");
 				writeSessionRecord(ctx);
-				if (badgeEmoji.length === 0) detach(claimBadgeIfMissing(ctx), "badge claim");
+				if (registered && badgeEmoji.length === 0) detach(claimBadgeIfMissing(ctx), "badge claim");
 				detach(readTmuxPlace(), "tmux place");
 				reapOldFiles();
 				reapHeldMessages();
@@ -7115,6 +7116,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 		ctx.setInterval(() => {
 			try {
+				detach(followSession(ctx), "session follow");
 				detach(drainInbox(), "inbox drain");
 				drainPending();
 				maybeType();
@@ -7130,12 +7132,177 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}, DRAIN_MS);
 
 		await readTmuxPlace();
-		claimLaunch(ctx);
+		if (registered) claimLaunch(ctx);
 		syncOwnNode(ctx);
 
 		writeSessionRecord(ctx);
 		detach(retryPendingUnpins(), "startup pin cleanup");
 	});
+
+	/**
+	 * Stops writing the record of an id this instance no longer owns. When omp moved it off the id, its own
+	 * record goes and what it routed follows it to the next registration. When a lease holder took the id over,
+	 * the record and everything it routes belong to that instance, which continues the same conversation.
+	 */
+	function releaseLostId(ctx: ExtensionContext): void {
+		if (!registered) return;
+		const live = ctx.sessionManager.getSessionId();
+		if (live !== sessionId) {
+			registered = false;
+			if (readSessionRecord(sessionId)?.instance === instance) {
+				removeStatePath(SESSIONS_DIR, `${sessionId}.json`);
+				leftIds.push(sessionId);
+			}
+			sessionId = live;
+			return;
+		}
+		if (!heldElsewhere(sessionId)) return;
+		registered = false;
+		recentMessages.length = 0;
+		lastNotifiedAt = 0;
+		standingQuestion = null;
+		pinnedMessageId = null;
+		pinPendingUntil = 0;
+		closeOfferMessageId = null;
+		replyQuestionMessageId = null;
+	}
+
+	/**
+	 * omp moves a resumed session to a continuation id on the first save while another omp process holds the
+	 * file, and raises no extension event for it. Until then both processes report one id, so the instance
+	 * that does not own the record waits instead of writing it, and the id is polled.
+	 */
+	async function followSession(ctx: ExtensionContext): Promise<void> {
+		releaseLostId(ctx);
+		if (registered) return;
+		// Cleared through `finally`, which runs after this assignment even when the pass never awaits.
+		registering ??= (async () => {
+			sessionId = ctx.sessionManager.getSessionId();
+			if (!heldElsewhere(sessionId)) await register(ctx);
+		})().finally(() => {
+			registering = null;
+		});
+		await registering;
+	}
+
+	/**
+	 * Takes the record at `sessionId`, which a crash, a previous run or an outranked holder left. Its fields win
+	 * over what this instance carries from an id it left, and an absent record leaves the carried state.
+	 */
+	async function register(ctx: ExtensionContext): Promise<void> {
+		resetReactionRouteForStartup(sessionId);
+		const inbox = resolve(INBOX_DIR, sessionId);
+		if (inbox.startsWith(`${resolve(STATE_DIR)}${sep}`)) mkdirSync(inbox, { recursive: true, mode: 0o700 });
+		reapDeadSessions(false);
+		// A session restored after a crash takes back the record the reaper set aside, tag and open
+		// questions included, so everything below reads it as an ordinary resume.
+		const crash = readSessionRecord(sessionId) === null ? readCrash(sessionId) : null;
+		const marker = readJsonFile(join(CRASH_DIR, `${sessionId}.restored`)) as { batch?: unknown } | null;
+		if (crash !== null && marker?.batch !== crash.batch) {
+			const adopted: SessionRecord = {
+				...crash.record,
+				instance,
+				leased: false,
+				pid: process.pid,
+				heartbeat: Date.now(),
+				systemShutdownAt: 0,
+			};
+			writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(adopted), 0o600);
+			writePrivateJson(CRASH_DIR, `${sessionId}.restored`, { batch: crash.batch });
+			const { state, heartbeat, systemShutdownAt: shutAt } = crash.record;
+			if (state.length > 0 && state !== "idle") {
+				const when = new Date(Math.max(heartbeat, shutAt)).toLocaleString("sv-SE");
+				crashNote = [
+					shutAt > 0
+						? `This session was shut down around ${when}, because the machine restarted.`
+						: `This session died without shutting down around ${when}, because ${crash.machine ? "the machine restarted" : "its omp process ended unexpectedly"}.`,
+					`It was ${state} at that moment, so that turn was cut off and any command it was running was killed. It has just been restored from its saved transcript, and the user has not yet said whether to go on.`,
+					"No user message has arrived since it ended, and the last one in this transcript predates that, so it is no instruction to go on.",
+					"In this turn, do not continue, retry or redo any of the work, not even a command that was cut off. Only look at what tells where the work stands.",
+					"If work remains, call notify_status with urgency orange, a brief summary of where the work stands, and options that include continuing it, then end the turn with one sentence saying you are waiting for the answer.",
+					"If no work remains, end the turn with one sentence saying so, without calling notify_status, and nothing reaches Telegram.",
+				].join(" ");
+			}
+		}
+		reapOldFiles();
+		sessionTag = claimTag();
+		// Base-36 tag as a number: stable across resumes, unique across live sessions.
+		draftId = Number.parseInt(sessionTag, 36) + 1;
+		const previous = readSessionRecord(sessionId);
+		if (previous !== null) {
+			badgeOverride = previous.label;
+			badgeCode = previous.code;
+			standingQuestion =
+				previous.standing !== null && typeof previous.standing.id === "string"
+					? { ...previous.standing, head: typeof previous.standing.head === "string" ? previous.standing.head : "" }
+					: null;
+			for (const id of previous.recent) if (!recentMessages.includes(id)) recentMessages.push(id);
+			lastNotifiedAt = Math.max(lastNotifiedAt, previous.lastNotified);
+			pinnedMessageId = previous.pinned;
+			pinPendingUntil = previous.pinPendingUntil;
+			closeOfferMessageId = previous.closeOffer;
+			replyQuestionMessageId = previous.replyQuestion;
+		}
+		const left = new Set(leftIds.splice(0));
+		left.delete(sessionId);
+		// Queued replies, held agent messages, and the sent and received messages a left id may still list, edit
+		// or clear all belong to this conversation.
+		for (const id of left) {
+			for (const name of listJson(join(INBOX_DIR, id))) {
+				const entry = readJsonFile(join(INBOX_DIR, id, name));
+				if (entry !== null) writePrivateJson(join(INBOX_DIR, sessionId), name, entry);
+			}
+			removeStatePath(INBOX_DIR, id);
+			for (const name of listJson(join(PENDING_DIR, id))) {
+				if (name === "card.json" || name === "resuming.json") continue;
+				const item = readJsonFile(join(PENDING_DIR, id, name));
+				if (item !== null) writePrivateJson(join(PENDING_DIR, sessionId), name, item);
+			}
+			removeStatePath(PENDING_DIR, id);
+			removeStatePath(REACTION_ROUTE_LOCK_DIR, `${id}.lock`);
+		}
+		if (left.size > 0) {
+			for (const name of listJson(SENT_DIR)) {
+				const sent = readSentRecord(Number(name.slice(0, -5)));
+				if (sent !== null && left.has(sent.session.id)) {
+					writePrivateJson(SENT_DIR, name, { ...sent, session: { ...sent.session, id: sessionId } });
+				}
+			}
+			for (const name of listJson(INCOMING_DIR)) {
+				const received = parseIncomingRecord(readJsonFile(join(INCOMING_DIR, name)), Number(name.slice(0, -5)));
+				if (received !== null && left.has(received.session.id)) {
+					writePrivateJson(INCOMING_DIR, name, { ...received, session: { id: sessionId } });
+				}
+			}
+		}
+		registered = true;
+		// The badge is claimed and persisted under one claim, so a session starting at the same moment
+		// cannot validate the same free emoji before this record exists.
+		const claimed = await withBadgeClaim(
+			() => {
+				const taken = new Set(badgesInUse().keys());
+				if (previous !== null && previous.emoji.length > 0 && !taken.has(previous.emoji)) {
+					badgeEmoji = previous.emoji;
+					badgeChosen = previous.emojiChosen;
+				} else if (badgeEmoji.length === 0 || taken.has(badgeEmoji)) {
+					badgeEmoji = freeBadge(taken);
+					badgeChosen = false;
+				}
+				writeSessionRecord(ctx);
+			},
+			() => {
+				// Nothing about the badge survives outside the claim: a duplicate emoji defeats the point
+				// of having one, so the session starts badge-less and the heartbeat keeps trying. The
+				// record itself has to exist regardless, because routing a reply reads it.
+				badgeEmoji = "";
+				badgeChosen = false;
+				writeSessionRecord(ctx);
+			},
+		);
+		if (!claimed.ok) {
+			pi.logger.warn("notify-telegram: badge claim unavailable at startup, retrying on the heartbeat");
+		}
+	}
 
 	pi.on("input", async (_event, ctx) => {
 		turnSummary = null;
@@ -7158,6 +7325,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	// The agent loop is the only truthful "working" signal: `input` also fires for
 	// submissions that never start a turn, which left the typing status stuck on.
 	pi.on("agent_start", async (_event, ctx) => {
+		if (sessionCtx !== null) await followSession(ctx);
 		turnActive = true;
 		statusBlockUsed = false;
 		detach(unpinRed(ctx), "new-work unpin");
@@ -7258,10 +7426,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		draftDirty = true;
 	}
 
-	pi.on("message_end", async (event) => {
+	pi.on("message_end", async (event, ctx) => {
 		const message: unknown = event.message;
 		if (message === null || typeof message !== "object") return;
 		if (!("role" in message) || message.role !== "assistant") return;
+		if (sessionCtx !== null) {
+			// The user's message was saved before the model answered it, and omp moves a process that does not
+			// hold the session's lease on that save, so the id still reported here is this process's own.
+			leasedId = ctx.sessionManager.getSessionId();
+			await followSession(ctx);
+		}
 		if (!("usage" in message)) return;
 		const usage: unknown = message.usage;
 		if (usage === null || typeof usage !== "object") return;
@@ -7293,7 +7467,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		recorded.cost += cost;
 	});
 
-	pi.on("tool_execution_start", async (event) => {
+	pi.on("tool_execution_start", async (event, ctx) => {
+		if (sessionCtx !== null) await followSession(ctx);
 		turnTools += 1;
 		const intent = typeof event.intent === "string" && event.intent.length > 0 ? `: ${event.intent}` : "";
 		currentTool = clip(`${typeof event.toolName === "string" ? event.toolName : "tool"}${intent}`, 80);
