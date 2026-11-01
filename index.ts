@@ -7191,7 +7191,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 */
 	async function register(ctx: ExtensionContext): Promise<void> {
 		resetReactionRouteForStartup(sessionId);
-		mkdirSync(join(INBOX_DIR, sessionId), { recursive: true, mode: 0o700 });
+		const inbox = resolve(INBOX_DIR, sessionId);
+		if (inbox.startsWith(`${resolve(STATE_DIR)}${sep}`)) mkdirSync(inbox, { recursive: true, mode: 0o700 });
 		reapDeadSessions(false);
 		// A session restored after a crash takes back the record the reaper set aside, tag and open
 		// questions included, so everything below reads it as an ordinary resume.
