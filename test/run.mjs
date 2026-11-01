@@ -1146,6 +1146,71 @@ heading("a session resumed while another omp holds it");
 		"the continuation reads it",
 		resumed.steers.some((s) => s.text.includes("for the continuation")),
 	);
+	// A card the holder sends is answered by the holder, whichever of the two drains first.
+	const heldAskState = {};
+	const heldAsk = holder.tools
+		.get("ask")
+		.execute("held-ask", singleQuestion, undefined, undefined, stubbornCtx(holder.ctx, heldAskState));
+	await settle(150);
+	const heldPick = lastCall("sendMessage")
+		.body.reply_markup.inline_keyboard.flat()
+		.find((b) => b.text.startsWith("Postgres")).callback_data;
+	const closedNotices = () =>
+		called("sendMessage").filter((c) => String(c.body.text).includes("That question is closed")).length;
+	const closedBefore = closedNotices();
+	api.queued = [
+		{
+			update_id: 3302,
+			callback_query: {
+				id: "cb-held",
+				data: heldPick,
+				from: { id: CHAT },
+				message: { message_id: api.nextMessage - 1, chat: { id: CHAT } },
+			},
+		},
+	];
+	await holder.pump(250);
+	await resumed.pump(120);
+	await holder.pump(150);
+	const heldAnswer = await Promise.race([heldAsk, settle(500).then(() => null)]);
+	check(
+		"a press on the holder's card reaches the holder, not the continuation",
+		heldAnswer?.details.selectedOptions[0] === "Postgres",
+	);
+	await holder.tools
+		.get("notify_status")
+		.execute(
+			"held-choice",
+			{ summary: "Pick one.", urgency: "orange", options: opts("Go", "Wait") },
+			undefined,
+			undefined,
+			holder.ctx,
+		);
+	await holder.fire("session_stop");
+	await settle();
+	const heldGo = lastCall("sendMessage")
+		.body.reply_markup.inline_keyboard.flat()
+		.find((b) => b.text.startsWith("Go")).callback_data;
+	const holderSteers = holder.steers.length;
+	api.queued = [
+		{
+			update_id: 3304,
+			callback_query: {
+				id: "cb-held-choice",
+				data: heldGo,
+				from: { id: CHAT },
+				message: { message_id: api.nextMessage - 1, chat: { id: CHAT } },
+			},
+		},
+	];
+	await holder.pump(250);
+	await resumed.pump(120);
+	await holder.pump(150);
+	check(
+		"a press on the holder's turn-end choice reaches the holder",
+		holder.steers.slice(holderSteers).some((s) => s.text === "Go") && !resumed.steers.some((s) => s.text === "Go"),
+	);
+	check("neither press is answered as a closed question", closedNotices() === closedBefore);
 	await resumed.fire("session_shutdown");
 	await holder.fire("session_shutdown");
 
