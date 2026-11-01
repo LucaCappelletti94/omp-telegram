@@ -2442,6 +2442,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	let lastReap = 0;
 
+	/** Removes `name` under `dir` only when it resolves inside the private state directory, since session ids name it. */
+	function removeStatePath(dir: string, name: string): void {
+		const path = resolve(dir, name);
+		if (path.startsWith(`${resolve(STATE_DIR)}${sep}`)) rmSync(path, { recursive: true, force: true });
+	}
+
 	/** Downloaded files are working input, and sent messages are grading records. Neither is an archive. */
 	function reapOldFiles(): void {
 		if (Date.now() - lastReap < 3_600_000) return;
@@ -7023,6 +7029,116 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.on("session_start", async (_event, ctx) => {
+		config = loadConfig();
+		if (config === null && existsSync(CONFIG_PATH)) {
+			// The file exists but did not parse, which is what a write race looks like. One retry.
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			config = loadConfig();
+		}
+		if (config === null) {
+			pi.logger.debug("notify-telegram disabled: no usable config at ~/.omp/agent/notify-telegram.json");
+			return;
+		}
+		sessionCtx = ctx;
+		mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+		try {
+			// mkdir applies the mode only at creation; a dir inherited from an older version stays loose otherwise.
+			chmodSync(STATE_DIR, 0o700);
+		} catch {}
+		mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
+		sessionAlive = true;
+		systemShutdownAt = 0;
+		await followSession(ctx);
+		if (!registered) {
+			pi.logger.info("notify-telegram: another omp process holds this session, waiting until one of them saves", {
+				sessionId,
+			});
+		}
+		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
+			rmSync(LOCK_FILE, { recursive: true, force: true });
+		}
+		rmSync(LEGACY_LOCK_DIR, { recursive: true, force: true });
+		acquireLock();
+
+		detach(
+			callTelegram(
+				config,
+				"setMyCommands",
+				{
+					commands: [
+						{ command: "status", description: "Show what each session is doing" },
+						{ command: "fleet", description: "List every tmux omp window and its state" },
+						{ command: "hidequestions", description: "Hide open question buttons" },
+						{ command: "stop", description: "Abort the running turn, reply to pick the session" },
+						{ command: "deps", description: "Draw the dependencies between sessions" },
+						{ command: "resume", description: "Resume an ended session that has updates waiting" },
+					],
+				},
+				15_000,
+			),
+			"command menu",
+		);
+		detach(callTelegram(config, "setChatMenuButton", { menu_button: { type: "commands" } }, 15_000), "menu button");
+
+		if (ctx.hasUI) {
+			unsubscribeInput = ctx.ui.onTerminalInput(() => {
+				lastLocalInput = Date.now();
+				return undefined;
+			});
+		}
+
+		// Timers before any network call: a failed start must still receive.
+		ctx.setInterval(() => {
+			try {
+				reloadConfig();
+				detach(followSession(ctx), "session follow");
+				writeSessionRecord(ctx);
+				if (registered && badgeEmoji.length === 0) detach(claimBadgeIfMissing(ctx), "badge claim");
+				detach(readTmuxPlace(), "tmux place");
+				reapOldFiles();
+				reapHeldMessages();
+				if (ownsLock()) refreshLock();
+				else acquireLock();
+				syncOwnNode(ctx);
+				if (ownsLock()) {
+					graphTick();
+					reapDeadSessions(true);
+					detach(retryPendingUnpins(), "pending pin cleanup");
+					detach(renderCrashCards(), "crash cards");
+				}
+			} catch (error) {
+				pi.logger.warn("notify-telegram: heartbeat failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}, HEARTBEAT_MS);
+
+		ctx.setInterval(() => {
+			try {
+				detach(followSession(ctx), "session follow");
+				detach(drainInbox(), "inbox drain");
+				drainPending();
+				maybeType();
+				maybeDraft();
+				maybeDashboard();
+				// Re-read rather than trusting a boolean: two pollers caused 918 Telegram conflicts.
+				if (ownsLock()) detach(pollOnce(), "telegram poll");
+			} catch (error) {
+				pi.logger.warn("notify-telegram: drain failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}, DRAIN_MS);
+
+		await readTmuxPlace();
+		if (registered) claimLaunch(ctx);
+		syncOwnNode(ctx);
+
+		writeSessionRecord(ctx);
+		detach(retryPendingUnpins(), "startup pin cleanup");
+	});
+
 	/**
 	 * Stops writing the record of an id this instance no longer owns. When omp moved it off the id, its own
 	 * record goes and what it routed follows it to the next registration. When a lease holder took the id over,
@@ -7034,7 +7150,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (live !== sessionId) {
 			registered = false;
 			if (readSessionRecord(sessionId)?.instance === instance) {
-				rmSync(join(SESSIONS_DIR, `${sessionId}.json`), { force: true });
+				removeStatePath(SESSIONS_DIR, `${sessionId}.json`);
 				leftIds.push(sessionId);
 			}
 			sessionId = live;
@@ -7135,14 +7251,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const entry = readJsonFile(join(INBOX_DIR, id, name));
 				if (entry !== null) writePrivateJson(join(INBOX_DIR, sessionId), name, entry);
 			}
-			rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
+			removeStatePath(INBOX_DIR, id);
 			for (const name of listJson(join(PENDING_DIR, id))) {
 				if (name === "card.json" || name === "resuming.json") continue;
 				const item = readJsonFile(join(PENDING_DIR, id, name));
 				if (item !== null) writePrivateJson(join(PENDING_DIR, sessionId), name, item);
 			}
-			rmSync(join(PENDING_DIR, id), { recursive: true, force: true });
-			rmSync(reactionRouteLockFile(id), { force: true });
+			removeStatePath(PENDING_DIR, id);
+			removeStatePath(REACTION_ROUTE_LOCK_DIR, `${id}.lock`);
 		}
 		if (left.size > 0) {
 			for (const name of listJson(SENT_DIR)) {
@@ -7186,116 +7302,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pi.logger.warn("notify-telegram: badge claim unavailable at startup, retrying on the heartbeat");
 		}
 	}
-
-	pi.on("session_start", async (_event, ctx) => {
-		config = loadConfig();
-		if (config === null && existsSync(CONFIG_PATH)) {
-			// The file exists but did not parse, which is what a write race looks like. One retry.
-			await new Promise((resolve) => setTimeout(resolve, 300));
-			config = loadConfig();
-		}
-		if (config === null) {
-			pi.logger.debug("notify-telegram disabled: no usable config at ~/.omp/agent/notify-telegram.json");
-			return;
-		}
-		sessionCtx = ctx;
-		mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-		try {
-			// mkdir applies the mode only at creation; a dir inherited from an older version stays loose otherwise.
-			chmodSync(STATE_DIR, 0o700);
-		} catch {}
-		mkdirSync(SESSIONS_DIR, { recursive: true, mode: 0o700 });
-		sessionAlive = true;
-		systemShutdownAt = 0;
-		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
-			rmSync(LOCK_FILE, { recursive: true, force: true });
-		}
-		rmSync(LEGACY_LOCK_DIR, { recursive: true, force: true });
-		await followSession(ctx);
-		if (!registered) {
-			pi.logger.info("notify-telegram: another omp process holds this session, waiting until one of them saves", {
-				sessionId,
-			});
-		}
-		acquireLock();
-
-		detach(
-			callTelegram(
-				config,
-				"setMyCommands",
-				{
-					commands: [
-						{ command: "status", description: "Show what each session is doing" },
-						{ command: "fleet", description: "List every tmux omp window and its state" },
-						{ command: "hidequestions", description: "Hide open question buttons" },
-						{ command: "stop", description: "Abort the running turn, reply to pick the session" },
-						{ command: "deps", description: "Draw the dependencies between sessions" },
-						{ command: "resume", description: "Resume an ended session that has updates waiting" },
-					],
-				},
-				15_000,
-			),
-			"command menu",
-		);
-		detach(callTelegram(config, "setChatMenuButton", { menu_button: { type: "commands" } }, 15_000), "menu button");
-
-		if (ctx.hasUI) {
-			unsubscribeInput = ctx.ui.onTerminalInput(() => {
-				lastLocalInput = Date.now();
-				return undefined;
-			});
-		}
-
-		// Timers before any network call: a failed start must still receive.
-		ctx.setInterval(() => {
-			try {
-				reloadConfig();
-				detach(followSession(ctx), "session follow");
-				writeSessionRecord(ctx);
-				if (registered && badgeEmoji.length === 0) detach(claimBadgeIfMissing(ctx), "badge claim");
-				detach(readTmuxPlace(), "tmux place");
-				reapOldFiles();
-				reapHeldMessages();
-				if (ownsLock()) refreshLock();
-				else acquireLock();
-				syncOwnNode(ctx);
-				if (ownsLock()) {
-					graphTick();
-					reapDeadSessions(true);
-					detach(retryPendingUnpins(), "pending pin cleanup");
-					detach(renderCrashCards(), "crash cards");
-				}
-			} catch (error) {
-				pi.logger.warn("notify-telegram: heartbeat failed", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		}, HEARTBEAT_MS);
-
-		ctx.setInterval(() => {
-			try {
-				detach(followSession(ctx), "session follow");
-				detach(drainInbox(), "inbox drain");
-				drainPending();
-				maybeType();
-				maybeDraft();
-				maybeDashboard();
-				// Re-read rather than trusting a boolean: two pollers caused 918 Telegram conflicts.
-				if (ownsLock()) detach(pollOnce(), "telegram poll");
-			} catch (error) {
-				pi.logger.warn("notify-telegram: drain failed", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		}, DRAIN_MS);
-
-		await readTmuxPlace();
-		if (registered) claimLaunch(ctx);
-		syncOwnNode(ctx);
-
-		writeSessionRecord(ctx);
-		detach(retryPendingUnpins(), "startup pin cleanup");
-	});
 
 	pi.on("input", async (_event, ctx) => {
 		turnSummary = null;

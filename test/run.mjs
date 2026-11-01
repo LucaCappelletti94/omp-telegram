@@ -1098,6 +1098,13 @@ heading("a session resumed while another omp holds it");
 	const pollsBefore = called("getUpdates").length;
 	await resumed.pump(60);
 	check("the waiting instance does not poll on the holder's lock", called("getUpdates").length === pollsBefore);
+	const waitingSend = await resumed.tools
+		.get("session_message")
+		.execute("sm-wait", { to: record(heldId).tag, text: "hello" }, undefined, undefined, resumed.ctx);
+	check(
+		"a waiting instance refuses to message, since a reply would reach the holder",
+		waitingSend.isError === true && waitingSend.details.sent === false,
+	);
 
 	const continuationId = "01a03951-0000-0000-0000-000000000000";
 	resumed.move(continuationId);
@@ -1219,7 +1226,35 @@ heading("a session resumed while another omp holds it");
 	await settle();
 	const moverMessage = api.nextMessage - 1;
 	const moverTag = record(leftId).tag;
-	writeFileSync(join(inboxOf(leftId), "3302.json"), JSON.stringify({ kind: "text", value: "queued before the move" }));
+	rmSync(lockFile, { force: true });
+	mover.heartbeat();
+	api.queued = [
+		{
+			update_id: 3302,
+			message: {
+				message_id: 3302,
+				date: 1,
+				chat: { id: CHAT },
+				text: "queued before the move",
+				reply_to_message: { message_id: moverMessage },
+			},
+		},
+	];
+	await mover.pump(250);
+	const heldForLeft = join(root, "notify-telegram/graph/pending", leftId);
+	mkdirSync(heldForLeft, { recursive: true });
+	writeFileSync(
+		join(heldForLeft, "o-01a03957-merged.json"),
+		JSON.stringify({
+			kind: "outcome",
+			at: Date.now(),
+			source: "01a03957-0000-0000-0000-000000000000",
+			outcome: "merged",
+			title: "held across the move",
+			place: "widget",
+			edge: "waits-on",
+		}),
+	);
 	const reachedId = "01a03954-0000-0000-0000-000000000000";
 	mover.move(reachedId);
 	await mover.pump(150);
@@ -1232,7 +1267,12 @@ heading("a session resumed while another omp holds it");
 		"an entry queued for the left id still arrives",
 		mover.steers.some((s) => s.text.includes("queued before the move")),
 	);
+	check(
+		"an update held for the left id still arrives",
+		mover.customs.some((c) => String(c.message.content).includes("held across the move")),
+	);
 	check("its sent messages belong to the new id", sentRecordFile(moverMessage).session.id === reachedId);
+	check("the reply it received belongs to the new id", incomingRecordFile(3302).session.id === reachedId);
 	await mover.fire("session_shutdown");
 	rmSync(lockFile, { force: true });
 	one.heartbeat();
