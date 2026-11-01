@@ -1106,6 +1106,64 @@ heading("a session resumed while another omp holds it");
 		waitingSend.isError === true && waitingSend.details.sent === false,
 	);
 
+	// A machine waking from sleep finds every heartbeat old, the live holder's included. The waiting
+	// instance must not take the holder for dead and answer the card the holder sent before the sleep.
+	const beforeSleep = clockSkew;
+	const holderInstance = record(heldId).instance;
+	const sleptAsk = holder.tools
+		.get("ask")
+		.execute("slept-ask", singleQuestion, undefined, undefined, stubbornCtx(holder.ctx, {}));
+	await settle(150);
+	const sleptPick = lastCall("sendMessage")
+		.body.reply_markup.inline_keyboard.flat()
+		.find((b) => b.text.startsWith("Postgres")).callback_data;
+	const closedBeforeSleep = called("sendMessage").filter((c) =>
+		String(c.body.text).includes("That question is closed"),
+	).length;
+	jump(10 * 60_000);
+	await resumed.pump(120);
+	check(
+		"after a sleep, the waiting instance leaves the live holder's record alone",
+		record(heldId).instance === holderInstance,
+	);
+	api.queued = [
+		{
+			update_id: 3299,
+			callback_query: {
+				id: "cb-slept",
+				data: sleptPick,
+				from: { id: CHAT },
+				message: { message_id: api.nextMessage - 1, chat: { id: CHAT } },
+			},
+		},
+	];
+	await holder.pump(250);
+	await resumed.pump(120);
+	await holder.pump(150);
+	const sleptAnswer = await Promise.race([sleptAsk, settle(500).then(() => null)]);
+	check(
+		"after a sleep, a press on the holder's card still reaches the holder",
+		sleptAnswer?.details.selectedOptions[0] === "Postgres",
+	);
+	check(
+		"and the waiting instance does not answer it as a closed question",
+		called("sendMessage").filter((c) => String(c.body.text).includes("That question is closed")).length ===
+			closedBeforeSleep,
+	);
+	// A holder that stops writing while the waiting instance stays awake is hung, and is taken over.
+	for (let step = 0; step < 13; step++) {
+		jump(4_000);
+		await resumed.pump(20);
+	}
+	check(
+		"a holder silent through the waiting instance's waking hours is taken over",
+		record(heldId).instance !== holderInstance,
+	);
+	holder.heartbeat();
+	await resumed.pump(60);
+	check("the leased holder takes its record back once it runs again", record(heldId).instance === holderInstance);
+	clockSkew = beforeSleep;
+
 	const continuationId = "01a03951-0000-0000-0000-000000000000";
 	resumed.move(continuationId);
 	await resumed.pump(150);

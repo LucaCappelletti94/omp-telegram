@@ -111,6 +111,8 @@ const REACTION_ROUTE_WAIT_MS = 5_000;
 const HEARTBEAT_MS = 15_000;
 const LOCK_STALE_MS = 45_000;
 const DRAIN_MS = 1_000;
+/** A drain tick this late means the process did not run, as when the machine slept. */
+const WAKE_GAP_MS = 5_000;
 /** Two pin attempts and the maximum retry-after, rounded up. */
 const PIN_SETTLE_MS = 60_000;
 /** A chain of agent messages ends here unless a user prompt starts a new one. */
@@ -1699,6 +1701,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let leasedId = "";
 	/** Ids this instance left whose inbox, pending queue and message ownership move to the next registration. */
 	const leftIds: string[] = [];
+	/** Since when this process has run without a gap, so a heartbeat that aged while it slept proves nothing. */
+	let awakeSince = Date.now();
+	let lastRunAt = awakeSince;
 	let lastLocalInput = Date.now();
 	let pollInFlight = false;
 	let drainInFlight = false;
@@ -2349,6 +2354,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** Restarts `awakeSince` when this process has not run for a while, as after the machine slept, and says so. */
+	function noteWake(): boolean {
+		const now = Date.now();
+		const woke = now - lastRunAt > WAKE_GAP_MS;
+		if (woke) awakeSince = now;
+		lastRunAt = now;
+		return woke;
+	}
+
+	/** How long this process has run without a gap, zero when the drain tick has yet to see a wake. */
+	function awakeFor(): number {
+		const now = Date.now();
+		return now - lastRunAt > WAKE_GAP_MS ? 0 : now - awakeSince;
+	}
+
 	/**
 	 * Another live instance writes the record of `id` and outranks this one. omp lets the first process to
 	 * save a session keep it and moves the other on its next save, so a proven lease wins. Between two
@@ -2357,7 +2377,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function heldElsewhere(id: string): boolean {
 		const holder = readSessionRecord(id);
 		if (holder === null || holder.instance === instance) return false;
-		if (Date.now() - holder.heartbeat > LOCK_STALE_MS || !processRuns(holder.pid)) return false;
+		if (holder.heartbeat === 0 || !processRuns(holder.pid)) return false;
+		// Sleep stops every process at once, so a live holder is taken for hung only after it missed its
+		// heartbeats through a stretch this process was awake for.
+		if (Date.now() - holder.heartbeat > LOCK_STALE_MS && awakeFor() > LOCK_STALE_MS) return false;
 		const leased = leasedId === id;
 		return holder.leased === leased ? holder.instance < instance : holder.leased;
 	}
@@ -7116,6 +7139,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 		ctx.setInterval(() => {
 			try {
+				// Every heartbeat aged through the sleep, and routing skips a session whose record looks stale.
+				if (noteWake()) writeSessionRecord(ctx);
 				detach(followSession(ctx), "session follow");
 				detach(drainInbox(), "inbox drain");
 				drainPending();
