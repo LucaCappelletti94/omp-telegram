@@ -432,7 +432,9 @@ interface TelegramMessage {
 	date: number;
 	/** A private chat carries its user's first name. */
 	chat: { id: number; first_name?: string };
-	reply_to_message?: { message_id: number };
+	reply_to_message?: { message_id: number; text?: string; caption?: string };
+	/** The part of the replied-to message the user quoted, when they picked one. */
+	quote?: { text?: string };
 	text?: string;
 	caption?: string;
 	photo?: Array<{ file_id: string; file_size?: number }>;
@@ -636,6 +638,10 @@ interface InboxEntry {
 	targetPreEdit?: boolean;
 	/** Message id the sender replied to. */
 	replyTo?: number;
+	/** The excerpt of the replied-to message the sender quoted. */
+	quote?: string;
+	/** The replied-to message as Telegram rendered it, for when no sent record holds it. */
+	replyText?: string;
 	caption?: string;
 	mime?: string;
 	/** Agent message id, which a reply quotes. */
@@ -669,6 +675,9 @@ interface MediaRetry {
 	messageId: number;
 	caption?: string;
 	replyTo?: number;
+	/** What the reply refers to, as on a text entry. */
+	quote?: string;
+	replyText?: string;
 	attempts: number;
 	nextAt: number;
 }
@@ -3587,6 +3596,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			caption: job.caption,
 			messageId: job.messageId,
 			replyTo: job.replyTo,
+			quote: job.quote,
+			replyText: job.replyText,
 		});
 		trackIncoming(job.messageId, job.target);
 	}
@@ -4291,6 +4302,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (isChatEvent(message)) return;
 		const replyTo = message.reply_to_message?.message_id;
 		const text = message.text ?? message.caption;
+		// What the reply refers to travels with it, because the session's agent sees only what the entry holds.
+		const reference = {
+			quote: message.quote?.text,
+			replyText: message.reply_to_message?.text ?? message.reply_to_message?.caption,
+		};
 
 		const command =
 			typeof text === "string"
@@ -4403,6 +4419,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				messageId: message.message_id,
 				caption: message.caption,
 				replyTo,
+				...reference,
 				attempts: 1,
 				nextAt: 0,
 			};
@@ -4464,6 +4481,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			value: text,
 			messageId: message.message_id,
 			replyTo,
+			...reference,
 		});
 		trackIncoming(message.message_id, routed);
 	}
@@ -4950,6 +4968,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					value: raw.value,
 					messageId: raw.messageId,
 					replyTo: raw.replyTo,
+					quote: raw.quote,
+					replyText: raw.replyText,
 					caption: raw.caption,
 					mime: raw.mime,
 				});
@@ -5025,6 +5045,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		}
 		return discarded;
+	}
+
+	/**
+	 * What a reply from Telegram refers to, as a block placed before it in the same user message: the excerpt the
+	 * user quoted, or else the whole message of this session they replied to. The sent record holds that message as
+	 * this session wrote it, and Telegram's rendering stands in when no record does. Null for a message that
+	 * replies to nothing.
+	 */
+	function replyReference(entry: Partial<InboxEntry>): { type: "text"; text: string } | null {
+		if (!isTelegramMessageId(entry.replyTo)) return null;
+		if (typeof entry.quote === "string" && entry.quote.trim().length > 0) {
+			return {
+				type: "text",
+				text: `The user's Telegram message below replies to this part of a message you sent:\n\n${entry.quote}`,
+			};
+		}
+		const replied = readSentRecord(entry.replyTo)?.text ?? (typeof entry.replyText === "string" ? entry.replyText : "");
+		if (replied.trim().length === 0) return null;
+		return { type: "text", text: `The user's Telegram message below replies to this message you sent:\n\n${replied}` };
 	}
 
 	/** Sequential: two taps in one poll batch must see each other's state. */
@@ -5241,16 +5280,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						// No `deliverAs`: omp steers a running turn and starts one when idle. An explicit
 						// steer only interrupts, so on a finished session it delivered nothing at all.
 						closeReplyQuestion(entry.replyTo);
+						const reference = replyReference(entry);
 						pi.sendUserMessage([
 							{ type: "image", data, mimeType: entry.mime },
+							...(reference === null ? [] : [reference]),
 							{ type: "text", text: caption.length > 0 ? caption : "(image sent from Telegram)" },
 						]);
 					} else {
 						const tail = caption.length > 0 ? ` Caption: ${caption}` : "";
 						closeReplyQuestion(entry.replyTo);
-						pi.sendUserMessage(
-							`The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`,
-						);
+						const sent = `The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`;
+						const reference = replyReference(entry);
+						pi.sendUserMessage(reference === null ? sent : [reference, { type: "text", text: sent }]);
 					}
 					replyOwedAt = Date.now();
 					ackDelivered(entry.messageId);
@@ -5304,7 +5345,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					}
 					continue;
 				}
-				pi.sendUserMessage(entry.value);
+				const reference = replyReference(entry);
+				pi.sendUserMessage(reference === null ? entry.value : [reference, { type: "text", text: entry.value }]);
 				replyOwedAt = Date.now();
 				ackDelivered(entry.messageId);
 			}
