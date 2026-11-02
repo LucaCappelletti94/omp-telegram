@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -371,6 +372,8 @@ interface Config {
 	dashboardSeconds: number;
 	/** What an option calls the user instead of "you". Learned from Telegram unless set by hand. */
 	userName: string | null;
+	/** This extension instance's lifetime, ended at shutdown so no throttle wait outlives the session. Never written to disk. */
+	lifetime?: AbortSignal;
 }
 
 interface SessionRecord {
@@ -1208,20 +1211,70 @@ interface TelegramEnvelope {
 	parameters?: { retry_after?: unknown };
 }
 
+/** Set while a tool the agent is blocked on runs, so its calls refuse a long throttle instead of waiting it out. */
+const agentWaiting = new AsyncLocalStorage<true>();
+/** When every omp process may send again, written by whichever process Telegram last told to wait. */
+const THROTTLE_FILE = join(STATE_DIR, "throttle.json");
+/** A toast has its own short deadline, polling must never stop, and a typing action is not a message. */
+const THROTTLE_EXEMPT: Record<string, true> = { answerCallbackQuery: true, getUpdates: true, sendChatAction: true };
+/** The longest a tool the agent is blocked on waits out the shared throttle before its call is refused. */
+const AGENT_THROTTLE_WAIT_MS = 30_000;
+
+function throttledUntil(): number {
+	const raw = readJsonFile(THROTTLE_FILE) as { until?: unknown } | null;
+	return typeof raw?.until === "number" ? raw.until : 0;
+}
+
+/** Seconds the shared throttle still holds every send back, for a refusal to tell the agent. Empty when none. */
+function throttleNote(): string {
+	const left = Math.ceil((throttledUntil() - Date.now()) / 1000);
+	return left > 0 ? ` Telegram is throttling this bot for ${left} more ${left === 1 ? "second" : "seconds"}.` : "";
+}
+
 /**
- * Telegram throttles a bot to roughly one message per second per chat. Several sessions ending a
- * turn together will hit it, and dropping those notifications silently is the wrong answer, so a
- * short retry-after is honoured exactly once. `send` is re-invoked rather than reused, since a
+ * Telegram throttles a bot to roughly one message per second per chat, and its `retry_after` is the time left
+ * before the request can be repeated, for every sender of the chat. So a 429 is written down for every omp
+ * process, and each send or edit first waits out what another process was told. A tool the agent is blocked on
+ * waits at most `AGENT_THROTTLE_WAIT_MS`, and a process shutting down not at all. Both get the throttle as a
+ * refusal instead. A short retry-after is still honoured once. `send` is re-invoked rather than reused, since a
  * request body is spent by its first attempt.
  */
 async function sendWithRetry(
+	method: string,
 	send: () => Promise<Response>,
+	lifetime?: AbortSignal,
 ): Promise<{ response: Response; envelope: TelegramEnvelope | null }> {
+	if (!Object.hasOwn(THROTTLE_EXEMPT, method)) {
+		const until = throttledUntil();
+		const heldBack = (): { response: Response; envelope: TelegramEnvelope } => {
+			const retryAfter = Math.max(1, Math.ceil((until - Date.now()) / 1000));
+			return {
+				response: new Response(null, { status: 429 }),
+				envelope: {
+					ok: false,
+					description: `Too Many Requests: retry after ${retryAfter}, held back because Telegram told an omp session to wait`,
+					parameters: { retry_after: retryAfter },
+				},
+			};
+		};
+		if (until - Date.now() > AGENT_THROTTLE_WAIT_MS && agentWaiting.getStore() === true) return heldBack();
+		while (Date.now() < until) {
+			if (lifetime?.aborted === true) return heldBack();
+			await new Promise((wake) => setTimeout(wake, Math.min(250, until - Date.now())));
+		}
+	}
 	for (let attempt = 0; ; attempt++) {
 		const response = await send();
 		const payload: unknown = await response.json().catch(() => null);
 		const envelope = payload !== null && typeof payload === "object" ? (payload as TelegramEnvelope) : null;
 		const retryAfter = envelope?.parameters?.retry_after;
+		if (
+			response.status === 429 &&
+			typeof retryAfter === "number" &&
+			Date.now() + retryAfter * 1000 > throttledUntil()
+		) {
+			writeFileAtomic(THROTTLE_FILE, JSON.stringify({ until: Date.now() + retryAfter * 1000 }), 0o600);
+		}
 		if (attempt > 0 || response.status !== 429 || typeof retryAfter !== "number" || retryAfter > 30) {
 			return { response, envelope };
 		}
@@ -1240,13 +1293,16 @@ async function callTelegramRaw<T>(
 	timeoutMs: number,
 	onFailure: (failure: TelegramFailure) => void,
 ): Promise<T | null> {
-	const { response, envelope } = await sendWithRetry(() =>
-		fetch(`https://api.telegram.org/bot${config.token}/${method}`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(body),
-			signal: AbortSignal.timeout(timeoutMs),
-		}),
+	const { response, envelope } = await sendWithRetry(
+		method,
+		() =>
+			fetch(`https://api.telegram.org/bot${config.token}/${method}`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+				signal: AbortSignal.timeout(timeoutMs),
+			}),
+		config.lifetime,
 	);
 	if (!response.ok || envelope === null || envelope.ok !== true) {
 		const retryAfter = envelope?.parameters?.retry_after;
@@ -1731,6 +1787,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	const z = pi.zod;
 
 	let config: Config | null = null;
+	/** Ends at shutdown, which releases every Telegram call of this instance still waiting out a throttle. */
+	const lifetime = new AbortController();
 	let sessionTag = "";
 	/** The session id whose record, inbox and pending queue this instance owns while `registered`. */
 	let sessionId = "";
@@ -1818,9 +1876,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	const noticedKinds = new Set<string>();
 	let activeCompaction: { trigger: string; action: string } | null = null;
 
-	/** A rejected detached promise is fatal in omp; the token never reaches the log. */
-	function detach(work: Promise<unknown>, label: string): void {
-		work.catch((error) => {
+	/**
+	 * A rejected detached promise is fatal in omp; the token never reaches the log. The work starts outside any tool's
+	 * mark, because nothing waits on it, so a throttle holds it back instead of refusing it.
+	 */
+	function detach(start: () => Promise<unknown>, label: string): void {
+		agentWaiting.exit(start).catch((error) => {
 			const raw = error instanceof Error ? error.message : String(error);
 			pi.logger.warn(`notify-telegram: ${label} failed`, {
 				error: config === null ? raw : raw.split(config.token).join("<token>"),
@@ -2481,7 +2542,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const queuedRedos = discardQueuedRedos(id);
 				if (queuedRedos > 0) {
 					detach(
-						serviceNotice("Grade kept, but its session ended before the queued redo could reach the agent.", false),
+						() =>
+							serviceNotice("Grade kept, but its session ended before the queued redo could reach the agent.", false),
 						"dead-session redo notice",
 					);
 				}
@@ -2489,10 +2551,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (dropped.length > 0) {
 					const title = titleOf(id);
 					detach(
-						serviceNotice(
-							`**${title}** ended before it read ${dropped.join(", ")}, which only a running session can act on, so nothing was done with ${dropped.length === 1 ? "it" : "them"}.`,
-							false,
-						),
+						() =>
+							serviceNotice(
+								`**${title}** ended before it read ${dropped.join(", ")}, which only a running session can act on, so nothing was done with ${dropped.length === 1 ? "it" : "them"}.`,
+								false,
+							),
 						"dead-session inbox notice",
 					);
 				}
@@ -2502,13 +2565,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					crashed.push(id);
 					machine ||= restarted;
 					// The ask died with its process. The restored agent asks again if it still needs to.
-					if (record.question !== null) detach(stripKeyboard(record.question), "crashed ask close");
+					const question = record.question;
+					if (question !== null) detach(() => stripKeyboard(question), "crashed ask close");
 				}
 				if (!restorable && record !== null) retireRecordedPin(record);
 				unlinkSync(join(SESSIONS_DIR, entry));
 				rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
 				// The crash card counts held updates itself, and a restore delivers them.
-				if (!restorable && listPending(id).items.length > 0) detach(raiseResumeCard(id), "resume card");
+				if (!restorable && listPending(id).items.length > 0) detach(() => raiseResumeCard(id), "resume card");
 				rmSync(reactionRouteLockFile(id), { force: true });
 			} finally {
 				rmSync(closing, { force: true });
@@ -2725,7 +2789,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		closeOfferMessageId = null;
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		if (!withEdit) return;
-		detach(stripKeyboard(messageId), "close-offer retire");
+		detach(() => stripKeyboard(messageId), "close-offer retire");
 	}
 
 	/** One line per omp pane, read from the same pane titles that drive the tmux tabs. Listing panes, not windows,
@@ -2938,13 +3002,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const { approved, reason } = notice.resolution;
 		const title = approved ? "Approval granted" : "Approval denied";
 		const detail = reason.length > 0 ? `\nReason: ${reason}` : "";
+		const cfg = config;
 		detach(
-			sendOrEdit(
-				config,
-				"editMessageText",
-				{ chat_id: config.chatId, message_id: notice.messageId },
-				withHead(ctx, title, `${notice.toolName} was ${approved ? "approved" : "denied"}.${detail}`),
-			),
+			() =>
+				sendOrEdit(
+					cfg,
+					"editMessageText",
+					{ chat_id: cfg.chatId, message_id: notice.messageId },
+					withHead(ctx, title, `${notice.toolName} was ${approved ? "approved" : "denied"}.${detail}`),
+				),
 			"approval resolution",
 		);
 	}
@@ -3044,7 +3110,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (shown !== null && shown.text === text && shown.pinned) return;
 		dashboardInFlight = true;
 		dashboardPublishedAt = Date.now();
-		detach(publishDashboard(config, text, shown), "fleet dashboard");
+		const cfg = config;
+		detach(() => publishDashboard(cfg, text, shown), "fleet dashboard");
 	}
 
 	/**
@@ -3160,8 +3227,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (Date.now() - draftSentAt < 10_000) return;
 		if (Date.now() - typingSentAt < TYPING_MS) return;
 		typingSentAt = Date.now();
+		const cfg = config;
 		detach(
-			callTelegram(config, "sendChatAction", { chat_id: config.chatId, action: "typing" }, 10_000),
+			() => callTelegram(cfg, "sendChatAction", { chat_id: cfg.chatId, action: "typing" }, 10_000),
 			"typing action",
 		);
 	}
@@ -3169,7 +3237,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Telegram's own upload status, for the seconds a file spends going up. */
 	function showUploading(action: "upload_photo" | "upload_document"): void {
 		if (config === null) return;
-		detach(callTelegram(config, "sendChatAction", { chat_id: config.chatId, action }, 10_000), "upload action");
+		const cfg = config;
+		detach(() => callTelegram(cfg, "sendChatAction", { chat_id: cfg.chatId, action }, 10_000), "upload action");
 	}
 
 	/** Streams the turn as an ephemeral draft bubble with a native stop control. */
@@ -3204,17 +3273,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const cfg = config;
 		const body = { chat_id: cfg.chatId, draft_id: draftId };
 		detach(
-			(async () => {
-				// Unclosed constructs degrade to literal text in toTelegramHtml, so a rendered draft is safe
-				// mid-stream; a rejected call still falls back to the raw text rather than dropping the tick.
-				const sent = await callTelegram(
-					cfg,
-					"sendMessageDraft",
-					{ ...body, text: toTelegramHtml(text), parse_mode: "HTML" },
-					10_000,
-				);
-				if (sent === null) await callTelegram(cfg, "sendMessageDraft", { ...body, text }, 10_000);
-			})(),
+			() =>
+				(async () => {
+					// Unclosed constructs degrade to literal text in toTelegramHtml, so a rendered draft is safe
+					// mid-stream; a rejected call still falls back to the raw text rather than dropping the tick.
+					const sent = await callTelegram(
+						cfg,
+						"sendMessageDraft",
+						{ ...body, text: toTelegramHtml(text), parse_mode: "HTML" },
+						10_000,
+					);
+					if (sent === null) await callTelegram(cfg, "sendMessageDraft", { ...body, text }, 10_000);
+				})(),
 			"draft stream",
 		);
 	}
@@ -3224,7 +3294,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (config === null || noticedKinds.has(kind)) return;
 		if (Date.now() - lastLocalInput < config.quietSeconds * 1000) return;
 		noticedKinds.add(kind);
-		detach(sessionNotice(ctx, text), "transparency notice");
+		detach(() => sessionNotice(ctx, text), "transparency notice");
 	}
 
 	/** Usage lines stay grouped by model, with the turn's tool count and wall time last. */
@@ -3254,13 +3324,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** A thumbs-up on the delivered message: received, the turn is running. */
 	function ackDelivered(messageId: number | undefined): void {
 		if (config === null || typeof messageId !== "number") return;
+		const cfg = config;
 		detach(
-			callTelegram(
-				config,
-				"setMessageReaction",
-				{ chat_id: config.chatId, message_id: messageId, reaction: [{ type: "emoji", emoji: "\u{1F44D}" }] },
-				10_000,
-			),
+			() =>
+				callTelegram(
+					cfg,
+					"setMessageReaction",
+					{ chat_id: cfg.chatId, message_id: messageId, reaction: [{ type: "emoji", emoji: "\u{1F44D}" }] },
+					10_000,
+				),
 			"delivery receipt",
 		);
 	}
@@ -3355,8 +3427,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	function retireRecordedPin(record: SessionRecord): void {
 		if (config === null || record.pinned === null) return;
-		const name = queueUnpin(config, record.pinned, record.pinPendingUntil);
-		detach(attemptUnpin(config, name), "recorded pin retire");
+		const cfg = config;
+		const name = queueUnpin(cfg, record.pinned, record.pinPendingUntil);
+		detach(() => attemptUnpin(cfg, name), "recorded pin retire");
 	}
 
 	/** A red status stays pinned until the next turn touches the session. */
@@ -4316,13 +4389,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (command === "deps") {
 			// Rendering starts a browser, which must not hold up the updates queued behind this one.
 			detach(
-				sendDependencyGraph(
-					cfg,
-					(text ?? "")
-						.trim()
-						.replace(/^\/deps(@\w+)?/u, "")
-						.trim(),
-				),
+				() =>
+					sendDependencyGraph(
+						cfg,
+						(text ?? "")
+							.trim()
+							.replace(/^\/deps(@\w+)?/u, "")
+							.trim(),
+					),
 				"dependency graph",
 			);
 			return;
@@ -4498,6 +4572,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// A half-written or hand-mangled file must never disable a working session.
 		if (fresh === null) return;
 		fresh.offset = Math.max(fresh.offset, config.offset);
+		fresh.lifetime = lifetime.signal;
 		config = fresh;
 	}
 
@@ -4617,8 +4692,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		beforeRecord?: (messageId: number) => void,
 	): Promise<void> {
 		if (config === null || messageId === null) return;
-		if (pinnedMessageId === messageId && sessionCtx !== null) {
-			detach(unpinRed(sessionCtx), "settled pin cleanup");
+		const owner = sessionCtx;
+		if (pinnedMessageId === messageId && owner !== null) {
+			detach(() => unpinRed(owner), "settled pin cleanup");
 		}
 		const inline_keyboard =
 			settled === undefined
@@ -4752,7 +4828,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					closeOfferMessageId = messageId;
 					writeSessionRecord(ctx);
 				} else {
-					detach(stripKeyboard(messageId), "late close-offer retire");
+					detach(() => stripKeyboard(messageId), "late close-offer retire");
 				}
 			}
 		};
@@ -5188,12 +5264,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						}
 						retireCloseOffer(true);
 					}
-					if (entry.value === "stop" && sessionCtx !== null) {
+					const stopping = sessionCtx;
+					if (entry.value === "stop" && stopping !== null) {
 						if (turnActive) {
-							sessionCtx.abort();
-							detach(sessionNotice(sessionCtx, "Stopping at your request."), "stop notice");
+							stopping.abort();
+							detach(() => sessionNotice(stopping, "Stopping at your request."), "stop notice");
 						} else {
-							detach(sessionNotice(sessionCtx, "No turn is running here."), "stop notice");
+							detach(() => sessionNotice(stopping, "No turn is running here."), "stop notice");
 						}
 					}
 					if (entry.value === "status" && sessionCtx !== null) {
@@ -5356,7 +5433,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	pi.registerTool({
+	/** Every tool's Telegram calls are made while the agent waits on it, which `sendWithRetry` reads to fail fast. */
+	const registerTool: ExtensionAPI["registerTool"] = (tool) =>
+		pi.registerTool({ ...tool, execute: (...args) => agentWaiting.run(true, () => tool.execute(...args)) });
+
+	registerTool({
 		name: "ask",
 		label: "Ask",
 		description:
@@ -5481,7 +5562,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			try {
 				const winner = await Promise.race([local, answered]);
 				if (winner.kind === "local") {
-					detach(settleAskMessage(ask, ask.messageId, "Answered at the terminal."), "terminal-answer edit");
+					detach(() => settleAskMessage(ask, ask.messageId, "Answered at the terminal."), "terminal-answer edit");
 					return winner.value;
 				}
 
@@ -5519,7 +5600,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerTool({
+	registerTool({
 		name: "notify_status",
 		label: "Notify Status",
 		description:
@@ -5647,7 +5728,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerTool({
+	registerTool({
 		name: "session_badge",
 		label: "Session Badge",
 		description:
@@ -5954,7 +6035,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				note: source.note.length > 0 ? source.note : undefined,
 			};
 			writePrivateJson(join(PENDING_DIR, dependent), `o-${source.session}-${outcome}.json`, item);
-			if (!isLiveSession(dependent)) detach(raiseResumeCard(dependent), "resume card");
+			if (!isLiveSession(dependent)) detach(() => raiseResumeCard(dependent), "resume card");
 		}
 		return dependents.length;
 	}
@@ -5997,7 +6078,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		rmSync(join(PENDING_DIR, id, "resuming.json"), { force: true });
 		if (items.length > 0) {
 			detach(
-				settleResumeCard(id, `\u2705 Delivered ${updates(items.length)} to **${titleOf(id)}**.`, false),
+				() => settleResumeCard(id, `\u2705 Delivered ${updates(items.length)} to **${titleOf(id)}**.`, false),
 				"resume card settle",
 			);
 		}
@@ -6370,8 +6451,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					writePrivateJson(CRASH_DIR, `${id}.json`, { ...kept, dismissed: true });
 					// What a restore would have adopted is dead now, so its buttons go and its pin comes down.
 					const { standing, closeOffer } = kept.record;
-					if (typeof standing?.messageId === "number") detach(stripKeyboard(standing.messageId), "crash dismiss");
-					if (closeOffer !== null) detach(stripKeyboard(closeOffer), "crash dismiss");
+					const stuck = standing?.messageId;
+					if (typeof stuck === "number") detach(() => stripKeyboard(stuck), "crash dismiss");
+					if (closeOffer !== null) detach(() => stripKeyboard(closeOffer), "crash dismiss");
 				}
 				toast = "Dismissed. omp --resume still reopens any of them by hand.";
 			}
@@ -6550,7 +6632,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		if (now - lastGraphPoll >= GRAPH_POLL_MS) {
 			lastGraphPoll = now;
-			detach(pollGraph(), "dependency poll");
+			detach(() => pollGraph(), "dependency poll");
 		}
 	}
 
@@ -6582,7 +6664,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		related: "related",
 	};
 
-	pi.registerTool({
+	registerTool({
 		name: "session_graph",
 		label: "Session Graph",
 		description: `Record and read the dependencies between omp sessions, kept for a year across restarts. \`action\` \`show\` (the default) lists what this session waits on and who waits on it, each with its status and pull request. \`status\` sets this session's \`status\` to one of ${AGENT_STATUSES.join(", ")}, with an optional \`note\` and an optional GitHub pull request URL in \`pr\` whose state is then polled. \`pushed\`, \`done\`, \`not-needed\` and \`abandoned\` are outcomes that wake every session waiting on this one, and so are a PR opening, merging or closing. \`link\` declares an edge from this session of \`type\` \`waits-on\` (this session needs \`to\` to reach an outcome first, and is woken by its outcomes), \`follows-up\` (this session continues the work of \`to\`) or \`related\`. \`unlink\` removes an edge this session declared. \`to\` is a live session's badge emoji or tag, or a session id prefix of at least 8 characters, which also reaches ended sessions. \`find\` lists the sessions whose label, repository or folder contains \`query\`, with their ids. Upstream edges come only from upstream_launch.`,
@@ -6753,7 +6835,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerTool({
+	registerTool({
 		name: "session_message",
 		label: "Session Message",
 		description: `Message another live omp session on this machine, addressed by the badge emoji it shows in Telegram, or by its tag when it has none. Call it with no \`to\` to list the live sessions with their badge, tag, state and folder. With \`to\` and \`text\`, the message reaches that session's agent at its next step without interrupting its tool calls, and wakes it when idle. Every message gets an \`id\`, and an answer passes it as \`reply_to\`. A chain of messages without a user prompt ends after ${AGENT_MAX_HOPS} hops and a send beyond that is refused, so report to your user instead of relaying further. Each message costs its recipient a turn, so send questions, answers and handoffs, never acknowledgements. \`text\` holds at most ${AGENT_TEXT_MAX} characters. For longer content, write a file and send its path.`,
@@ -6865,7 +6947,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					at: Date.now(),
 					message,
 				});
-				detach(raiseResumeCard(recipient), "resume card");
+				detach(() => raiseResumeCard(recipient), "resume card");
 				return {
 					content: [
 						{
@@ -6906,18 +6988,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		files: Array<{ field: string; name: string; data: Uint8Array }>,
 	): Promise<T | null> {
 		try {
-			const { response, envelope } = await sendWithRetry(() => {
-				const form = new FormData();
-				for (const [key, value] of Object.entries(fields)) form.append(key, String(value));
-				for (const file of files) {
-					form.append(file.field, new Blob([file.data as Uint8Array<ArrayBuffer>]), file.name);
-				}
-				return fetch(`https://api.telegram.org/bot${cfg.token}/${method}`, {
-					method: "POST",
-					body: form,
-					signal: AbortSignal.timeout(120_000),
-				});
-			});
+			const { response, envelope } = await sendWithRetry(
+				method,
+				() => {
+					const form = new FormData();
+					for (const [key, value] of Object.entries(fields)) form.append(key, String(value));
+					for (const file of files) {
+						form.append(file.field, new Blob([file.data as Uint8Array<ArrayBuffer>]), file.name);
+					}
+					return fetch(`https://api.telegram.org/bot${cfg.token}/${method}`, {
+						method: "POST",
+						body: form,
+						signal: AbortSignal.timeout(120_000),
+					});
+				},
+				cfg.lifetime,
+			);
 			if (envelope === null || envelope.ok !== true) {
 				pi.logger.warn("telegram upload failed", { method, status: response.status });
 				return null;
@@ -6930,7 +7016,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	pi.registerTool({
+	registerTool({
 		name: "notify_file",
 		label: "Notify File",
 		description:
@@ -7049,7 +7135,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					return accepted;
 				});
 				if (sent === null) {
-					return { content: [{ type: "text", text: "Error: Telegram rejected the album upload" }], isError: true };
+					return {
+						content: [{ type: "text", text: `Error: Telegram rejected the album upload.${throttleNote()}` }],
+						isError: true,
+					};
 				}
 				for (const message of sent) sentIds.push(message.message_id);
 			} else {
@@ -7086,7 +7175,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					});
 					if (sent === null) {
 						return {
-							content: [{ type: "text", text: `Error: Telegram rejected the upload of ${file.path}` }],
+							content: [
+								{ type: "text", text: `Error: Telegram rejected the upload of ${file.path}.${throttleNote()}` },
+							],
 							isError: true,
 						};
 					}
@@ -7118,7 +7209,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 	}
 
-	pi.registerTool({
+	registerTool({
 		name: "notify_message",
 		label: "Manage Telegram Message",
 		description:
@@ -7197,7 +7288,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					}
 					return accepted === true;
 				}, messageId);
-				if (!deleted) return fail(`Telegram refused deletion. ${refusal}`);
+				if (!deleted) return fail(`Telegram refused deletion. ${refusal}${throttleNote()}`);
 			} else {
 				const text = typeof p.text === "string" ? p.text.trim() : "";
 				if (text.length === 0) return fail("`text` must contain the replacement message body.");
@@ -7214,7 +7305,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					previous.kind,
 					{ text },
 				);
-				if (edited === null) return fail("Telegram refused the edit.");
+				if (edited === null) return fail(`Telegram refused the edit.${throttleNote()}`);
 				if (standingQuestion?.messageId === messageId) {
 					standingQuestion.head = source;
 					writeSessionRecord(ctx);
@@ -7234,7 +7325,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * handed to a markdown renderer whose fence rules are not the ones measured here, and it is
 	 * never truncated, because half an issue body is worse than none.
 	 */
-	pi.registerTool({
+	registerTool({
 		name: "notify_snippet",
 		label: "Notify Snippet",
 		description:
@@ -7295,7 +7386,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			const sent = await sendOrEdit(config, "sendMessage", { chat_id: config.chatId }, plain, "", "snippet");
 			if (sent === null) {
-				return { content: [{ type: "text", text: "Error: Telegram rejected the snippet" }], isError: true };
+				return {
+					content: [{ type: "text", text: `Error: Telegram rejected the snippet.${throttleNote()}` }],
+					isError: true,
+				};
 			}
 			lastNotifiedAt = Date.now();
 			writeSessionRecord(ctx);
@@ -7383,13 +7477,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (pendingAsk === ask) {
 				pendingAsk = previous;
 				if (ask.messageId !== null)
-					detach(settleAskMessage(ask, ask.messageId, "Launch cancelled."), "upstream-confirm close");
+					detach(() => settleAskMessage(ask, ask.messageId, "Launch cancelled."), "upstream-confirm close");
 			}
 			noteState();
 		}
 	}
 
-	pi.registerTool({
+	registerTool({
 		name: "upstream_launch",
 		label: "Upstream Launch",
 		description:
@@ -7467,12 +7561,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				fork: `${outcome.created ? "a new fork" : "your existing fork"} ${outcome.pushRepo}`,
 			}[outcome.mode];
 			detach(
-				notify(
-					ctx,
-					"notice",
-					"\u2B06\uFE0F Upstream launched",
-					`${outcome.owner}/${outcome.name} \u2014 ${args.problem}\nBranch \`${outcome.branch}\` in ${where}. It runs in its own tmux tab now.`,
-				),
+				() =>
+					notify(
+						ctx,
+						"notice",
+						"\u2B06\uFE0F Upstream launched",
+						`${outcome.owner}/${outcome.name} \u2014 ${args.problem}\nBranch \`${outcome.branch}\` in ${where}. It runs in its own tmux tab now.`,
+					),
 				"upstream launch notice",
 			);
 			lastNotifiedAt = Date.now();
@@ -7500,6 +7595,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pi.logger.debug("notify-telegram disabled: no usable config at ~/.omp/agent/notify-telegram.json");
 			return;
 		}
+		config.lifetime = lifetime.signal;
 		sessionCtx = ctx;
 		mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
 		try {
@@ -7521,25 +7617,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		rmSync(LEGACY_LOCK_DIR, { recursive: true, force: true });
 		acquireLock();
 
+		const cfg = config;
 		detach(
-			callTelegram(
-				config,
-				"setMyCommands",
-				{
-					commands: [
-						{ command: "status", description: "Show what each session is doing" },
-						{ command: "fleet", description: "List every tmux omp window and its state" },
-						{ command: "hidequestions", description: "Hide open question buttons" },
-						{ command: "stop", description: "Abort the running turn, reply to pick the session" },
-						{ command: "deps", description: "Draw the dependencies between sessions" },
-						{ command: "resume", description: "Resume an ended session that has updates waiting" },
-					],
-				},
-				15_000,
-			),
+			() =>
+				callTelegram(
+					cfg,
+					"setMyCommands",
+					{
+						commands: [
+							{ command: "status", description: "Show what each session is doing" },
+							{ command: "fleet", description: "List every tmux omp window and its state" },
+							{ command: "hidequestions", description: "Hide open question buttons" },
+							{ command: "stop", description: "Abort the running turn, reply to pick the session" },
+							{ command: "deps", description: "Draw the dependencies between sessions" },
+							{ command: "resume", description: "Resume an ended session that has updates waiting" },
+						],
+					},
+					15_000,
+				),
 			"command menu",
 		);
-		detach(callTelegram(config, "setChatMenuButton", { menu_button: { type: "commands" } }, 15_000), "menu button");
+		detach(() => callTelegram(cfg, "setChatMenuButton", { menu_button: { type: "commands" } }, 15_000), "menu button");
 
 		if (ctx.hasUI) {
 			unsubscribeInput = ctx.ui.onTerminalInput(() => {
@@ -7552,10 +7650,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		ctx.setInterval(() => {
 			try {
 				reloadConfig();
-				detach(followSession(ctx), "session follow");
+				detach(() => followSession(ctx), "session follow");
 				writeSessionRecord(ctx);
-				if (registered && badgeEmoji.length === 0) detach(claimBadgeIfMissing(ctx), "badge claim");
-				detach(readTmuxPlace(), "tmux place");
+				if (registered && badgeEmoji.length === 0) detach(() => claimBadgeIfMissing(ctx), "badge claim");
+				detach(() => readTmuxPlace(), "tmux place");
 				reapOldFiles();
 				reapHeldMessages();
 				if (ownsLock()) refreshLock();
@@ -7564,9 +7662,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (ownsLock()) {
 					graphTick();
 					reapDeadSessions(true);
-					detach(retryPendingUnpins(), "pending pin cleanup");
-					detach(renderCrashCards(), "crash cards");
-					detach(retryMedia(), "media retry");
+					detach(() => retryPendingUnpins(), "pending pin cleanup");
+					detach(() => renderCrashCards(), "crash cards");
+					detach(() => retryMedia(), "media retry");
 				}
 			} catch (error) {
 				pi.logger.warn("notify-telegram: heartbeat failed", {
@@ -7579,14 +7677,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			try {
 				// Every heartbeat aged through the sleep, and routing skips a session whose record looks stale.
 				if (noteWake()) writeSessionRecord(ctx);
-				detach(followSession(ctx), "session follow");
-				detach(drainInbox(), "inbox drain");
+				detach(() => followSession(ctx), "session follow");
+				detach(() => drainInbox(), "inbox drain");
 				drainPending();
 				maybeType();
 				maybeDraft();
 				maybeDashboard();
 				// Re-read rather than trusting a boolean: two pollers caused 918 Telegram conflicts.
-				if (ownsLock()) detach(pollOnce(), "telegram poll");
+				if (ownsLock()) detach(() => pollOnce(), "telegram poll");
 			} catch (error) {
 				pi.logger.warn("notify-telegram: drain failed", {
 					error: error instanceof Error ? error.message : String(error),
@@ -7599,7 +7697,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		syncOwnNode(ctx);
 
 		writeSessionRecord(ctx);
-		detach(retryPendingUnpins(), "startup pin cleanup");
+		detach(() => retryPendingUnpins(), "startup pin cleanup");
 	});
 
 	/**
@@ -7782,14 +7880,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		chainHop = null;
 		statusBlockUsed = false;
 		recoveryTurn = false;
-		detach(unpinRed(ctx), "input unpin");
+		detach(() => unpinRed(ctx), "input unpin");
 		closeReplyQuestion();
 		const standing = standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
 			writeSessionRecord(ctx);
 			detach(
-				settleQuestionMessage(standing.messageId, standing.head, "Answered at the terminal."),
+				() => settleQuestionMessage(standing.messageId, standing.head, "Answered at the terminal."),
 				"standing-question close",
 			);
 		}
@@ -7801,7 +7899,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (sessionCtx !== null) await followSession(ctx);
 		turnActive = true;
 		statusBlockUsed = false;
-		detach(unpinRed(ctx), "new-work unpin");
+		detach(() => unpinRed(ctx), "new-work unpin");
 		retireCloseOffer(true);
 		closeReplyQuestion();
 		const standing = standingQuestion;
@@ -7809,7 +7907,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			standingQuestion = null;
 			writeSessionRecord(ctx);
 			detach(
-				settleQuestionMessage(standing.messageId, standing.head, "Superseded by new work."),
+				() => settleQuestionMessage(standing.messageId, standing.head, "Superseded by new work."),
 				"standing-question close",
 			);
 		}
@@ -8016,7 +8114,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				red: "\u{1F534} Action required",
 			};
 			const recorded = turnSummary;
-			detach(unpinRed(ctx), "status unpin");
+			detach(() => unpinRed(ctx), "status unpin");
 			const pinGeneration = redPinGeneration;
 			turnSummary = null;
 			// The record keeps the headline only: `/status` lists it beside every other session.
@@ -8053,17 +8151,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							closeOfferMessageId = messageId;
 							writeSessionRecord(ctx);
 						} else if (messageId !== null) {
-							detach(stripKeyboard(messageId), "late close-offer retire");
+							detach(() => stripKeyboard(messageId), "late close-offer retire");
 						}
 					}
 					if (recorded.urgency === "red") return pinRed(ctx, sent, pinGeneration);
 					return undefined;
 				});
-				detach(work, "turn-end notice");
+				detach(() => work, "turn-end notice");
 				return;
 			}
 			detach(
-				sendStandingQuestion(ctx, heads[recorded.urgency], recorded, quiet, pinGeneration, usageFooter()),
+				() => sendStandingQuestion(ctx, heads[recorded.urgency], recorded, quiet, pinGeneration, usageFooter()),
 				"turn-end question",
 			);
 			return;
@@ -8094,21 +8192,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						: `${clip(tail, 600)}...`;
 		const generation = redPinGeneration;
 		detach(
-			deliverTurnEnd(
-				(onRefused) =>
-					notify(
-						ctx,
-						"status",
-						title,
-						body,
-						quiet ? { disable_notification: true } : {},
-						usageFooter(),
-						undefined,
-						undefined,
-						onRefused,
-					),
-				() => generation === redPinGeneration,
-			),
+			() =>
+				deliverTurnEnd(
+					(onRefused) =>
+						notify(
+							ctx,
+							"status",
+							title,
+							body,
+							quiet ? { disable_notification: true } : {},
+							usageFooter(),
+							undefined,
+							undefined,
+							onRefused,
+						),
+					() => generation === redPinGeneration,
+				),
 			"turn-end notice",
 		);
 	});
@@ -8135,7 +8234,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				finishApprovalNotice(ctx, notice);
 			},
 		);
-		detach(work, "approval notice");
+		detach(() => work, "approval notice");
 	});
 
 	pi.on("tool_approval_resolved", async (event, ctx) => {
@@ -8153,11 +8252,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			event !== null && typeof event === "object" && "provider" in event && typeof event.provider === "string"
 				? event.provider
 				: "unavailable";
-		detach(sessionNotice(ctx, `Credential disabled for ${provider}.`), "credential notice");
+		detach(() => sessionNotice(ctx, `Credential disabled for ${provider}.`), "credential notice");
 	});
 
 	pi.on("session_shutdown", async () => {
-		// systemd says `stopping` once a reboot or poweroff is queued, and omp allows this handler two seconds.
+		// omp allows this handler two seconds, so nothing in it may wait out a Telegram throttle.
+		lifetime.abort();
+		// systemd says `stopping` once a reboot or poweroff is queued.
 		if (sessionCtx !== null && (await run("systemctl", ["is-system-running"], 1_000)).stdout === "stopping") {
 			systemShutdownAt = Date.now();
 		}
@@ -8174,7 +8275,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const messageId = ask.messageId;
 			ask.messageId = null;
 			if (config !== null) {
-				detach(settleAskMessage(ask, messageId, "This question is no longer active."), "pending-question close");
+				detach(() => settleAskMessage(ask, messageId, "This question is no longer active."), "pending-question close");
 			}
 		}
 		// A restore after the reboot adopts the standing question and the red pin, and a dismiss retires them.
@@ -8184,12 +8285,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 			if (config !== null) {
 				detach(
-					settleQuestionMessage(standing.messageId, standing.head, "**Session closed.**"),
+					() => settleQuestionMessage(standing.messageId, standing.head, "**Session closed.**"),
 					"standing-question close",
 				);
 			}
 		}
-		if (sessionCtx !== null && systemShutdownAt === 0) detach(unpinRed(sessionCtx), "shutdown unpin");
+		const closingCtx = sessionCtx;
+		if (closingCtx !== null && systemShutdownAt === 0) detach(() => unpinRed(closingCtx), "shutdown unpin");
 		await Promise.allSettled(redPinOperations);
 		closeReplyQuestion();
 		sessionAlive = false;
