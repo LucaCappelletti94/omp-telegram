@@ -1981,6 +1981,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		payload?: unknown,
 		beforeRecord?: (messageId: number) => void,
 		sentSession = snapshotSentSession(),
+		onRefused?: (failure: TelegramFailure) => void,
 	): Promise<TelegramMessage | null> {
 		const previousRecord = method === "sendMessage" ? null : readSentRecord(Number(body.message_id));
 		const replyMarkup = body.reply_markup ?? previousRecord?.replyMarkup;
@@ -1991,6 +1992,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const source = fitToTelegram(plain, keep);
 			let sentText = source;
 			let refusal = "";
+			let failed: TelegramFailure | null = null;
 			let sent = await callTelegramRaw<TelegramMessage>(
 				cfg,
 				method,
@@ -1998,6 +2000,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				15_000,
 				(failure) => {
 					refusal = failure.description;
+					failed = failure;
 				},
 			);
 			if (method !== "sendMessage" && sent === null && refusal.includes("message is not modified")) {
@@ -2026,6 +2029,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					}
 				}
 			}
+			if (sent === null && failed !== null) onRefused?.(failed);
 			return sent;
 		};
 		const work = async (acceptEdit: () => void): Promise<TelegramMessage | null> =>
@@ -4411,7 +4415,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** Settled options survive as dead grey buttons. `settled`, not `keep`, which now means an untruncatable tail. */
+	/**
+	 * Settled options survive as dead grey buttons. `settled`, not `keep`, which now means an untruncatable tail.
+	 * `beforeRecord` also runs when Telegram refuses the edit for good, such as for a deleted message, because
+	 * a retry cannot change that answer and the question must not wait on it. A throttle or server error
+	 * leaves it unrun, so the caller can retry.
+	 */
 	async function settleQuestionMessage(
 		messageId: number | null,
 		head: string,
@@ -4427,6 +4436,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			settled === undefined
 				? []
 				: settled.map((row) => row.map((button) => ({ ...button, callback_data: SETTLED_CALLBACK, disabled: {} })));
+		let final = false;
 		await sendOrEdit(
 			config,
 			"editMessageText",
@@ -4436,7 +4446,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			null,
 			undefined,
 			beforeRecord,
+			undefined,
+			(failure) => {
+				final = failure.status !== 429 && failure.status < 500;
+			},
 		);
+		if (final && beforeRecord !== undefined) {
+			beforeRecord(messageId);
+			if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+		}
 	}
 
 	/** The current question's message, under the same head the live message carried. Past the last question there is nothing to settle. */

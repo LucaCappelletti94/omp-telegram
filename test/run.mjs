@@ -9093,6 +9093,7 @@ await settle(150);
 const failedEditQuestionId = api.nextMessage - 1;
 const failedEditButton = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0];
 api.failMethods = ["editMessageText"];
+api.failStatus = 429;
 api.queued = [answerButton(9030, failedEditQuestionId, failedEditButton.callback_data)];
 await ownershipPoller.pump(250);
 await failedEditSession.pump(250);
@@ -9103,13 +9104,14 @@ check(
 		failedEditState.aborted !== true,
 );
 api.failMethods = [];
+api.failStatus = undefined;
 await failedEditSession.pump(250);
 const failedEditResult = await failedEditAsk;
 check(
 	"the queued tap answers the question once the settlement edit is accepted",
 	failedEditResult.details.selectedOptions[0] === "SQLite" && inboxCount(failedEditSession.id) === 0,
 );
-const failedTextSession = spawn("01a07009-0000-0000-0000-000000000000", "/home/dev/work/failed-text");
+const failedTextSession = spawn("01a0700f-0000-0000-0000-000000000000", "/home/dev/work/failed-text");
 await failedTextSession.fire("session_start");
 const failedTextState = {};
 const failedTextAsk = failedTextSession.tools
@@ -9118,6 +9120,7 @@ const failedTextAsk = failedTextSession.tools
 await settle(150);
 const failedTextQuestionId = api.nextMessage - 1;
 api.failMethods = ["editMessageText"];
+api.failStatus = 429;
 api.queued = [replyTo(9035, failedTextQuestionId, "Use the arena")];
 await ownershipPoller.pump(250);
 await failedTextSession.pump(250);
@@ -9128,12 +9131,40 @@ check(
 		failedTextState.aborted !== true,
 );
 api.failMethods = [];
+api.failStatus = undefined;
 await failedTextSession.pump(250);
 const failedTextResult = await failedTextAsk;
 check(
 	"the queued typed answer reaches the question once the settlement edit is accepted",
 	failedTextResult.details.customInput === "Use the arena" && inboxCount(failedTextSession.id) === 0,
 );
+// Telegram refusing the edit for good, here because the card was deleted, cannot change on a retry, so
+// the answer is taken instead of blocking every later entry behind it.
+const goneCardSession = spawn("01a07010-0000-0000-0000-000000000000", "/home/dev/work/gone-card");
+await goneCardSession.fire("session_start");
+const goneCardState = {};
+let goneCardResult = null;
+const goneCardAsk = goneCardSession.tools
+	.get("ask")
+	.execute("fb-gone-card", singleQuestion, undefined, undefined, stubbornCtx(goneCardSession.ctx, goneCardState))
+	.then((result) => {
+		goneCardResult = result;
+	});
+await settle(150);
+const goneCardQuestionId = api.nextMessage - 1;
+api.failMethods = ["editMessageText"];
+api.failDescription = "Bad Request: message to edit not found";
+api.queued = [replyTo(9036, goneCardQuestionId, "Use the pool")];
+await ownershipPoller.pump(250);
+await goneCardSession.pump(250);
+check(
+	"an answer whose card Telegram reports deleted reaches the question without waiting",
+	goneCardResult?.details.customInput === "Use the pool" && inboxCount(goneCardSession.id) === 0,
+);
+api.failMethods = [];
+api.failDescription = undefined;
+await goneCardSession.pump(250);
+await goneCardAsk;
 
 // A staged redo survives a feedback append failure, then commits exactly once on redelivery.
 fb.heartbeat();
@@ -9229,6 +9260,7 @@ const redoRetryMessageId = api.nextMessage - 1;
 api.queued = [react(9034, redoRetryMessageId, ["\u{1F44E}"])];
 await ownershipPoller.pump(250);
 api.failMethods = ["editMessageText"];
+api.failStatus = 429;
 await redoRetrySession.pump(250);
 check(
 	"a redo survives a rejected settlement edit",
@@ -9237,6 +9269,7 @@ check(
 		redoRetryState.aborted !== true,
 );
 api.failMethods = [];
+api.failStatus = undefined;
 await redoRetrySession.pump(250);
 const redoRetryResult = await redoRetryAsk;
 check(
