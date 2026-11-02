@@ -3544,21 +3544,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		writePrivateJson(MEDIA_RETRY_DIR, `${job.updateId}.json`, { ...job, nextAt: Date.now() + delay });
 	}
 
+	/** This process wrote the job, so only what reaches a file name, an inbox path or Telegram is checked. */
 	function readMediaRetry(raw: unknown): MediaRetry | null {
-		if (raw === null || typeof raw !== "object") return null;
-		const job = raw as Partial<MediaRetry>;
-		const media = job.media as Partial<IncomingFile> | undefined;
-		if (!Number.isSafeInteger(job.updateId) || !isStateToken(job.target) || typeof job.owner !== "string") return null;
-		if (!isTelegramMessageId(job.messageId) || !Number.isSafeInteger(job.attempts) || typeof job.nextAt !== "number") {
+		const job = raw as Partial<MediaRetry> | null;
+		if (job === null || typeof job !== "object" || !Number.isSafeInteger(job.updateId) || !isStateToken(job.target)) {
 			return null;
 		}
-		if (media === undefined || media === null || typeof media.fileId !== "string" || typeof media.mime !== "string") {
+		const media = job.media;
+		if (typeof job.owner !== "string" || typeof media?.fileId !== "string" || typeof media.mime !== "string")
 			return null;
-		}
-		if (!["photo", "voice", "audio", "document"].includes(media.kind ?? "")) return null;
-		if (job.caption !== undefined && typeof job.caption !== "string") return null;
-		if (job.replyTo !== undefined && !isTelegramMessageId(job.replyTo)) return null;
-		return job as MediaRetry;
+		if (!["photo", "voice", "audio", "document"].includes(media.kind)) return null;
+		return { attempts: 1, nextAt: 0, ...job } as MediaRetry;
 	}
 
 	let mediaRetryInFlight = false;
