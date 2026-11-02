@@ -9081,7 +9081,8 @@ await uploadWork;
 api.queued = [uploadReaction];
 await ownershipPoller.pump(250);
 check("feedback grades the accepted upload record", feedbackLines().at(-1).message.kind === "file");
-// A failed settlement edit leaves the visible native question open for another answer.
+// A tap or a typed answer whose settlement edit Telegram refuses stays queued, because the user was
+// already told it was sent and has no reason to press again. It answers once the edit goes through.
 const failedEditSession = spawn("01a07005-0000-0000-0000-000000000000", "/home/dev/work/failed-edit");
 await failedEditSession.fire("session_start");
 const failedEditState = {};
@@ -9096,14 +9097,43 @@ api.queued = [answerButton(9030, failedEditQuestionId, failedEditButton.callback
 await ownershipPoller.pump(250);
 await failedEditSession.pump(250);
 check(
-	"a rejected settlement edit keeps question ownership open",
-	record(failedEditSession.id).question === failedEditQuestionId && failedEditState.aborted !== true,
+	"a tap whose settlement edit is refused stays queued with the question open",
+	record(failedEditSession.id).question === failedEditQuestionId &&
+		inboxCount(failedEditSession.id) === 1 &&
+		failedEditState.aborted !== true,
 );
 api.failMethods = [];
-api.queued = [answerButton(9031, failedEditQuestionId, failedEditButton.callback_data)];
-await ownershipPoller.pump(250);
 await failedEditSession.pump(250);
-await failedEditAsk;
+const failedEditResult = await failedEditAsk;
+check(
+	"the queued tap answers the question once the settlement edit is accepted",
+	failedEditResult.details.selectedOptions[0] === "SQLite" && inboxCount(failedEditSession.id) === 0,
+);
+const failedTextSession = spawn("01a07009-0000-0000-0000-000000000000", "/home/dev/work/failed-text");
+await failedTextSession.fire("session_start");
+const failedTextState = {};
+const failedTextAsk = failedTextSession.tools
+	.get("ask")
+	.execute("fb-failed-text", singleQuestion, undefined, undefined, stubbornCtx(failedTextSession.ctx, failedTextState));
+await settle(150);
+const failedTextQuestionId = api.nextMessage - 1;
+api.failMethods = ["editMessageText"];
+api.queued = [replyTo(9035, failedTextQuestionId, "Use the arena")];
+await ownershipPoller.pump(250);
+await failedTextSession.pump(250);
+check(
+	"a typed answer whose settlement edit is refused stays queued with the question open",
+	record(failedTextSession.id).question === failedTextQuestionId &&
+		inboxCount(failedTextSession.id) === 1 &&
+		failedTextState.aborted !== true,
+);
+api.failMethods = [];
+await failedTextSession.pump(250);
+const failedTextResult = await failedTextAsk;
+check(
+	"the queued typed answer reaches the question once the settlement edit is accepted",
+	failedTextResult.details.customInput === "Use the arena" && inboxCount(failedTextSession.id) === 0,
+);
 
 // A staged redo survives a feedback append failure, then commits exactly once on redelivery.
 fb.heartbeat();

@@ -4595,31 +4595,29 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return true;
 	}
 
-	async function applyCallback(ask: PendingAsk, payload: string): Promise<void> {
+	/** False when the press is still owed, because Telegram refused the edit that would settle it. */
+	async function applyCallback(ask: PendingAsk, payload: string): Promise<boolean> {
 		const [action, tag, rawIndex, rawOption] = payload.split(":");
-		if (tag !== ask.askId || Number.parseInt(rawIndex ?? "", 10) !== ask.index) return;
+		if (tag !== ask.askId || Number.parseInt(rawIndex ?? "", 10) !== ask.index) return true;
 		const question = ask.questions[ask.index];
-		if (question === undefined) return;
+		if (question === undefined) return true;
 
-		if (action === "d") {
-			await advance(ask);
-			return;
-		}
-		if (action !== "o") return;
+		if (action === "d") return await advance(ask);
+		if (action !== "o") return true;
 
 		const optionIndex = Number.parseInt(rawOption ?? "", 10);
 		const label = question.options[optionIndex]?.label;
-		if (label === undefined) return;
+		if (label === undefined) return true;
 		const selected = ask.selected[ask.index] ?? new Set<string>();
 		if (question.multi === true) {
 			if (selected.has(label)) selected.delete(label);
 			else selected.add(label);
 			ask.selected[ask.index] = selected;
 			await presentQuestion(ask, true);
-			return;
+			return true;
 		}
 		ask.selected[ask.index] = new Set([label]);
-		await advance(ask);
+		return await advance(ask);
 	}
 
 	async function closeReactionRouteForShutdown(): Promise<number> {
@@ -4757,7 +4755,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					deliverAgentMessage(message);
 					continue;
 				}
-				if (entry.kind !== "redo") rmSync(processing, { force: true });
+				// The user was told an answer reached this session, so one Telegram refuses to settle waits for
+				// the next drain instead of being dropped.
+				const answersAsk =
+					pendingAsk !== null &&
+					(entry.kind === "text" || (entry.kind === "callback" && !/^[kxc]:/u.test(entry.value)));
+				if (entry.kind !== "redo" && !answersAsk) rmSync(processing, { force: true });
 				// New work voids the close offer, so a tap queued behind it cannot close a session about to start a turn.
 				if (
 					entry.kind === "text" ||
@@ -4862,13 +4865,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					continue;
 				}
 				if (entry.kind === "callback") {
-					if (ask !== null) {
-						await applyCallback(ask, entry.value);
+					if (ask === null) {
+						rmSync(processing, { force: true });
+						if (sessionCtx !== null) {
+							await sessionNotice(sessionCtx, "That question is closed. It was answered or cancelled at the terminal.");
+						} else {
+							await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
+						}
+					} else if (await applyCallback(ask, entry.value)) {
+						rmSync(processing, { force: true });
 						replyOwedAt = Date.now();
-					} else if (sessionCtx !== null) {
-						await sessionNotice(sessionCtx, "That question is closed. It was answered or cancelled at the terminal.");
 					} else {
-						await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
+						try {
+							renameSync(processing, queued);
+						} catch {}
+						break;
 					}
 					continue;
 				}
@@ -4940,10 +4951,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (ask !== null) {
 					ask.custom[ask.index] = entry.value;
 					ask.selected[ask.index] = new Set<string>();
-					replyOwedAt = Date.now();
-					await advance(ask);
+					if (await advance(ask)) {
+						rmSync(processing, { force: true });
+						replyOwedAt = Date.now();
+					} else {
+						try {
+							renameSync(processing, queued);
+						} catch {}
+						break;
+					}
 					continue;
 				}
+				rmSync(processing, { force: true });
 				pi.sendUserMessage(entry.value);
 				replyOwedAt = Date.now();
 				ackDelivered(entry.messageId);
