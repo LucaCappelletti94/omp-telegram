@@ -632,6 +632,8 @@ check(
 	"a rate-limited send is logged with what Telegram actually said",
 	two.warns.some((w) => JSON.stringify(w.meta ?? {}).includes("Too Many Requests")),
 );
+// The 60 seconds Telegram asked for would now hold back every later send in this file, so they count as passed.
+rmSync(join(root, "notify-telegram/throttle.json"), { force: true });
 
 // A complaint about the buttons also says "parse", but the plain retry keeps the same buttons, so
 // re-sending repeats the identical malformed request.
@@ -3748,10 +3750,12 @@ rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 		);
 	await session.fire("session_stop");
 	await settle();
-	// The older send waits out its rate-limit retry while the replacement turn lands first.
+	// The older send waits out its rate-limit retry while the replacement turn lands first. This case is about a
+	// refusal arriving after its replacement, so the shared deadline the first 429 wrote counts as passed.
 	api.failMethods = [];
 	api.failStatus = undefined;
 	api.failRetryAfter = undefined;
+	rmSync(join(root, "notify-telegram/throttle.json"), { force: true });
 	await session.fire("agent_start");
 	await session.tools
 		.get("notify_status")
@@ -6469,6 +6473,100 @@ heading("uncovered event handlers");
 	);
 	check("a failed compaction names the failure", lastCall("sendMessage").body.text.includes("out of memory"));
 	await ev.fire("agent_end");
+}
+
+heading("shared Telegram throttle");
+{
+	const throttleFile = join(root, "notify-telegram/throttle.json");
+	const statusSends = (summary) => called("sendMessage").filter((c) => String(c.body.text).includes(summary)).length;
+	/** The shared deadline as written, or 0 when there is none, read without checking first that the file exists. */
+	const sharedUntil = () => {
+		try {
+			return JSON.parse(readFileSync(throttleFile, "utf8")).until;
+		} catch {
+			return 0;
+		}
+	};
+	const turnEnd = async (session, summary) => {
+		await session.fire("input");
+		await session.tools
+			.get("notify_status")
+			.execute(`thr-${summary}`, { summary, urgency: "green", effect: "none" }, undefined, undefined, session.ctx);
+		await session.fire("session_stop");
+	};
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const ta = spawn("01a06022-0000-0000-0000-000000000000", "/home/dev/work/throttle-a");
+	await ta.fire("session_start");
+	const tb = spawn("01a06023-0000-0000-0000-000000000000", "/home/dev/work/throttle-b");
+	await tb.fire("session_start");
+
+	// A 429 one session gets is written down for every omp process to obey.
+	api.failMethods = ["sendMessage"];
+	api.failStatus = 429;
+	api.failRetryAfter = 40;
+	api.failDescription = "Too Many Requests: retry after 40";
+	await turnEnd(ta, "Throttle seed.");
+	await settle(200);
+	api.failMethods = [];
+	api.failStatus = undefined;
+	api.failRetryAfter = undefined;
+	api.failDescription = undefined;
+	check("a 429 is shared with every process through the state directory", sharedUntil() > Date.now() + 30_000);
+
+	// A tool the agent is blocked on refuses at once rather than freezing the agent for 40 seconds.
+	const sendsBefore = called("sendMessage").length;
+	const startedAt = Date.now();
+	const snippet = await tb.tools
+		.get("notify_snippet")
+		.execute("thr-snippet", { purpose: "a command", text: "ls" }, undefined, undefined, tb.ctx);
+	check(
+		"a tool call refuses at once during a long shared throttle and says how long it lasts",
+		snippet.isError === true &&
+			/throttling this bot for \d+ more seconds?/.test(JSON.stringify(snippet.content)) &&
+			Date.now() - startedAt < 1000 &&
+			called("sendMessage").length === sendsBefore,
+	);
+
+	// A toast has its own short deadline and is never held back.
+	api.queued = [
+		{
+			update_id: 6690,
+			callback_query: {
+				id: "thr-toast",
+				data: "o:nobody-1:0:0",
+				from: { id: CHAT },
+				message: { message_id: 1, chat: { id: CHAT } },
+			},
+		},
+	];
+	const toastsBefore = called("answerCallbackQuery").length;
+	await ta.pump(250);
+	await tb.pump(250);
+	check("a toast is answered during the shared throttle", called("answerCallbackQuery").length > toastsBefore);
+
+	// A detached send waits the throttle out, then goes.
+	writeFileSync(throttleFile, JSON.stringify({ until: Date.now() + 1500 }));
+	await turnEnd(tb, "Waited status.");
+	await settle(300);
+	const heldBack = statusSends("Waited status.") === 0;
+	await settle(2000);
+	check(
+		"a detached send waits out the shared throttle and is then sent",
+		heldBack && statusSends("Waited status.") === 1,
+	);
+
+	// Shutdown ends a wait, so no throttle keeps a closing session alive.
+	writeFileSync(throttleFile, JSON.stringify({ until: Date.now() + 60_000 }));
+	await turnEnd(ta, "Never sent.");
+	await settle(300);
+	await ta.fire("session_shutdown");
+	await settle(600);
+	check(
+		"shutdown releases a send waiting on the shared throttle without sending it",
+		statusSends("Never sent.") === 0 && ta.warns.some((w) => JSON.stringify(w.meta ?? {}).includes("held back")),
+	);
+	rmSync(throttleFile, { force: true });
+	await tb.fire("session_shutdown");
 }
 
 heading("media fetch failures");
