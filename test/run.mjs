@@ -11115,10 +11115,11 @@ heading("dependency graph across sessions");
 	const tmuxLog = join(root, "graph-tmux.log");
 	const mmdcLog = join(root, "graph-mmdc.log");
 	const prJson = join(root, "graph-pr.json");
+	const prGone = join(root, "graph-pr-gone");
 	for (const log of [ghLog, tmuxLog, mmdcLog]) writeFileSync(log, "");
 	writeFileSync(
 		join(gBin, "gh"),
-		`#!/bin/sh\necho "$*" >> ${ghLog}\ncase "$1 $2" in\n  "pr view") cat ${prJson} ;;\n  "pr list") printf '%s' "$GRAPH_PR_LIST" ;;\n  *) exit 1 ;;\nesac\n`,
+		`#!/bin/sh\necho "$*" >> ${ghLog}\ncase "$1 $2" in\n  "pr view") if [ -f ${prGone} ]; then echo "GraphQL: Could not resolve to a Repository with the name 'someorg/docs'. (repository)" >&2; exit 1; fi; cat ${prJson} ;;\n  "pr list") printf '%s' "$GRAPH_PR_LIST" ;;\n  *) exit 1 ;;\nesac\n`,
 		{ mode: 0o755 },
 	);
 	writeFileSync(
@@ -11737,6 +11738,39 @@ heading("dependency graph across sessions");
 			waiter.warns.slice(waiterWarns).some((w) => w.m.includes("could not read a pull request")) &&
 			waiter.customs.length === waiterCustoms,
 	);
+
+	// A pull request whose repository GitHub no longer has is gone for good. Its dependents hear so once, and
+	// it is not looked up again.
+	await graph(waiter, { action: "link", type: "waits-on", to: followerId.slice(0, 8) });
+	writeFileSync(prGone, "");
+	const goneCustoms = waiter.customs.length;
+	jump(10 * 60_000 + 1_000);
+	beatAll(waiter, follower, back);
+	await settle(400);
+	await waiter.pump(150);
+	const goneFile = join(graphDir, "pr", `${followerId}.json`);
+	const lookupsOf = () =>
+		readFileSync(ghLog, "utf8")
+			.split("\n")
+			.filter((line) => line.includes("pr view https://github.com/someorg/docs/pull/9")).length;
+	check(
+		"a pull request whose repository no longer exists is recorded as gone and wakes its dependents",
+		existsSync(goneFile) &&
+			JSON.parse(readFileSync(goneFile, "utf8")).state === "gone" &&
+			waiter.customs.length === goneCustoms + 1 &&
+			waiter.customs.at(-1).message.content.includes("gone"),
+	);
+	const goneLookups = lookupsOf();
+	jump(10 * 60_000 + 1_000);
+	beatAll(waiter, follower, back);
+	await settle(400);
+	await waiter.pump(150);
+	check(
+		"a gone pull request is not looked up again and wakes nobody twice",
+		lookupsOf() === goneLookups && waiter.customs.length === goneCustoms + 1,
+	);
+	rmSync(prGone, { force: true });
+	await graph(waiter, { action: "unlink", type: "waits-on", to: followerId.slice(0, 8) });
 
 	check(
 		"unlinking an edge the session never declared is refused",

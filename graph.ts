@@ -11,12 +11,21 @@ export type EdgeType = (typeof EDGE_TYPES)[number];
 export const AGENT_STATUSES = ["working", "waiting", "blocked", "pushed", "done", "not-needed", "abandoned"] as const;
 export type AgentStatus = (typeof AGENT_STATUSES)[number];
 
-export type PrState = "pr-open" | "draft" | "changes-requested" | "ci-failing" | "approved" | "merged" | "closed";
+/** `gone` is a pull request GitHub no longer finds, with its repository or itself deleted. */
+export type PrState =
+	| "pr-open"
+	| "draft"
+	| "changes-requested"
+	| "ci-failing"
+	| "approved"
+	| "merged"
+	| "closed"
+	| "gone";
 
 /** `not-started` marks a launch whose child session never claimed it. */
 export type DisplayStatus = AgentStatus | PrState | "not-started";
 
-export type Outcome = "pushed" | "done" | "not-needed" | "abandoned" | "pr-opened" | "merged" | "closed";
+export type Outcome = "pushed" | "done" | "not-needed" | "abandoned" | "pr-opened" | "merged" | "closed" | "gone";
 
 export interface GraphEdge {
 	from: string;
@@ -57,6 +66,7 @@ export interface PrRecord {
 const FINISHED: Partial<Record<DisplayStatus, true>> = {
 	merged: true,
 	closed: true,
+	gone: true,
 	"not-needed": true,
 	abandoned: true,
 	done: true,
@@ -91,7 +101,8 @@ export function outcomeOfStatus(before: string | undefined, after: AgentStatus):
 }
 
 export function outcomeOfPr(before: PrState | undefined, after: PrState, emitted: readonly Outcome[]): Outcome | null {
-	const outcome: Outcome = after === "merged" ? "merged" : after === "closed" ? "closed" : "pr-opened";
+	const outcome: Outcome =
+		after === "merged" ? "merged" : after === "closed" ? "closed" : after === "gone" ? "gone" : "pr-opened";
 	if (emitted.includes(outcome) || before === after) return null;
 	return outcome;
 }
@@ -227,6 +238,7 @@ const STYLE: Record<DisplayStatus, string> = {
 	merged: "fill:#bbf7d0,stroke:#15803d,color:#14532d",
 	done: "fill:#bbf7d0,stroke:#15803d,color:#14532d",
 	closed: "fill:#e5e7eb,stroke:#6b7280,color:#6b7280",
+	gone: "fill:#e5e7eb,stroke:#6b7280,color:#6b7280,stroke-dasharray:4 3",
 	"not-needed": "fill:#e5e7eb,stroke:#6b7280,color:#6b7280",
 	abandoned: "fill:#e5e7eb,stroke:#6b7280,color:#6b7280",
 };
