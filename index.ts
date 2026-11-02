@@ -16,7 +16,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -3528,8 +3528,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	function releaseLock(file: string = LOCK_FILE): void {
 		if (!ownsLock(file)) return;
+		const path = resolve(file);
+		if (!path.startsWith(`${resolve(STATE_DIR)}${sep}`)) return;
 		try {
-			unlinkSync(file);
+			unlinkSync(path);
 		} catch {}
 	}
 
@@ -3656,7 +3658,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		const original = (media.name ?? remote).split("/").at(-1) ?? "file";
 		mkdirSync(MEDIA_DIR, { recursive: true, mode: 0o700 });
-		const path = join(MEDIA_DIR, standardFileName({ at: Date.now(), kind: media.kind, owner, updateId, original }));
+		const path = resolve(MEDIA_DIR, standardFileName({ at: Date.now(), kind: media.kind, owner, updateId, original }));
+		if (!path.startsWith(`${resolve(STATE_DIR)}${sep}`)) {
+			return { dropped: "That file could not be saved inside the state directory, so it was dropped." };
+		}
 		writeFileSync(path, bytes, { mode: 0o600 });
 		return { path };
 	}
@@ -4950,7 +4955,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// A waiting instance never opened the route of the id it reports, which belongs to the holder.
 		if (!registered) return 0;
 		mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
-		const closing = reactionRouteClosingFile(sessionId);
+		const closing = resolve(reactionRouteClosingFile(sessionId));
+		if (!closing.startsWith(`${resolve(STATE_DIR)}${sep}`)) return 0;
 		writeFileSync(closing, randomUUID(), { flag: "wx", mode: 0o600 });
 		try {
 			const deadline = Date.now() + REACTION_ROUTE_WAIT_MS;
@@ -6075,7 +6081,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				{ deliverAs: "aside", triggerTurn: true },
 			);
 		}
-		rmSync(join(PENDING_DIR, id, "resuming.json"), { force: true });
+		removeStatePath(join(PENDING_DIR, id), "resuming.json");
 		if (items.length > 0) {
 			detach(
 				() => settleResumeCard(id, `\u2705 Delivered ${updates(items.length)} to **${titleOf(id)}**.`, false),
@@ -7612,9 +7618,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			});
 		}
 		if (existsSync(LOCK_FILE) && statSync(LOCK_FILE).isDirectory()) {
-			rmSync(LOCK_FILE, { recursive: true, force: true });
+			removeStatePath(STATE_DIR, basename(LOCK_FILE));
 		}
-		rmSync(LEGACY_LOCK_DIR, { recursive: true, force: true });
+		removeStatePath(STATE_DIR, basename(LEGACY_LOCK_DIR));
 		acquireLock();
 
 		const cfg = config;
