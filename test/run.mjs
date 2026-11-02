@@ -1400,6 +1400,63 @@ heading("a session resumed while another omp holds it");
 	rmSync(lockFile, { force: true });
 	one.heartbeat();
 }
+{
+	// After a sleep the poller can route a press before the session it targets has run since the wake, so that
+	// session's heartbeat is still old. A record whose process runs takes the press, and a dead one does not.
+	const wakeClock = clockSkew;
+	const tapFor = (updateId, data, messageId) => ({
+		update_id: updateId,
+		callback_query: {
+			id: `cb-${updateId}`,
+			data,
+			from: { id: CHAT },
+			message: { message_id: messageId, chat: { id: CHAT } },
+		},
+	});
+	const target = spawn("01a03960-0000-0000-0000-000000000000", "/home/dev/work/wake-target");
+	await target.fire("session_start");
+	let wakeAnswer = null;
+	target.tools
+		.get("ask")
+		.execute("wake-ask", singleQuestion, undefined, undefined, stubbornCtx(target.ctx, {}))
+		.then((result) => {
+			wakeAnswer = result;
+		});
+	await settle(150);
+	const wakeQuestion = api.nextMessage - 1;
+	const wakePick = lastCall("sendMessage")
+		.body.reply_markup.inline_keyboard.flat()
+		.find((b) => b.text.startsWith("Postgres")).callback_data;
+	jump(10 * 60_000);
+	api.queued = [tapFor(3310, wakePick, wakeQuestion)];
+	await one.pump(250);
+	check(
+		"after a sleep, a press reaches a live session that has not run since the wake",
+		inboxCount(target.id) === 1 && !lastCall("answerCallbackQuery").body.text.includes("gone"),
+	);
+	await target.pump(250);
+	check("and that session takes it as the answer", wakeAnswer?.details.selectedOptions[0] === "Postgres");
+	const deadRecordFile = join(sessionsDir, "01a03961-0000-0000-0000-000000000000.json");
+	writeFileSync(
+		deadRecordFile,
+		JSON.stringify({
+			...record(target.id),
+			instance: "dead-instance",
+			pid: deadPid,
+			tag: "dedw1",
+			heartbeat: Date.now() - 10 * 60_000,
+		}),
+	);
+	api.queued = [tapFor(3311, "o:dedw1-1:0:0", wakeQuestion)];
+	await one.pump(250);
+	check(
+		"after a sleep, a press for a session whose process is gone is still refused",
+		lastCall("answerCallbackQuery").body.text.includes("gone"),
+	);
+	rmSync(deadRecordFile, { force: true });
+	await target.fire("session_shutdown");
+	clockSkew = wakeClock;
+}
 
 // ------------------------------------------------- context reaches the terminal
 heading("context reaches both surfaces");
@@ -10635,9 +10692,13 @@ heading("session_message between live sessions");
 	);
 	rmSync(join(sessionsDir, `${legacyId}.json`), { force: true });
 
-	jump(46_000);
+	// The sender stays awake through the target's silence, so the stale heartbeat is evidence, not sleep.
+	for (let step = 0; step < 13; step++) {
+		jump(4_000);
+		await a.pump(20);
+	}
 	const stale = await message(a, { to: hedgehog, text: "still there?" });
-	check("a session whose heartbeat went stale is not addressable", stale.isError === true);
+	check("a session whose heartbeat went stale while the sender was awake is not addressable", stale.isError === true);
 
 	for (const s of [a, b, c]) await s.fire("session_shutdown");
 }
