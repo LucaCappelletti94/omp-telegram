@@ -12161,6 +12161,119 @@ heading("sessions that died without shutting down");
 		crashCalls().length === cardsBeforeGone + 1 && reposted !== cardId && cardEdits(reposted) === 0,
 	);
 
+	// What reached a session after it died but before it drained is held for its restore, never deleted.
+	const heldId = "0c2a0016-0000-7000-8000-000000000016";
+	const heldWorkDir = folder("held-inbox");
+	const heldQuestion = 771;
+	const heldMulti = 772;
+	const askedOn = (id, question) =>
+		writeFileSync(
+			join(root, "notify-telegram/sent", `${id}.json`),
+			JSON.stringify({
+				version: 1,
+				id,
+				at: Date.now(),
+				kind: "question",
+				text: question.question,
+				session: { id: heldId, tag: "0c2a0", emoji: "", name: "", cwd: heldWorkDir },
+				payload: { context: "", question },
+			}),
+		);
+	askedOn(heldQuestion, singleQuestion.questions[0]);
+	askedOn(heldMulti, {
+		id: "targets",
+		question: "Targets?",
+		multi: true,
+		options: askOpts("linux", "macos", "windows"),
+	});
+	crashed(heldId, {
+		cwd: heldWorkDir,
+		label: "Held inbox",
+		state: "working",
+		boot: bootId,
+		pid: gone.pid,
+		question: heldQuestion,
+		standing: { id: "st-held", messageId: 773, labels: ["Merge", "Wait"], head: "held head" },
+	});
+	mkdirSync(inboxOf(heldId), { recursive: true });
+	const queueFor = (name, entry) => writeFileSync(join(inboxOf(heldId), name), JSON.stringify(entry));
+	queueFor("9601.json", { kind: "text", value: "Go on with the parser", messageId: 800_601 });
+	queueFor("9602.json", { kind: "callback", value: "o:zzzzz-1:0:1", messageId: heldQuestion });
+	queueFor("9603.json", { kind: "command", value: "stop" });
+	queueFor("9604.json", { kind: "callback", value: "c:st-held:1", messageId: 773 });
+	// Linux on, windows on, linux off, Done, then a tap after Done that a running session would discard too.
+	queueFor("9605.json", { kind: "callback", value: "o:zzzzz-2:0:0", messageId: heldMulti });
+	queueFor("9606.json", { kind: "callback", value: "o:zzzzz-2:0:2", messageId: heldMulti });
+	queueFor("9607.json", { kind: "callback", value: "o:zzzzz-2:0:0", messageId: heldMulti });
+	queueFor("9608.json", { kind: "callback", value: "d:zzzzz-2:0", messageId: heldMulti });
+	queueFor("9609.json", { kind: "callback", value: "o:zzzzz-2:0:1", messageId: heldMulti });
+	queueFor("9610.json", { kind: "callback", value: `k:${heldId}`, messageId: 774 });
+	queueFor("9611.json", { kind: "callback", value: "o:zzzzz-1:0:0", messageId: heldQuestion });
+	queueFor(`${Date.now()}-0123456789ab.json`, {
+		kind: "agent",
+		value: "The schema landed",
+		id: "0123456789ab",
+		hop: 1,
+		from: { session: workingId, emoji: "", label: "Peer", cwd: "/peer", tag: "peer1" },
+	});
+	const heldDirOf = join(root, "notify-telegram/graph/pending", heldId);
+	const heldItems = () =>
+		existsSync(heldDirOf)
+			? readdirSync(heldDirOf).filter((f) => f.endsWith(".json") && f !== "card.json" && f !== "resuming.json")
+			: [];
+	const sendsBeforeHeld = called("sendMessage").length;
+	first.heartbeat();
+	await settle(150);
+	check(
+		"what reached a dead session before it drained is held for its restore",
+		heldItems().length === 5 && !existsSync(inboxOf(heldId)),
+	);
+	check("the crash card counts what is held", crashCalls().at(-1)?.body.text.includes("5 updates waiting") === true);
+	check(
+		"a command and a close tap for a dead session are dropped with a notice naming them",
+		called("sendMessage")
+			.slice(sendsBeforeHeld)
+			.some((c) => String(c.body.text).includes("/stop") && String(c.body.text).includes("a close tap")),
+	);
+	const heldBack = spawn(heldId, heldWorkDir);
+	await heldBack.fire("session_start");
+	await heldBack.pump(300);
+	// The first drain tick hands the held entries back to the inbox, and the next one reads them.
+	await heldBack.pump(300);
+	const heldNote = heldBack.customs.find((c) => /died without shutting down/i.test(c.message.content ?? ""));
+	check(
+		"the restore note says the user wrote after the session ended",
+		/after it ended/i.test(heldNote?.message.content ?? "") &&
+			!/No user message has arrived/.test(heldNote?.message.content ?? ""),
+	);
+	check(
+		"the restored session receives the held text",
+		heldBack.steers.some((s) => s.text === "Go on with the parser"),
+	);
+	check(
+		"a held tap reaches the restored session as the answer it gave, and a later tap on it is discarded",
+		heldBack.steers.filter((s) => String(s.text).includes("Which backend?")).length === 1 &&
+			heldBack.steers.some((s) => String(s.text).includes("Which backend?") && String(s.text).includes("Postgres")),
+	);
+	check(
+		"a held tap on the standing question reaches the session as the label chosen",
+		heldBack.steers.some((s) => s.text === "Wait"),
+	);
+	const targets = heldBack.steers.filter((s) => String(s.text).includes("Targets?"));
+	check(
+		"held multiple-choice taps reach the session as the one selection confirmed with Done",
+		targets.length === 1 &&
+			targets[0].text.includes('"windows"') &&
+			!targets[0].text.includes('"linux"') &&
+			!targets[0].text.includes('"macos"') &&
+			!targets[0].text.includes("had not pressed Done"),
+	);
+	check(
+		"a held agent message reaches the restored session",
+		JSON.stringify(heldBack.customs).includes("The schema landed") && heldItems().length === 0,
+	);
+	await heldBack.fire("session_shutdown");
+
 	// A week on, the card's records are gone and a tap says so. The batch file was written by a render
 	// since, which must not keep a card with nothing left on it alive.
 	jump(8 * 24 * 3_600_000);
