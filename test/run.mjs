@@ -149,6 +149,10 @@ const jump = (ms) => {
 	clockSkew += ms;
 };
 const called = (method) => api.calls.filter((c) => c.method === method);
+/** What the user wrote in a steered message, which follows the reference block a reply carries. */
+const steerText = (steer) => (typeof steer?.text === "string" ? steer.text : (steer?.text?.at(-1)?.text ?? ""));
+/** The reference block a reply carries ahead of the user's text, empty for a message that replies to nothing. */
+const referenceOf = (steer) => (Array.isArray(steer?.text) && steer.text.length > 1 ? (steer.text[0]?.text ?? "") : "");
 const lastCall = (method) => called(method).at(-1);
 const sessionsDir = join(root, "notify-telegram/sessions");
 const inboxOf = (id) => join(root, "notify-telegram/inbox", id);
@@ -1205,7 +1209,7 @@ heading("a session resumed while another omp holds it");
 	await resumed.pump(120);
 	check(
 		"the continuation reads it",
-		resumed.steers.some((s) => s.text.includes("for the continuation")),
+		resumed.steers.some((s) => steerText(s).includes("for the continuation")),
 	);
 	// A card the holder sends is answered by the holder, whichever of the two drains first.
 	const heldAskState = {};
@@ -1330,8 +1334,8 @@ heading("a session resumed while another omp holds it");
 	await idle.pump(120);
 	check(
 		"the instance that saved first takes over the conversation's routing",
-		active.steers.some((s) => s.text.includes("for the lease holder")) &&
-			!idle.steers.some((s) => s.text.includes("for the lease holder")),
+		active.steers.some((s) => steerText(s).includes("for the lease holder")) &&
+			!idle.steers.some((s) => steerText(s).includes("for the lease holder")),
 	);
 	check("it keeps the conversation's tag", record(racedId).tag === racedTag);
 	const forkedId = "01a03956-0000-0000-0000-000000000000";
@@ -1391,7 +1395,7 @@ heading("a session resumed while another omp holds it");
 	);
 	check(
 		"an entry queued for the left id still arrives",
-		mover.steers.some((s) => s.text.includes("queued before the move")),
+		mover.steers.some((s) => steerText(s).includes("queued before the move")),
 	);
 	check(
 		"an update held for the left id still arrives",
@@ -7034,9 +7038,68 @@ heading("replies reach an idle session");
 	await ir.pump(250);
 	await ir.pump(250);
 	const delivered = ir.steers.at(-1);
-	check("the reply reaches the session", delivered?.text === "go on then");
+	check("the reply reaches the session", steerText(delivered) === "go on then");
 	// A steer interrupts a running turn. An idle session has none, so the message is dropped.
 	check("a reply to an idle session does not ask for a steer", delivered?.options?.deliverAs !== "steer");
+	check(
+		"a reply carries the whole message it answers, as this session sent it",
+		referenceOf(delivered).includes("Done, over to you."),
+	);
+	const replyFrom = (updateId, text, extra) => ({
+		update_id: updateId,
+		message: {
+			message_id: updateId,
+			date: 1,
+			chat: { id: CHAT },
+			text,
+			reply_to_message: { message_id: summaryId },
+			...extra,
+		},
+	});
+	api.queued = [replyFrom(943, "why this part?", { quote: { text: "over to you", position: 6 } })];
+	await ir.pump(250);
+	await ir.pump(250);
+	const quoted = ir.steers.at(-1);
+	check(
+		"a reply that quotes part of the message carries only that part",
+		referenceOf(quoted).includes("over to you") &&
+			!referenceOf(quoted).includes("Done,") &&
+			steerText(quoted) === "why this part?",
+	);
+	rmSync(join(root, "notify-telegram/sent", `${summaryId}.json`), { force: true });
+	api.queued = [
+		replyFrom(944, "and now?", { reply_to_message: { message_id: summaryId, text: "Rendered by Telegram" } }),
+	];
+	await ir.pump(250);
+	await ir.pump(250);
+	check(
+		"without a sent record a reply carries Telegram's copy of the message",
+		referenceOf(ir.steers.at(-1)).includes("Rendered by Telegram") && steerText(ir.steers.at(-1)) === "and now?",
+	);
+	// A reply to a message with no text anywhere, such as a photo without a caption, has nothing to show.
+	api.queued = [replyFrom(945, "plain please")];
+	await ir.pump(250);
+	await ir.pump(250);
+	check("a reply whose message has no text arrives as the plain text", ir.steers.at(-1)?.text === "plain please");
+	const replyDoc = join(root, "idle-reply.pdf");
+	writeFileSync(replyDoc, "pdf-bytes");
+	writeFileSync(
+		join(inboxOf(ir.id), "946.json"),
+		JSON.stringify({
+			kind: "file",
+			value: replyDoc,
+			mime: "application/pdf",
+			messageId: 946,
+			replyTo: summaryId,
+			replyText: "Rendered by Telegram",
+		}),
+	);
+	await ir.pump(250);
+	check(
+		"a file sent as a reply carries the message it answers",
+		referenceOf(ir.steers.at(-1)).includes("Rendered by Telegram") &&
+			steerText(ir.steers.at(-1)).includes("The user sent a file"),
+	);
 
 	// An image reply lands the same way.
 	const shot = join(root, "idle-shot.png");
@@ -7272,7 +7335,7 @@ heading("ambiguous plain messages ask which session");
 	];
 	await left.pump(250);
 	await right.pump(250);
-	check("a reply skips the picker entirely", right.steers.at(-1)?.text === "answering directly");
+	check("a reply skips the picker entirely", steerText(right.steers.at(-1)) === "answering directly");
 
 	// f. Room for the omission note is reserved while the list is built, so a list that would fit
 	// whole can lose its last session to a note that was never needed. The window between "fits"
