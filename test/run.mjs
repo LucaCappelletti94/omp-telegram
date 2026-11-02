@@ -12186,6 +12186,8 @@ heading("sessions that died without shutting down");
 		multi: true,
 		options: askOpts("linux", "macos", "windows"),
 	});
+	askedOn(777, { id: "platforms", question: "Platforms?", multi: true, options: askOpts("arm", "x86") });
+	askedOn(778, { id: "extras", question: "Extras?", multi: true, options: askOpts("docs", "bench") });
 	crashed(heldId, {
 		cwd: heldWorkDir,
 		label: "Held inbox",
@@ -12209,6 +12211,19 @@ heading("sessions that died without shutting down");
 	queueFor("9609.json", { kind: "callback", value: "o:zzzzz-2:0:1", messageId: heldMulti });
 	queueFor("9610.json", { kind: "callback", value: `k:${heldId}`, messageId: 774 });
 	queueFor("9611.json", { kind: "callback", value: "o:zzzzz-1:0:0", messageId: heldQuestion });
+	// The drain had renamed this one before the process died.
+	queueFor("9612.json.processing", { kind: "text", value: "picked up mid-drain", messageId: 800_612 });
+	// Taps that answer nothing now, and entries that carry nothing.
+	queueFor("9613.json", { kind: "callback", value: "o:zzzzz-3:0:0", messageId: 779 });
+	queueFor("9614.json", { kind: "callback", value: "c:st-old:0", messageId: 773 });
+	queueFor("9615.json", { kind: "callback", value: "z:unknown", messageId: heldQuestion });
+	queueFor("9616.json", { kind: "bogus", value: "nothing" });
+	queueFor("9617.json", { kind: "text", value: "" });
+	// Options chosen without Done, and a Done with nothing left chosen.
+	queueFor("9618.json", { kind: "callback", value: "o:zzzzz-4:0:1", messageId: 777 });
+	queueFor("9619.json", { kind: "callback", value: "o:zzzzz-5:0:0", messageId: 778 });
+	queueFor("9620.json", { kind: "callback", value: "o:zzzzz-5:0:0", messageId: 778 });
+	queueFor("9621.json", { kind: "callback", value: "d:zzzzz-5:0", messageId: 778 });
 	queueFor(`${Date.now()}-0123456789ab.json`, {
 		kind: "agent",
 		value: "The schema landed",
@@ -12226,14 +12241,19 @@ heading("sessions that died without shutting down");
 	await settle(150);
 	check(
 		"what reached a dead session before it drained is held for its restore",
-		heldItems().length === 5 && !existsSync(inboxOf(heldId)),
+		heldItems().length === 8 && !existsSync(inboxOf(heldId)),
 	);
-	check("the crash card counts what is held", crashCalls().at(-1)?.body.text.includes("5 updates waiting") === true);
+	check("the crash card counts what is held", crashCalls().at(-1)?.body.text.includes("8 updates waiting") === true);
 	check(
-		"a command and a close tap for a dead session are dropped with a notice naming them",
+		"what only a running session could act on is dropped with a notice naming it",
 		called("sendMessage")
 			.slice(sendsBeforeHeld)
-			.some((c) => String(c.body.text).includes("/stop") && String(c.body.text).includes("a close tap")),
+			.some(
+				(c) =>
+					String(c.body.text).includes("/stop") &&
+					String(c.body.text).includes("a close tap") &&
+					String(c.body.text).includes("a tap on a question that is no longer on record"),
+			),
 	);
 	const heldBack = spawn(heldId, heldWorkDir);
 	await heldBack.fire("session_start");
@@ -12267,6 +12287,23 @@ heading("sessions that died without shutting down");
 			!targets[0].text.includes('"linux"') &&
 			!targets[0].text.includes('"macos"') &&
 			!targets[0].text.includes("had not pressed Done"),
+	);
+	check(
+		"an entry the drain had already picked up when the session died is held too",
+		heldBack.steers.some((s) => s.text === "picked up mid-drain"),
+	);
+	check(
+		"options chosen without Done reach the session as chosen but not confirmed",
+		heldBack.steers.some(
+			(s) =>
+				String(s.text).includes("Platforms?") &&
+				String(s.text).includes('"x86"') &&
+				String(s.text).includes("had not pressed Done"),
+		),
+	);
+	check(
+		"a Done with nothing chosen reaches the session as no option selected",
+		heldBack.steers.some((s) => String(s.text).includes("Extras?") && String(s.text).includes("no option selected")),
 	);
 	check(
 		"a held agent message reaches the restored session",

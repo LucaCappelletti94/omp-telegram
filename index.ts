@@ -978,25 +978,15 @@ function pendingItemOf(raw: unknown): PendingItem | null {
 		});
 		return message === null ? null : { kind: "message", at: item.at, message };
 	}
+	// This process wrote the item, and `drainInbox` checks the entry again when it is delivered.
 	if (item.kind === "inbox") {
 		const entry = item.entry as Partial<InboxEntry> | null | undefined;
-		if (!Number.isSafeInteger(item.updateId) || typeof item.summary !== "string") return null;
-		if (entry === null || typeof entry !== "object" || (entry.kind !== "text" && entry.kind !== "file")) return null;
-		if (typeof entry.value !== "string" || entry.value.length === 0) return null;
-		return {
-			kind: "inbox",
-			at: item.at,
-			updateId: item.updateId as number,
-			summary: item.summary,
-			entry: {
-				kind: entry.kind,
-				value: entry.value,
-				messageId: isTelegramMessageId(entry.messageId) ? entry.messageId : undefined,
-				replyTo: isTelegramMessageId(entry.replyTo) ? entry.replyTo : undefined,
-				caption: typeof entry.caption === "string" ? entry.caption : undefined,
-				mime: typeof entry.mime === "string" ? entry.mime : undefined,
-			},
-		};
+		const valid =
+			Number.isSafeInteger(item.updateId) &&
+			typeof item.summary === "string" &&
+			typeof entry?.value === "string" &&
+			(entry.kind === "text" || entry.kind === "file");
+		return valid ? (item as unknown as PendingItem) : null;
 	}
 	if (item.kind !== "outcome") return null;
 	if (!isStateToken(item.source) || typeof item.outcome !== "string" || typeof item.title !== "string") return null;
@@ -2472,7 +2462,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 				const dropped = holdDeadInbox(id, record);
 				if (dropped.length > 0) {
-					const title = record === null ? id.slice(0, 8) : crashTitle(record);
+					const title = titleOf(id);
 					detach(
 						serviceNotice(
 							`**${title}** ended before it read ${dropped.join(", ")}, which only a running session can act on, so nothing was done with ${dropped.length === 1 ? "it" : "them"}.`,
@@ -4758,13 +4748,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function tappedQuestion(
 		messageId: number | undefined,
 	): { question: string; labels: string[]; multi: boolean } | null {
-		const payload = messageId === undefined ? undefined : readSentRecord(messageId)?.payload;
-		const asked = (payload as { question?: unknown } | undefined)?.question as Partial<ExplainedQuestion> | undefined;
-		if (asked === undefined || asked === null || typeof asked.question !== "string" || !Array.isArray(asked.options)) {
-			return null;
-		}
-		const labels = asked.options.map((option) => (typeof option?.label === "string" ? option.label : ""));
-		return { question: asked.question, labels, multi: asked.multi === true };
+		const asked = (readSentRecord(messageId ?? 0)?.payload as { question?: Partial<ExplainedQuestion> } | undefined)
+			?.question;
+		if (typeof asked?.question !== "string" || !Array.isArray(asked.options)) return null;
+		return {
+			question: asked.question,
+			labels: asked.options.map((option) => String(option?.label)),
+			multi: asked.multi === true,
+		};
 	}
 
 	/**
@@ -7502,12 +7493,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const { state, heartbeat, systemShutdownAt: shutAt } = crash.record;
 			if (state.length > 0 && state !== "idle") {
 				const when = new Date(Math.max(heartbeat, shutAt)).toLocaleString("sv-SE");
-				const wrote = listPending(sessionId).items.filter(({ item }) => item.kind === "inbox").length;
+				const wrote = listPending(sessionId).items.some(({ item }) => item.kind === "inbox");
 				crashNote = [
 					shutAt > 0
 						? `This session was shut down around ${when}, because the machine restarted.`
 						: `This session died without shutting down around ${when}, because ${crash.machine ? "the machine restarted" : "its omp process ended unexpectedly"}.`,
-					...(wrote === 0
+					...(!wrote
 						? [
 								`It was ${state} at that moment, so that turn was cut off and any command it was running was killed. It has just been restored from its saved transcript, and the user has not yet said whether to go on.`,
 								"No user message has arrived since it ended, and the last one in this transcript predates that, so it is no instruction to go on.",
@@ -7516,7 +7507,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							]
 						: [
 								`It was ${state} at that moment, so that turn was cut off and any command it was running was killed. It has just been restored from its saved transcript.`,
-								`The user sent ${wrote === 1 ? "1 message" : `${wrote} messages`} after it ended, which arrive right after this note, so those are the instructions for this turn.`,
+								"The user wrote after it ended, and what they sent arrives right after this note, so that is the instruction for this turn.",
 								"Do not continue, retry or redo any of the cut-off work unless they ask for it, not even a command that was cut off.",
 								"If they leave open whether to go on and work remains, call notify_status with urgency orange, a brief summary of where the work stands, and options that include continuing it, then end the turn with one sentence saying you are waiting for the answer.",
 							]),
