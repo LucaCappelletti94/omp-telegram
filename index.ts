@@ -3440,9 +3440,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {}
 	}
 
+	/**
+	 * Whether a record's session can take a routed update. Sleep stops every process at once, so a heartbeat that
+	 * aged while this process slept proves nothing until this process has been awake for as long as a heartbeat may
+	 * take, as in `heldElsewhere`. Until then a session whose process still runs counts as live. One that shut down
+	 * cleanly, with heartbeat 0, never does.
+	 */
+	function routable(record: SessionRecord): boolean {
+		if (Date.now() - record.heartbeat <= LOCK_STALE_MS) return true;
+		return record.heartbeat > 0 && awakeFor() <= LOCK_STALE_MS && processRuns(record.pid);
+	}
+
 	/** Replied-to message, then recency. Unresolvable targets are refused, not guessed. */
 	function routeMessage(replyTo: number | undefined): string | null {
-		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
+		const live = allRecords().filter(({ record }) => routable(record));
 		if (replyTo !== undefined) {
 			return live.find(({ record }) => record.recent?.includes(replyTo) === true)?.id ?? null;
 		}
@@ -3456,10 +3467,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function routeByAskId(askId: string): string | null {
 		const tag = askId.split("-")[0] ?? "";
 		if (tag.length === 0) return null;
-		return (
-			allRecords().find(({ record }) => record.tag === tag && Date.now() - record.heartbeat <= LOCK_STALE_MS)?.id ??
-			null
-		);
+		return allRecords().find(({ record }) => record.tag === tag && routable(record))?.id ?? null;
 	}
 
 	function deliver(target: string, updateId: number, entry: InboxEntry): void {
@@ -3626,9 +3634,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * finishing together is the only case where a plain message genuinely could belong to either.
 	 */
 	function ambiguousTargets(): Array<{ id: string; record: SessionRecord }> {
-		const live = allRecords().filter(
-			({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS && record.lastNotified > 0,
-		);
+		const live = allRecords().filter(({ record }) => routable(record) && record.lastNotified > 0);
 		let newest = 0;
 		for (const { record } of live) newest = Math.max(newest, record.lastNotified);
 		return live.filter(({ record }) => newest - record.lastNotified <= AMBIGUOUS_WINDOW_MS);
@@ -3730,9 +3736,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	async function deliverHeldMessage(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
 		const [, rawUpdate = "", tag = ""] = (callback.data ?? "").split(":");
 		const held = readHeldMessage(rawUpdate);
-		const owner = allRecords().find(
-			({ record }) => record.tag === tag && Date.now() - record.heartbeat <= LOCK_STALE_MS,
-		);
+		const owner = allRecords().find(({ record }) => record.tag === tag && routable(record));
 		const gone = held === null || owner === undefined;
 		const stopping = held?.kind === "command";
 		await callTelegram(
@@ -4003,7 +4007,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (token === null) throw new Error("Reaction inbox route is busy");
 			try {
 				const owner = readSessionRecord(target);
-				const liveOwner = owner !== null && Date.now() - owner.heartbeat <= LOCK_STALE_MS;
+				const liveOwner = owner !== null && routable(owner);
 				if (!ownsOpenReactionRoute(target, token)) throw new Error("Reaction inbox route is closing");
 				const alreadyRecorded = feedbackHasUpdate(transaction.updateId);
 				if (!liveOwner) {
@@ -4110,7 +4114,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const agentWrote = record.kind !== "notice" && record.kind !== "approval";
 		const wantsRedo = grade !== null && grade <= REDO_GRADE && (previous.grade === null || grade < previous.grade);
 		const owner = wantsRedo && agentWrote ? readSessionRecord(record.session.id) : null;
-		const liveOwner = owner !== null && Date.now() - owner.heartbeat <= LOCK_STALE_MS;
+		const liveOwner = owner !== null && routable(owner);
 		const statusQuestion = isStatusQuestion(record);
 		const targetOpen =
 			record.kind === "question"
@@ -4332,8 +4336,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				return;
 			}
 			const running = allRecords().filter(
-				({ record }) =>
-					Date.now() - record.heartbeat <= LOCK_STALE_MS && record.state.length > 0 && record.state !== "idle",
+				({ record }) => routable(record) && record.state.length > 0 && record.state !== "idle",
 			);
 			if (running.length === 0) {
 				await serviceNotice("No turn is running.", false);
@@ -4359,7 +4362,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				command === "status"
 					? [routeMessage(undefined)].filter((id): id is string => id !== null)
 					: allRecords()
-							.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
+							.filter(({ record }) => routable(record))
 							.map(({ id }) => id);
 			for (const target of targets) {
 				deliver(target, update.update_id, { kind: "command", value: command });
@@ -5841,7 +5844,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** A badge or tag of a live session, or an id prefix of any live session or graph node, when unambiguous. */
 	function resolveSession(to: string): string | null {
-		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
+		const live = allRecords().filter(({ record }) => routable(record));
 		const byBadge =
 			live.find(({ record }) => record.emoji.length > 0 && record.emoji === to) ??
 			live.find(({ record }) => record.tag === to);
@@ -6735,9 +6738,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const to = typeof p.to === "string" ? p.to.trim() : "";
 			const text = typeof p.text === "string" ? p.text.trim() : "";
 			const replyTo = typeof p.reply_to === "string" && p.reply_to.trim().length > 0 ? p.reply_to.trim() : undefined;
-			const live = allRecords().filter(
-				({ id, record }) => id !== sessionId && Date.now() - record.heartbeat <= LOCK_STALE_MS,
-			);
+			const live = allRecords().filter(({ id, record }) => id !== sessionId && routable(record));
 			const peers =
 				live.length === 0
 					? "No other omp session is live."
