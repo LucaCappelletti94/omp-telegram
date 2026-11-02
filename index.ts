@@ -4968,6 +4968,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					value: raw.value,
 					messageId: raw.messageId,
 					replyTo: raw.replyTo,
+					quote: raw.quote,
+					replyText: raw.replyText,
 					caption: raw.caption,
 					mime: raw.mime,
 				});

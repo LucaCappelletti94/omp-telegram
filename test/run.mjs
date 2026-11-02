@@ -12476,7 +12476,14 @@ heading("sessions that died without shutting down");
 	});
 	mkdirSync(inboxOf(heldId), { recursive: true });
 	const queueFor = (name, entry) => writeFileSync(join(inboxOf(heldId), name), JSON.stringify(entry));
-	queueFor("9601.json", { kind: "text", value: "Go on with the parser", messageId: 800_601 });
+	// A reply keeps the message it answers while it is held.
+	queueFor("9601.json", {
+		kind: "text",
+		value: "Go on with the parser",
+		messageId: 800_601,
+		replyTo: heldQuestion,
+		quote: "Which backend?",
+	});
 	queueFor("9602.json", { kind: "callback", value: "o:zzzzz-1:0:1", messageId: heldQuestion });
 	queueFor("9603.json", { kind: "command", value: "stop" });
 	queueFor("9604.json", { kind: "callback", value: "c:st-held:1", messageId: 773 });
@@ -12544,8 +12551,10 @@ heading("sessions that died without shutting down");
 			!/No user message has arrived/.test(heldNote?.message.content ?? ""),
 	);
 	check(
-		"the restored session receives the held text",
-		heldBack.steers.some((s) => s.text === "Go on with the parser"),
+		"the restored session receives the held text with the part of the message it quoted",
+		heldBack.steers.some(
+			(s) => steerText(s) === "Go on with the parser" && referenceOf(s).includes("this part of a message you sent"),
+		),
 	);
 	check(
 		"a held tap reaches the restored session as the answer it gave, and a later tap on it is discarded",
