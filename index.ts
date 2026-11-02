@@ -76,6 +76,8 @@ const DASHBOARD_FILE = join(STATE_DIR, "dashboard.json");
 const DASHBOARD_LOCK_FILE = join(STATE_DIR, "dashboard.lock");
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const MEDIA_DIR = join(STATE_DIR, "media");
+/** One file per download Telegram could not hand over yet, retried by the poller until it can. */
+const MEDIA_RETRY_DIR = join(STATE_DIR, "media-retry");
 /** Every session message as sent, keyed by message id: a reaction names only the id. */
 const SENT_DIR = join(STATE_DIR, "sent");
 const SENT_IN_FLIGHT_DIR = join(STATE_DIR, "sent-in-flight");
@@ -656,6 +658,19 @@ interface IncomingFile {
 	mime: string;
 	size?: number;
 	name?: string;
+}
+
+/** A download Telegram could not hand over yet, with everything its delivery needs once it can. */
+interface MediaRetry {
+	updateId: number;
+	media: IncomingFile;
+	target: string;
+	owner: string;
+	messageId: number;
+	caption?: string;
+	replyTo?: number;
+	attempts: number;
+	nextAt: number;
 }
 
 /** Largest photo size wins; Telegram photos are always JPEG. */
@@ -3465,46 +3480,145 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Bot API refuses getFile beyond 20 MB; larger uploads get a notice instead of silence. Every
-	 * abandoned path logs its own reason: the user-facing notice is necessarily generic, so without
-	 * this a lost file leaves nothing to diagnose.
+	 * Bot API refuses getFile beyond 20 MB, and larger uploads get a notice instead of silence. A throttle, a server
+	 * error, an expired link or a broken connection says nothing about the file, whose id Telegram keeps for good,
+	 * so those come back as `retry`. Every outcome that loses the file says why in `dropped`. Each path logs its own
+	 * reason, so a lost or deferred file always leaves something to diagnose.
 	 */
 	async function downloadMedia(
 		cfg: Config,
 		media: IncomingFile,
 		updateId: number,
 		owner: string,
-	): Promise<string | null> {
-		const give = (reason: string, meta: Record<string, unknown> = {}): null => {
+	): Promise<{ path: string } | { retry: true } | { dropped: string }> {
+		const log = (reason: string, meta: Record<string, unknown> = {}): void => {
 			pi.logger.warn(`notify-telegram: media ${reason}`, { fileId: media.fileId, updateId, ...meta });
-			return null;
 		};
+		const oversized = { dropped: "That file could not be fetched (20 MB is the ceiling), so it was dropped." };
 		if (media.size !== undefined && media.size > MEDIA_MAX_BYTES) {
-			return give("oversized before download", { size: media.size, ceiling: MEDIA_MAX_BYTES });
+			log("oversized before download", { size: media.size, ceiling: MEDIA_MAX_BYTES });
+			return oversized;
 		}
-		const file = await callTelegram<{ file_path?: string }>(cfg, "getFile", { file_id: media.fileId }, 30_000);
-		const remote = file?.file_path;
-		if (typeof remote !== "string" || remote.length === 0) return give("no file path from getFile");
 		// A thrown fetch here must not escape: pollOnce would never advance the update
 		// offset, refetching the batch and re-delivering its earlier updates forever.
+		const refused: { failure: TelegramFailure | null } = { failure: null };
+		let file: { file_path?: string } | null = null;
+		try {
+			file = await callTelegramRaw<{ file_path?: string }>(
+				cfg,
+				"getFile",
+				{ file_id: media.fileId },
+				30_000,
+				(failure) => {
+					refused.failure = failure;
+					log("getFile refused", { ...failure });
+				},
+			);
+		} catch (error) {
+			log("getFile failed", { error: error instanceof Error ? error.message : String(error) });
+			return { retry: true };
+		}
+		const failure = refused.failure;
+		if (file === null && failure !== null) {
+			if (failure.status === 429 || failure.status >= 500) return { retry: true };
+			if (/file is too big/i.test(failure.description)) return oversized;
+			return {
+				dropped: `That file could not be fetched, because Telegram refused it (${clip(failure.description, 120)}), so it was dropped.`,
+			};
+		}
+		const remote = file?.file_path;
+		if (typeof remote !== "string" || remote.length === 0) {
+			log("no file path from getFile");
+			return { dropped: "That file could not be fetched, because Telegram gave no path for it, so it was dropped." };
+		}
 		let bytes: Uint8Array;
 		try {
 			const response = await fetch(`https://api.telegram.org/file/bot${cfg.token}/${remote}`, {
 				signal: AbortSignal.timeout(60_000),
 			});
-			if (!response.ok) return give("download rejected", { status: response.status });
+			if (!response.ok) {
+				log("download rejected", { status: response.status });
+				// The link lasts at least an hour, and the next attempt's getFile issues a fresh one.
+				if (response.status === 404 || response.status === 429 || response.status >= 500) return { retry: true };
+				return {
+					dropped: `That file could not be fetched, because its download was refused with status ${response.status}, so it was dropped.`,
+				};
+			}
 			bytes = new Uint8Array(await response.arrayBuffer());
 		} catch (error) {
-			return give("download failed", { error: error instanceof Error ? error.message : String(error) });
+			log("download failed", { error: error instanceof Error ? error.message : String(error) });
+			return { retry: true };
 		}
 		if (bytes.byteLength > MEDIA_MAX_BYTES) {
-			return give("oversized after download", { bytes: bytes.byteLength, ceiling: MEDIA_MAX_BYTES });
+			log("oversized after download", { bytes: bytes.byteLength, ceiling: MEDIA_MAX_BYTES });
+			return oversized;
 		}
 		const original = (media.name ?? remote).split("/").at(-1) ?? "file";
 		mkdirSync(MEDIA_DIR, { recursive: true, mode: 0o700 });
 		const path = join(MEDIA_DIR, standardFileName({ at: Date.now(), kind: media.kind, owner, updateId, original }));
 		writeFileSync(path, bytes, { mode: 0o600 });
-		return path;
+		return { path };
+	}
+
+	/** Hands a fetched file to the session it was routed to, exactly as on arrival. */
+	function deliverMedia(job: MediaRetry, path: string): void {
+		deliver(job.target, job.updateId, {
+			kind: "file",
+			value: path,
+			mime: job.media.mime,
+			caption: job.caption,
+			messageId: job.messageId,
+			replyTo: job.replyTo,
+		});
+		trackIncoming(job.messageId, job.target);
+	}
+
+	/** Saves a download for the poller to try again, 15 seconds after the first failure and doubling up to 10 minutes. */
+	function deferMedia(job: MediaRetry): void {
+		const delay = Math.min(15_000 * 2 ** (job.attempts - 1), 600_000);
+		writePrivateJson(MEDIA_RETRY_DIR, `${job.updateId}.json`, { ...job, nextAt: Date.now() + delay });
+	}
+
+	/** This process wrote the job, so only what reaches a file name, an inbox path or Telegram is checked. */
+	function readMediaRetry(raw: unknown): MediaRetry | null {
+		const job = raw as Partial<MediaRetry> | null;
+		if (job === null || typeof job !== "object" || !Number.isSafeInteger(job.updateId) || !isStateToken(job.target)) {
+			return null;
+		}
+		const media = job.media;
+		if (typeof job.owner !== "string" || typeof media?.fileId !== "string" || typeof media.mime !== "string")
+			return null;
+		if (!["photo", "voice", "audio", "document"].includes(media.kind)) return null;
+		return { attempts: 1, nextAt: 0, ...job } as MediaRetry;
+	}
+
+	let mediaRetryInFlight = false;
+
+	/** The poller's pass over deferred downloads, each tried once its wait is over. */
+	async function retryMedia(): Promise<void> {
+		if (config === null || mediaRetryInFlight) return;
+		const cfg = config;
+		mediaRetryInFlight = true;
+		try {
+			for (const entry of listJson(MEDIA_RETRY_DIR)) {
+				const job = readMediaRetry(readJsonFile(join(MEDIA_RETRY_DIR, entry)));
+				if (job === null) {
+					removeStatePath(MEDIA_RETRY_DIR, entry);
+					continue;
+				}
+				if (job.nextAt > Date.now()) continue;
+				const fetched = await downloadMedia(cfg, job.media, job.updateId, job.owner);
+				if ("retry" in fetched) {
+					deferMedia({ ...job, attempts: job.attempts + 1 });
+					continue;
+				}
+				removeStatePath(MEDIA_RETRY_DIR, entry);
+				if ("path" in fetched) deliverMedia(job, fetched.path);
+				else await serviceNotice(fetched.dropped, false);
+			}
+		} finally {
+			mediaRetryInFlight = false;
+		}
 	}
 
 	/**
@@ -4267,20 +4381,31 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			const record = readSessionRecord(target);
 			const owner = record === null ? "unknown" : fileOwner(record.tag, record.emoji);
-			const saved = await downloadMedia(cfg, media, update.update_id, owner);
-			if (saved === null) {
-				await serviceNotice("That file could not be fetched (20 MB is the ceiling), so it was dropped.", false);
+			const fetched = await downloadMedia(cfg, media, update.update_id, owner);
+			const job: MediaRetry = {
+				updateId: update.update_id,
+				media,
+				target,
+				owner,
+				messageId: message.message_id,
+				caption: message.caption,
+				replyTo,
+				attempts: 1,
+				nextAt: 0,
+			};
+			if ("retry" in fetched) {
+				deferMedia(job);
+				await serviceNotice(
+					"That file could not be fetched yet, because Telegram did not hand it over. It will be tried again until it arrives.",
+					false,
+				);
 				return;
 			}
-			deliver(target, update.update_id, {
-				kind: "file",
-				value: saved,
-				mime: media.mime,
-				caption: message.caption,
-				messageId: message.message_id,
-				replyTo,
-			});
-			trackIncoming(message.message_id, target);
+			if ("dropped" in fetched) {
+				await serviceNotice(fetched.dropped, false);
+				return;
+			}
+			deliverMedia(job, fetched.path);
 			return;
 		}
 
@@ -7385,6 +7510,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					reapDeadSessions(true);
 					detach(retryPendingUnpins(), "pending pin cleanup");
 					detach(renderCrashCards(), "crash cards");
+					detach(retryMedia(), "media retry");
 				}
 			} catch (error) {
 				pi.logger.warn("notify-telegram: heartbeat failed", {
