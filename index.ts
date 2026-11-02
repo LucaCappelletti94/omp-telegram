@@ -3000,14 +3000,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * A second board in the chat needs its own pin, and a pin comes back as an incoming message, so
+	 * What a refused edit says about the message it targeted. A second board or crash card needs its
+	 * own place in the chat, and a board needs its own pin, which comes back as an incoming message, so
 	 * re-posting on a refusal that says nothing about the message having vanished is expensive and
 	 * self-sustaining. Only Telegram naming a missing message earns a replacement.
 	 */
-	function boardVerdict(description: string): "gone" | "current" | "keep" {
+	function editVerdict(description: string): "gone" | "current" | "keep" {
 		const said = description.toLowerCase();
 		if (said.includes("not found") || said.includes("message_id_invalid")) return "gone";
-		// The board already carries this text, which is what two publishers of one fleet collide on.
+		// The message already carries this text, which is what two publishers of one fleet collide on.
 		if (said.includes("not modified")) return "current";
 		return "keep";
 	}
@@ -3038,7 +3039,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					},
 				);
 				if (pinned !== null) return "confirmed";
-				const verdict = boardVerdict(refusal);
+				const verdict = editVerdict(refusal);
 				pi.logger.warn("notify-telegram: the fleet board pin was refused", { description: refusal, verdict });
 				return verdict === "gone" ? "gone" : "owed";
 			};
@@ -3065,7 +3066,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						const pin = shown.pinned || (await tryPin(shown.messageId)) === "confirmed";
 						return remember(shown.messageId, pin);
 					}
-					const verdict = boardVerdict(refusal);
+					const verdict = editVerdict(refusal);
 					pi.logger.warn("notify-telegram: the fleet board edit was refused", { description: refusal, verdict });
 					if (verdict === "current") {
 						const pin = shown.pinned || (await tryPin(shown.messageId)) === "confirmed";
@@ -5943,6 +5944,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					rows.push([{ text: buttonText(`Restore ${crashTitle(record)}`), callback_data: `kr:${id}` }]);
 				}
 			}
+			// Every record this card offered has expired, so there is nothing left to show or restore. A tap on
+			// its remaining buttons is answered as expired.
+			if (lines.length === 0) {
+				removeStatePath(CRASH_BATCH_DIR, entry);
+				continue;
+			}
 			if (rows.length > 1) rows.push([{ text: "Restore all", callback_data: `ka:${batchId}`, style: "success" }]);
 			if (rows.length > 0) rows.push([{ text: "Dismiss", callback_data: `kd:${batchId}` }]);
 			const died = batch.ids.length - shut;
@@ -5962,11 +5969,32 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				parse_mode: "HTML",
 				reply_markup: { inline_keyboard: rows },
 			};
+			const refused: { failure: TelegramFailure | null } = { failure: null };
+			const noteRefusal = (failure: TelegramFailure): void => {
+				refused.failure = failure;
+				pi.logger.warn("telegram call failed", { ...failure });
+			};
 			const sent =
 				batch.messageId === null
-					? await callTelegram<TelegramMessage>(cfg, "sendMessage", body, 15_000)
-					: await callTelegram(cfg, "editMessageText", { ...body, message_id: batch.messageId }, 15_000);
-			if (sent === null) continue;
+					? await callTelegramRaw<TelegramMessage>(cfg, "sendMessage", body, 15_000, noteRefusal)
+					: await callTelegramRaw(
+							cfg,
+							"editMessageText",
+							{ ...body, message_id: batch.messageId },
+							15_000,
+							noteRefusal,
+						);
+			if (sent === null) {
+				const failure = refused.failure;
+				const verdict = failure === null ? "keep" : editVerdict(failure.description);
+				if (batch.messageId !== null && verdict === "gone") {
+					writePrivateJson(CRASH_BATCH_DIR, entry, { ...batch, messageId: null, shown: "" });
+				} else if (verdict === "current" || (failure !== null && failure.status !== 429 && failure.status < 500)) {
+					// The card shows this text already, or Telegram would refuse it the same way again, so only new content is sent.
+					writePrivateJson(CRASH_BATCH_DIR, entry, { ...batch, shown });
+				}
+				continue;
+			}
 			const messageId = batch.messageId ?? (sent as TelegramMessage).message_id;
 			writePrivateJson(CRASH_BATCH_DIR, entry, { ...batch, messageId, shown });
 		}
