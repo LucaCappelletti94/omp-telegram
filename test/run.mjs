@@ -6479,6 +6479,14 @@ heading("shared Telegram throttle");
 {
 	const throttleFile = join(root, "notify-telegram/throttle.json");
 	const statusSends = (summary) => called("sendMessage").filter((c) => String(c.body.text).includes(summary)).length;
+	/** The shared deadline as written, or 0 when there is none, read without checking first that the file exists. */
+	const sharedUntil = () => {
+		try {
+			return JSON.parse(readFileSync(throttleFile, "utf8")).until;
+		} catch {
+			return 0;
+		}
+	};
 	const turnEnd = async (session, summary) => {
 		await session.fire("input");
 		await session.tools
@@ -6503,10 +6511,7 @@ heading("shared Telegram throttle");
 	api.failStatus = undefined;
 	api.failRetryAfter = undefined;
 	api.failDescription = undefined;
-	check(
-		"a 429 is shared with every process through the state directory",
-		existsSync(throttleFile) && JSON.parse(readFileSync(throttleFile, "utf8")).until > Date.now() + 30_000,
-	);
+	check("a 429 is shared with every process through the state directory", sharedUntil() > Date.now() + 30_000);
 
 	// A tool the agent is blocked on refuses at once rather than freezing the agent for 40 seconds.
 	const sendsBefore = called("sendMessage").length;
