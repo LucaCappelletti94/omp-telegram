@@ -4705,7 +4705,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!registered || drainInFlight || closing) return;
 		drainInFlight = true;
 		try {
-			const dir = join(INBOX_DIR, sessionId);
+			const dir = resolve(INBOX_DIR, sessionId);
+			if (!dir.startsWith(`${resolve(STATE_DIR)}${sep}`)) return;
 			if (!existsSync(dir)) return;
 			const names = readdirSync(dir)
 				.filter((entry) => entry.endsWith(".json") || entry.endsWith(".json.processing"))
