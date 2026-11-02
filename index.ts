@@ -1160,6 +1160,8 @@ interface TelegramFailure {
 	method: string;
 	status: number;
 	description: string;
+	/** Seconds Telegram asks to wait before repeating the request, given with a 429. */
+	retryAfter?: number;
 }
 
 interface TelegramEnvelope {
@@ -1210,10 +1212,12 @@ async function callTelegramRaw<T>(
 		}),
 	);
 	if (!response.ok || envelope === null || envelope.ok !== true) {
+		const retryAfter = envelope?.parameters?.retry_after;
 		onFailure({
 			method,
 			status: response.status,
 			description: typeof envelope?.description === "string" ? envelope.description : "no description",
+			...(typeof retryAfter === "number" && retryAfter >= 0 ? { retryAfter } : {}),
 		});
 		return null;
 	}
@@ -2829,6 +2833,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		kind: SentKind,
 		payload?: unknown,
 		beforeRecord?: (messageId: number) => void,
+		onRefused?: (failure: TelegramFailure) => void,
 	): Promise<TelegramMessage | null> {
 		const sentSession = snapshotSentSession();
 		if (/```|(^|\n)\|.+\|/.test(plain)) {
@@ -2848,7 +2853,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			);
 			if (sent !== null) return sent;
 		}
-		return await sendOrEdit(cfg, "sendMessage", body, plain, keep, kind, payload, beforeRecord, sentSession);
+		return await sendOrEdit(cfg, "sendMessage", body, plain, keep, kind, payload, beforeRecord, sentSession, onRefused);
 	}
 
 	/** `keep` is a short tail exempt from truncation, so an oversized body cannot swallow the usage footer. */
@@ -2861,6 +2866,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		keep = "",
 		payload?: unknown,
 		beforeRecord?: (messageId: number) => void,
+		onRefused?: (failure: TelegramFailure) => void,
 	): Promise<TelegramMessage | null> {
 		if (config === null) return null;
 		const sent = await sendStructured(
@@ -2871,6 +2877,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			kind,
 			payload,
 			beforeRecord,
+			onRefused,
 		);
 		lastNotifiedAt = Date.now();
 		writeSessionRecord(ctx);
@@ -4476,6 +4483,45 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
+	/**
+	 * Sends a turn-end message until Telegram takes it, for as long as `current` holds and the session is not
+	 * closing. The message is the only one saying the turn ended and what it asks, so no timer gives it up. A 429
+	 * waits exactly its `retry_after`, since an earlier attempt cannot succeed. A server or network failure backs
+	 * off from 2 s up to a minute. Any other refusal is final, because the same request would be refused again.
+	 */
+	async function deliverTurnEnd(
+		send: (onRefused: (failure: TelegramFailure) => void) => Promise<TelegramMessage | null>,
+		current: () => boolean,
+	): Promise<TelegramMessage | null> {
+		let backoffMs = 2_000;
+		for (;;) {
+			const refused: { failure: TelegramFailure | null } = { failure: null };
+			let failed = false;
+			let sent: TelegramMessage | null = null;
+			try {
+				sent = await send((failure) => {
+					refused.failure = failure;
+				});
+			} catch (error) {
+				failed = true;
+				pi.logger.warn("notify-telegram: a turn-end send failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			if (sent !== null) return sent;
+			const failure = refused.failure;
+			if (!failed && (failure === null || (failure.status !== 429 && failure.status < 500))) return null;
+			const throttled = failure?.status === 429 && failure.retryAfter !== undefined;
+			const until = Date.now() + (throttled ? (failure?.retryAfter ?? 0) * 1000 : backoffMs);
+			if (!throttled) backoffMs = Math.min(backoffMs * 2, 60_000);
+			while (Date.now() < until) {
+				if (closing || !current()) return null;
+				await sleepMs(Math.min(250, until - Date.now()));
+			}
+			if (closing || !current()) return null;
+		}
+	}
+
 	/** Blocks nothing: a press starts the next turn. Only the latest stands. */
 	async function sendStandingQuestion(
 		ctx: ExtensionContext,
@@ -4529,18 +4575,24 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 			}
 		};
-		const sent = await sendStructured(
-			config,
-			{
-				chat_id: config.chatId,
-				reply_markup: { inline_keyboard: keyboard, force_reply: true },
-				...urgencyExtras(recorded, quiet),
-			},
-			body,
-			keep,
-			"standing",
-			recorded,
-			publishStanding,
+		const cfg = config;
+		const sent = await deliverTurnEnd(
+			(onRefused) =>
+				sendStructured(
+					cfg,
+					{
+						chat_id: cfg.chatId,
+						reply_markup: { inline_keyboard: keyboard, force_reply: true },
+						...urgencyExtras(recorded, quiet),
+					},
+					body,
+					keep,
+					"standing",
+					recorded,
+					publishStanding,
+					onRefused,
+				),
+			ownsSlot,
 		);
 		if (ownsSlot()) {
 			if (sent === null) standingQuestion = { id, messageId: null, labels, head: settlementHead };
@@ -7616,15 +7668,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const registerReplyQuestion = (messageId: number): void => {
 					if (replyQuestionToken === replyQuestionGeneration) replyQuestionMessageId = messageId;
 				};
-				const work = notify(
-					ctx,
-					"status",
-					heads[recorded.urgency],
-					body,
-					extra,
-					usageFooter(),
-					recorded,
-					replyQuestionToken === null ? undefined : registerReplyQuestion,
+				const work = deliverTurnEnd(
+					(onRefused) =>
+						notify(
+							ctx,
+							"status",
+							heads[recorded.urgency],
+							body,
+							extra,
+							usageFooter(),
+							recorded,
+							replyQuestionToken === null ? undefined : registerReplyQuestion,
+							onRefused,
+						),
+					() => pinGeneration === redPinGeneration,
 				).then((sent) => {
 					const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
 					if (recorded.urgency === "green") {
@@ -7671,8 +7728,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					: wantsReply
 						? `...${clipEnd(tail, 600)}`
 						: `${clip(tail, 600)}...`;
+		const generation = redPinGeneration;
 		detach(
-			notify(ctx, "status", title, body, quiet ? { disable_notification: true } : {}, usageFooter()),
+			deliverTurnEnd(
+				(onRefused) =>
+					notify(
+						ctx,
+						"status",
+						title,
+						body,
+						quiet ? { disable_notification: true } : {},
+						usageFooter(),
+						undefined,
+						undefined,
+						onRefused,
+					),
+				() => generation === redPinGeneration,
+			),
 			"turn-end notice",
 		);
 	});

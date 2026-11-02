@@ -595,8 +595,8 @@ check(
 );
 
 // A real rate limit: 429 with a retry_after past the ceiling sendWithRetry is willing to wait, so
-// it declines and hands the refusal up. Re-sending on that adds a request to the thing already
-// refusing them and strips formatting that was never at fault.
+// it declines and hands the refusal up. Nothing is sent again before retry_after has passed, since
+// that adds a request to the thing already refusing them, and formatting that was never at fault stays.
 api.failMethods = ["sendMessage"];
 api.failStatus = 429;
 api.failRetryAfter = 60;
@@ -619,7 +619,7 @@ api.failStatus = undefined;
 api.failRetryAfter = undefined;
 api.failDescription = undefined;
 const throttledAttempts = called("sendMessage").slice(beforeThrottled);
-check("a rate-limited send is not re-sent", throttledAttempts.length === 1);
+check("a rate-limited send is not re-sent before its retry_after", throttledAttempts.length === 1);
 check("a rate-limited send keeps its formatting", throttledAttempts[0]?.body.parse_mode === "HTML");
 check(
 	"a rate-limited send is logged with what Telegram actually said",
@@ -3696,6 +3696,100 @@ rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 			record(session.id).pinned === null &&
 			record(session.id).standing === null &&
 			session.steers.some((s) => s.text === "Agent will proceed"),
+	);
+	await session.fire("session_shutdown");
+}
+{
+	// A turn-end question Telegram throttles past the one retry the call layer makes is sent again once the
+	// throttle passes, because it is the only message saying the turn ended and what it asks.
+	const session = spawn(crypto.randomUUID(), "/home/dev/work/standing-throttled");
+	await session.fire("session_start");
+	api.failMethods = ["sendMessage"];
+	api.failStatus = 429;
+	api.failRetryAfter = 1;
+	api.failDescription = "Too Many Requests: retry after 1";
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"stand-throttled",
+			{ summary: "Throttled decision.", urgency: "orange", options: opts("Agent will ship", "Agent will wait") },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	await session.fire("session_stop");
+	// Past the call layer's own retry at 1.5 s, so only a later attempt can still deliver it.
+	await settle(2000);
+	api.failMethods = [];
+	api.failStatus = undefined;
+	api.failRetryAfter = undefined;
+	api.failDescription = undefined;
+	await settle(1500);
+	const delivered = called("sendMessage").filter((c) => String(c.body.text).includes("Throttled decision."));
+	check(
+		"a throttled turn-end question is delivered once the throttle passes",
+		delivered.length >= 3 && record(session.id).standing?.messageId === api.nextMessage - 1,
+	);
+	await session.fire("session_shutdown");
+}
+{
+	// A throttled status gives way to the user moving on, and is never sent after it.
+	const session = spawn(crypto.randomUUID(), "/home/dev/work/status-throttled-input");
+	await session.fire("session_start");
+	api.failMethods = ["sendMessage"];
+	api.failStatus = 429;
+	api.failRetryAfter = 1;
+	api.failDescription = "Too Many Requests: retry after 1";
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"status-throttled",
+			{ summary: "Superseded status.", urgency: "green", effect: "none" },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	await session.fire("session_stop");
+	await settle(2000);
+	await session.fire("input");
+	api.failMethods = [];
+	api.failStatus = undefined;
+	api.failRetryAfter = undefined;
+	api.failDescription = undefined;
+	const attemptsAtInput = called("sendMessage").filter((c) =>
+		String(c.body.text).includes("Superseded status."),
+	).length;
+	await settle(1500);
+	check(
+		"a throttled status is not sent after the user moves on",
+		called("sendMessage").filter((c) => String(c.body.text).includes("Superseded status.")).length === attemptsAtInput,
+	);
+	await session.fire("session_shutdown");
+}
+{
+	// A refusal that is not a throttle or a server error would be repeated word for word, so it is final.
+	const session = spawn(crypto.randomUUID(), "/home/dev/work/status-refused");
+	await session.fire("session_start");
+	api.failMethods = ["sendMessage"];
+	api.failStatus = 400;
+	api.failDescription = "Bad Request: chat not found";
+	await session.tools
+		.get("notify_status")
+		.execute(
+			"status-refused",
+			{ summary: "Refused status.", urgency: "green", effect: "none" },
+			undefined,
+			undefined,
+			session.ctx,
+		);
+	await session.fire("session_stop");
+	await settle(2500);
+	api.failMethods = [];
+	api.failStatus = undefined;
+	api.failDescription = undefined;
+	check(
+		"a status refused for good is not sent again",
+		called("sendMessage").filter((c) => String(c.body.text).includes("Refused status.")).length === 1,
 	);
 	await session.fire("session_shutdown");
 }
