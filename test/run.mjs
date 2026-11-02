@@ -3018,10 +3018,12 @@ heading("durable pin retirement");
 		const session = await start();
 		const oldId = await red(session);
 		api.failMethods = ["unpinChatMessage"];
+		api.failStatus = 429;
 		await session.fire("agent_start");
 		await settle();
 		if (recovery === "restart") await session.fire("session_shutdown");
 		api.failMethods = [];
+		api.failStatus = undefined;
 		const owner = recovery === "restart" ? await start() : session;
 		const currentId = await red(owner);
 		owner.heartbeat();
@@ -3055,6 +3057,7 @@ heading("durable pin retirement");
 		await settle();
 		const batch = JSON.parse(readFileSync(join(crashDir, "batches", `${crash.batch}.json`), "utf8"));
 		api.failMethods = ["unpinChatMessage"];
+		api.failStatus = 429;
 		api.queued = [
 			{
 				update_id: 88001,
@@ -3069,6 +3072,7 @@ heading("durable pin retirement");
 		await owner.pump(150);
 		await owner.fire("session_shutdown");
 		api.failMethods = [];
+		api.failStatus = undefined;
 		const successor = await start();
 		successor.heartbeat();
 		await settle(150);
@@ -3090,11 +3094,13 @@ heading("durable pin retirement");
 		const id = record(session.id).pinned;
 		await session.fire("agent_start");
 		api.failMethods = ["unpinChatMessage"];
+		api.failStatus = 429;
 		api.pinMessageGate = null;
 		gate.resolve();
 		await settle();
 		await session.fire("session_shutdown");
 		api.failMethods = [];
+		api.failStatus = undefined;
 		const successor = await start();
 		await settle(150);
 		check("a refused stale-pin compensation survives shutdown", !api.pinned.has(id));
@@ -3142,6 +3148,26 @@ heading("durable pin retirement");
 		session.heartbeat();
 		await settle(150);
 		check("cleanup recovers after the unpin transport error", !api.pinned.has(id));
+		await session.fire("session_shutdown");
+	}
+	{
+		// A refusal that is neither a throttle nor a server error would come back word for word, so the
+		// journal gives the unpin up after one attempt instead of repeating it on every heartbeat.
+		const session = await start();
+		const id = await red(session);
+		api.failMethods = ["unpinChatMessage"];
+		api.failDescription = "Bad Request: not enough rights to manage pinned messages in the chat";
+		await session.fire("agent_start");
+		await settle();
+		const attempts = () => called("unpinChatMessage").filter((c) => c.body.message_id === id).length;
+		const afterFirst = attempts();
+		session.heartbeat();
+		await settle(150);
+		session.heartbeat();
+		await settle(150);
+		api.failMethods = [];
+		api.failDescription = undefined;
+		check("an unpin refused for good is attempted once and given up", afterFirst >= 1 && attempts() === afterFirst);
 		await session.fire("session_shutdown");
 	}
 	for (const restored of [false, true]) {

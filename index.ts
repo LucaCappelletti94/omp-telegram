@@ -3247,6 +3247,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		const work = (async () => {
 			let refusal = "";
+			let status = 0;
 			const removed = await callTelegramRaw<boolean>(
 				cfg,
 				"unpinChatMessage",
@@ -3254,11 +3255,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				10_000,
 				(failure) => {
 					refusal = failure.description.toLowerCase();
+					status = failure.status;
 					pi.logger.warn("telegram call failed", { ...failure });
 				},
 			);
 			const gone = refusal.includes("message to unpin not found") || refusal.includes("message_id_invalid");
-			if (removed !== true && !gone) return;
+			// A refusal that is neither a throttle nor a server error would come back word for word on every retry.
+			const final = status > 0 && status !== 429 && status < 500;
+			if (removed !== true && !gone && !final) return;
+			if (removed !== true && !gone) {
+				pi.logger.warn("notify-telegram: an unpin refused for good was given up", {
+					messageId: raw.messageId,
+					description: refusal,
+				});
+			}
 			const current = readJsonFile(join(PENDING_UNPINS_DIR, name)) as { token?: unknown } | null;
 			if (current?.token === raw.token) writePrivateJson(PENDING_UNPINS_DIR, name, null);
 		})();
