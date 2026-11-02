@@ -990,6 +990,7 @@ const OUTCOME_PHRASE: Record<Outcome, string> = {
 	"pr-opened": "opened its pull request",
 	merged: "was merged",
 	closed: "closed its pull request without merging",
+	gone: "has its pull request gone from GitHub, which no longer finds it or its repository",
 };
 
 function outcomeSummary(item: Extract<PendingItem, { kind: "outcome" }>): string {
@@ -6062,8 +6063,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				try {
 					data = viewed.ok ? JSON.parse(viewed.stdout) : null;
 				} catch {}
-				const state = data === null ? null : classifyPr(data);
-				if (data === null || state === null) {
+				// GitHub saying the repository or the pull request does not exist is final, unlike a failed call.
+				const gone = !viewed.ok && /Could not resolve to a (Repository|PullRequest)\b/.test(viewed.stderr);
+				const state: PrState | null = gone ? "gone" : data === null ? null : classifyPr(data);
+				if (state === null) {
 					pi.logger.warn("notify-telegram: could not read a pull request", { url, stderr: clip(viewed.stderr, 200) });
 					continue;
 				}
@@ -6074,7 +6077,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const now = Date.now();
 				const record: PrRecord = {
 					url,
-					number: typeof data.number === "number" ? data.number : 0,
+					number: typeof data?.number === "number" ? data.number : (previous?.number ?? 0),
 					state,
 					checkedAt: now,
 					changedAt: previous !== null && previous.state === state ? previous.changedAt : now,
