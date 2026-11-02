@@ -11941,11 +11941,54 @@ heading("sessions that died without shutting down");
 		/died without shutting down/i.test(lostNote) && /ended unexpectedly/i.test(lostNote),
 	);
 
-	// A week on, the card's records are gone and a tap says so.
+	// Telegram calling the edit unchanged means the card already shows that text, so it is current.
+	const batchFile = join(crashDir, "batches", `${batch}.json`);
+	writeFileSync(batchFile, JSON.stringify({ ...JSON.parse(readFileSync(batchFile, "utf8")), shown: "stale" }));
+	const cardEdits = (messageId = cardId) =>
+		called("editMessageText").filter((c) => c.body.message_id === messageId).length;
+	const editsBeforeUnchanged = cardEdits();
+	api.failMethods = ["editMessageText"];
+	api.failDescription =
+		"Bad Request: message is not modified: specified new message content and reply markup are exactly the same";
+	first.heartbeat();
+	await settle(150);
+	api.failMethods = [];
+	api.failDescription = undefined;
+	first.heartbeat();
+	await settle(150);
+	check("a crash card Telegram calls unchanged is not edited again", cardEdits() === editsBeforeUnchanged + 1);
+
+	// A card Telegram reports deleted is posted again once, and the new message is the one kept.
+	writeFileSync(batchFile, JSON.stringify({ ...JSON.parse(readFileSync(batchFile, "utf8")), shown: "stale" }));
+	const cardsBeforeGone = crashCalls().length;
+	api.failMethods = ["editMessageText"];
+	api.failDescription = "Bad Request: message to edit not found";
+	first.heartbeat();
+	await settle(150);
+	api.failMethods = [];
+	api.failDescription = undefined;
+	first.heartbeat();
+	await settle(150);
+	first.heartbeat();
+	await settle(150);
+	const reposted = JSON.parse(readFileSync(batchFile, "utf8")).messageId;
+	check(
+		"a crash card Telegram reports deleted is posted again once",
+		crashCalls().length === cardsBeforeGone + 1 && reposted !== cardId && cardEdits(reposted) === 0,
+	);
+
+	// A week on, the card's records are gone and a tap says so. The batch file was written by a render
+	// since, which must not keep a card with nothing left on it alive.
 	jump(8 * 24 * 3_600_000);
+	utimesSync(batchFile, new Date(Date.now()), new Date(Date.now()));
+	const editsBeforeExpiry = cardEdits(reposted);
 	first.heartbeat();
 	await settle(150);
 	check("a week-old crash record expires", !existsSync(join(crashDir, `${loneId}.json`)));
+	check(
+		"a card whose records all expired is retired without another edit",
+		!existsSync(batchFile) && cardEdits(reposted) === editsBeforeExpiry,
+	);
 	const expiredToast = await tap(first, 9506, `kr:${loneId}`, loneCardId);
 	check(
 		"a tap on an expired card says so and strips its buttons",
