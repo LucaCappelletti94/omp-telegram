@@ -9138,6 +9138,33 @@ check(
 	"the queued typed answer reaches the question once the settlement edit is accepted",
 	failedTextResult.details.customInput === "Use the arena" && inboxCount(failedTextSession.id) === 0,
 );
+// A tap on an earlier question of the ask or on an option that does not exist answers nothing, so it is
+// discarded rather than kept, and the valid tap queued behind it still answers.
+const staleTapSession = spawn("01a07011-0000-0000-0000-000000000000", "/home/dev/work/stale-tap");
+await staleTapSession.fire("session_start");
+let staleTapResult = null;
+staleTapSession.tools
+	.get("ask")
+	.execute("fb-stale-tap", singleQuestion, undefined, undefined, stubbornCtx(staleTapSession.ctx, {}))
+	.then((result) => {
+		staleTapResult = result;
+	});
+await settle(150);
+const staleTapQuestionId = api.nextMessage - 1;
+const staleTapData = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data;
+const [staleAction, staleTag] = staleTapData.split(":");
+api.queued = [
+	answerButton(9070, staleTapQuestionId, `${staleAction}:${staleTag}:5:0`),
+	answerButton(9071, staleTapQuestionId, `${staleAction}:${staleTag}:0:9`),
+	answerButton(9072, staleTapQuestionId, `${staleAction}:${staleTag}`),
+	answerButton(9073, staleTapQuestionId, staleTapData),
+];
+await ownershipPoller.pump(250);
+await staleTapSession.pump(250);
+check(
+	"a stale or malformed tap is discarded without holding back the valid one behind it",
+	inboxCount(staleTapSession.id) === 0 && staleTapResult?.details.selectedOptions[0] === "SQLite",
+);
 // Telegram refusing the edit for good, here because the card was deleted, cannot change on a retry, so
 // the answer is taken instead of blocking every later entry behind it.
 const goneCardSession = spawn("01a07010-0000-0000-0000-000000000000", "/home/dev/work/gone-card");

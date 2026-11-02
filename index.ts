@@ -4616,9 +4616,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** False when the press is still owed, because Telegram refused the edit that would settle it. */
 	async function applyCallback(ask: PendingAsk, payload: string): Promise<boolean> {
 		const [action, tag, rawIndex, rawOption] = payload.split(":");
-		if (tag !== ask.askId || Number.parseInt(rawIndex ?? "", 10) !== ask.index) return true;
 		const question = ask.questions[ask.index];
-		if (question === undefined) return true;
+		if (tag !== ask.askId || Number.parseInt(rawIndex ?? "", 10) !== ask.index || question === undefined) return true;
 
 		if (action === "d") return await advance(ask);
 		if (action !== "o") return true;
@@ -4884,21 +4883,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					continue;
 				}
 				if (entry.kind === "callback") {
-					if (ask === null) {
-						rmSync(processing, { force: true });
-						if (sessionCtx !== null) {
-							await sessionNotice(sessionCtx, "That question is closed. It was answered or cancelled at the terminal.");
-						} else {
-							await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
+					if (ask !== null) {
+						// A refused settlement goes back in the queue. Should even the rename fail, the entry stays as
+						// `.processing`, which the next drain also reads.
+						if (!(await applyCallback(ask, entry.value))) {
+							renameSync(processing, queued);
+							break;
 						}
-					} else if (await applyCallback(ask, entry.value)) {
 						rmSync(processing, { force: true });
 						replyOwedAt = Date.now();
+					} else if (sessionCtx !== null) {
+						await sessionNotice(sessionCtx, "That question is closed. It was answered or cancelled at the terminal.");
 					} else {
-						try {
-							renameSync(processing, queued);
-						} catch {}
-						break;
+						await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
 					}
 					continue;
 				}
@@ -4974,14 +4971,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						rmSync(processing, { force: true });
 						replyOwedAt = Date.now();
 					} else {
-						try {
-							renameSync(processing, queued);
-						} catch {}
+						renameSync(processing, queued);
 						break;
 					}
 					continue;
 				}
-				rmSync(processing, { force: true });
 				pi.sendUserMessage(entry.value);
 				replyOwedAt = Date.now();
 				ackDelivered(entry.messageId);
