@@ -6290,6 +6290,7 @@ heading("uncovered event handlers");
 heading("media fetch failures");
 {
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const mediaClock = clockSkew;
 	const mf = spawn("01a06021-0000-0000-0000-000000000000", "/home/dev/work/mediafail");
 	await mf.fire("session_start");
 	// Recency routing would hand these to whichever session notified last, so each update
@@ -6343,18 +6344,70 @@ heading("media fetch failures");
 	check("a getFile with an empty path drops the file with a notice", emptyPath.notice.includes("could not be fetched"));
 	api.filePath = "documents/file_9.oga";
 
-	api.fileDownload = "error";
-	const rejectedBytes = await dropped("rejected");
-	check("a rejected download drops the file with a notice", rejectedBytes.notice.includes("could not be fetched"));
-	check("a rejected download leaves a trace", traced("download rejected"));
-	api.fileDownload = "throw";
-	const brokenPipe = await dropped("broken");
-	check("a thrown download drops the file with a notice", brokenPipe.notice.includes("could not be fetched"));
+	// A throttle, a server error or a broken connection says nothing about the file, whose id Telegram keeps for
+	// good, so the download waits and is tried again instead of dropping what the user sent.
+	const retried = async (fileId, fail, recover) => {
+		fail();
+		const queued = await dropped(fileId);
+		recover();
+		const before = mf.steers.length;
+		jump(16_000);
+		mf.heartbeat();
+		await settle(150);
+		await mf.pump(250);
+		return { notice: queued.notice, queued: !queued.delivered, delivered: mf.steers.length > before };
+	};
+	const throttled = await retried(
+		"throttled",
+		() => {
+			api.failMethods = ["getFile"];
+			api.failStatus = 429;
+		},
+		() => {
+			api.failMethods = [];
+			api.failStatus = undefined;
+		},
+	);
+	check(
+		"a throttled getFile is queued with a notice that it will be tried again",
+		throttled.queued && throttled.notice.includes("tried again") && !throttled.notice.includes("20 MB"),
+	);
+	check("a throttled getFile is delivered once Telegram hands the file over", throttled.delivered);
+	const serverError = await retried(
+		"rejected",
+		() => {
+			api.fileDownload = "error";
+		},
+		() => {
+			api.fileDownload = "ok";
+		},
+	);
+	check(
+		"a download the server fails is queued, not dropped",
+		serverError.queued && serverError.notice.includes("tried again"),
+	);
+	check("a download the server failed is delivered on a later attempt", serverError.delivered);
+	check("a failed download leaves a trace", traced("download rejected"));
+	const brokenPipe = await retried(
+		"broken",
+		() => {
+			api.fileDownload = "throw";
+		},
+		() => {
+			api.fileDownload = "ok";
+		},
+	);
+	check(
+		"a download whose connection broke is queued, not dropped",
+		brokenPipe.queued && brokenPipe.notice.includes("tried again"),
+	);
+	check("a download whose connection broke is delivered on a later attempt", brokenPipe.delivered);
 	check("a thrown download leaves a trace", traced("download failed"));
-	api.fileDownload = "ok";
+	check("a refused getFile does not blame the 20 MB ceiling", !refused.notice.includes("20 MB"));
 
 	const good = await dropped("good");
 	check("a healthy download still reaches the session", good.delivered);
+	clockSkew = mediaClock;
 }
 
 heading("rich status options");
