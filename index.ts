@@ -830,7 +830,9 @@ type PendingItem =
 			link?: string;
 			note?: string;
 	  }
-	| { kind: "message"; at: number; message: AgentMessage };
+	| { kind: "message"; at: number; message: AgentMessage }
+	/** What the user sent a session that died before reading it, delivered as if it had just arrived. */
+	| { kind: "inbox"; at: number; updateId: number; summary: string; entry: InboxEntry };
 
 function readJsonFile(path: string): unknown {
 	try {
@@ -975,6 +977,16 @@ function pendingItemOf(raw: unknown): PendingItem | null {
 			from: m.from as AgentSender,
 		});
 		return message === null ? null : { kind: "message", at: item.at, message };
+	}
+	// This process wrote the item, and `drainInbox` checks the entry again when it is delivered.
+	if (item.kind === "inbox") {
+		const entry = item.entry as Partial<InboxEntry> | null | undefined;
+		const valid =
+			Number.isSafeInteger(item.updateId) &&
+			typeof item.summary === "string" &&
+			typeof entry?.value === "string" &&
+			(entry.kind === "text" || entry.kind === "file");
+		return valid ? (item as unknown as PendingItem) : null;
 	}
 	if (item.kind !== "outcome") return null;
 	if (!isStateToken(item.source) || typeof item.outcome !== "string" || typeof item.title !== "string") return null;
@@ -2446,6 +2458,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					detach(
 						serviceNotice("Grade kept, but its session ended before the queued redo could reach the agent.", false),
 						"dead-session redo notice",
+					);
+				}
+				const dropped = holdDeadInbox(id, record);
+				if (dropped.length > 0) {
+					const title = titleOf(id);
+					detach(
+						serviceNotice(
+							`**${title}** ended before it read ${dropped.join(", ")}, which only a running session can act on, so nothing was done with ${dropped.length === 1 ? "it" : "them"}.`,
+							false,
+						),
+						"dead-session inbox notice",
 					);
 				}
 				if (restorable) {
@@ -4721,6 +4744,120 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** The question a tap was pressed on, read back from the message it was pressed on. */
+	function tappedQuestion(
+		messageId: number | undefined,
+	): { question: string; labels: string[]; multi: boolean } | null {
+		const asked = (readSentRecord(messageId ?? 0)?.payload as { question?: Partial<ExplainedQuestion> } | undefined)
+			?.question;
+		if (typeof asked?.question !== "string" || !Array.isArray(asked.options)) return null;
+		return {
+			question: asked.question,
+			labels: asked.options.map((option) => String(option?.label)),
+			multi: asked.multi === true,
+		};
+	}
+
+	/**
+	 * Moves what reached a dead session's inbox into its held updates, which its crash card or resume card counts
+	 * and its next run delivers. A tap on its question becomes a message giving the answer, because that question
+	 * died with the process. Returns what only a running process can act on, which is dropped.
+	 */
+	function holdDeadInbox(target: string, record: SessionRecord | null): string[] {
+		const dir = resolve(INBOX_DIR, target);
+		if (!dir.startsWith(`${resolve(STATE_DIR)}${sep}`)) return [];
+		if (!existsSync(dir)) return [];
+		const held = resolve(PENDING_DIR, target);
+		if (!held.startsWith(`${resolve(STATE_DIR)}${sep}`)) return [];
+		const dropped: string[] = [];
+		let order = 0;
+		const hold = (updateId: number, summary: string, entry: InboxEntry): void => {
+			const item: PendingItem = { kind: "inbox", at: Date.now() + order++, updateId, summary, entry };
+			writePrivateJson(held, `i-${updateId}.json`, item);
+		};
+		// A multiple-choice question's taps toggle options, so they count once together, at Done or at the end. Only
+		// the first answer counts, as on a running session, which discards a tap on a question it already settled.
+		const toggles = new Map<number, { updateId: number; question: string; chosen: Set<string> }>();
+		const settled = new Set<number>();
+		const settleToggles = (messageId: number, done: boolean): void => {
+			const open = toggles.get(messageId);
+			if (open === undefined) return;
+			toggles.delete(messageId);
+			settled.add(messageId);
+			const chosen = open.chosen.size === 0 ? "no option selected" : [...open.chosen].map((l) => `"${l}"`).join(", ");
+			hold(open.updateId, `your answer: ${[...open.chosen].join(", ") || "none"}`, {
+				kind: "text",
+				value: `After this session ended, the user answered your question "${open.question}" with ${chosen}. That question closed with the session, so this is its answer.${done ? "" : " The user had not pressed Done."}`,
+			});
+		};
+		const names = readdirSync(dir)
+			.filter((name) => name.endsWith(".json") || name.endsWith(".json.processing"))
+			.sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10));
+		for (const name of names) {
+			const raw = readJsonFile(join(dir, name)) as Partial<InboxEntry> | null;
+			if (raw === null || typeof raw !== "object" || typeof raw.value !== "string" || raw.value.length === 0) continue;
+			const updateId = Number.parseInt(name, 10);
+			if (raw.kind === "agent") {
+				const message = agentMessageOf(raw);
+				if (message !== null) {
+					const item: PendingItem = { kind: "message", at: Date.now() + order++, message };
+					writePrivateJson(held, `m-${Date.now()}-${message.id}.json`, item);
+				}
+				continue;
+			}
+			if (raw.kind === "text" || raw.kind === "file") {
+				const summary = raw.kind === "text" ? `your message: ${clip(raw.value, 80)}` : "a file you sent";
+				hold(updateId, summary, {
+					kind: raw.kind,
+					value: raw.value,
+					messageId: raw.messageId,
+					replyTo: raw.replyTo,
+					caption: raw.caption,
+					mime: raw.mime,
+				});
+				continue;
+			}
+			if (raw.kind === "command") {
+				dropped.push(`/${raw.value}`);
+				continue;
+			}
+			if (raw.kind !== "callback") continue;
+			const [action, first, second, third] = raw.value.split(":");
+			if (action === "k" || action === "x") {
+				dropped.push("a close tap");
+				continue;
+			}
+			if (action === "c") {
+				const standing = record?.standing ?? null;
+				const label =
+					standing !== null && standing.id === first ? standing.labels[Number.parseInt(second ?? "", 10)] : undefined;
+				if (label === undefined) dropped.push("a tap on a question that is no longer on record");
+				else hold(updateId, `your answer: ${label}`, { kind: "text", value: label });
+				continue;
+			}
+			const question = tappedQuestion(raw.messageId);
+			if ((action !== "o" && action !== "d") || question === null || raw.messageId === undefined) {
+				dropped.push("a tap on a question that is no longer on record");
+				continue;
+			}
+			if (settled.has(raw.messageId)) continue;
+			const label = question.labels[Number.parseInt(third ?? "", 10)];
+			if (!question.multi && (action !== "o" || label === undefined)) continue;
+			const open = toggles.get(raw.messageId) ?? { updateId, question: question.question, chosen: new Set<string>() };
+			toggles.set(raw.messageId, { ...open, updateId });
+			if (!question.multi && label !== undefined) {
+				open.chosen.add(label);
+				settleToggles(raw.messageId, true);
+			} else if (action === "d") {
+				settleToggles(raw.messageId, true);
+			} else if (label !== undefined && !open.chosen.delete(label)) {
+				open.chosen.add(label);
+			}
+		}
+		for (const messageId of [...toggles.keys()]) settleToggles(messageId, false);
+		return dropped;
+	}
+
 	function discardQueuedRedos(target: string): number {
 		const dir = join(INBOX_DIR, target);
 		if (!existsSync(dir)) return 0;
@@ -5666,6 +5803,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				deliverAgentMessage(item.message);
 				continue;
 			}
+			// Back through the inbox, so it reaches the agent exactly as if it had arrived now.
+			if (item.kind === "inbox") {
+				deliver(id, item.updateId, item.entry);
+				continue;
+			}
 			pi.sendMessage(
 				{ customType: DEPENDENCY_MESSAGE_TYPE, content: outcomeText(item), display: true, details: item },
 				{ deliverAs: "aside", triggerTurn: true },
@@ -5711,7 +5853,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			.map(({ item }) =>
 				item.kind === "outcome"
 					? `- ${outcomeSummary(item)}`
-					: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
+					: item.kind === "inbox"
+						? `- ${item.summary}`
+						: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
 			);
 		const text = `\u23F8\uFE0F **${titleOf(id)}** has ended with ${updates(items.length)} waiting:\n${lines.join("\n")}\n\nResume it to deliver them?`;
 		const body = {
@@ -7349,14 +7493,24 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const { state, heartbeat, systemShutdownAt: shutAt } = crash.record;
 			if (state.length > 0 && state !== "idle") {
 				const when = new Date(Math.max(heartbeat, shutAt)).toLocaleString("sv-SE");
+				const wrote = listPending(sessionId).items.some(({ item }) => item.kind === "inbox");
 				crashNote = [
 					shutAt > 0
 						? `This session was shut down around ${when}, because the machine restarted.`
 						: `This session died without shutting down around ${when}, because ${crash.machine ? "the machine restarted" : "its omp process ended unexpectedly"}.`,
-					`It was ${state} at that moment, so that turn was cut off and any command it was running was killed. It has just been restored from its saved transcript, and the user has not yet said whether to go on.`,
-					"No user message has arrived since it ended, and the last one in this transcript predates that, so it is no instruction to go on.",
-					"In this turn, do not continue, retry or redo any of the work, not even a command that was cut off. Only look at what tells where the work stands.",
-					"If work remains, call notify_status with urgency orange, a brief summary of where the work stands, and options that include continuing it, then end the turn with one sentence saying you are waiting for the answer.",
+					...(!wrote
+						? [
+								`It was ${state} at that moment, so that turn was cut off and any command it was running was killed. It has just been restored from its saved transcript, and the user has not yet said whether to go on.`,
+								"No user message has arrived since it ended, and the last one in this transcript predates that, so it is no instruction to go on.",
+								"In this turn, do not continue, retry or redo any of the work, not even a command that was cut off. Only look at what tells where the work stands.",
+								"If work remains, call notify_status with urgency orange, a brief summary of where the work stands, and options that include continuing it, then end the turn with one sentence saying you are waiting for the answer.",
+							]
+						: [
+								`It was ${state} at that moment, so that turn was cut off and any command it was running was killed. It has just been restored from its saved transcript.`,
+								"The user wrote after it ended, and what they sent arrives right after this note, so that is the instruction for this turn.",
+								"Do not continue, retry or redo any of the cut-off work unless they ask for it, not even a command that was cut off.",
+								"If they leave open whether to go on and work remains, call notify_status with urgency orange, a brief summary of where the work stands, and options that include continuing it, then end the turn with one sentence saying you are waiting for the answer.",
+							]),
 					"If no work remains, end the turn with one sentence saying so, without calling notify_status, and nothing reaches Telegram.",
 				].join(" ");
 			}
