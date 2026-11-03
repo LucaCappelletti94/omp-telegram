@@ -6675,9 +6675,53 @@ heading("paced release after a throttle");
 	);
 	await board.fire("session_shutdown");
 	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
-	rmSync(throttleFile, { force: true });
 	writeConfig();
+
+	// A late 429 with a shorter retry_after never shortens the deadline another process was given.
+	rmSync(throttleFile, { force: true });
+	let releaseLate;
+	const lateResponse = new Promise((resolve) => {
+		releaseLate = resolve;
+	});
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		if (String(url).endsWith("/sendMessage") && String(init.body).includes("Late refusal.")) {
+			await lateResponse;
+			return {
+				ok: false,
+				status: 429,
+				json: async () => ({
+					ok: false,
+					description: "Too Many Requests: retry after 1",
+					parameters: { retry_after: 1 },
+				}),
+			};
+		}
+		return realFetch(url, init);
+	};
+	await turnEnd(peers[0], "Late refusal.");
+	await settle(100);
+	const longDeadline = Date.now() + 40_000;
+	writeFileSync(throttleFile, JSON.stringify({ until: longDeadline, paceUntil: longDeadline + 30_000, next: 0 }));
+	releaseLate();
+	await settle(100);
+	globalThis.fetch = realFetch;
+	check(
+		"a late 429 with a shorter retry_after keeps the longer shared deadline",
+		readJsonFileSafe(throttleFile)?.until === longDeadline,
+	);
+
+	// Shutdown never waits for a paced slot, since omp gives the handler two seconds.
+	writeFileSync(throttleFile, JSON.stringify({ until: 0, paceUntil: Date.now() + 30_000, next: Date.now() + 3_000 }));
+	const callsAtShutdown = api.calls.length;
 	for (const peer of peers) await peer.fire("session_shutdown");
+	await settle(3_500);
+	check(
+		"shutdown refuses a send that would wait for a paced slot",
+		peers.some((peer) => peer.warns.some((w) => JSON.stringify(w.meta ?? {}).includes("held back"))) &&
+			api.calls.slice(callsAtShutdown).every((c) => c.method === "getUpdates"),
+	);
+	rmSync(throttleFile, { force: true });
 }
 
 heading("media fetch failures");
