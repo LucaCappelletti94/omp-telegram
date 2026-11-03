@@ -9837,6 +9837,34 @@ check(
 	"the queued typed answer reaches the question once the settlement edit is accepted",
 	failedTextResult.details.customInput === "Use the arena" && inboxCount(failedTextSession.id) === 0,
 );
+
+// A notice the poller owes waits out a throttle without holding up the button presses queued behind it.
+const blockedPollSession = spawn("01a07013-0000-0000-0000-000000000000", "/home/dev/work/blocked-poll");
+await blockedPollSession.fire("session_start");
+const blockedPollAsk = blockedPollSession.tools
+	.get("ask")
+	.execute("fb-blocked-poll", singleQuestion, undefined, undefined, stubbornCtx(blockedPollSession.ctx, {}));
+await settle(150);
+const blockedPollQuestionId = api.nextMessage - 1;
+const blockedPollButton = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0];
+writeFileSync(join(root, "notify-telegram/throttle.json"), JSON.stringify({ until: Date.now() + 60_000 }));
+const toastsBeforeBlocked = called("answerCallbackQuery").length;
+api.queued = [
+	replyTo(9061, 1, "Where does this go?"),
+	answerButton(9062, blockedPollQuestionId, blockedPollButton.callback_data),
+];
+await ownershipPoller.pump(250);
+check(
+	"a press behind a throttled poller notice is toasted and delivered",
+	called("answerCallbackQuery").length > toastsBeforeBlocked && inboxCount(blockedPollSession.id) === 1,
+);
+rmSync(join(root, "notify-telegram/throttle.json"), { force: true });
+await blockedPollSession.pump(250);
+check(
+	"the delivered press answers its question",
+	(await Promise.race([blockedPollAsk, settle(500).then(() => null)]))?.details.selectedOptions[0] === "SQLite",
+);
+ownershipPoller.heartbeat();
 // A tap on an earlier question of the ask or on an option that does not exist answers nothing, so it is
 // discarded rather than kept, and the valid tap queued behind it still answers.
 const staleTapSession = spawn("01a07011-0000-0000-0000-000000000000", "/home/dev/work/stale-tap");

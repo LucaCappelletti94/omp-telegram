@@ -1221,8 +1221,16 @@ const THROTTLE_FILE = join(STATE_DIR, "throttle.json");
 const THROTTLE_LOCK_FILE = join(STATE_DIR, "throttle.lock");
 /** The lock is held for a synchronous read and write, so one this old belongs to a process that died holding it. */
 const THROTTLE_LOCK_STALE_MS = 2_000;
-/** A toast has its own short deadline, polling must never stop, and a typing action is not a message. */
-const THROTTLE_EXEMPT: Record<string, true> = { answerCallbackQuery: true, getUpdates: true, sendChatAction: true };
+/**
+ * A toast has its own short deadline, polling must never stop, a typing action is not a message, and `getFile`
+ * only reads a file the user sent, which the poller fetches before the updates queued behind it.
+ */
+const THROTTLE_EXEMPT: Record<string, true> = {
+	answerCallbackQuery: true,
+	getFile: true,
+	getUpdates: true,
+	sendChatAction: true,
+};
 /** The longest a tool the agent is blocked on waits out the shared throttle before its call is refused. */
 const AGENT_THROTTLE_WAIT_MS = 30_000;
 /** One send per second, the most Telegram's FAQ allows a bot in one chat. */
@@ -3033,6 +3041,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await serviceNotice(`${messageHead(ctx)}\n\n${text}`);
 	}
 
+	/** A notice the poller owes, sent without holding up the updates queued behind it. Never a reply target. */
+	function pollerNotice(text: string): void {
+		detach(() => serviceNotice(text, false), "poller notice");
+	}
+
 	/** Structured markdown (tables, fences) goes out as a native rich message; anything else keeps the HTML subset path. */
 	async function sendStructured(
 		cfg: Config,
@@ -3966,20 +3979,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					name: owner.record.label || owner.record.name,
 					cwd: owner.record.cwd,
 				};
-		await sendOrEdit(
-			cfg,
-			"editMessageText",
-			{
-				chat_id: cfg.chatId,
-				message_id: callback.message.message_id,
-				reply_markup: { inline_keyboard: [] },
-			},
-			closing,
-			"",
-			sentSession === undefined ? null : "notice",
-			undefined,
-			undefined,
-			sentSession,
+		const picker = callback.message.message_id;
+		// Toasted and delivered already, so the presses queued behind this one need not wait for the edit.
+		detach(
+			() =>
+				sendOrEdit(
+					cfg,
+					"editMessageText",
+					{ chat_id: cfg.chatId, message_id: picker, reply_markup: { inline_keyboard: [] } },
+					closing,
+					"",
+					sentSession === undefined ? null : "notice",
+					undefined,
+					undefined,
+					sentSession,
+				),
+			"session picker close",
 		);
 	}
 
@@ -4029,11 +4044,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			})),
 		);
 		if (settled.length === 0) return;
-		await callTelegram(
-			cfg,
-			"editMessageReplyMarkup",
-			{ chat_id: cfg.chatId, message_id: message.message_id, reply_markup: { inline_keyboard: settled } },
-			10_000,
+		detach(
+			() =>
+				callTelegram(
+					cfg,
+					"editMessageReplyMarkup",
+					{ chat_id: cfg.chatId, message_id: message.message_id, reply_markup: { inline_keyboard: settled } },
+					10_000,
+				),
+			"external question close",
 		);
 	}
 
@@ -4266,10 +4285,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (pending !== null) {
 			try {
 				if (!commitReactionTransaction(pending)) {
-					await serviceNotice(
-						"Grade kept, but that session ended before its queued redo could reach the agent.",
-						false,
-					);
+					pollerNotice("Grade kept, but that session ended before its queued redo could reach the agent.");
 				}
 			} catch (error) {
 				pi.logger.warn("telegram: could not finish a reaction transaction", {
@@ -4290,9 +4306,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (beforeEdit === undefined && sentRecordInFlight(reaction.message_id, record === null)) return false;
 		if (beforeEdit === undefined) record = readSentRecord(reaction.message_id) ?? record;
 		if (record === null) {
-			await serviceNotice(
+			pollerNotice(
 				`Reaction error: that message is not on record, so the reaction was not kept; session messages stay gradable for ${SENT_KEEP_MS / 86_400_000} days.`,
-				false,
 			);
 			return;
 		}
@@ -4363,13 +4378,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		if (ungraded.length > 0) {
 			const scale = REACTION_SCALE.map(([g, set]) => `${g > 0 ? "+" : ""}${g} ${set.join("")}`).join(" \u00B7 ");
-			await serviceNotice(
+			pollerNotice(
 				`Reaction error: ${ungraded.join(" ")} is outside the grading scale, so it was kept without a grade; graded reactions: ${scale}.`,
-				false,
 			);
 		}
 		if (redo && !redoRouted) {
-			await serviceNotice("Grade kept, but that session ended before its queued redo could reach the agent.", false);
+			pollerNotice("Grade kept, but that session ended before its queued redo could reach the agent.");
 		}
 		if (wantsRedo && !redo) {
 			const reason =
@@ -4378,7 +4392,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					: agentWrote
 						? "Grade kept, but that session is gone, so nothing was redone."
 						: "Grade kept, but those were this bot's own words, so there is nothing to redo.";
-			await serviceNotice(reason, false);
+			pollerNotice(reason);
 		}
 	}
 
@@ -4504,23 +4518,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 		if (command === "resume") {
-			await sendResumeList(cfg);
+			detach(() => sendResumeList(cfg), "resume list");
 			return;
 		}
 		if (command === "fleet") {
 			// Sent directly rather than through sendOrEdit: a fleet listing is not a session message
 			// and must stay out of the reply-routing history.
 			const report = fitToTelegram(fleetReport() ?? "\u{1F535} No tmux server is reachable from this process.", "");
-			await callTelegram(
-				cfg,
-				"sendMessage",
-				{
-					chat_id: cfg.chatId,
-					text: toTelegramHtml(report),
-					parse_mode: "HTML",
-					link_preview_options: { is_disabled: true },
-				},
-				15_000,
+			detach(
+				() =>
+					callTelegram(
+						cfg,
+						"sendMessage",
+						{
+							chat_id: cfg.chatId,
+							text: toTelegramHtml(report),
+							parse_mode: "HTML",
+							link_preview_options: { is_disabled: true },
+						},
+						15_000,
+					),
+				"fleet report",
 			);
 			return;
 		}
@@ -4531,7 +4549,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (replyTo !== undefined) {
 				const target = routeMessage(replyTo);
 				if (target === null) {
-					await serviceNotice("No live omp session owns that message, so nothing was stopped.", false);
+					pollerNotice("No live omp session owns that message, so nothing was stopped.");
 					return;
 				}
 				deliver(target, update.update_id, { kind: "command", value: command });
@@ -4542,7 +4560,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				({ record }) => routable(record) && record.state.length > 0 && record.state !== "idle",
 			);
 			if (running.length === 0) {
-				await serviceNotice("No turn is running.", false);
+				pollerNotice("No turn is running.");
 				return;
 			}
 			if (running.length === 1 && running[0] !== undefined) {
@@ -4550,12 +4568,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				trackIncoming(message.message_id, running[0].id);
 				return;
 			}
-			await askWhichSession(
-				cfg,
-				update,
-				{ kind: "command", value: command, messageId: message.message_id },
-				`\u{1F535} ${running.length} sessions are running a turn. Which one should stop?`,
-				running,
+			detach(
+				() =>
+					askWhichSession(
+						cfg,
+						update,
+						{ kind: "command", value: command, messageId: message.message_id },
+						`\u{1F535} ${running.length} sessions are running a turn. Which one should stop?`,
+						running,
+					),
+				"stop picker",
 			);
 			return;
 		}
@@ -4582,7 +4604,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (media !== null) {
 			const target = routeMessage(replyTo);
 			if (target === null) {
-				await serviceNotice("No live omp session owns that message, so it was dropped.", false);
+				pollerNotice("No live omp session owns that message, so it was dropped.");
 				return;
 			}
 			const record = readSessionRecord(target);
@@ -4602,14 +4624,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			};
 			if ("retry" in fetched) {
 				deferMedia(job);
-				await serviceNotice(
+				pollerNotice(
 					"That file could not be fetched yet, because Telegram did not hand it over. It will be tried again until it arrives.",
-					false,
 				);
 				return;
 			}
 			if ("dropped" in fetched) {
-				await serviceNotice(fetched.dropped, false);
+				pollerNotice(fetched.dropped);
 				return;
 			}
 			deliverMedia(job, fetched.path);
@@ -4617,18 +4638,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 
 		if (text === undefined || text.length === 0) {
-			await serviceNotice(
+			pollerNotice(
 				"That message type does not reach the agent. Send text, a photo, a voice note, an audio file, or a document.",
-				false,
 			);
 			return;
 		}
 
 		const target = routeMessage(replyTo);
 		if (target === null) {
-			await serviceNotice(
+			pollerNotice(
 				"No live omp session owns that message, so it was dropped. Reply to a message from the session you mean.",
-				false,
 			);
 			return;
 		}
@@ -4641,12 +4660,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				// An open question outranks recency: a bare message plainly answers it.
 				const asking = rivals.filter(({ record }) => record.state === WAITING_ON_QUESTION);
 				if (asking.length !== 1 || asking[0] === undefined) {
-					await askWhichSession(
-						cfg,
-						update,
-						{ kind: "text", value: text, messageId: message.message_id },
-						`\u{1F535} ${rivals.length} sessions finished within a minute of each other, so I did not guess. Which one did you mean?`,
-						rivals,
+					detach(
+						() =>
+							askWhichSession(
+								cfg,
+								update,
+								{ kind: "text", value: text, messageId: message.message_id },
+								`\u{1F535} ${rivals.length} sessions finished within a minute of each other, so I did not guess. Which one did you mean?`,
+								rivals,
+							),
+						"session picker",
 					);
 					return;
 				}
@@ -6320,22 +6343,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (readCardId(id) !== callback.message?.message_id) {
 				toast = "That resume card is already closed.";
 			} else {
-				await settleResumeCard(
-					id,
-					`Dismissed the resume offer for **${titleOf(id)}**. Updates remain available through /resume.`,
-					false,
-				);
+				const text = `Dismissed the resume offer for **${titleOf(id)}**. Updates remain available through /resume.`;
+				detach(() => settleResumeCard(id, text, false), "resume card close");
 				toast = "Resume offer dismissed.";
 			}
 		} else if (isLiveSession(id)) {
 			toast = "That session is already running, so its updates reach it directly.";
 		} else if (data.startsWith("l:")) {
 			const count = listPending(id).items.length;
-			await settleResumeCard(
-				id,
-				`\u23F8\uFE0F ${updates(count)} for **${titleOf(id)}** ${count === 1 ? "is" : "are"} held until you resume it. /resume lists it.`,
-				true,
-			);
+			const text = `\u23F8\uFE0F ${updates(count)} for **${titleOf(id)}** ${count === 1 ? "is" : "are"} held until you resume it. /resume lists it.`;
+			detach(() => settleResumeCard(id, text, true), "resume card hold");
 			toast = "Held until you resume it.";
 		} else if (Date.now() - readResumingAt(id) < RESUME_START_MS) {
 			toast = "That session is already starting.";
@@ -6343,7 +6360,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const resumed = await resumeSession(id);
 			if (resumed.ok) {
 				writePrivateJson(join(PENDING_DIR, id), "resuming.json", { at: Date.now() });
-				await settleResumeCard(id, `\u25B6\uFE0F Resuming **${titleOf(id)}** in a new tmux window.`, true);
+				const text = `\u25B6\uFE0F Resuming **${titleOf(id)}** in a new tmux window.`;
+				detach(() => settleResumeCard(id, text, true), "resume card resume");
 				toast = "Resuming in a new tmux window.";
 			} else {
 				toast = clip(resumed.error, 190);
@@ -6586,11 +6604,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		if (toast === null) {
 			const messageId = callback.message?.message_id;
-			if (typeof messageId === "number") await stripKeyboard(messageId);
+			if (typeof messageId === "number") detach(() => stripKeyboard(messageId), "expired crash card");
 			toast = "That crash is no longer on record.";
 		}
-		await redrawCrashCards();
 		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callback.id, text: toast }, 10_000);
+		// The redraw may wait for Telegram, and neither the toast nor the presses queued behind it can.
+		detach(() => redrawCrashCards(), "crash cards");
 	}
 
 	async function sendDependencyGraph(cfg: Config, filter: string): Promise<void> {
