@@ -4948,6 +4948,40 @@ await rvB.pump(250);
 check("the replied-to session aborts", rvB.aborts === 1);
 check("the poller session does not", rvA.aborts === 0);
 
+// A /stop or a file replying to a message no live session owns reaches nobody, and the user is told so.
+const abortsBeforeUnowned = rvA.aborts + rvB.aborts;
+api.queued = [
+	{
+		update_id: 731,
+		message: { message_id: 731, date: 1, chat: { id: CHAT }, text: "/stop", reply_to_message: { message_id: 1 } },
+	},
+];
+await rvA.pump(250);
+check(
+	"a /stop replying to an unowned message stops nothing and says so",
+	rvA.aborts + rvB.aborts === abortsBeforeUnowned &&
+		(lastCall("sendMessage")?.body.text ?? "").includes("nothing was stopped"),
+);
+const fetchesBeforeUnowned = called("getFile").length;
+api.queued = [
+	{
+		update_id: 732,
+		message: {
+			message_id: 732,
+			date: 1,
+			chat: { id: CHAT },
+			voice: { file_id: "unowned" },
+			reply_to_message: { message_id: 1 },
+		},
+	},
+];
+await rvA.pump(250);
+check(
+	"a file replying to an unowned message is dropped unfetched and the user is told",
+	called("getFile").length === fetchesBeforeUnowned &&
+		(lastCall("sendMessage")?.body.text ?? "").includes("so it was dropped"),
+);
+
 // streamDrafts: false silences the stream entirely.
 writeConfig({ streamDrafts: false });
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
@@ -7635,6 +7669,27 @@ heading("ambiguous plain messages ask which session");
 	const answers = called("answerCallbackQuery");
 	check("a stale pick says the message is gone", /no longer waiting/i.test(answers.at(-1)?.body.text ?? ""));
 
+	// c2. A pick on a picker no session ever recorded closes it without making it a reply target.
+	const unrecordedPicker = 959_001;
+	api.queued = [
+		{
+			update_id: 957,
+			callback_query: {
+				id: "cbpick3",
+				data: `m:958:${rightTag}`,
+				from: { id: CHAT },
+				message: { message_id: unrecordedPicker, chat: { id: CHAT } },
+			},
+		},
+	];
+	await left.pump(250);
+	check(
+		"a gone pick on an unrecorded picker closes it without recording it",
+		/no longer waiting/i.test(
+			called("editMessageText").find((c) => c.body.message_id === unrecordedPicker)?.body.text ?? "",
+		) && !existsSync(join(root, `notify-telegram/sent/${unrecordedPicker}.json`)),
+	);
+
 	// d. Sessions that finished far apart are not ambiguous, so the newest just gets it.
 	const leftRecord = JSON.parse(readFileSync(join(sessionsDir, `${left.id}.json`), "utf8"));
 	writeFileSync(
@@ -9032,6 +9087,27 @@ await extSess.pump(200);
 check(
 	"a choice containing colons is recorded whole",
 	JSON.parse(readFileSync(join(answersDir, `${colonKey}.json`), "utf8")).choice === "2026-09-07T10:30",
+);
+
+// A press on an external question whose message carries no keyboard records the choice and edits nothing.
+const bareKey = "e0e0e0e0e0e0e0e0";
+const editsBeforeBare = called("editMessageReplyMarkup").length;
+api.queued = [
+	{
+		update_id: 908,
+		callback_query: {
+			id: "ext-cb-bare",
+			data: `e:${bareKey}:keep`,
+			from: { id: CHAT },
+			message: { message_id: 47, chat: { id: CHAT } },
+		},
+	},
+];
+await extSess.pump(200);
+check(
+	"a press on a keyboardless external question is recorded without an edit",
+	JSON.parse(readFileSync(join(answersDir, `${bareKey}.json`), "utf8")).choice === "keep" &&
+		called("editMessageReplyMarkup").length === editsBeforeBare,
 );
 
 // The first press on a key wins: a later press in the same batch neither overwrites nor re-settles.
@@ -11716,6 +11792,22 @@ heading("dependency graph across sessions");
 	beatAll(waiter, follower, child);
 	await settle(400);
 	check("a repeated poll holds nothing twice", pendingOf(parentId).length === 1 && cardCalls().length === 1);
+	api.queued = [
+		{
+			update_id: 9099,
+			callback_query: {
+				id: "gl1",
+				data: `l:${parentId}`,
+				from: { id: CHAT },
+				message: { message_id: 424242, chat: { id: CHAT } },
+			},
+		},
+	];
+	await waiter.pump(250);
+	check(
+		"Later on one held item says it is held",
+		/1 update for .* is held until you resume it/.test(lastCall("editMessageText")?.body.text ?? ""),
+	);
 
 	const editsBefore = called("editMessageText").length;
 	const heldSend = await child.tools
