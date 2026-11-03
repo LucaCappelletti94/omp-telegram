@@ -5294,14 +5294,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/** Tells the user a tap missed its question, without holding up the entries queued behind it. */
-	function staleNotice(text: string, routable = true): void {
-		const owner = sessionCtx;
-		detach(() => (owner !== null ? sessionNotice(owner, text) : serviceNotice(text, routable)), "stale tap notice");
+	function staleNotice(owner: ExtensionContext, text: string): void {
+		detach(() => sessionNotice(owner, text), "stale tap notice");
 	}
 
 	/** Sequential: two taps in one poll batch must see each other's state. */
 	async function drainInbox(): Promise<void> {
-		if (!registered || drainInFlight || closing) return;
+		const owner = sessionCtx;
+		if (!registered || drainInFlight || closing || owner === null) return;
 		drainInFlight = true;
 		try {
 			const dir = resolve(INBOX_DIR, sessionId);
@@ -5445,7 +5445,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						closeOfferMessageId !== entry.messageId
 					) {
 						// A destructive press from an old or duplicated keyboard is an accident waiting to happen.
-						staleNotice("That close offer is no longer current, so the session stayed open.", false);
+						staleNotice(owner, "That close offer is no longer current, so the session stayed open.");
 						continue;
 					}
 					closing = true;
@@ -5477,7 +5477,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							replyOwedAt = Date.now();
 						}
 					} else {
-						staleNotice("That question is closed. It was superseded or already answered.");
+						staleNotice(owner, "That question is closed. It was superseded or already answered.");
 					}
 					continue;
 				}
@@ -5486,7 +5486,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						applyCallback(ask, entry.value);
 						replyOwedAt = Date.now();
 					} else {
-						staleNotice("That question is closed. It was answered or cancelled at the terminal.");
+						staleNotice(owner, "That question is closed. It was answered or cancelled at the terminal.");
 					}
 					continue;
 				}
@@ -7620,9 +7620,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		if (signal?.aborted === true) {
 			// Aborted before or while the card went out, which cancels the launch as an abort during the wait does.
-			if (pendingAsk === ask) pendingAsk = previous;
-			const shown = ask.messageId;
-			if (shown !== null) detach(() => settleAskMessage(ask, shown, ask.outcome), "upstream-confirm close");
+			// The abort already restored the previous question, and a card that landed is closed.
+			detach(() => settleAskMessage(ask, ask.messageId, ask.outcome), "upstream-confirm close");
 			noteState();
 			return { action: "cancel" };
 		}
@@ -7651,7 +7650,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (pendingAsk === ask) {
 				pendingAsk = previous;
 				if (ask.messageId !== null)
-					detach(() => settleAskMessage(ask, ask.messageId, ask.outcome), "upstream-confirm close");
+					detach(() => settleAskMessage(ask, ask.messageId, "Launch cancelled."), "upstream-confirm close");
 			}
 			noteState();
 		}

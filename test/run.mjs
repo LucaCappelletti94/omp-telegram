@@ -2922,6 +2922,35 @@ writeFileSync(join(inboxOf(tq.id), "994.json"), JSON.stringify({ kind: "callback
 await tq.pump(250);
 check("a press after the terminal answered is refused", lastCall("sendMessage").body.text.includes("closed"));
 
+// A press whose option index cannot be read closes the question without starting a turn.
+await tq.fire("input");
+await tq.tools
+	.get("notify_status")
+	.execute(
+		"q5b",
+		{ summary: "Choose once more.", urgency: "orange", options: opts("Keep", "Drop") },
+		undefined,
+		undefined,
+		tq.ctx,
+	);
+await tq.fire("session_stop");
+await settle(150);
+const unreadableStanding = record(tq.id).standing;
+const steersBeforeUnreadable = tq.steers.length;
+writeFileSync(
+	join(inboxOf(tq.id), "996.json"),
+	JSON.stringify({ kind: "callback", value: `c:${unreadableStanding.id}:9` }),
+);
+await tq.pump(250);
+check(
+	"a press with an unreadable option closes the question and starts no turn",
+	tq.steers.length === steersBeforeUnreadable &&
+		record(tq.id).standing === null &&
+		called("editMessageText").some(
+			(c) => c.body.message_id === unreadableStanding.messageId && c.body.text.includes("This question is closed."),
+		),
+);
+
 await tq.tools
 	.get("notify_status")
 	.execute(
