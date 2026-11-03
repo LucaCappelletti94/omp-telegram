@@ -1250,14 +1250,17 @@ function readThrottle(): ThrottleState {
 async function changeThrottle<T>(
 	change: (state: ThrottleState) => { state: ThrottleState | null; result: T },
 ): Promise<T> {
+	const lock = resolve(THROTTLE_LOCK_FILE);
+	if (!lock.startsWith(`${resolve(STATE_DIR)}${sep}`))
+		throw new Error("The throttle lock lies outside the state directory");
 	for (;;) {
 		try {
-			writeFileSync(THROTTLE_LOCK_FILE, "", { flag: "wx", mode: 0o600 });
+			writeFileSync(lock, "", { flag: "wx", mode: 0o600 });
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			try {
-				if (Date.now() - statSync(THROTTLE_LOCK_FILE).mtimeMs > THROTTLE_LOCK_STALE_MS) {
-					rmSync(THROTTLE_LOCK_FILE, { force: true });
+				if (Date.now() - statSync(lock).mtimeMs > THROTTLE_LOCK_STALE_MS) {
+					rmSync(lock, { force: true });
 				}
 			} catch {}
 			await sleepMs(5);
@@ -1268,7 +1271,7 @@ async function changeThrottle<T>(
 			if (state !== null) writeFileAtomic(THROTTLE_FILE, JSON.stringify(state), 0o600);
 			return result;
 		} finally {
-			rmSync(THROTTLE_LOCK_FILE, { force: true });
+			rmSync(lock, { force: true });
 		}
 	}
 }
