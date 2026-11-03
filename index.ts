@@ -1258,11 +1258,9 @@ async function changeThrottle<T>(
 			writeFileSync(lock, "", { flag: "wx", mode: 0o600 });
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			try {
-				if (Date.now() - statSync(lock).mtimeMs > THROTTLE_LOCK_STALE_MS) {
-					rmSync(lock, { force: true });
-				}
-			} catch {}
+			// A lock that vanished since the failed create reads as fresh, and the next pass takes it.
+			const heldSince = statSync(lock, { throwIfNoEntry: false })?.mtimeMs ?? Date.now();
+			if (Date.now() - heldSince > THROTTLE_LOCK_STALE_MS) rmSync(lock, { force: true });
 			await sleepMs(5);
 			continue;
 		}
@@ -1314,7 +1312,6 @@ async function admit(lifetime?: AbortSignal): Promise<number | null> {
 		if (now >= state.paceUntil) return null;
 		const booked = await changeThrottle((current) => {
 			const at = Date.now();
-			if (at >= current.paceUntil) return { state: null, result: at };
 			const free = Math.max(at, current.until, current.next);
 			if ((background || ending) && free > at) return { state: null, result: null };
 			return { state: { ...current, next: free + PACE_GAP_MS }, result: free };
@@ -6417,12 +6414,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let crashRender: Promise<void> | null = null;
 	let crashRenderOwed = false;
 
-	/**
-	 * Only the poller sends and edits crash cards. Ten sessions restored at once would otherwise
-	 * race their edits and leave the card showing whichever view landed last. A render waiting for a
-	 * paced slot can outlast a heartbeat, so a render requested meanwhile runs once it ends.
-	 */
-	function renderCrashCards(): Promise<void> {
+	/** Renders the crash cards once no render is in progress, since one waiting for a paced slot can outlast a heartbeat. */
+	function redrawCrashCards(): Promise<void> {
 		if (crashRender !== null) {
 			crashRenderOwed = true;
 			return crashRender;
@@ -6431,7 +6424,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			try {
 				do {
 					crashRenderOwed = false;
-					await renderCrashCardsOnce();
+					await renderCrashCards();
 				} while (crashRenderOwed);
 			} finally {
 				crashRender = null;
@@ -6440,7 +6433,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return crashRender;
 	}
 
-	async function renderCrashCardsOnce(): Promise<void> {
+	/**
+	 * Only the poller sends and edits crash cards. Ten sessions restored at once would otherwise
+	 * race their edits and leave the card showing whichever view landed last.
+	 */
+	async function renderCrashCards(): Promise<void> {
 		if (config === null) return;
 		const cfg = config;
 		const sessions = (n: number): string => (n === 1 ? "1 session" : `${n} sessions`);
@@ -6592,7 +6589,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (typeof messageId === "number") await stripKeyboard(messageId);
 			toast = "That crash is no longer on record.";
 		}
-		await renderCrashCards();
+		await redrawCrashCards();
 		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callback.id, text: toast }, 10_000);
 	}
 
@@ -7792,7 +7789,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					graphTick();
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
-					detachBackground(() => renderCrashCards(), "crash cards");
+					detachBackground(() => redrawCrashCards(), "crash cards");
 					detach(() => retryMedia(), "media retry");
 				}
 			} catch (error) {

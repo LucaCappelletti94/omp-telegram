@@ -6548,6 +6548,35 @@ heading("shared Telegram throttle");
 	await tb.pump(250);
 	check("a toast is answered during the shared throttle", called("answerCallbackQuery").length > toastsBefore);
 
+	// A toast Telegram throttles is tried once more after its retry_after, since it is never held back.
+	api.failMethods = ["answerCallbackQuery"];
+	api.failStatus = 429;
+	api.failRetryAfter = 1;
+	api.failDescription = "Too Many Requests: retry after 1";
+	api.queued = [
+		{
+			update_id: 6691,
+			callback_query: {
+				id: "thr-toast-429",
+				data: "o:nobody-1:0:0",
+				from: { id: CHAT },
+				message: { message_id: 1, chat: { id: CHAT } },
+			},
+		},
+	];
+	await ta.pump(250);
+	await tb.pump(250);
+	await settle(1_600);
+	api.failMethods = [];
+	api.failStatus = undefined;
+	api.failRetryAfter = undefined;
+	api.failDescription = undefined;
+	const toastTries = called("answerCallbackQuery").filter((c) => c.body.callback_query_id === "thr-toast-429");
+	check(
+		"a throttled toast is tried once more after its retry_after",
+		toastTries.length === 2 && toastTries[1].at - toastTries[0].at >= 1_000,
+	);
+
 	// A detached send waits the throttle out, then goes.
 	writeFileSync(throttleFile, JSON.stringify({ until: Date.now() + 1500 }));
 	await turnEnd(tb, "Waited status.");
@@ -6677,6 +6706,23 @@ heading("paced release after a throttle");
 	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
 	writeConfig();
 
+	// A state directory the lock cannot be created in fails the send instead of spinning on the lock forever, and
+	// the turn end goes once the directory is writable again.
+	const stateDir = join(root, "notify-telegram");
+	writeFileSync(throttleFile, JSON.stringify({ until: 0, paceUntil: Date.now() + 30_000, next: 0 }));
+	chmodSync(stateDir, 0o500);
+	await turnEnd(peers[1], "Past a locked directory.");
+	await settle(300);
+	const failedWhileLocked = sentAt("Past a locked directory.") === undefined;
+	chmodSync(stateDir, 0o700);
+	await settle(2_500);
+	check(
+		"a lock that cannot be created fails the send, which goes once the state directory is writable",
+		failedWhileLocked &&
+			peers[1].warns.some((w) => /send.*failed/.test(w.m)) &&
+			sentAt("Past a locked directory.") !== undefined,
+	);
+
 	// A late 429 with a shorter retry_after never shortens the deadline another process was given.
 	rmSync(throttleFile, { force: true });
 	let releaseLate;
@@ -6711,9 +6757,42 @@ heading("paced release after a throttle");
 		readJsonFileSafe(throttleFile)?.until === longDeadline,
 	);
 
+	// A tool the agent is blocked on refuses at once when the slot it would get is more than 30 s away.
+	writeFileSync(throttleFile, JSON.stringify({ until: 0, paceUntil: Date.now() + 120_000, next: Date.now() + 60_000 }));
+	const snippetStart = Date.now();
+	const pacedSnippet = await peers[0].tools
+		.get("notify_snippet")
+		.execute("paced-snippet", { purpose: "a command", text: "ls" }, undefined, undefined, peers[0].ctx);
+	check(
+		"a tool call refuses at once when its paced slot is over 30 s away, and says how long",
+		pacedSnippet.isError === true &&
+			/throttling this bot for \d+ more seconds/.test(JSON.stringify(pacedSnippet.content)) &&
+			Date.now() - snippetStart < 1000,
+	);
+
+	// A lock that vanishes between the failed create and the age check is taken on the next pass.
+	writeFileSync(throttleFile, JSON.stringify({ until: 0, paceUntil: Date.now() + 30_000, next: 0 }));
+	writeFileSync(throttleLock, "");
+	const realStat = fs.statSync;
+	fs.statSync = (path, options) => {
+		if (String(path).endsWith("throttle.lock")) rmSync(path, { force: true });
+		return realStat(path, options);
+	};
+	syncBuiltinESMExports();
+	await turnEnd(peers[1], "Past a vanished lock.");
+	await settle(300);
+	fs.statSync = realStat;
+	syncBuiltinESMExports();
+	check(
+		"a lock that vanishes while its age is read is taken on the next pass",
+		sentAt("Past a vanished lock.") !== undefined,
+	);
+
 	// Shutdown never waits for a paced slot, since omp gives the handler two seconds.
 	writeFileSync(throttleFile, JSON.stringify({ until: 0, paceUntil: Date.now() + 30_000, next: Date.now() + 3_000 }));
 	const callsAtShutdown = api.calls.length;
+	await turnEnd(peers[2], "Waiting for a slot.");
+	await settle(100);
 	for (const peer of peers) await peer.fire("session_shutdown");
 	await settle(3_500);
 	check(
