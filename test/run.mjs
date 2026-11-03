@@ -72,7 +72,7 @@ globalThis.fetch = async (url, init) => {
 				bytes[key] = new Uint8Array(await value.arrayBuffer());
 			}
 		}
-		api.calls.push({ method, body, files, bytes });
+		api.calls.push({ method, body, files, bytes, at: Date.now() });
 		if (api.uploadGate !== null) await api.uploadGate;
 		if ((api.failMethods ?? []).includes(method)) {
 			return { ok: false, status: 400, json: async () => ({ ok: false, description: "failed by test" }) };
@@ -82,7 +82,7 @@ globalThis.fetch = async (url, init) => {
 		return { ok: true, json: async () => ({ ok: true, result }) };
 	}
 	const body = JSON.parse(init.body);
-	api.calls.push({ method, body });
+	api.calls.push({ method, body, at: Date.now() });
 	if ((api.failMethods ?? []).includes(method)) {
 		// The status and the description are what a caller decides from, so a test chooses both.
 		// A rate limit carries retry_after, which is what sendWithRetry reads.
@@ -1985,6 +1985,8 @@ await settle(2400);
 globalThis.fetch = savedFetch;
 check("a 429 is retried rather than dropped", sendAttempts >= 2);
 check("the retry waits for the requested delay", Date.now() - startedAt >= 1000);
+// Sends stay paced for 30 s after a 429, which would slow every later check in this file.
+rmSync(join(root, "notify-telegram/throttle.json"), { force: true });
 
 // Link previews off, and the wider markdown set.
 const md = [
@@ -3825,6 +3827,7 @@ rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 		delivered.length >= 3 && record(session.id).standing?.messageId === api.nextMessage - 1,
 	);
 	await session.fire("session_shutdown");
+	rmSync(join(root, "notify-telegram/throttle.json"), { force: true });
 }
 {
 	// A throttled status gives way to the user moving on, and is never sent after it.
@@ -3859,6 +3862,7 @@ rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 		called("sendMessage").filter((c) => String(c.body.text).includes("Superseded status.")).length === attemptsAtInput,
 	);
 	await session.fire("session_shutdown");
+	rmSync(join(root, "notify-telegram/throttle.json"), { force: true });
 }
 {
 	// A refusal that is not a throttle or a server error would be repeated word for word, so it is final.
@@ -6567,6 +6571,113 @@ heading("shared Telegram throttle");
 	);
 	rmSync(throttleFile, { force: true });
 	await tb.fire("session_shutdown");
+}
+
+heading("paced release after a throttle");
+{
+	const readJsonFileSafe = (path) => {
+		try {
+			return JSON.parse(readFileSync(path, "utf8"));
+		} catch {
+			return null;
+		}
+	};
+	const throttleFile = join(root, "notify-telegram/throttle.json");
+	const sentAt = (summary) => called("sendMessage").find((c) => String(c.body.text).includes(summary))?.at;
+	const turnEnd = async (session, summary) => {
+		await session.fire("input");
+		await session.tools
+			.get("notify_status")
+			.execute(`paced-${summary}`, { summary, urgency: "green", effect: "none" }, undefined, undefined, session.ctx);
+		await session.fire("session_stop");
+	};
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const peers = [];
+	for (const index of [0, 1, 2]) {
+		const peer = spawn(`01a06031-000${index}-0000-0000-000000000000`, `/home/dev/work/paced-${index}`);
+		await peer.fire("session_start");
+		peers.push(peer);
+	}
+
+	// Telegram has not objected, so turn ends ending together are sent together.
+	await turnEnd(peers[0], "Unpaced first.");
+	await turnEnd(peers[1], "Unpaced second.");
+	await settle(300);
+	check(
+		"sends are not paced while Telegram has not throttled the bot",
+		Math.abs((sentAt("Unpaced first.") ?? 0) - (sentAt("Unpaced second.") ?? Number.POSITIVE_INFINITY)) < 250,
+	);
+
+	// Every send that waited out the deadline would fire in the same tick and earn the next 429. They go one
+	// per second instead, the seed's own retry included.
+	api.failMethods = ["sendMessage"];
+	api.failStatus = 429;
+	api.failRetryAfter = 1;
+	api.failDescription = "Too Many Requests: retry after 1";
+	await turnEnd(peers[0], "Paced seed.");
+	await settle(100);
+	api.failMethods = [];
+	api.failStatus = undefined;
+	api.failRetryAfter = undefined;
+	api.failDescription = undefined;
+	await turnEnd(peers[1], "Paced one.");
+	await turnEnd(peers[2], "Paced two.");
+	await settle(4500);
+	const released = ["Paced seed.", "Paced one.", "Paced two."].map(sentAt);
+	const ordered = released.filter((at) => at !== undefined).sort((a, b) => a - b);
+	check(
+		"sends released by a passing throttle go out one per second",
+		ordered.length === 3 && ordered[1] - ordered[0] >= 900 && ordered[2] - ordered[1] >= 900,
+	);
+
+	// A process that died holding the throttle lock would stall every paced send of every process, so a lock that
+	// old is broken.
+	const throttleLock = join(root, "notify-telegram/throttle.lock");
+	writeFileSync(throttleFile, JSON.stringify({ until: 0, paceUntil: Date.now() + 30_000, next: 0 }));
+	writeFileSync(throttleLock, "");
+	const deadHolder = (baseNow() - 5_000) / 1000;
+	utimesSync(throttleLock, deadHolder, deadHolder);
+	await turnEnd(peers[1], "Past a dead lock.");
+	await settle(300);
+	check(
+		"a throttle lock left by a dead process is broken, so paced sends go on",
+		sentAt("Past a dead lock.") !== undefined && !existsSync(throttleLock),
+	);
+
+	// A board edit nobody waits on yields to a turn end that arrives after it while sends are paced. The pacing is
+	// seeded only once the board is posted, with a slot already booked 1.5 s ahead.
+	rmSync(throttleFile, { force: true });
+	writeConfig({ pinnedDashboard: true, dashboardSeconds: 0 });
+	const board = spawn("01a06031-0004-0000-0000-000000000000", "/home/dev/work/paced-board");
+	await board.fire("session_start");
+	await turnEnd(board, "Board owner done.");
+	await settle(150);
+	await board.pump(250);
+	const boardId = readJsonFileSafe(join(root, "notify-telegram/dashboard.json"))?.messageId;
+	writeFileSync(throttleFile, JSON.stringify({ until: 0, paceUntil: Date.now() + 30_000, next: Date.now() + 1500 }));
+	await board.fire("agent_start");
+	await board.fire("tool_execution_start", { toolName: "bash", intent: "Paced build" });
+	await settle(60);
+	await board.pump(300);
+	await turnEnd(peers[2], "Ahead of the board.");
+	// Every foreground send booked meanwhile goes first, so the edit lands only once the slots ahead are spent.
+	const boardEdit = () =>
+		called("editMessageText").find((c) => c.body.message_id === boardId && String(c.body.text).includes("Paced build"))
+			?.at;
+	const boardDeadline = Date.now() + 10_000;
+	while (boardEdit() === undefined && Date.now() < boardDeadline) await settle(100);
+	const boardEditAt = boardEdit();
+	check(
+		"a background board edit waits behind a turn end booked after it",
+		boardId !== undefined &&
+			boardEditAt !== undefined &&
+			(sentAt("Ahead of the board.") ?? Number.POSITIVE_INFINITY) < boardEditAt,
+	);
+	await board.fire("session_shutdown");
+	rmSync(join(root, "notify-telegram/dashboard.json"), { force: true });
+	rmSync(throttleFile, { force: true });
+	writeConfig();
+	for (const peer of peers) await peer.fire("session_shutdown");
 }
 
 heading("media fetch failures");
@@ -12070,7 +12181,17 @@ heading("sessions that died without shutting down");
 		"the open ask of a crashed session loses its buttons",
 		called("editMessageReplyMarkup").some((c) => c.body.message_id === 501),
 	);
+	// A second heartbeat while the first card is still being sent must not post a second card.
+	let releaseCard;
+	api.sendMessageGate = new Promise((resolve) => {
+		releaseCard = resolve;
+	});
 	first.heartbeat();
+	await settle(50);
+	first.heartbeat();
+	await settle(50);
+	releaseCard();
+	api.sendMessageGate = null;
 	await settle(150);
 	const card = crashCalls().at(-1)?.body;
 	check("the poller posts one card for the whole batch", crashCalls().length === cardsBefore + 1);
