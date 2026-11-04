@@ -1008,6 +1008,39 @@ check(
 	called("sendMessage").length === staleReapNotices + 1 && lastCall("sendMessage").body.text.includes("session ended"),
 );
 
+// A stale closing fence a killed shutdown leaves behind must not stop the reaper from claiming the route.
+const deadFenced = "01a03001-dead-0000-0000-000000000000";
+writeFileSync(
+	join(sessionsDir, `${deadFenced}.json`),
+	JSON.stringify({
+		pid: deadPid,
+		tag: "deadf",
+		name: "",
+		cwd: "/x",
+		emoji: "\u{1F480}",
+		label: "",
+		lastNotified: 0,
+		heartbeat: Date.now() - 120_000,
+	}),
+);
+const deadFencedLocks = join(root, "notify-telegram/reaction-route-locks");
+mkdirSync(deadFencedLocks, { recursive: true });
+const deadFencedClosing = join(deadFencedLocks, `${deadFenced}.closing`);
+writeFileSync(deadFencedClosing, "dead-shutdown-token");
+const deadFencedAge = (Date.now() - 60_000) / 1000;
+utimesSync(deadFencedClosing, deadFencedAge, deadFencedAge);
+const fencedReaper = spawn("01a03501-0000-0000-0000-000000000000", "/home/dev/work/fenced");
+await fencedReaper.fire("session_start");
+await settle(50);
+check(
+	"a stale closing fence does not block the dead-session reaper",
+	!existsSync(join(sessionsDir, `${deadFenced}.json`)) &&
+		existsSync(join(root, "notify-telegram/crashed", `${deadFenced}.json`)) &&
+		!existsSync(deadFencedClosing),
+);
+// Delete its fresh record so it cannot hold a palette badge into the crash section's badge re-solve.
+rmSync(join(sessionsDir, `${fencedReaper.id}.json`), { force: true });
+
 // ------------------------------------------------------------- reply routing
 heading("reply routing");
 const rr1 = spawn("01a03900-0000-0000-0000-000000000000", "/home/dev/work/subql");
@@ -9173,6 +9206,33 @@ check(
 	called("editMessageReplyMarkup").filter((c) => c.body.message_id === 46).length === 1,
 );
 
+// An asker that never created the answers directory still gets its answer recorded.
+rmSync(answersDir, { recursive: true, force: true });
+const missingKey = "m1ss1ng1answers";
+const missingAnswerPath = join(answersDir, `${missingKey}.json`);
+api.queued = [
+	{
+		update_id: 909,
+		callback_query: {
+			id: "ext-cb-missing",
+			data: `e:${missingKey}:yes`,
+			from: { id: CHAT },
+			message: {
+				message_id: 48,
+				chat: { id: CHAT },
+				reply_markup: { inline_keyboard: [[{ text: "Yes", callback_data: `e:${missingKey}:yes` }]] },
+			},
+		},
+	},
+];
+await extSess.pump(250);
+const missingAnswer = existsSync(missingAnswerPath) ? JSON.parse(readFileSync(missingAnswerPath, "utf8")) : null;
+check(
+	"a press is recorded when the answers directory does not exist yet",
+	missingAnswer?.choice === "yes" &&
+		called("answerCallbackQuery").find((c) => c.body.callback_query_id === "ext-cb-missing")?.body.text === "Recorded.",
+);
+
 // ------------------------------------------------------------ reactions
 heading("reactions grade what the agent sent");
 // A reaction carries only a message id, so its grade stores the sent-message record with it.
@@ -10392,6 +10452,8 @@ await routeRaceSession.fire("session_stop");
 await settle(150);
 const routeRaceMessageId = record(routeRaceSession.id).recent.at(-1);
 writeFileSync(routeLockFile, JSON.stringify({ token: "held", pid: process.pid }));
+// The suite's clock runs ahead of the filesystem's, and a fence older than it reads as a dead process's.
+utimesSync(routeLockFile, new Date(Date.now()), new Date(Date.now()));
 const routeRaceReaction = react(9038, routeRaceMessageId, ["\u{1F44E}"]);
 const routeRaceOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
 api.queued = [routeRaceReaction];
@@ -10474,18 +10536,15 @@ writeFileSync(
 		targetPreEdit: "yes",
 	}),
 );
-const malformedStoredOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
 const feedbackBeforeMalformedStored = feedbackLines().length;
 api.queued = [react(malformedStoredUpdate, statusId, ["\u{1F44E}"])];
 await ownershipPoller.pump(250);
 check(
-	"a malformed stored redo cannot forge pre-edit eligibility",
-	JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === malformedStoredOffset &&
-		feedbackLines().length === feedbackBeforeMalformedStored &&
-		existsSync(malformedStoredFile) &&
+	"a malformed stored redo forges nothing and is dropped",
+	feedbackLines().length === feedbackBeforeMalformedStored &&
+		!existsSync(malformedStoredFile) &&
 		inboxCount(fb.id) === 0,
 );
-rmSync(malformedStoredFile, { force: true });
 
 const malformedRedoFile = join(inboxOf(fb.id), "9040.json");
 const steersBeforeMalformedRedo = fb.steers.length;
@@ -10605,6 +10664,74 @@ check(
 		feedbackLines().at(-1).redo === true &&
 		fb.steers.length === steersBeforeStableNegative + 1,
 );
+
+// A stale route fence a dead poller leaves behind must not stop the next redo to that session.
+const staleFenceSession = spawn("01a07100-0000-0000-0000-000000000000", "/home/dev/work/stale-fence");
+await staleFenceSession.fire("session_start");
+await staleFenceSession.fire("input");
+await staleFenceSession.tools
+	.get("notify_status")
+	.execute(
+		"fb-stale-fence",
+		{ summary: "Fence expiration audit.", urgency: "green", effect: "none" },
+		undefined,
+		undefined,
+		staleFenceSession.ctx,
+	);
+await staleFenceSession.fire("session_stop");
+await settle(150);
+const staleFenceMessageId = record(staleFenceSession.id).recent.at(-1);
+const pressTarget = spawn("01a07101-0000-0000-0000-000000000000", "/home/dev/work/press-target");
+await pressTarget.fire("session_start");
+const staleFenceLockFile = join(routeLockDir, `${staleFenceSession.id}.lock`);
+writeFileSync(staleFenceLockFile, "dead-poller-token");
+const staleFenceAge = (Date.now() - 60_000) / 1000;
+utimesSync(staleFenceLockFile, staleFenceAge, staleFenceAge);
+const staleFenceOffset = JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset;
+check("the fence batch sits above the current offset", staleFenceOffset === 9074);
+const stalePressPath = join(inboxOf(pressTarget.id), "9076.json");
+api.queued = [
+	react(9075, staleFenceMessageId, ["\u{1F44E}"]),
+	answerButton(9076, staleFenceMessageId, `k:${record(pressTarget.id).tag}-1:0`),
+];
+await ownershipPoller.pump(250);
+const stalePress = existsSync(stalePressPath) ? JSON.parse(readFileSync(stalePressPath, "utf8")) : null;
+check(
+	"a stale route fence is taken over, letting the redo and the press behind it through",
+	!existsSync(staleFenceLockFile) &&
+		feedbackLines().at(-1)?.updateId === 9075 &&
+		feedbackLines().at(-1)?.redo === true &&
+		existsSync(join(inboxOf(staleFenceSession.id), "9075.json")) &&
+		stalePress?.kind === "callback" &&
+		JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === 9077,
+);
+rmSync(stalePressPath, { force: true });
+rmSync(join(inboxOf(staleFenceSession.id), "9075.json"), { force: true });
+
+// A malformed stored transaction must not hold the offset, so a press queued behind it still lands.
+const malformedBehindFile = join(root, "notify-telegram/reaction-pending/9077.json");
+writeFileSync(malformedBehindFile, JSON.stringify({ transaction: 1, updateId: 9077, feedback: { updateId: 9078 } }));
+const malformedBehindFeedback = feedbackLines().length;
+const malformedBehindPressPath = join(inboxOf(pressTarget.id), "9078.json");
+api.queued = [
+	react(9077, statusId, ["\u{1F44E}"]),
+	answerButton(9078, statusId, `k:${record(pressTarget.id).tag}-1:0`),
+];
+await ownershipPoller.pump(250);
+const malformedBehindPress = existsSync(malformedBehindPressPath)
+	? JSON.parse(readFileSync(malformedBehindPressPath, "utf8"))
+	: null;
+check(
+	"a press queued behind a malformed stored reaction is delivered and the offset passes both",
+	feedbackLines().length === malformedBehindFeedback &&
+		!existsSync(malformedBehindFile) &&
+		malformedBehindPress?.kind === "callback" &&
+		JSON.parse(readFileSync(join(root, "notify-telegram.json"), "utf8")).offset === 9079,
+);
+rmSync(malformedBehindPressPath, { force: true });
+// Delete their fresh records so they cannot hold palette badges into the crash section's badge re-solve.
+rmSync(join(sessionsDir, `${staleFenceSession.id}.json`), { force: true });
+rmSync(join(sessionsDir, `${pressTarget.id}.json`), { force: true });
 
 // Sent-message records have a longer retention period than downloaded media.
 const staleRecord = join(sentDir, "1.json");
