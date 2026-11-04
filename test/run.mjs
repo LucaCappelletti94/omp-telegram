@@ -12410,6 +12410,15 @@ heading("dependency graph across sessions");
 		"the card record points at the replacement card",
 		JSON.parse(readFileSync(deletedCardFile, "utf8")).messageId !== firstDeletedCard,
 	);
+	// A card file still holding its empty claim means a raise has not sent yet, so the next item adds no second card.
+	writeFileSync(deletedCardFile, "{}");
+	const inflightSends = called("sendMessage").length;
+	await sendDeleted("third try");
+	await settle(150);
+	check(
+		"a held item for a session whose resume card is in flight sends no second card",
+		called("sendMessage").length === inflightSends && readFileSync(deletedCardFile, "utf8") === "{}",
+	);
 	api.editRefusals = [];
 	rmSync(nodeFile(deletedId));
 	rmSync(join(graphDir, "pending", deletedId), { recursive: true, force: true });
