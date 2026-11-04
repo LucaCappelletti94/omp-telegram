@@ -1,6 +1,7 @@
 // Full suite against a stubbed Telegram API; sends nothing.
 
 import { spawn as startProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs, {
 	chmodSync,
 	existsSync,
@@ -13891,6 +13892,812 @@ heading("sessions that died without shutting down");
 	process.env.PATH = savedPath;
 }
 
+// ---------------------------------------------------------------- version skew
+
+const stampFiles = ["index.ts", "render.ts", "graph.ts"].map((name) => new URL(`../${name}`, import.meta.url).pathname);
+const stampOf = () => {
+	const h = createHash("sha256");
+	for (const f of stampFiles) h.update(readFileSync(f));
+	return h.digest("hex");
+};
+
+heading("stale code yields the fleet locks");
+clockSkew = 0;
+// Earlier sections left records with old heartbeats; make them fresh so this section's reaper has no stale material.
+mkdirSync(sessionsDir, { recursive: true });
+for (const f of readdirSync(sessionsDir)) {
+	const id = f.slice(0, -5);
+	try {
+		writeFileSync(join(sessionsDir, f), JSON.stringify({ ...record(id), heartbeat: Date.now() }));
+	} catch {}
+}
+rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+rmSync(join(root, "notify-telegram/dashboard.lock"), { force: true });
+writeConfig({ pinnedDashboard: true });
+const vsBin = join(root, "vs-bin");
+mkdirSync(vsBin, { recursive: true });
+writeFileSync(
+	join(vsBin, "tmux"),
+	`#!/bin/sh
+echo "$*" >> "$VS_TMUX_LOG"
+S="$VS_STATE"
+case "$1" in
+  capture-pane) cat "$S/capture" ;;
+  display-message)
+    case "$5" in
+      *pane_dead*) cat "$S/pane_dead" ;;
+      *pane_pid*) cat "$S/pane_pid" ;;
+      *window_activity*) cat "$S/window_activity" ;;
+      *pane_id*) grep -qx "$4" "$S/pane_ok" || exit 1 ;;
+    esac ;;
+  list-panes) cat "$S/list_panes" ;;
+  respawn-pane)
+    [ "$(cat "$S/respawn_fails" 2>/dev/null || echo 0)" = "0" ] || { echo "respawn refused" 1>&2; exit 1; }
+    printf '%s\n' "$@" >> "$S/argv" ;;
+  *) exit 0 ;;
+esac
+`,
+	{ mode: 0o755 },
+);
+writeFileSync(join(vsBin, "systemctl"), "#!/bin/sh\necho running\n", { mode: 0o755 });
+const savedVsPath = process.env.PATH;
+process.env.PATH = `${vsBin}:${savedVsPath}`;
+const vsState = join(root, "vs-state");
+mkdirSync(vsState, { recursive: true });
+const vsSet = (name, value) => writeFileSync(join(vsState, name), value);
+const vsTmuxLog = join(root, "vs-tmux.log");
+process.env.VS_STATE = vsState;
+process.env.VS_TMUX_LOG = vsTmuxLog;
+vsSet("capture", "idle\n");
+vsSet("pane_dead", "0");
+vsSet("pane_pid", "0");
+vsSet("pane_ok", "%9\n");
+vsSet("list_panes", "");
+vsSet("window_activity", String(Math.floor(Date.now() / 1000) - 3600));
+vsSet("respawn_fails", "0");
+writeFileSync(vsTmuxLog, "");
+const vsLog = () => readFileSync(vsTmuxLog, "utf8");
+const vsLogReset = () => writeFileSync(vsTmuxLog, "");
+const dummies = [];
+const dummy = (command, ...args) => {
+	const child = startProcess(command, args);
+	dummies.push(child);
+	return child;
+};
+
+const stampOriginal = stampOf();
+const renderBytes = readFileSync(stampFiles[1]);
+const restoreStamp = () => writeFileSync(stampFiles[1], renderBytes);
+const vsPoller = spawn("01a1f101-0000-7000-8000-000000000001", "/home/dev/work/version-skew", "The poller");
+await vsPoller.fire("session_start");
+check("the record carries the stamp of the code it loaded", record(vsPoller.id).codeStamp === stampOriginal);
+check(
+	"the poller lock carries the stamp",
+	JSON.parse(readFileSync(join(root, "notify-telegram/poller.lock"), "utf8")).code === stampOriginal,
+);
+await vsPoller.pump(150);
+const vsBoard = join(root, "notify-telegram/dashboard.lock");
+check(
+	"the dashboard lock carries the stamp",
+	existsSync(vsBoard) && JSON.parse(readFileSync(vsBoard, "utf8")).code === stampOriginal,
+);
+
+writeFileSync(stampFiles[1], Buffer.concat([renderBytes, Buffer.from("\n// version-skew stamp test\n")]));
+const stampNew = stampOf();
+check("the holder's stamp no longer matches the disk", record(vsPoller.id).codeStamp !== stampNew);
+vsPoller.heartbeat();
+check(
+	"a stale holder keeps the poller lock while no current-code session is live",
+	JSON.parse(readFileSync(join(root, "notify-telegram/poller.lock"), "utf8")).sessionId === vsPoller.id,
+);
+const vsFresh = spawn("01a1f102-0000-7000-8000-000000000002", "/home/dev/work/version-skew", "The current one");
+await vsFresh.fire("session_start");
+check("the current-code session records the new stamp", record(vsFresh.id).codeStamp === stampNew);
+check(
+	"a current-code session does not steal a live holder's fresh lock",
+	JSON.parse(readFileSync(join(root, "notify-telegram/poller.lock"), "utf8")).sessionId === vsPoller.id,
+);
+vsPoller.heartbeat();
+await settle(50);
+check(
+	"a stale holder yields the poller lock while a current-code session is live",
+	!existsSync(join(root, "notify-telegram/poller.lock")),
+);
+check("a stale holder yields the board lock", !existsSync(vsBoard));
+vsFresh.heartbeat();
+await settle(50);
+const vsOwner = JSON.parse(readFileSync(join(root, "notify-telegram/poller.lock"), "utf8"));
+check(
+	"the current-code session takes the freed lock with its own stamp",
+	vsOwner.sessionId === vsFresh.id && vsOwner.code === stampNew,
+);
+restoreStamp();
+vsFresh.heartbeat();
+await settle(50);
+vsPoller.heartbeat();
+await settle(50);
+check(
+	"the poller is back once the disk matches its code again",
+	JSON.parse(readFileSync(join(root, "notify-telegram/poller.lock"), "utf8")).sessionId === vsPoller.id,
+);
+await vsFresh.fire("session_shutdown");
+
+heading("the restart wave of the current-code poller");
+const vsSessions = join(root, "sessions");
+mkdirSync(join(vsSessions, "proj"), { recursive: true });
+const vsFolder = (n) => {
+	const dir = join(root, `vs-folder-${n}`);
+	mkdirSync(dir, { recursive: true });
+	return dir;
+};
+const vsTranscript = (id) => {
+	const path = join(vsSessions, "proj", `2026-01-01T00-00-00Z_${id}.jsonl`);
+	writeFileSync(path, "{}\n");
+	return path;
+};
+const vsMarker = (id) => join(root, "notify-telegram/restart-pending", `${id}.json`);
+const vsMarkerRead = (id) => {
+	try {
+		return JSON.parse(readFileSync(vsMarker(id), "utf8"));
+	} catch {
+		return null;
+	}
+};
+const vsNoticeTexts = () =>
+	called("sendMessage")
+		.filter((c) => String(c.body?.text ?? "").includes("could not be restarted"))
+		.map((c) => c.body.text);
+const vsWaveNotices = () => vsNoticeTexts().length;
+const lastVsNotice = () => vsNoticeTexts().at(-1) ?? "";
+const vsCandidate = (session, folder, fields) => {
+	const next = {
+		...record(session.id),
+		state: "idle",
+		tmux: "work",
+		tmuxWindow: 9,
+		tmuxPane: "%9",
+		cwd: folder,
+		lastInputAt: Date.now() - 3 * 60_000,
+		heartbeat: Date.now(),
+		...fields,
+	};
+	writeFileSync(join(sessionsDir, `${session.id}.json`), JSON.stringify(next));
+	return next;
+};
+const vsRetire = (id) =>
+	writeFileSync(join(sessionsDir, `${id}.json`), JSON.stringify({ ...record(id), heartbeat: 0 }));
+
+// A stale record with a live standing question, close offer and red pin is restarted, its shutdown keeps
+// all three, and the resumed process adopts them.
+{
+	const folder = vsFolder("adopt");
+	const transcript = vsTranscript("01a1f110-0000-7000-8000-000000000010");
+	const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const stale = spawn("01a1f110-0000-7000-8000-000000000010", folder, "Stale one");
+	await stale.fire("session_start");
+	// Plain green opens the close offer; the green choice becomes the standing question; the red light gets pinned.
+	await stale.tools
+		.get("notify_status")
+		.execute(
+			"vs1",
+			{ summary: "The first pass is done.", urgency: "green", effect: "thumbs_up" },
+			undefined,
+			undefined,
+			stale.ctx,
+		);
+	await stale.fire("session_stop");
+	await settle(150);
+	await stale.tools.get("notify_status").execute(
+		"vs2",
+		{
+			summary: "Green, choose.",
+			urgency: "green",
+			effect: "thumbs_up",
+			question: "What next for the stale one?",
+			options: opts("Go", "Stop"),
+		},
+		undefined,
+		undefined,
+		stale.ctx,
+	);
+	await stale.fire("session_stop");
+	await settle(150);
+	await stale.tools
+		.get("notify_status")
+		.execute("vs3", { summary: "The red light.", urgency: "red" }, undefined, undefined, stale.ctx);
+	await stale.fire("session_stop");
+	await settle(150);
+	const redMessage = api.nextMessage - 1;
+	check("the candidate's red status is pinned", api.pinned.has(redMessage));
+	const before = record(stale.id);
+	check(
+		"the candidate has a standing question and a close offer",
+		before.standing !== null && before.closeOffer !== null && before.pinned === redMessage,
+	);
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: old.pid });
+	vsSet("pane_ok", "%9\n");
+	vsSet("pane_pid", String(old.pid));
+	vsSet("pane_dead", "1");
+	vsSet("capture", "idle\n");
+	vsLogReset();
+	vsPoller.heartbeat();
+	// The exit wait needs a probe round after the kill, so wait for the respawn instead of a fixed settle.
+	for (let i = 0; i < 40 && !vsLog().includes("respawn-pane"); i++) await settle(100);
+	const marker = vsMarkerRead(stale.id);
+	check(
+		"the wave wrote the restart marker before the kill",
+		marker !== null && marker.pid === old.pid && typeof marker.at === "number",
+	);
+	const log = vsLog();
+	check(
+		"the pane is held open while the process is gone and respawned with the transcript",
+		log.includes("remain-on-exit on") &&
+			log.indexOf("remain-on-exit on") < log.indexOf("respawn-pane") &&
+			log.includes(`omp --resume '${transcript}'`),
+	);
+	await stale.fire("session_shutdown");
+	await settle(150);
+	const after = record(stale.id);
+	check(
+		"a restart shutdown keeps the standing question",
+		after.standing !== null && after.standing.id === before.standing.id,
+	);
+	check("a restart shutdown keeps the close offer", after.closeOffer === before.closeOffer);
+	check("a restart shutdown keeps the red pin", after.pinned === redMessage && api.pinned.has(redMessage));
+	check("the marker is consumed by the shutdown", !existsSync(vsMarker(stale.id)));
+	const back = spawn(stale.id, folder, "Stale one");
+	await back.fire("session_start");
+	await settle(100);
+	vsPoller.heartbeat();
+	await settle(200);
+	check(
+		"the wave confirms the resume by the record, the new pid and the current stamp",
+		record(stale.id).pid !== old.pid,
+	);
+	check("the resumed process adopts the standing question", record(stale.id).standing?.id === before.standing.id);
+	check("the resumed process adopts the close offer", record(stale.id).closeOffer === before.closeOffer);
+	check("the resumed process adopts the red pin", record(stale.id).pinned === redMessage);
+	writeFileSync(
+		join(inboxOf(stale.id), "9601.json"),
+		JSON.stringify({ kind: "callback", value: `c:${before.standing.id}:0` }),
+	);
+	await back.pump(250);
+	check(
+		"the turn-end question survives the restart and starts the next turn",
+		back.steers.some((x) => x.text === "Go"),
+	);
+	check("a fully restarted wave sends no notice", vsWaveNotices() === 0);
+	await back.fire("session_shutdown");
+	vsRetire(stale.id);
+}
+
+// A stale record with no stamp and an open turn-end question waits for the answer, and says nothing.
+{
+	const folder = vsFolder("old-question");
+	const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const stale = spawn("01a1f111-0000-7000-8000-000000000011", folder, "Stale two");
+	await stale.fire("session_start");
+	const rec = vsCandidate(stale, folder, {
+		codeStamp: "",
+		pid: old.pid,
+		standing: { id: "vs-old-q", messageId: 99001, labels: ["Go"], head: "head" },
+	});
+	delete rec.lastInputAt;
+	writeFileSync(join(sessionsDir, `${stale.id}.json`), JSON.stringify(rec));
+	vsSet("pane_pid", String(old.pid));
+	vsLogReset();
+	vsPoller.heartbeat();
+	await settle(400);
+	check(
+		"an old-code session with an open question is not restarted",
+		!vsLog().includes("respawn-pane") && !existsSync(vsMarker(stale.id)),
+	);
+	check("a busy skip sends no notice", vsWaveNotices() === 0);
+	vsRetire(stale.id);
+	old.kill("SIGKILL");
+}
+
+// Each remaining gate, one candidate at a time, each silent.
+{
+	const busyChecks = [
+		{ id: "01a1f112-0000-7000-8000-000000000012", name: "a working state", fields: { state: "working" } },
+		{ id: "01a1f113-0000-7000-8000-000000000013", name: "a question on screen", fields: {} },
+		{ id: "01a1f114-0000-7000-8000-000000000014", name: "recent input", fields: { lastInputAt: Date.now() - 60_000 } },
+		{ id: "01a1f115-0000-7000-8000-000000000015", name: "recent terminal activity", fields: {} },
+	];
+	const busyDummies = [];
+	for (const spec of busyChecks) {
+		const folder = vsFolder(spec.name);
+		const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+		busyDummies.push(old);
+		const stale = spawn(spec.id, folder, `Stale ${spec.name}`);
+		await stale.fire("session_start");
+		vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: old.pid, ...spec.fields });
+		if (spec.name === "a question on screen") vsSet("capture", "1. Go\n2. Stop\n⏎ select ⎋ cancel\n");
+		if (spec.name === "recent terminal activity") {
+			const rec = record(spec.id);
+			delete rec.lastInputAt;
+			writeFileSync(join(sessionsDir, `${spec.id}.json`), JSON.stringify(rec));
+			vsSet("window_activity", String(Math.floor(Date.now() / 1000) - 30));
+		}
+		vsSet("pane_pid", String(old.pid));
+		vsLogReset();
+		vsPoller.heartbeat();
+		await settle(400);
+		check(
+			`the wave leaves a ${spec.name} session alone, without a notice`,
+			!vsLog().includes("respawn-pane") && !existsSync(vsMarker(spec.id)) && vsWaveNotices() === 0,
+		);
+		vsSet("capture", "idle\n");
+		vsSet("window_activity", String(Math.floor(Date.now() / 1000) - 3600));
+		vsRetire(spec.id);
+	}
+	for (const old of busyDummies) old.kill("SIGKILL");
+}
+
+// A child process that is not one of omp's own workers blocks the restart.
+{
+	const folder = vsFolder("stray-child");
+	const old = dummy("bash", "-c", "( exec -a stray sleep 600 ) & wait");
+	const stale = spawn("01a1f116-0000-7000-8000-000000000016", folder, "Stale six");
+	await stale.fire("session_start");
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: old.pid });
+	vsSet("pane_pid", String(old.pid));
+	vsLogReset();
+	vsPoller.heartbeat();
+	await settle(400);
+	check(
+		"a session with a non-worker child is not restarted",
+		!vsLog().includes("respawn-pane") && !existsSync(vsMarker(stale.id)) && vsWaveNotices() === 0,
+	);
+	vsRetire(stale.id);
+	old.kill("SIGKILL");
+}
+
+// The same shape with a worker child passes the gate, and a resume nobody confirms is reported once.
+{
+	const folder = vsFolder("worker-child");
+	const old = dummy("bash", "-c", "( exec -a __omp_worker_test sleep 600 ) & wait");
+	const stale = spawn("01a1f117-0000-7000-8000-000000000017", folder, "Stale seven");
+	await stale.fire("session_start");
+	const transcript = vsTranscript(stale.id);
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: old.pid });
+	vsSet("pane_pid", String(old.pid));
+	vsSet("pane_dead", "1");
+	vsLogReset();
+	vsPoller.heartbeat();
+	for (let i = 0; i < 40 && !vsLog().includes("omp --resume"); i++) await settle(100);
+	await stale.fire("session_shutdown");
+	await settle(100);
+	check("a worker child does not block the restart", vsLog().includes(`omp --resume '${transcript}'`));
+	jump(95_000);
+	vsPoller.heartbeat();
+	await settle(200);
+	check(
+		"an unconfirmed resume is reported with its tab and reason",
+		vsWaveNotices() === 1 &&
+			lastVsNotice().includes("work:9") &&
+			lastVsNotice().includes("Stale seven") &&
+			lastVsNotice().includes("not confirmed"),
+	);
+	vsRetire(stale.id);
+	old.kill("SIGKILL");
+}
+
+// Failures found before the kill are reported in one notice, and the process is left alone.
+{
+	const folderT = vsFolder("no-transcript");
+	const folderF = vsFolder("no-folder-folder");
+	const missingTranscript = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const t = spawn("01a1f118-0000-7000-8000-000000000018", folderT, "Stale eight");
+	await t.fire("session_start");
+	vsTranscript("01a1f119-0000-7000-8000-000000000019");
+	vsCandidate(t, folderT, { codeStamp: "stale-stamp", pid: missingTranscript.pid });
+	const missingFolder = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const f = spawn("01a1f119-0000-7000-8000-000000000019", folderF, "Stale nine");
+	await f.fire("session_start");
+	vsCandidate(f, join(root, "vs-gone-folder"), { codeStamp: "stale-stamp", pid: missingFolder.pid });
+	const missingPane = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const p = spawn("01a1f120-0000-7000-8000-000000000020", folderT, "Stale ten");
+	await p.fire("session_start");
+	vsCandidate(p, folderT, { codeStamp: "stale-stamp", pid: missingPane.pid, tmuxPane: "%17" });
+	vsSet("pane_ok", "%9\n");
+	vsSet("pane_dead", "0");
+	vsLogReset();
+	vsPoller.heartbeat();
+	await settle(500);
+	vsPoller.heartbeat();
+	await settle(200);
+	check(
+		"one wave notice names every failed tab and its reason",
+		vsWaveNotices() === 2 &&
+			lastVsNotice().includes("no transcript") &&
+			lastVsNotice().includes("folder is gone") &&
+			lastVsNotice().includes("no pane") &&
+			lastVsNotice().includes("Stale eight") &&
+			lastVsNotice().includes("Stale nine") &&
+			lastVsNotice().includes("Stale ten"),
+	);
+	check(
+		"a pre-kill failure leaves the process running",
+		missingTranscript.exitCode === null && missingFolder.exitCode === null && missingPane.exitCode === null,
+	);
+	check(
+		"a pre-kill failure never respawns a pane",
+		!vsLog().includes("respawn-pane") && !vsLog().includes("new-window"),
+	);
+	vsRetire(t.id);
+	vsRetire(f.id);
+	vsRetire(p.id);
+	missingTranscript.kill("SIGKILL");
+	missingFolder.kill("SIGKILL");
+	missingPane.kill("SIGKILL");
+}
+
+// A process that does not exit is left running, reported, retried by the next wave, not reported twice.
+{
+	const sigLog = join(root, "vs-signal.log");
+	process.env.VS_SIGNAL_LOG = sigLog;
+	writeFileSync(sigLog, "");
+	const stubborn = dummy(
+		process.execPath,
+		"-e",
+		'process.on("SIGTERM", () => { require("fs").appendFileSync(process.env.VS_SIGNAL_LOG, "TERM\\n"); }); setInterval(() => {}, 1000);',
+	);
+	const folder = vsFolder("stubborn");
+	const stale = spawn("01a1f121-0000-7000-8000-000000000021", folder, "Stale eleven");
+	await stale.fire("session_start");
+	vsTranscript(stale.id);
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: stubborn.pid });
+	vsSet("pane_pid", String(stubborn.pid));
+	vsSet("pane_dead", "1");
+	vsLogReset();
+	vsPoller.heartbeat();
+	// The marker proves the wave reached the kill, so the exit wait's deadline is set before the jump.
+	for (let i = 0; i < 40 && !existsSync(vsMarker(stale.id)); i++) await settle(100);
+	await settle(100);
+	jump(31_000);
+	await settle(1500);
+	vsPoller.heartbeat();
+	await settle(400);
+	check(
+		"a process that ignores SIGTERM is left running and reported",
+		stubborn.exitCode === null && vsWaveNotices() === 3 && lastVsNotice().includes("did not exit"),
+	);
+	check("the wave that reported it did not respawn a pane", !vsLog().includes("respawn-pane"));
+	writeFileSync(join(sessionsDir, `${stale.id}.json`), JSON.stringify({ ...record(stale.id), heartbeat: Date.now() }));
+	vsLogReset();
+	vsPoller.heartbeat();
+	// The retry's kill takes real milliseconds through the fake tmux.
+	for (
+		let i = 0;
+		i < 40 &&
+		readFileSync(sigLog, "utf8")
+			.split("\n")
+			.filter((l) => l === "TERM").length < 2;
+		i++
+	)
+		await settle(100);
+	check(
+		"the next wave retries a process that did not exit",
+		readFileSync(sigLog, "utf8")
+			.split("\n")
+			.filter((l) => l === "TERM").length === 2,
+	);
+	// Retiring now keeps the next wave from opening a third entry whose restart would run past this subtest.
+	vsRetire(stale.id);
+	jump(31_000);
+	await settle(1500);
+	vsPoller.heartbeat();
+	await settle(400);
+	check("the same failure is not reported twice", vsWaveNotices() === 3);
+	stubborn.kill("SIGKILL");
+}
+
+// A respawn that fails twice opens a new window in the same tmux session and is reported.
+{
+	const folder = vsFolder("respawn-fail");
+	const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const stale = spawn("01a1f122-0000-7000-8000-000000000022", folder, "Stale twelve");
+	await stale.fire("session_start");
+	const transcript = vsTranscript(stale.id);
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: old.pid });
+	vsSet("pane_pid", String(old.pid));
+	vsSet("pane_dead", "1");
+	vsSet("respawn_fails", "1");
+	vsLogReset();
+	vsPoller.heartbeat();
+	for (let i = 0; i < 40 && !vsLog().includes("new-window"); i++) await settle(100);
+	const log = vsLog();
+	check(
+		"a failed respawn is retried once and then a new window opens in the same tmux session",
+		log.split("respawn-pane").length - 1 === 2 &&
+			log.includes("new-window") &&
+			log.includes("=work") &&
+			log.includes(`omp --resume '${transcript}'`),
+	);
+	const back = spawn(stale.id, folder, "Stale twelve");
+	await back.fire("session_start");
+	await settle(100);
+	vsPoller.heartbeat();
+	await settle(200);
+	check(
+		"the new window is reported even though the resume confirmed",
+		vsWaveNotices() === 4 && lastVsNotice().includes("new window"),
+	);
+	await back.fire("session_shutdown");
+	vsRetire(stale.id);
+	vsSet("respawn_fails", "0");
+	old.kill("SIGKILL");
+}
+
+// An old record without a pane id is found through its pid and its parent, and driven with send-keys.
+{
+	const parentPidFile = join(root, "vs-parent-pid");
+	process.env.VS_CHILD_FILE = parentPidFile;
+	const shell = dummy("sh", "-c", `sleep 600 & S=$!; echo $S > "$VS_CHILD_FILE"; wait $S`);
+	await settle(150);
+	const ompPid = Number(readFileSync(parentPidFile, "utf8"));
+	const folder = vsFolder("pane-by-parent");
+	const stale = spawn("01a1f123-0000-7000-8000-000000000023", folder, "Stale thirteen");
+	await stale.fire("session_start");
+	const transcript = vsTranscript(stale.id);
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: ompPid, tmuxPane: "" });
+	const rec = record(stale.id);
+	delete rec.tmuxPane;
+	writeFileSync(join(sessionsDir, `${stale.id}.json`), JSON.stringify(rec));
+	vsSet("pane_ok", "%11\n");
+	vsSet("pane_pid", String(shell.pid));
+	vsSet("list_panes", `%11\t${shell.pid}\t0\n`);
+	vsSet("pane_dead", "0");
+	vsLogReset();
+	vsPoller.heartbeat();
+	for (let i = 0; i < 40 && !vsLog().includes("send-keys"); i++) await settle(100);
+	const log = vsLog();
+	check(
+		"a pane whose process is the parent of the session is found and driven with send-keys",
+		log.includes("send-keys") &&
+			log.includes(`cd '${folder}' && omp --resume '${transcript}'`) &&
+			!log.includes("respawn-pane"),
+	);
+	const back = spawn(stale.id, folder, "Stale thirteen");
+	await back.fire("session_start");
+	await settle(100);
+	vsPoller.heartbeat();
+	await settle(200);
+	check("the send-keys resume is confirmed", record(stale.id).pid === process.pid && vsWaveNotices() === 4);
+	await back.fire("session_shutdown");
+	vsRetire(stale.id);
+	shell.kill("SIGKILL");
+}
+
+// A send-keys restart must type nothing while the old process still runs, and type the resume once it is gone.
+{
+	const folder = vsFolder("sendkeys-delay");
+	const late = dummy(
+		process.execPath,
+		"-e",
+		"process.on('SIGTERM', () => { setTimeout(() => process.exit(0), 2000) }); setInterval(() => {}, 1000);",
+	);
+	const stale = spawn("01a1f124-0000-7000-8000-000000000024", folder, "Stale fourteen");
+	await stale.fire("session_start");
+	const transcript = vsTranscript(stale.id);
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: late.pid, tmuxPane: "" });
+	vsSet("pane_ok", "%11\n");
+	vsSet("pane_pid", "1");
+	vsSet("list_panes", `%11\t${late.pid}\t0\n`);
+	vsSet("pane_dead", "0");
+	vsLogReset();
+	vsPoller.heartbeat();
+	for (let i = 0; i < 40 && !existsSync(vsMarker(stale.id)); i++) await settle(100);
+	await settle(300);
+	const quiet = !vsLog().includes("send-keys") && late.exitCode === null;
+	for (let i = 0; i < 60 && !vsLog().includes("send-keys"); i++) await settle(100);
+	const log = vsLog();
+	check(
+		"a send-keys restart types nothing while the old process still runs and types the resume once it has exited",
+		quiet &&
+			log.includes(`send-keys -t %11 -l cd '${folder}' && omp --resume '${transcript}'`) &&
+			log.includes("send-keys -t %11 Enter"),
+	);
+	vsRetire(stale.id);
+}
+
+// A folder whose name has a space and a single quote must reach the respawn command intact.
+{
+	const folder = join(root, "vs q'uote folder");
+	mkdirSync(folder, { recursive: true });
+	const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const stale = spawn("01a1f125-0000-7000-8000-000000000025", folder, "Stale fifteen");
+	await stale.fire("session_start");
+	const transcript = vsTranscript(stale.id);
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: old.pid });
+	vsSet("pane_ok", "%11\n");
+	vsSet("pane_pid", String(old.pid));
+	vsSet("list_panes", `%11\t${old.pid}\t0\n`);
+	vsSet("pane_dead", "1");
+	vsSet("respawn_fails", "0");
+	writeFileSync(join(vsState, "argv"), "");
+	vsLogReset();
+	vsPoller.heartbeat();
+	for (let i = 0; i < 40 && !vsLog().includes("respawn-pane"); i++) await settle(100);
+	const argv = readFileSync(join(vsState, "argv"), "utf8").split("\n");
+	check(
+		"a cwd with a space and a single quote reaches the shell intact in the respawn command",
+		argv.includes(folder) && argv.includes(`omp --resume '${transcript}'`),
+	);
+	vsRetire(stale.id);
+	old.kill("SIGKILL");
+}
+
+// The lock itself: old-code and stale-code holders are taken over by the rules from dead-poller-lock.
+{
+	const lockFile = join(root, "notify-telegram/poller.lock");
+	const placeLock = (lock) => {
+		writeFileSync(`${lockFile}.vs.tmp`, JSON.stringify(lock));
+		renameSync(`${lockFile}.vs.tmp`, lockFile);
+	};
+	placeLock({ sessionId: "01a1f130-0000-7000-8000-000000000030", pid: deadPid, heartbeat: Date.now() });
+	vsPoller.pump(150);
+	check(
+		"a drain tick takes a fresh lock whose holder has no stamp and is gone",
+		JSON.parse(readFileSync(lockFile, "utf8")).sessionId === vsPoller.id,
+	);
+	placeLock({
+		sessionId: "01a1f131-0000-7000-8000-000000000031",
+		pid: deadPid,
+		heartbeat: Date.now() - 60_000,
+		code: "stale-stamp",
+	});
+	vsPoller.heartbeat();
+	await settle(50);
+	check(
+		"a heartbeat takes a stale-heartbeat lock that names stale code",
+		JSON.parse(readFileSync(lockFile, "utf8")).sessionId === vsPoller.id,
+	);
+	placeLock({
+		sessionId: "01a1f132-0000-7000-8000-000000000032",
+		pid: process.pid,
+		heartbeat: Date.now(),
+		code: "stale-stamp",
+	});
+	vsPoller.heartbeat();
+	await settle(50);
+	check(
+		"a fresh lock held by a live process is left alone",
+		JSON.parse(readFileSync(lockFile, "utf8")).sessionId === "01a1f132-0000-7000-8000-000000000032",
+	);
+}
+
+// A record carrying the poller's own stamp is never a candidate, no matter how tempting it looks.
+{
+	const id = "01a1f140-0000-7000-8000-000000000040";
+	const folder = vsFolder("current-code");
+	const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	vsTranscript(id);
+	const rec = {
+		instance: "vs-current",
+		leased: false,
+		pid: old.pid,
+		tag: "vscur1",
+		name: "Stale looking",
+		cwd: folder,
+		emoji: "",
+		emojiChosen: false,
+		label: "",
+		code: "",
+		lastNotified: 0,
+		recent: [],
+		question: null,
+		replyQuestion: null,
+		standing: null,
+		closeOffer: null,
+		pinned: null,
+		pinPendingUntil: 0,
+		state: "idle",
+		health: "",
+		summary: "",
+		summaryAt: 0,
+		heartbeat: Date.now(),
+		systemShutdownAt: 0,
+		messaging: 1,
+		boot: "boot-before-the-crash",
+		argv: [],
+		tmux: "work",
+		tmuxWindow: 9,
+		tmuxPane: "%9",
+		lastInputAt: Date.now() - 3 * 60_000,
+		codeStamp: stampOriginal,
+	};
+	writeFileSync(join(sessionsDir, `${id}.json`), JSON.stringify(rec));
+	vsSet("pane_pid", String(old.pid));
+	vsLogReset();
+	vsPoller.heartbeat();
+	await settle(400);
+	check(
+		"a current-code record is never a restart candidate",
+		!vsLog().includes("respawn-pane") && !existsSync(vsMarker(id)) && old.exitCode === null,
+	);
+	rmSync(join(sessionsDir, `${id}.json`), { force: true });
+	old.kill("SIGKILL");
+}
+
+// The reaper leaves a record alone while its restart marker is live, and takes it up once the marker ages out.
+{
+	const id = "01a1f141-0000-7000-8000-000000000041";
+	const rec = {
+		instance: "vs-reaped",
+		leased: false,
+		pid: deadPid,
+		tag: "vsreap",
+		name: "Mid restart",
+		cwd: vsFolder("reaped"),
+		emoji: "",
+		emojiChosen: false,
+		label: "",
+		code: "",
+		lastNotified: 0,
+		recent: [],
+		question: null,
+		replyQuestion: null,
+		standing: null,
+		closeOffer: null,
+		pinned: null,
+		pinPendingUntil: 0,
+		state: "idle",
+		health: "",
+		summary: "",
+		summaryAt: 0,
+		heartbeat: Date.now() - 100_000,
+		systemShutdownAt: 0,
+		messaging: 1,
+		boot: "boot-before-the-crash",
+		argv: [],
+		tmux: "work",
+		tmuxWindow: 9,
+		tmuxPane: "%9",
+		lastInputAt: 0,
+		codeStamp: "stale-stamp",
+	};
+	writeFileSync(join(sessionsDir, `${id}.json`), JSON.stringify(rec));
+	mkdirSync(join(root, "notify-telegram/restart-pending"), { recursive: true });
+	writeFileSync(vsMarker(id), JSON.stringify({ at: Date.now(), pid: deadPid }), { mode: 0o600 });
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	vsPoller.heartbeat();
+	await settle(150);
+	check(
+		"the reaper leaves a marked record alone while its restart marker is live",
+		existsSync(join(sessionsDir, `${id}.json`)) && !existsSync(join(root, "notify-telegram/crashed", `${id}.json`)),
+	);
+	jump(6 * 60_000);
+	vsPoller.heartbeat();
+	await settle(200);
+	check(
+		"the reaper takes up a marked record once its marker is gone",
+		!existsSync(join(sessionsDir, `${id}.json`)) && existsSync(join(root, "notify-telegram/crashed", `${id}.json`)),
+	);
+}
+
+restoreStamp();
+process.env.PATH = savedVsPath;
+delete process.env.VS_STATE;
+delete process.env.VS_TMUX_LOG;
+delete process.env.VS_CHILD_FILE;
+delete process.env.VS_SIGNAL_LOG;
+for (const child of dummies) {
+	if (child.exitCode === null) child.kill("SIGKILL");
+}
+await settle(200);
+vsPoller.heartbeat();
+await settle(100);
+await vsPoller.fire("session_shutdown");
+for (const f of readdirSync(sessionsDir)) rmSync(join(sessionsDir, f), { force: true });
+check(
+	"the extension files are left as they were",
+	readFileSync(stampFiles[1], "utf8") === renderBytes.toString("utf8"),
+);
+console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
+process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);
