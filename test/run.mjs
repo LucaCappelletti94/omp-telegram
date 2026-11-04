@@ -673,11 +673,10 @@ api.failDescription = undefined;
 const markupAttempts = called("sendMessage").slice(beforeMarkup);
 check("a rejected keyboard is not re-sent unchanged", markupAttempts.length === 1);
 
-// A plain retry that is itself throttled must wait out the 429 it recorded, so the card still
-// lands once the retry_after has passed.
+// A 429 over 30 s is refused instead of retried in flight, so the card must wait it out and still land.
 api.plainStatus = 429;
-api.plainRetryAfter = 1;
-api.plainDescription = "Too Many Requests: retry after 1";
+api.plainRetryAfter = 31;
+api.plainDescription = "Too Many Requests: retry after 31";
 const rp = spawn("01a06009-0000-0000-0000-000000000009", "/home/dev/work/refused-plain");
 await rp.fire("session_start");
 const rpState = {};
@@ -689,8 +688,16 @@ check("the card is not delivered while its plain retry is throttled", api.nextMe
 api.plainStatus = undefined;
 api.plainRetryAfter = undefined;
 api.plainDescription = undefined;
-jump(1_200);
-await settle(400);
+// A 32s jump reads as a machine wake and refreshes heartbeats, so the pre-jump ages come back.
+const skewBefore = clockSkew;
+const preJumpHeartbeats = new Map(
+	readdirSync(sessionsDir)
+		.filter((entry) => entry.endsWith(".json"))
+		.map((entry) => [entry, JSON.parse(readFileSync(join(sessionsDir, entry), "utf8")).heartbeat ?? 0]),
+);
+jump(32_000);
+// The retry wakes in 250ms real-time slices, so allow several before the card lands.
+await settle(2500);
 const rpCard = called("sendMessage")
 	.slice(rpFrom)
 	.filter((c) => c.body.parse_mode === undefined && (c.body.text ?? "").includes("Which backend?"))
@@ -707,6 +714,18 @@ rmSync(join(root, "notify-telegram/throttle.json"), { force: true });
 // A text answer closes the question so a later bare message is never held for it.
 writeFileSync(join(inboxOf(rp.id), "701.json"), JSON.stringify({ kind: "text", value: "SQLite" }));
 await rp.pump(150);
+for (const entry of readdirSync(sessionsDir)) {
+	if (!entry.endsWith(".json")) continue;
+	const path = join(sessionsDir, entry);
+	const pre = preJumpHeartbeats.get(entry);
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		if (pre === undefined || parsed.heartbeat === pre) continue;
+		writeFileSync(path, JSON.stringify({ ...parsed, heartbeat: pre }));
+	} catch {}
+}
+// The suite's late rewind would otherwise leave this jump's skew in every stamp it wrote.
+clockSkew = skewBefore;
 api.rejectHtml = false;
 writeFileSync(join(inboxOf(two.id), "700.json"), JSON.stringify({ kind: "callback", value: `o:${richAskId}:0:0` }));
 await two.pump(150);
