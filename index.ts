@@ -4313,7 +4313,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		if (pendingExists) {
 			// It never validates, so keeping it would hold the offset on this update forever.
-			rmSync(reactionTransactionFile(updateId), { force: true });
+			removeStatePath(REACTION_PENDING_DIR, `${updateId}.json`);
 			pi.logger.warn("telegram: rejected a malformed reaction transaction", { update: updateId });
 			return;
 		}
