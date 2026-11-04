@@ -3935,7 +3935,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		const omitted = rivals.length - listed.length;
 		// The picker is the held message's only way to the user, so it is sent until Telegram takes it.
-		const held = heldMessagePath(String(update.update_id));
+		const heldId = String(update.update_id);
 		await deliverUntilTaken(
 			(onRefused) =>
 				callTelegramRaw<TelegramMessage>(
@@ -3958,7 +3958,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					15_000,
 					onRefused,
 				),
-			() => existsSync(held),
+			() => readHeldMessage(heldId) !== null,
 		);
 	}
 
