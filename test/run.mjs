@@ -13931,6 +13931,7 @@ case "$1" in
       *pane_id*) grep -qx "$4" "$S/pane_ok" || exit 1 ;;
     esac ;;
   list-panes) cat "$S/list_panes" ;;
+  has-session) [ -e "$S/session_missing" ] && exit 1 || exit 0 ;;
   respawn-pane)
     [ "$(cat "$S/respawn_fails" 2>/dev/null || echo 0)" = "0" ] || { echo "respawn refused" 1>&2; exit 1; }
     printf '%s\n' "$@" >> "$S/argv" ;;
@@ -14527,6 +14528,113 @@ const vsRetire = (id) =>
 		argv.includes(folder) && argv.includes(`omp --resume '${transcript}'`),
 	);
 	vsRetire(stale.id);
+	old.kill("SIGKILL");
+}
+
+// The transcript lookup survives a stray entry and an unreadable project dir, and reports a missing sessions dir.
+{
+	const folder = vsFolder("transcript-robust");
+	const stray = join(vsSessions, "aa-stray.txt");
+	const unreadable = join(vsSessions, "aa-unreadable");
+	const d1 = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const stale = spawn("01a1f126-0000-7000-8000-000000000026", folder, "Stale sixteen");
+	await stale.fire("session_start");
+	const transcript = vsTranscript(stale.id);
+	writeFileSync(stray, "x");
+	mkdirSync(unreadable, { recursive: true });
+	chmodSync(unreadable, 0);
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: d1.pid });
+	vsSet("pane_ok", "%9\n");
+	vsSet("pane_pid", String(d1.pid));
+	vsSet("list_panes", `%9\t${d1.pid}\t0\n`);
+	vsSet("pane_dead", "1");
+	vsLogReset();
+	vsPoller.heartbeat();
+	for (let i = 0; i < 40 && !vsLog().includes("respawn-pane"); i++) await settle(100);
+	check(
+		"a stray entry and an unreadable project dir do not hide the transcript",
+		vsLog().includes(`omp --resume '${transcript}'`),
+	);
+	await stale.fire("session_shutdown");
+	vsRetire(stale.id);
+	d1.kill("SIGKILL");
+	chmodSync(unreadable, 0o755);
+	rmSync(unreadable, { recursive: true, force: true });
+	rmSync(stray, { force: true });
+
+	const d2 = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const stale2 = spawn("01a1f127-0000-7000-8000-000000000027", folder, "Stale seventeen");
+	await stale2.fire("session_start");
+	vsTranscript(stale2.id);
+	vsCandidate(stale2, folder, { codeStamp: "stale-stamp", pid: d2.pid });
+	vsSet("pane_ok", "%9\n");
+	vsSet("pane_pid", String(d2.pid));
+	vsSet("list_panes", `%9\t${d2.pid}\t0\n`);
+	vsLogReset();
+	renameSync(vsSessions, `${vsSessions}.gone`);
+	vsPoller.heartbeat();
+	await settle(700);
+	renameSync(`${vsSessions}.gone`, vsSessions);
+	check(
+		"a missing sessions dir is reported as no transcript",
+		lastVsNotice().includes("no transcript") && lastVsNotice().includes("Stale seventeen"),
+	);
+	vsRetire(stale2.id);
+	d2.kill("SIGKILL");
+}
+
+// A pre-stamp session with no open question is restarted, not left waiting for an answer.
+{
+	const folder = vsFolder("old-noq");
+	const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const stale = spawn("01a1f128-0000-7000-8000-000000000028", folder, "Stale eighteen");
+	await stale.fire("session_start");
+	const transcript = vsTranscript(stale.id);
+	vsCandidate(stale, folder, { codeStamp: "", pid: old.pid });
+	vsSet("pane_ok", "%9\n");
+	vsSet("pane_pid", String(old.pid));
+	vsSet("list_panes", `%9\t${old.pid}\t0\n`);
+	vsSet("pane_dead", "1");
+	vsLogReset();
+	vsPoller.heartbeat();
+	for (let i = 0; i < 40 && !vsLog().includes("respawn-pane"); i++) await settle(100);
+	check("a pre-stamp session with no open question is restarted", vsLog().includes(`omp --resume '${transcript}'`));
+	await stale.fire("session_shutdown");
+	vsRetire(stale.id);
+	old.kill("SIGKILL");
+}
+
+// A failed respawn whose tmux session is gone and has no name falls back to the default session.
+{
+	const folder = vsFolder("no-tmux");
+	const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const stale = spawn("01a1f129-0000-7000-8000-000000000029", folder, "Stale nineteen");
+	await stale.fire("session_start");
+	const transcript = vsTranscript(stale.id);
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: old.pid, tmux: "" });
+	vsSet("pane_ok", "%9\n");
+	vsSet("pane_pid", String(old.pid));
+	vsSet("list_panes", `%9\t${old.pid}\t0\n`);
+	vsSet("pane_dead", "1");
+	vsSet("respawn_fails", "1");
+	writeFileSync(join(vsState, "session_missing"), "");
+	vsLogReset();
+	vsPoller.heartbeat();
+	for (let i = 0; i < 40 && !vsLog().includes("new-session"); i++) await settle(100);
+	const log = vsLog();
+	check(
+		"a failed respawn with no session name opens the default session",
+		log.includes(`new-session -d -s omp -n restart ${stale.id.slice(0, 8)} -c ${folder} omp --resume '${transcript}'`),
+	);
+	vsPoller.heartbeat();
+	await settle(400);
+	check(
+		"the new-session fallback is reported with the folder as the tab",
+		lastVsNotice().includes("new window") && lastVsNotice().includes(folder),
+	);
+	vsRetire(stale.id);
+	vsSet("respawn_fails", "0");
+	rmSync(join(vsState, "session_missing"), { force: true });
 	old.kill("SIGKILL");
 }
 

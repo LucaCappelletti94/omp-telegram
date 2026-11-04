@@ -1540,7 +1540,6 @@ function codeStampOfFiles(): string {
 
 /** The parent of `pid`, 0 when the kernel says none: the field after the last `)` of `/proc/pid/stat`. */
 function parentOf(pid: number): number {
-	if (pid <= 0) return 0;
 	try {
 		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
 		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
