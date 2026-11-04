@@ -1213,41 +1213,137 @@ interface TelegramEnvelope {
 
 /** Set while a tool the agent is blocked on runs, so its calls refuse a long throttle instead of waiting it out. */
 const agentWaiting = new AsyncLocalStorage<true>();
-/** When every omp process may send again, written by whichever process Telegram last told to wait. */
+/** Set for work nobody waits on, such as the board, crash cards and unpin retries, which yields to everything else. */
+const backgroundWork = new AsyncLocalStorage<true>();
+/** Telegram's deadline and the pacing that follows it, shared by every omp process. */
 const THROTTLE_FILE = join(STATE_DIR, "throttle.json");
+/** Held for the instant a process reads and rewrites `THROTTLE_FILE`, so two claims never book one slot. */
+const THROTTLE_LOCK_FILE = join(STATE_DIR, "throttle.lock");
+/** The lock is held for a synchronous read and write, so one this old belongs to a process that died holding it. */
+const THROTTLE_LOCK_STALE_MS = 2_000;
 /** A toast has its own short deadline, polling must never stop, and a typing action is not a message. */
 const THROTTLE_EXEMPT: Record<string, true> = { answerCallbackQuery: true, getUpdates: true, sendChatAction: true };
 /** The longest a tool the agent is blocked on waits out the shared throttle before its call is refused. */
 const AGENT_THROTTLE_WAIT_MS = 30_000;
+/** One send per second, the most Telegram's FAQ allows a bot in one chat. */
+const PACE_GAP_MS = 1_000;
+/** How long past Telegram's deadline sends stay paced, so the sends it held back cannot burst into the next 429. */
+const PACE_TAIL_MS = 30_000;
 
-function throttledUntil(): number {
-	const raw = readJsonFile(THROTTLE_FILE) as { until?: unknown } | null;
-	return typeof raw?.until === "number" ? raw.until : 0;
+/**
+ * `until` is Telegram's deadline. Until `paceUntil` every send takes a slot, and `next` is the first slot no send
+ * has booked yet.
+ */
+interface ThrottleState {
+	until: number;
+	paceUntil: number;
+	next: number;
 }
 
-/** Seconds the shared throttle still holds every send back, for a refusal to tell the agent. Empty when none. */
+function readThrottle(): ThrottleState {
+	const raw = readJsonFile(THROTTLE_FILE) as Partial<Record<keyof ThrottleState, unknown>> | null;
+	const at = (value: unknown): number => (typeof value === "number" ? value : 0);
+	return { until: at(raw?.until), paceUntil: at(raw?.paceUntil), next: at(raw?.next) };
+}
+
+/** Runs `change` on the shared throttle state while holding `THROTTLE_LOCK_FILE`, and writes back what it returns. */
+async function changeThrottle<T>(
+	change: (state: ThrottleState) => { state: ThrottleState | null; result: T },
+): Promise<T> {
+	const lock = resolve(THROTTLE_LOCK_FILE);
+	if (!lock.startsWith(`${resolve(STATE_DIR)}${sep}`))
+		throw new Error("The throttle lock lies outside the state directory");
+	for (;;) {
+		try {
+			writeFileSync(lock, "", { flag: "wx", mode: 0o600 });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			// A lock that vanished since the failed create reads as fresh, and the next pass takes it.
+			const heldSince = statSync(lock, { throwIfNoEntry: false })?.mtimeMs ?? Date.now();
+			if (Date.now() - heldSince > THROTTLE_LOCK_STALE_MS) rmSync(lock, { force: true });
+			await sleepMs(5);
+			continue;
+		}
+		try {
+			const { state, result } = change(readThrottle());
+			if (state !== null) writeFileAtomic(THROTTLE_FILE, JSON.stringify(state), 0o600);
+			return result;
+		} finally {
+			rmSync(lock, { force: true });
+		}
+	}
+}
+
+/** Seconds the shared throttle and the slots booked after it still hold a send back, for a refusal. Empty when none. */
 function throttleNote(): string {
-	const left = Math.ceil((throttledUntil() - Date.now()) / 1000);
+	const state = readThrottle();
+	const now = Date.now();
+	const left = Math.ceil((Math.max(state.until, now < state.paceUntil ? state.next : 0) - now) / 1000);
 	return left > 0 ? ` Telegram is throttling this bot for ${left} more ${left === 1 ? "second" : "seconds"}.` : "";
+}
+
+/**
+ * Waits until a non-exempt call may go, and returns null, or returns the time that holds it back when it must be
+ * refused instead. After a 429 every waiting send would fire in the same instant the deadline passes and earn the
+ * next 429, so until `paceUntil` each takes a slot one `PACE_GAP_MS` after the last. Background work takes only a
+ * slot nobody has booked ahead of it, so answers, cards and turn ends go first.
+ */
+async function admit(lifetime?: AbortSignal): Promise<number | null> {
+	const agent = agentWaiting.getStore() === true;
+	const background = backgroundWork.getStore() === true;
+	let slot = 0;
+	for (;;) {
+		const state = readThrottle();
+		const now = Date.now();
+		const ending = lifetime?.aborted === true;
+		if (now < state.until) {
+			if (ending || (agent && state.until - now > AGENT_THROTTLE_WAIT_MS)) return state.until;
+			// A new 429 voids the slot, which was booked against the old deadline.
+			slot = 0;
+			await sleepMs(Math.min(250, state.until - now));
+			continue;
+		}
+		if (slot > 0) {
+			if (now >= slot) return null;
+			if (ending) return slot;
+			await sleepMs(Math.min(250, slot - now));
+			continue;
+		}
+		if (now >= state.paceUntil) return null;
+		const booked = await changeThrottle((current) => {
+			const at = Date.now();
+			const free = Math.max(at, current.until, current.next);
+			if ((background || ending) && free > at) return { state: null, result: null };
+			return { state: { ...current, next: free + PACE_GAP_MS }, result: free };
+		});
+		if (booked === null) {
+			if (ending) return Math.max(state.next, now);
+			await sleepMs(250);
+			continue;
+		}
+		if (agent && booked - Date.now() > AGENT_THROTTLE_WAIT_MS) return booked;
+		slot = booked;
+	}
 }
 
 /**
  * Telegram throttles a bot to roughly one message per second per chat, and its `retry_after` is the time left
  * before the request can be repeated, for every sender of the chat. So a 429 is written down for every omp
- * process, and each send or edit first waits out what another process was told. A tool the agent is blocked on
- * waits at most `AGENT_THROTTLE_WAIT_MS`, and a process shutting down not at all. Both get the throttle as a
- * refusal instead. A short retry-after is still honoured once. `send` is re-invoked rather than reused, since a
- * request body is spent by its first attempt.
+ * process, and each send or edit first passes `admit`. A tool the agent is blocked on waits at most
+ * `AGENT_THROTTLE_WAIT_MS`, and a process shutting down not at all. Both get the throttle as a refusal instead.
+ * A short retry-after is still honoured once, through `admit` like any other send. `send` is re-invoked rather
+ * than reused, since a request body is spent by its first attempt.
  */
 async function sendWithRetry(
 	method: string,
 	send: () => Promise<Response>,
 	lifetime?: AbortSignal,
 ): Promise<{ response: Response; envelope: TelegramEnvelope | null }> {
-	if (!Object.hasOwn(THROTTLE_EXEMPT, method)) {
-		const until = throttledUntil();
-		const heldBack = (): { response: Response; envelope: TelegramEnvelope } => {
-			const retryAfter = Math.max(1, Math.ceil((until - Date.now()) / 1000));
+	const exempt = Object.hasOwn(THROTTLE_EXEMPT, method);
+	for (let attempt = 0; ; attempt++) {
+		const heldUntil = exempt ? null : await admit(lifetime);
+		if (heldUntil !== null) {
+			const retryAfter = Math.max(1, Math.ceil((heldUntil - Date.now()) / 1000));
 			return {
 				response: new Response(null, { status: 429 }),
 				envelope: {
@@ -1256,29 +1352,25 @@ async function sendWithRetry(
 					parameters: { retry_after: retryAfter },
 				},
 			};
-		};
-		if (until - Date.now() > AGENT_THROTTLE_WAIT_MS && agentWaiting.getStore() === true) return heldBack();
-		while (Date.now() < until) {
-			if (lifetime?.aborted === true) return heldBack();
-			await new Promise((wake) => setTimeout(wake, Math.min(250, until - Date.now())));
 		}
-	}
-	for (let attempt = 0; ; attempt++) {
 		const response = await send();
 		const payload: unknown = await response.json().catch(() => null);
 		const envelope = payload !== null && typeof payload === "object" ? (payload as TelegramEnvelope) : null;
 		const retryAfter = envelope?.parameters?.retry_after;
-		if (
-			response.status === 429 &&
-			typeof retryAfter === "number" &&
-			Date.now() + retryAfter * 1000 > throttledUntil()
-		) {
-			writeFileAtomic(THROTTLE_FILE, JSON.stringify({ until: Date.now() + retryAfter * 1000 }), 0o600);
+		if (response.status === 429 && typeof retryAfter === "number") {
+			const until = Date.now() + retryAfter * 1000;
+			await changeThrottle((current) => ({
+				state:
+					until > current.until
+						? { ...current, until, paceUntil: Math.max(current.paceUntil, until + PACE_TAIL_MS) }
+						: null,
+				result: undefined,
+			}));
 		}
 		if (attempt > 0 || response.status !== 429 || typeof retryAfter !== "number" || retryAfter > 30) {
 			return { response, envelope };
 		}
-		await new Promise((wake) => setTimeout(wake, (retryAfter + 0.5) * 1000));
+		if (exempt) await sleepMs((retryAfter + 0.5) * 1000);
 	}
 }
 
@@ -1887,6 +1979,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				error: config === null ? raw : raw.split(config.token).join("<token>"),
 			});
 		});
+	}
+
+	/** `detach` for work nobody waits on, which takes a paced slot only when no other send has one booked. */
+	function detachBackground(start: () => Promise<unknown>, label: string): void {
+		detach(() => backgroundWork.run(true, start), label);
 	}
 
 	function callTelegram<T>(
@@ -3111,7 +3208,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		dashboardInFlight = true;
 		dashboardPublishedAt = Date.now();
 		const cfg = config;
-		detach(() => publishDashboard(cfg, text, shown), "fleet dashboard");
+		detachBackground(() => publishDashboard(cfg, text, shown), "fleet dashboard");
 	}
 
 	/**
@@ -6313,6 +6410,29 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return !kept.dismissed && !crashRestored(id, kept, batch) && Date.now() - kept.restoringAt >= RESUME_START_MS;
 	}
 
+	/** The crash-card render in progress, which a render asked for meanwhile follows instead of racing. */
+	let crashRender: Promise<void> | null = null;
+	let crashRenderOwed = false;
+
+	/** Renders the crash cards once no render is in progress, since one waiting for a paced slot can outlast a heartbeat. */
+	function redrawCrashCards(): Promise<void> {
+		if (crashRender !== null) {
+			crashRenderOwed = true;
+			return crashRender;
+		}
+		crashRender = (async () => {
+			try {
+				do {
+					crashRenderOwed = false;
+					await renderCrashCards();
+				} while (crashRenderOwed);
+			} finally {
+				crashRender = null;
+			}
+		})();
+		return crashRender;
+	}
+
 	/**
 	 * Only the poller sends and edits crash cards. Ten sessions restored at once would otherwise
 	 * race their edits and leave the card showing whichever view landed last.
@@ -6469,7 +6589,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (typeof messageId === "number") await stripKeyboard(messageId);
 			toast = "That crash is no longer on record.";
 		}
-		await renderCrashCards();
+		await redrawCrashCards();
 		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callback.id, text: toast }, 10_000);
 	}
 
@@ -7668,8 +7788,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (ownsLock()) {
 					graphTick();
 					reapDeadSessions(true);
-					detach(() => retryPendingUnpins(), "pending pin cleanup");
-					detach(() => renderCrashCards(), "crash cards");
+					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
+					detachBackground(() => redrawCrashCards(), "crash cards");
 					detach(() => retryMedia(), "media retry");
 				}
 			} catch (error) {
@@ -7703,7 +7823,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		syncOwnNode(ctx);
 
 		writeSessionRecord(ctx);
-		detach(() => retryPendingUnpins(), "startup pin cleanup");
+		detachBackground(() => retryPendingUnpins(), "startup pin cleanup");
 	});
 
 	/**
