@@ -83,6 +83,8 @@ globalThis.fetch = async (url, init) => {
 	}
 	const body = JSON.parse(init.body);
 	api.calls.push({ method, body, at: Date.now() });
+	// A broken connection rejects the fetch, so no status line is ever read.
+	if ((api.fetchThrows ?? []).includes(method)) throw new TypeError("fetch failed");
 	if ((api.failMethods ?? []).includes(method)) {
 		// The status and the description are what a caller decides from, so a test chooses both.
 		// A rate limit carries retry_after, which is what sendWithRetry reads.
@@ -5832,6 +5834,63 @@ await orphanSess.fire("session_start");
 		report.includes("Could not remove") && report.includes("48 hours"),
 	);
 	check("a partial clear never claims a full one", !report.includes("Cleared all"));
+}
+
+// A network failure mid-clear must still shut the session down, and the clear reports what stays in the chat.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const ct = spawn("c1ea0017-0000-0000-0000-000000000000", "/home/dev/work/clearthrow");
+	let shutdowns = 0;
+	ct.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await ct.fire("session_start");
+	await ct.fire("input");
+	await ct.tools
+		.get("notify_status")
+		.execute("ct1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, ct.ctx);
+	await ct.fire("session_stop");
+	await settle(150);
+	const offer = record(ct.id).closeOffer;
+	api.fetchThrows = ["deleteMessages"];
+	writeFileSync(
+		join(inboxOf(ct.id), "6710.json"),
+		JSON.stringify({ kind: "callback", value: `x:${record(ct.id).tag}`, messageId: offer }),
+	);
+	await ct.pump(500);
+	api.fetchThrows = [];
+	check("a clear whose send dies on the network still shuts the session down", shutdowns === 1);
+	const deadReport = lastCall("sendMessage").body.text ?? "";
+	check(
+		"the dead clear reports the messages left in the chat",
+		deadReport.includes("Could not remove") && deadReport.includes("tracked messages"),
+	);
+}
+
+// A network failure while stripping the close button must not leave the pane alive.
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const st = spawn("c1ea0018-0000-0000-0000-000000000000", "/home/dev/work/stripthrow");
+	let shutdowns = 0;
+	st.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await st.fire("session_start");
+	await st.fire("input");
+	await st.tools
+		.get("notify_status")
+		.execute("st1", { summary: "All done.", urgency: "green", effect: "none" }, undefined, undefined, st.ctx);
+	await st.fire("session_stop");
+	await settle(150);
+	const offer = record(st.id).closeOffer;
+	api.fetchThrows = ["editMessageReplyMarkup"];
+	writeFileSync(
+		join(inboxOf(st.id), "6711.json"),
+		JSON.stringify({ kind: "callback", value: `k:${record(st.id).tag}`, messageId: offer }),
+	);
+	await st.pump(250);
+	api.fetchThrows = [];
+	check("a close whose strip dies on the network still shuts the session down", shutdowns === 1);
 }
 
 // A clear tapped on a green standing question deletes the question and never rewrites it at shutdown.
