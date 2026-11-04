@@ -13,6 +13,7 @@ import {
 	fitToTelegram,
 	isMarkupFailure,
 	packRows,
+	parsedLength,
 	plainStamps,
 	relativeTime,
 	stanceOf,
@@ -68,7 +69,7 @@ heading("fitting a message to the telegram limit");
 
 	const long = "&".repeat(5000);
 	const cut = fitToTelegram(long, "\n\n`12 in / 34 out`");
-	check("an oversized body is cut to fit", cut.length <= TELEGRAM_TEXT_MAX);
+	check("an oversized body is cut to fit", parsedLength(toTelegramHtml(cut)) <= TELEGRAM_TEXT_MAX);
 	check("the cut says it happened", cut.includes("truncated, full text at the terminal"));
 	check("the kept tail survives the cut", cut.endsWith("\n\n`12 in / 34 out`"));
 	check("the cut keeps as much as it can", cut.length > 4000);
@@ -77,7 +78,7 @@ heading("fitting a message to the telegram limit");
 	const cutFence = fitToTelegram(fenced, "");
 	check("a cut inside a fence closes it", (cutFence.match(/```/g) ?? []).length % 2 === 0);
 	check("a closed fence renders as one pre block", (toTelegramHtml(cutFence).match(/<pre>/g) ?? []).length === 1);
-	check("a cut fenced body fits", cutFence.length <= TELEGRAM_TEXT_MAX);
+	check("a cut fenced body fits", parsedLength(toTelegramHtml(cutFence)) <= TELEGRAM_TEXT_MAX);
 
 	const emoji = "\u{1F600}".repeat(3000);
 	const cutEmoji = fitToTelegram(emoji, "");
@@ -90,6 +91,20 @@ heading("fitting a message to the telegram limit");
 	const cutStamp = fitToTelegram(stamped, "");
 	check("the probe cut would land inside the stamp", cutStamp.indexOf("(truncated") > 4040);
 	check("a cut never lands inside a time stamp", !cutStamp.includes("<tg-time") || cutStamp.includes("</tg-time>"));
+
+	// A stamp inside code ships escaped rather than as a tag, so its full tag text is on the
+	// wire and must spend the budget, or the send goes over 4096 and Telegram refuses it.
+	const stamp = `<tg-time unix="1730000000" format="r">07:00</tg-time>`;
+	const fencedStamp = `${"A".repeat(4082)}\n\`\`\`\n${stamp}\n\`\`\``;
+	check(
+		"a stamp inside a fence fits on the wire",
+		parsedLength(toTelegramHtml(fitToTelegram(fencedStamp, ""))) <= TELEGRAM_TEXT_MAX,
+	);
+	const inlineStamp = `${"B".repeat(4082)} \`${stamp}\``;
+	check(
+		"a stamp inside inline code fits on the wire",
+		parsedLength(toTelegramHtml(fitToTelegram(inlineStamp, ""))) <= TELEGRAM_TEXT_MAX,
+	);
 
 	// Telegram does not count a stamp's tag markup, so neither may the budget: forty stamped rows
 	// whose visible text just fits must go out whole rather than lose rows to markup.
