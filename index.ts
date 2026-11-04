@@ -112,6 +112,8 @@ const BOOT_ID = (() => {
 
 const REACTION_ROUTE_WAIT_MS = 5_000;
 const HEARTBEAT_MS = 15_000;
+/** A route fence is held across a handful of file writes, so one this old belongs to a dead process. */
+const REACTION_ROUTE_LOCK_STALE_MS = 2 * HEARTBEAT_MS;
 const LOCK_STALE_MS = 45_000;
 const DRAIN_MS = 1_000;
 /** A drain tick this late means the process did not run, as when the machine slept. */
@@ -2653,6 +2655,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (died && !restarted && processRuns(record.pid)) continue;
 			mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
 			const closing = reactionRouteClosingFile(id);
+			dropStaleFence(closing);
 			try {
 				writeFileSync(closing, randomUUID(), { flag: "wx", mode: 0o600 });
 			} catch {
@@ -4072,8 +4075,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const fresh = valid && !externalAnswered.has(key);
 		if (fresh) {
 			externalAnswered.add(key);
-			// The asker created this directory to receive the answer. Recorded before the toast,
-			// which then reports a delivery this write has already made.
+			// Recorded before the toast, which then reports a delivery this write has already made.
+			mkdirSync(EXTERNAL_ANSWERS_DIR, { recursive: true, mode: 0o700 });
 			writeFileAtomic(join(EXTERNAL_ANSWERS_DIR, `${key}.json`), JSON.stringify({ choice, at: Date.now() }), 0o600);
 		} else if (!valid) {
 			pi.logger.warn("telegram: rejected an external answer with a malformed key or choice", {
@@ -4232,11 +4235,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {}
 	}
 
+	/** Removes a fence older than a live one can be, which a dead process left behind. */
+	function dropStaleFence(path: string): void {
+		const born = statSync(path, { throwIfNoEntry: false })?.mtimeMs;
+		if (born !== undefined && Date.now() - born > REACTION_ROUTE_LOCK_STALE_MS) rmSync(path, { force: true });
+	}
+
 	function takeReactionRouteLock(target: string, duringShutdown = false): string | null {
 		mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
 		const closing = reactionRouteClosingFile(target);
+		if (!duringShutdown) dropStaleFence(closing);
 		if (!duringShutdown && existsSync(closing)) return null;
 		const path = reactionRouteLockFile(target);
+		dropStaleFence(path);
 		const token = randomUUID();
 		try {
 			writeFileSync(path, token, { flag: "wx", mode: 0o600 });
@@ -4353,8 +4364,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 		if (pendingExists) {
+			// It never validates, so keeping it would hold the offset on this update forever.
+			removeStatePath(REACTION_PENDING_DIR, `${updateId}.json`);
 			pi.logger.warn("telegram: rejected a malformed reaction transaction", { update: updateId });
-			return false;
+			return;
 		}
 		const beforeEdit = recordBeforePendingEdit(reaction.message_id);
 		if (beforeEdit === null) return false;
