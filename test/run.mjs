@@ -1740,6 +1740,23 @@ for (const s of contenders) {
 }
 check("still only one poller after takeover", takers === 1);
 
+// A fresh heartbeat proves nothing once its process is gone, so a drain tick takes the lock at once.
+writeFileSync(lockPath, JSON.stringify({ sessionId: "dead-holder", pid: deadPid, heartbeat: Date.now() }));
+const taker = contenders[0];
+const deadPollsBefore = called("getUpdates").length;
+taker.timers[1]();
+await settle(40);
+check("a drain tick takes a dead holder's fresh lock", owner().sessionId === taker.id);
+taker.timers[1]();
+await settle(40);
+check("the successor polls on the next drain tick", called("getUpdates").length > deadPollsBefore);
+// Only a gone process frees the lock, so a fresh heartbeat from a live process keeps it.
+writeFileSync(lockPath, JSON.stringify({ sessionId: "live-holder", pid: process.pid, heartbeat: Date.now() }));
+const nonTaker = contenders[1];
+nonTaker.timers[1]();
+await settle(40);
+check("a drain tick leaves a live holder's fresh lock", owner().sessionId === "live-holder");
+
 // A non-owner exiting must not delete the lock, which is what produced the ENOENT storm.
 const nonOwner = contenders.find((s) => s.id !== owner().sessionId);
 await nonOwner.fire("session_shutdown");

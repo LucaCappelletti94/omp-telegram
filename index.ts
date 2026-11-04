@@ -3599,14 +3599,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * One poller only, or Telegram 409s. Atomic `wx` create; ownership re-read, never cached. The owner is the
 	 * extension instance, because two omp processes can report one session id.
 	 */
-	function readLock(file: string = LOCK_FILE): { instance: string; heartbeat: number } | null {
+	function readLock(file: string = LOCK_FILE): { instance: string; pid: number; heartbeat: number } | null {
 		if (!existsSync(file)) return null;
 		try {
 			const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
 			if (parsed === null || typeof parsed !== "object") return null;
-			const raw = parsed as { instance?: unknown; heartbeat?: unknown };
+			const raw = parsed as { instance?: unknown; pid?: unknown; heartbeat?: unknown };
 			if (typeof raw.heartbeat !== "number") return null;
-			return { instance: typeof raw.instance === "string" ? raw.instance : "", heartbeat: raw.heartbeat };
+			return {
+				instance: typeof raw.instance === "string" ? raw.instance : "",
+				pid: typeof raw.pid === "number" ? raw.pid : 0,
+				heartbeat: raw.heartbeat,
+			};
 		} catch {
 			return null;
 		}
@@ -3618,7 +3622,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			writeFileSync(file, mine, { flag: "wx" });
 		} catch {
 			const held = readLock(file);
-			if (held !== null && Date.now() - held.heartbeat < LOCK_STALE_MS) return false;
+			// A fresh heartbeat proves nothing once its process is gone, so a dead holder's lock is free at once.
+			if (held !== null && Date.now() - held.heartbeat < LOCK_STALE_MS && processRuns(held.pid)) return false;
 			try {
 				unlinkSync(file);
 			} catch {}
@@ -7858,6 +7863,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				maybeDashboard();
 				// Re-read rather than trusting a boolean: two pollers caused 918 Telegram conflicts.
 				if (ownsLock()) detach(() => pollOnce(), "telegram poll");
+				else {
+					// A holder whose process is gone frees the lock now, before its heartbeat goes stale.
+					const held = readLock();
+					if (held !== null && held.pid > 0 && !processRuns(held.pid)) acquireLock();
+				}
 			} catch (error) {
 				pi.logger.warn("notify-telegram: drain failed", {
 					error: error instanceof Error ? error.message : String(error),
