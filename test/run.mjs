@@ -13162,6 +13162,23 @@ heading("sessions that died without shutting down");
 		lastCall("answerCallbackQuery").body.text === "That session is already starting." &&
 			!readFileSync(slowLog, "utf8").includes(`--resume ${slowC}`),
 	);
+	// Every session of the batch still opens its window, so Restore all is refused as a whole.
+	api.queued = [
+		{
+			update_id: 9517,
+			callback_query: {
+				id: "cb-9517",
+				from: { id: CHAT },
+				message: { message_id: slowCardId, chat: { id: CHAT } },
+				data: `ka:${slowBatch}`,
+			},
+		},
+	];
+	await first.pump(400);
+	check(
+		"a second restore all tap while the first is in flight is refused and starts nothing",
+		lastCall("answerCallbackQuery").body.text === "That session is already starting.",
+	);
 	await settle(2_500);
 	process.env.PATH = slowPath;
 	const slowOpened = readFileSync(slowLog, "utf8");
@@ -13170,6 +13187,7 @@ heading("sessions that died without shutting down");
 		slowOpened.includes(`new-window -d -t work:11 -n Slow one -c`) &&
 			slowOpened.includes(`new-window -d -t work:12 -n Slow two -c`) &&
 			slowOpened.includes(`new-window -d -t work:13 -n Slow three -c`) &&
+			slowOpened.split("new-window").length - 1 === 3 &&
 			slowOpened.split(`--resume ${slowC}`).length - 1 === 1,
 	);
 
