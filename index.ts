@@ -2890,9 +2890,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch (error) {
 			// The connection broke mid-clear, so whatever was not confirmed stays in the chat.
 			refused = messages.length - removed;
-			pi.logger.warn("notify-telegram: clearing the session's messages failed", {
-				error: error instanceof Error ? error.message : String(error),
-			});
+			pi.logger.warn("notify-telegram: clearing the session's messages failed", { error: String(error) });
 		}
 		try {
 			if (refused > 0 && sessionCtx !== null) {
