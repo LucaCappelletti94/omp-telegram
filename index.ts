@@ -4468,8 +4468,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			// The reaper closes only the cards its record names, so a tap on the owner-less card is the
 			// first thing that can retire it.
 			if (owner === null) {
-				const messageId = callback.message?.message_id;
-				if (typeof messageId === "number") detach(() => stripKeyboard(messageId), "orphan ask retire");
+				const messageId = callback.message.message_id;
+				detach(() => stripKeyboard(messageId), "orphan ask retire");
 			}
 			await callTelegram(
 				cfg,
