@@ -1740,8 +1740,13 @@ for (const s of contenders) {
 }
 check("still only one poller after takeover", takers === 1);
 
+// Placed by rename, as the extension writes it, so no reader ever sees a half-written lock.
+const placeLock = (lock) => {
+	writeFileSync(`${lockPath}.test.tmp`, JSON.stringify(lock));
+	renameSync(`${lockPath}.test.tmp`, lockPath);
+};
 // A fresh heartbeat proves nothing once its process is gone, so a drain tick takes the lock at once.
-writeFileSync(lockPath, JSON.stringify({ sessionId: "dead-holder", pid: deadPid, heartbeat: Date.now() }));
+placeLock({ sessionId: "dead-holder", pid: deadPid, heartbeat: Date.now() });
 const taker = contenders[0];
 const deadPollsBefore = called("getUpdates").length;
 taker.timers[1]();
@@ -1751,11 +1756,16 @@ taker.timers[1]();
 await settle(40);
 check("the successor polls on the next drain tick", called("getUpdates").length > deadPollsBefore);
 // Only a gone process frees the lock, so a fresh heartbeat from a live process keeps it.
-writeFileSync(lockPath, JSON.stringify({ sessionId: "live-holder", pid: process.pid, heartbeat: Date.now() }));
+placeLock({ sessionId: "live-holder", pid: process.pid, heartbeat: Date.now() });
 const nonTaker = contenders[1];
 nonTaker.timers[1]();
 await settle(40);
 check("a drain tick leaves a live holder's fresh lock", owner().sessionId === "live-holder");
+// A lock written without a pid is judged by its heartbeat alone, so a fresh one keeps its holder.
+placeLock({ sessionId: "pidless-holder", heartbeat: Date.now() });
+nonTaker.timers[0]();
+await settle(40);
+check("a heartbeat leaves a fresh lock that names no pid", owner().sessionId === "pidless-holder");
 
 // A non-owner exiting must not delete the lock, which is what produced the ENOENT storm.
 const nonOwner = contenders.find((s) => s.id !== owner().sessionId);

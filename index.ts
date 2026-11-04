@@ -3623,7 +3623,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {
 			const held = readLock(file);
 			// A fresh heartbeat proves nothing once its process is gone, so a dead holder's lock is free at once.
-			if (held !== null && Date.now() - held.heartbeat < LOCK_STALE_MS && processRuns(held.pid)) return false;
+			// A lock that names no pid leaves only its heartbeat to judge it by.
+			const fresh = held !== null && Date.now() - held.heartbeat < LOCK_STALE_MS;
+			if (fresh && (held.pid === 0 || processRuns(held.pid))) return false;
 			try {
 				unlinkSync(file);
 			} catch {}
