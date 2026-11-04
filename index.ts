@@ -538,6 +538,10 @@ interface PendingAsk {
 	questions: ExplainedQuestion[];
 	index: number;
 	messageId: number | null;
+	/** Counts card renders, so a selection redraw still retrying gives way to a newer one. */
+	renders: number;
+	/** What a card landing after the ask ended says, so it matches how the ask ended. */
+	outcome: string;
 	selected: Set<string>[];
 	custom: Array<string | undefined>;
 	finish: (results: AskResult[]) => void;
@@ -4328,9 +4332,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const owner = wantsRedo && agentWrote ? readSessionRecord(record.session.id) : null;
 		const liveOwner = owner !== null && routable(owner);
 		const statusQuestion = isStatusQuestion(record);
+		// A question whose settlement edit is still in flight was answered already, but the user reacted to it as shown,
+		// still open, so the grade reaches the agent as a redo all the same.
 		const targetOpen =
 			record.kind === "question"
-				? owner?.question === record.id
+				? beforeEdit !== undefined || owner?.question === record.id
 				: record.kind === "standing"
 					? owner?.standing?.messageId === record.id
 					: statusQuestion
@@ -4745,20 +4751,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Sends the card of the question the ask is on, or with `edit` redraws its selections, until Telegram takes it.
+	 * The terminal already shows the question, so nothing waits on this, and it gives up once the ask moves on.
+	 * A card that lands after that is settled at once, so no live buttons outlast their question.
+	 */
 	async function presentQuestion(ask: PendingAsk, edit: boolean): Promise<void> {
 		if (config === null) return;
-		const question = ask.questions[ask.index];
+		const index = ask.index;
+		const question = ask.questions[index];
 		if (question === undefined) return;
 		const blocks: string[] = [messageHead(ask.ctx)];
-		const position = ask.questions.length > 1 ? ` ${ask.index + 1} of ${ask.questions.length}` : "";
+		const position = ask.questions.length > 1 ? ` ${index + 1} of ${ask.questions.length}` : "";
 		blocks.push(`\u{1F534} Input needed${position}`);
 		const header = question.header?.trim() ?? "";
 		blocks.push(header.length > 0 ? `**${header}**\n${question.question}` : question.question);
 		if (ask.context.length > 0) blocks.push(ask.context);
 		// Every option gets its own section: the button label alone never explains a choice.
-		for (const [index, option] of question.options.entries()) {
+		for (const [optionIndex, option] of question.options.entries()) {
 			const preview = option.preview?.trim() ?? "";
-			const stance = stanceOf(question, option, index);
+			const stance = stanceOf(question, option, optionIndex);
 			const lines = [stance === null ? `**${option.label}**` : `**${option.label}** ${stance.marker}`];
 			lines.push(option.description.trim());
 			if (preview.length > 0) {
@@ -4772,49 +4784,70 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		const body = blocks.join("\n\n");
 		const markup = { inline_keyboard: questionKeyboard(ask, question), force_reply: true };
+		const cfg = config;
+		const showing = (): boolean => pendingAsk === ask && ask.index === index && !closing;
+		ask.renders += 1;
+		const render = ask.renders;
 
 		if (edit && ask.messageId !== null) {
-			await sendOrEdit(
-				config,
-				"editMessageText",
-				{ chat_id: config.chatId, message_id: ask.messageId, reply_markup: markup },
-				body,
-				"",
-				"question",
-				{ context: ask.context, question },
+			const messageId = ask.messageId;
+			await deliverUntilTaken(
+				(onRefused) =>
+					sendOrEdit(
+						cfg,
+						"editMessageText",
+						{ chat_id: cfg.chatId, message_id: messageId, reply_markup: markup },
+						body,
+						"",
+						"question",
+						{ context: ask.context, question },
+						undefined,
+						undefined,
+						onRefused,
+					),
+				() => showing() && ask.messageId === messageId && ask.renders === render,
 			);
 			return;
 		}
-		const sentMessage = await sendOrEdit(
-			config,
-			"sendMessage",
-			{ chat_id: config.chatId, reply_markup: markup },
-			body,
-			"",
-			"question",
-			{ context: ask.context, question },
-			(messageId) => {
-				ask.messageId = messageId;
-			},
+		if (!showing()) return;
+		const sent = await deliverUntilTaken(
+			(onRefused) =>
+				sendOrEdit(
+					cfg,
+					"sendMessage",
+					{ chat_id: cfg.chatId, reply_markup: markup },
+					body,
+					"",
+					"question",
+					{ context: ask.context, question },
+					(messageId) => {
+						if (showing()) ask.messageId = messageId;
+					},
+					undefined,
+					onRefused,
+				),
+			() => showing() && ask.messageId === null,
 		);
-		if (sentMessage === null && pendingAsk === ask) {
-			ask.messageId = null;
-			writeSessionRecord(ask.ctx);
+		if (sent !== null && ask.messageId !== sent.message_id) {
+			await settleQuestionMessage(sent.message_id, `${messageHead(ask.ctx)}\n\n${question.question}`, ask.outcome);
 		}
 	}
 
+	/** The latest settlement of each message still being sent, so an older one gives way to it. */
+	const settlements = new Map<number, number>();
+	let settlementSeq = 0;
+
 	/**
 	 * Settled options survive as dead grey buttons. `settled`, not `keep`, which now means an untruncatable tail.
-	 * `beforeRecord` also runs when Telegram refuses the edit for good, such as for a deleted message, because
-	 * a retry cannot change that answer and the question must not wait on it. A throttle or server error
-	 * leaves it unrun, so the caller can retry.
+	 * The edit is sent until Telegram takes it or refuses it for good, as for a deleted message. A newer settlement
+	 * of the same message or the session ending stops it. The question never waits on it, because its answer was
+	 * taken before.
 	 */
 	async function settleQuestionMessage(
 		messageId: number | null,
 		head: string,
 		result: string,
 		settled?: InlineButton[][],
-		beforeRecord?: (messageId: number) => void,
 	): Promise<void> {
 		if (config === null || messageId === null) return;
 		const owner = sessionCtx;
@@ -4825,24 +4858,29 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			settled === undefined
 				? []
 				: settled.map((row) => row.map((button) => ({ ...button, callback_data: SETTLED_CALLBACK, disabled: {} })));
-		let final = false;
-		await sendOrEdit(
-			config,
-			"editMessageText",
-			{ chat_id: config.chatId, message_id: messageId, reply_markup: { inline_keyboard } },
-			`${head}\n\n${result}`,
-			"",
-			null,
-			undefined,
-			beforeRecord,
-			undefined,
-			(failure) => {
-				final = failure.status !== 429 && failure.status < 500;
-			},
-		);
-		if (final && beforeRecord !== undefined) {
-			beforeRecord(messageId);
-			if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+		const cfg = config;
+		settlementSeq += 1;
+		const generation = settlementSeq;
+		settlements.set(messageId, generation);
+		try {
+			await deliverUntilTaken(
+				(onRefused) =>
+					sendOrEdit(
+						cfg,
+						"editMessageText",
+						{ chat_id: cfg.chatId, message_id: messageId, reply_markup: { inline_keyboard } },
+						`${head}\n\n${result}`,
+						"",
+						null,
+						undefined,
+						undefined,
+						undefined,
+						onRefused,
+					),
+				() => settlements.get(messageId) === generation,
+			);
+		} finally {
+			if (settlements.get(messageId) === generation) settlements.delete(messageId);
 		}
 	}
 
@@ -4852,29 +4890,24 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		messageId: number | null,
 		result: string,
 		settled?: InlineButton[][],
-		beforeRecord?: (messageId: number) => void,
 	): Promise<void> {
 		const question = ask.questions[ask.index];
 		if (question === undefined) return;
-		await settleQuestionMessage(
-			messageId,
-			`${messageHead(ask.ctx)}\n\n${question.question}`,
-			result,
-			settled,
-			beforeRecord,
-		);
+		await settleQuestionMessage(messageId, `${messageHead(ask.ctx)}\n\n${question.question}`, result, settled);
 	}
 
 	/**
-	 * Sends a turn-end message until Telegram takes it, for as long as `current` holds and the session is not
-	 * closing. The message is the only one saying the turn ended and what it asks, so no timer gives it up. A 429
-	 * waits exactly its `retry_after`, since an earlier attempt cannot succeed. A server or network failure backs
-	 * off from 2 s up to a minute. Any other refusal is final, because the same request would be refused again.
+	 * Sends a message or an edit until Telegram takes it, for as long as `current` holds and the session neither
+	 * closes nor shuts down. A turn end, a question card and a settlement are each the only place their message
+	 * shows, so no timer gives them up. A 429 waits exactly its `retry_after`, since an earlier attempt cannot
+	 * succeed. A server or network failure backs off from 2 s up to a minute. Any other refusal is final, because
+	 * the same request would be refused again.
 	 */
-	async function deliverTurnEnd(
+	async function deliverUntilTaken(
 		send: (onRefused: (failure: TelegramFailure) => void) => Promise<TelegramMessage | null>,
 		current: () => boolean,
 	): Promise<TelegramMessage | null> {
+		const live = (): boolean => !closing && !lifetime.signal.aborted && current();
 		let backoffMs = 2_000;
 		for (;;) {
 			const refused: { failure: TelegramFailure | null } = { failure: null };
@@ -4886,7 +4919,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				});
 			} catch (error) {
 				failed = true;
-				pi.logger.warn("notify-telegram: a turn-end send failed", {
+				pi.logger.warn("notify-telegram: a send Telegram must take failed", {
 					error: error instanceof Error ? error.message : String(error),
 				});
 			}
@@ -4897,10 +4930,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const until = Date.now() + (throttled ? (failure?.retryAfter ?? 0) * 1000 : backoffMs);
 			if (!throttled) backoffMs = Math.min(backoffMs * 2, 60_000);
 			while (Date.now() < until) {
-				if (closing || !current()) return null;
+				if (!live()) return null;
 				await sleepMs(Math.min(250, until - Date.now()));
 			}
-			if (closing || !current()) return null;
+			if (!live()) return null;
 		}
 	}
 
@@ -4958,7 +4991,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		};
 		const cfg = config;
-		const sent = await deliverTurnEnd(
+		const sent = await deliverUntilTaken(
 			(onRefused) =>
 				sendStructured(
 					cfg,
@@ -5005,70 +5038,61 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}));
 	}
 
-	async function advance(ask: PendingAsk): Promise<boolean> {
-		if (config === null) return false;
+	/**
+	 * Takes the answer to the current question at once and moves on. The answered card is settled and the next one
+	 * sent in the background, so a throttled Telegram never holds an answer back.
+	 */
+	function advance(ask: PendingAsk): void {
 		const messageId = ask.messageId;
 		const answered = ask.questions[ask.index];
 		const chosen = [...(ask.selected[ask.index] ?? new Set<string>())];
 		const shown = ask.custom[ask.index] ?? (chosen.length === 0 ? "no selection" : chosen.join(", "));
-		let advanced = false;
-		const publishAdvance = (settledMessageId: number): void => {
-			if (pendingAsk !== ask || ask.messageId !== settledMessageId) return;
-			ask.messageId = null;
-			ask.index += 1;
-			advanced = true;
-		};
-		if (answered !== undefined) {
-			const labels = answered.options.map((option) => option.label);
-			await settleAskMessage(
-				ask,
-				messageId,
-				`**Answered:** ${shown}`,
-				settledKeyboard(labels, new Set(chosen)),
-				publishAdvance,
+		if (answered !== undefined && messageId !== null) {
+			const head = `${messageHead(ask.ctx)}\n\n${answered.question}`;
+			const settled = settledKeyboard(
+				answered.options.map((option) => option.label),
+				new Set(chosen),
+			);
+			detach(
+				() => settleQuestionMessage(messageId, head, `**Answered:** ${shown}`, settled),
+				"answered question close",
 			);
 		}
-		if (!advanced) {
-			if (messageId !== null) return pendingAsk !== ask || ask.messageId !== messageId;
-			if (pendingAsk !== ask || ask.messageId !== null) return true;
-			ask.index += 1;
-			writeSessionRecord(ask.ctx);
-		}
+		ask.messageId = null;
+		ask.index += 1;
 		if (ask.index >= ask.questions.length) {
 			ask.finish(collectResults(ask));
-			return true;
+			return;
 		}
-		await presentQuestion(ask, false);
-		if (pendingAsk !== ask) {
-			// The terminal settled this ask while the next question was in flight; close the orphan keyboard.
-			await settleAskMessage(ask, ask.messageId, "This question is no longer active.");
-			ask.messageId = null;
-		}
-		return true;
+		writeSessionRecord(ask.ctx);
+		detach(() => presentQuestion(ask, false), "next question card");
 	}
 
-	/** False when the press is still owed, because Telegram refused the edit that would settle it. */
-	async function applyCallback(ask: PendingAsk, payload: string): Promise<boolean> {
+	/** A tap on an earlier question or on an option that does not exist answers nothing. */
+	function applyCallback(ask: PendingAsk, payload: string): void {
 		const [action, tag, rawIndex, rawOption] = payload.split(":");
 		const question = ask.questions[ask.index];
-		if (tag !== ask.askId || Number.parseInt(rawIndex ?? "", 10) !== ask.index || question === undefined) return true;
+		if (tag !== ask.askId || Number.parseInt(rawIndex ?? "", 10) !== ask.index || question === undefined) return;
 
-		if (action === "d") return await advance(ask);
-		if (action !== "o") return true;
+		if (action === "d") {
+			advance(ask);
+			return;
+		}
+		if (action !== "o") return;
 
 		const optionIndex = Number.parseInt(rawOption ?? "", 10);
 		const label = question.options[optionIndex]?.label;
-		if (label === undefined) return true;
+		if (label === undefined) return;
 		const selected = ask.selected[ask.index] ?? new Set<string>();
 		if (question.multi === true) {
 			if (selected.has(label)) selected.delete(label);
 			else selected.add(label);
 			ask.selected[ask.index] = selected;
-			await presentQuestion(ask, true);
-			return true;
+			detach(() => presentQuestion(ask, true), "question redraw");
+			return;
 		}
 		ask.selected[ask.index] = new Set([label]);
-		return await advance(ask);
+		advance(ask);
 	}
 
 	async function closeReactionRouteForShutdown(): Promise<number> {
@@ -5269,9 +5293,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return { type: "text", text: `The user's Telegram message below replies to this message you sent:\n\n${replied}` };
 	}
 
+	/** Tells the user a tap missed its question, without holding up the entries queued behind it. */
+	function staleNotice(owner: ExtensionContext, text: string): void {
+		detach(() => sessionNotice(owner, text), "stale tap notice");
+	}
+
 	/** Sequential: two taps in one poll batch must see each other's state. */
 	async function drainInbox(): Promise<void> {
-		if (!registered || drainInFlight || closing) return;
+		const owner = sessionCtx;
+		if (!registered || drainInFlight || closing || owner === null) return;
 		drainInFlight = true;
 		try {
 			const dir = resolve(INBOX_DIR, sessionId);
@@ -5343,12 +5373,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					deliverAgentMessage(message);
 					continue;
 				}
-				// The user was told an answer reached this session, so one Telegram refuses to settle waits for
-				// the next drain instead of being dropped.
-				const answersAsk =
-					pendingAsk !== null &&
-					(entry.kind === "text" || (entry.kind === "callback" && !/^[kxc]:/u.test(entry.value)));
-				if (entry.kind !== "redo" && !answersAsk) rmSync(processing, { force: true });
+				if (entry.kind !== "redo") rmSync(processing, { force: true });
 				// New work voids the close offer, so a tap queued behind it cannot close a session about to start a turn.
 				if (
 					entry.kind === "text" ||
@@ -5372,21 +5397,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (entry.kind === "command") {
 					if (entry.value === "hidequestions") {
 						if (ask !== null && ask.messageId !== null) {
-							await settleAskMessage(
-								ask,
-								ask.messageId,
-								"Question hidden. It stays open at the terminal.",
-								undefined,
-								(messageId) => {
-									if (pendingAsk === ask && ask.messageId === messageId) ask.messageId = null;
-								},
+							const hidden = ask.messageId;
+							ask.messageId = null;
+							if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+							detach(
+								() => settleAskMessage(ask, hidden, "Question hidden. It stays open at the terminal."),
+								"hidden question close",
 							);
 						}
 						const standing = standingQuestion;
 						if (standing !== null) {
 							standingQuestion = null;
 							if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-							await settleQuestionMessage(standing.messageId, standing.head, "Question hidden.");
+							detach(
+								() => settleQuestionMessage(standing.messageId, standing.head, "Question hidden."),
+								"hidden standing question close",
+							);
 						}
 						retireCloseOffer(true);
 					}
@@ -5399,11 +5425,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							detach(() => sessionNotice(stopping, "No turn is running here."), "stop notice");
 						}
 					}
-					if (entry.value === "status" && sessionCtx !== null) {
+					const reporter = sessionCtx;
+					if (entry.value === "status" && reporter !== null) {
 						// Our own line has to be current before it is read back with everyone else's.
-						writeSessionRecord(sessionCtx);
+						writeSessionRecord(reporter);
 						// Context-prefixed even for the fleet answer, so the reply says which session composed it.
-						await sessionNotice(sessionCtx, statusReport());
+						const report = statusReport();
+						detach(() => sessionNotice(reporter, report), "status report");
 					}
 					continue;
 				}
@@ -5417,9 +5445,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						closeOfferMessageId !== entry.messageId
 					) {
 						// A destructive press from an old or duplicated keyboard is an accident waiting to happen.
-						const text = "That close offer is no longer current, so the session stayed open.";
-						if (sessionCtx !== null) await sessionNotice(sessionCtx, text);
-						else await serviceNotice(text, false);
+						staleNotice(owner, "That close offer is no longer current, so the session stayed open.");
 						continue;
 					}
 					closing = true;
@@ -5436,37 +5462,31 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 						// Close even when the index is unreadable: state is already cleared,
 						// and a live-looking keyboard on a dead question misleads.
-						await settleQuestionMessage(
-							standing.messageId,
-							standing.head,
-							label === undefined ? "This question is closed." : `**Chosen:** ${label}`,
-							label === undefined ? undefined : settledKeyboard(standing.labels, new Set([label])),
+						detach(
+							() =>
+								settleQuestionMessage(
+									standing.messageId,
+									standing.head,
+									label === undefined ? "This question is closed." : `**Chosen:** ${label}`,
+									label === undefined ? undefined : settledKeyboard(standing.labels, new Set([label])),
+								),
+							"chosen standing question close",
 						);
 						if (label !== undefined) {
 							pi.sendUserMessage(label);
 							replyOwedAt = Date.now();
 						}
-					} else if (sessionCtx !== null) {
-						await sessionNotice(sessionCtx, "That question is closed. It was superseded or already answered.");
 					} else {
-						await serviceNotice("That question is closed. It was superseded or already answered.");
+						staleNotice(owner, "That question is closed. It was superseded or already answered.");
 					}
 					continue;
 				}
 				if (entry.kind === "callback") {
 					if (ask !== null) {
-						// A refused settlement goes back in the queue. Should even the rename fail, the entry stays as
-						// `.processing`, which the next drain also reads.
-						if (!(await applyCallback(ask, entry.value))) {
-							renameSync(processing, queued);
-							break;
-						}
-						rmSync(processing, { force: true });
+						applyCallback(ask, entry.value);
 						replyOwedAt = Date.now();
-					} else if (sessionCtx !== null) {
-						await sessionNotice(sessionCtx, "That question is closed. It was answered or cancelled at the terminal.");
 					} else {
-						await serviceNotice("That question is closed. It was answered or cancelled at the terminal.");
+						staleNotice(owner, "That question is closed. It was answered or cancelled at the terminal.");
 					}
 					continue;
 				}
@@ -5478,7 +5498,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							data = readFileSync(entry.value).toString("base64");
 						} catch {}
 						if (data.length === 0) {
-							await serviceNotice("An image you sent could not be read back from disk, so it was not delivered.");
+							detach(
+								() => serviceNotice("An image you sent could not be read back from disk, so it was not delivered."),
+								"unreadable image notice",
+							);
 							continue;
 						}
 						// No `deliverAs`: omp steers a running turn and starts one when idle. An explicit
@@ -5510,14 +5533,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						focusTmuxWindow();
 						ask.custom[ask.index] = entry.value;
 						ask.selected[ask.index] = new Set<string>();
-						if (await advance(ask)) {
-							rmSync(processing, { force: true });
-							replyOwedAt = Date.now();
-						} else {
-							try {
-								renameSync(processing, queued);
-							} catch {}
-						}
+						advance(ask);
+						rmSync(processing, { force: true });
+						replyOwedAt = Date.now();
 						continue;
 					}
 					if (
@@ -5540,13 +5558,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (ask !== null) {
 					ask.custom[ask.index] = entry.value;
 					ask.selected[ask.index] = new Set<string>();
-					if (await advance(ask)) {
-						rmSync(processing, { force: true });
-						replyOwedAt = Date.now();
-					} else {
-						renameSync(processing, queued);
-						break;
-					}
+					advance(ask);
+					replyOwedAt = Date.now();
 					continue;
 				}
 				const reference = replyReference(entry);
@@ -5667,12 +5680,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				questions,
 				index: 0,
 				messageId: null,
+				renders: 0,
+				outcome: "This question is no longer active.",
 				selected: questions.map(() => new Set<string>()),
 				custom: questions.map(() => undefined),
 				finish: remote.resolve,
 			};
 			pendingAsk = ask;
-			await presentQuestion(ask, false);
+			// The terminal shows the question at once, while the card goes out as soon as Telegram takes it.
+			detach(() => presentQuestion(ask, false), "question card");
 			lastNotifiedAt = Date.now();
 			writeSessionRecord(ctx);
 
@@ -5688,7 +5704,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			try {
 				const winner = await Promise.race([local, answered]);
 				if (winner.kind === "local") {
-					detach(() => settleAskMessage(ask, ask.messageId, "Answered at the terminal."), "terminal-answer edit");
+					ask.outcome = "Answered at the terminal.";
+					detach(() => settleAskMessage(ask, ask.messageId, ask.outcome), "terminal-answer edit");
 					return winner.value;
 				}
 
@@ -5707,15 +5724,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				};
 			} catch (error) {
 				const aborted = error instanceof Error && /cancel|abort/iu.test(error.message);
-				await settleAskMessage(
-					ask,
-					ask.messageId,
-					aborted ? "Cancelled at the terminal." : "This question is no longer active.",
-					undefined,
-					(messageId) => {
-						if (pendingAsk === ask && ask.messageId === messageId) pendingAsk = null;
-					},
-				);
+				if (aborted) ask.outcome = "Cancelled at the terminal.";
+				const closed = ask.messageId;
+				detach(() => settleAskMessage(ask, closed, ask.outcome), "cancelled question close");
 				throw error;
 			} finally {
 				if (pendingAsk === ask) pendingAsk = null;
@@ -7580,12 +7591,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			],
 			index: 0,
 			messageId: null,
+			renders: 0,
+			outcome: "Launch cancelled.",
 			selected: [new Set<string>()],
 			custom: [undefined],
 			finish: remote.resolve,
 		};
 		const previous = pendingAsk;
 		pendingAsk = ask;
+		// The card is the only place to answer, so it is sent until Telegram takes it, unless the call is aborted.
+		const stopCard = (): void => {
+			if (pendingAsk === ask) pendingAsk = previous;
+		};
+		signal?.addEventListener("abort", stopCard);
+		if (signal?.aborted) stopCard();
 		try {
 			await presentQuestion(ask, false);
 		} catch (error) {
@@ -7596,9 +7615,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				error: error instanceof Error ? error.message : String(error),
 			});
 			return { action: "unavailable" };
+		} finally {
+			signal?.removeEventListener("abort", stopCard);
+		}
+		if (signal?.aborted === true) {
+			// Aborted before or while the card went out, which cancels the launch as an abort during the wait does.
+			// The abort already restored the previous question, and a card that landed is closed.
+			detach(() => settleAskMessage(ask, ask.messageId, ask.outcome), "upstream-confirm close");
+			noteState();
+			return { action: "cancel" };
 		}
 		if (ask.messageId === null) {
-			// The card never reached Telegram, so there is nothing for the user to answer; do not block.
+			// Telegram refused the card for good, so there is nothing to answer.
 			if (pendingAsk === ask) pendingAsk = previous;
 			noteState();
 			return { action: "unavailable" };
@@ -8275,7 +8303,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const registerReplyQuestion = (messageId: number): void => {
 					if (replyQuestionToken === replyQuestionGeneration) replyQuestionMessageId = messageId;
 				};
-				const work = deliverTurnEnd(
+				const work = deliverUntilTaken(
 					(onRefused) =>
 						notify(
 							ctx,
@@ -8338,7 +8366,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const generation = redPinGeneration;
 		detach(
 			() =>
-				deliverTurnEnd(
+				deliverUntilTaken(
 					(onRefused) =>
 						notify(
 							ctx,

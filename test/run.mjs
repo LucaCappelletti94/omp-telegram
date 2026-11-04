@@ -2922,6 +2922,35 @@ writeFileSync(join(inboxOf(tq.id), "994.json"), JSON.stringify({ kind: "callback
 await tq.pump(250);
 check("a press after the terminal answered is refused", lastCall("sendMessage").body.text.includes("closed"));
 
+// A press whose option index cannot be read closes the question without starting a turn.
+await tq.fire("input");
+await tq.tools
+	.get("notify_status")
+	.execute(
+		"q5b",
+		{ summary: "Choose once more.", urgency: "orange", options: opts("Keep", "Drop") },
+		undefined,
+		undefined,
+		tq.ctx,
+	);
+await tq.fire("session_stop");
+await settle(150);
+const unreadableStanding = record(tq.id).standing;
+const steersBeforeUnreadable = tq.steers.length;
+writeFileSync(
+	join(inboxOf(tq.id), "996.json"),
+	JSON.stringify({ kind: "callback", value: `c:${unreadableStanding.id}:9` }),
+);
+await tq.pump(250);
+check(
+	"a press with an unreadable option closes the question and starts no turn",
+	tq.steers.length === steersBeforeUnreadable &&
+		record(tq.id).standing === null &&
+		called("editMessageText").some(
+			(c) => c.body.message_id === unreadableStanding.messageId && c.body.text.includes("This question is closed."),
+		),
+);
+
 await tq.tools
 	.get("notify_status")
 	.execute(
@@ -9856,8 +9885,12 @@ await uploadWork;
 api.queued = [uploadReaction];
 await ownershipPoller.pump(250);
 check("feedback grades the accepted upload record", feedbackLines().at(-1).message.kind === "file");
-// A tap or a typed answer whose settlement edit Telegram refuses stays queued, because the user was
-// already told it was sent and has no reason to press again. It answers once the edit goes through.
+// A tap or a typed answer reaches its question at once while Telegram refuses the edit that settles the card,
+// because the user was already told it was sent. The edit is sent again until Telegram takes it.
+const settleEdits = (messageId) =>
+	called("editMessageText").filter((c) => c.body.message_id === messageId && String(c.body.text).includes("Answered"))
+		.length;
+const within = (promise, ms) => Promise.race([promise, settle(ms).then(() => null)]);
 const failedEditSession = spawn("01a07005-0000-0000-0000-000000000000", "/home/dev/work/failed-edit");
 await failedEditSession.fire("session_start");
 const failedEditState = {};
@@ -9872,19 +9905,22 @@ api.failStatus = 429;
 api.queued = [answerButton(9030, failedEditQuestionId, failedEditButton.callback_data)];
 await ownershipPoller.pump(250);
 await failedEditSession.pump(250);
+const failedEditResult = await within(failedEditAsk, 500);
 check(
-	"a tap whose settlement edit is refused stays queued with the question open",
-	record(failedEditSession.id).question === failedEditQuestionId &&
-		inboxCount(failedEditSession.id) === 1 &&
-		failedEditState.aborted !== true,
+	"a tap answers its question while Telegram refuses the edit that settles the card",
+	failedEditResult?.details.selectedOptions[0] === "SQLite" &&
+		inboxCount(failedEditSession.id) === 0 &&
+		record(failedEditSession.id).question === null,
 );
+const refusedTapEdits = settleEdits(failedEditQuestionId);
 api.failMethods = [];
 api.failStatus = undefined;
-await failedEditSession.pump(250);
-const failedEditResult = await failedEditAsk;
+await settle(2500);
+const takenTapEdits = settleEdits(failedEditQuestionId);
+await settle(2500);
 check(
-	"the queued tap answers the question once the settlement edit is accepted",
-	failedEditResult.details.selectedOptions[0] === "SQLite" && inboxCount(failedEditSession.id) === 0,
+	"a refused settlement edit is sent again until Telegram takes it, then no more",
+	refusedTapEdits > 0 && takenTapEdits === refusedTapEdits + 1 && settleEdits(failedEditQuestionId) === takenTapEdits,
 );
 const failedTextSession = spawn("01a0700f-0000-0000-0000-000000000000", "/home/dev/work/failed-text");
 await failedTextSession.fire("session_start");
@@ -9899,20 +9935,69 @@ api.failStatus = 429;
 api.queued = [replyTo(9035, failedTextQuestionId, "Use the arena")];
 await ownershipPoller.pump(250);
 await failedTextSession.pump(250);
+const failedTextResult = await within(failedTextAsk, 500);
 check(
-	"a typed answer whose settlement edit is refused stays queued with the question open",
-	record(failedTextSession.id).question === failedTextQuestionId &&
-		inboxCount(failedTextSession.id) === 1 &&
-		failedTextState.aborted !== true,
+	"a typed answer reaches its question while Telegram refuses the edit that settles the card",
+	failedTextResult?.details.customInput === "Use the arena" && inboxCount(failedTextSession.id) === 0,
 );
+const refusedTextEdits = settleEdits(failedTextQuestionId);
 api.failMethods = [];
 api.failStatus = undefined;
-await failedTextSession.pump(250);
-const failedTextResult = await failedTextAsk;
+await settle(2500);
 check(
-	"the queued typed answer reaches the question once the settlement edit is accepted",
-	failedTextResult.details.customInput === "Use the arena" && inboxCount(failedTextSession.id) === 0,
+	"the typed answer's settlement edit lands once Telegram takes it",
+	settleEdits(failedTextQuestionId) === refusedTextEdits + 1,
 );
+
+// The checks above waited out retries for seconds, so the poller renews its lock before the next ones.
+ownershipPoller.heartbeat();
+// An ask card Telegram throttles is sent again until it lands, and the terminal shows the question meanwhile.
+const throttledCardSession = spawn("01a07012-0000-0000-0000-000000000000", "/home/dev/work/throttled-card");
+await throttledCardSession.fire("session_start");
+const throttledCardState = {};
+const cardSends = () =>
+	called("sendMessage").filter((c) => String(c.body.text).includes("Which backend?") && c.at >= throttledCardStart)
+		.length;
+const throttledCardStart = Date.now();
+api.failMethods = ["sendMessage"];
+api.failStatus = 429;
+api.failRetryAfter = 1;
+api.failDescription = "Too Many Requests: retry after 1";
+const throttledCardAsk = throttledCardSession.tools
+	.get("ask")
+	.execute(
+		"fb-throttled-card",
+		singleQuestion,
+		undefined,
+		undefined,
+		stubbornCtx(throttledCardSession.ctx, throttledCardState),
+	);
+await settle(150);
+check("the terminal asks at once while Telegram throttles the card", throttledCardState.params !== undefined);
+await settle(2600);
+const refusedCards = cardSends();
+api.failMethods = [];
+api.failStatus = undefined;
+api.failRetryAfter = undefined;
+api.failDescription = undefined;
+await settle(2500);
+const throttledCardId = api.nextMessage - 1;
+check(
+	"a throttled ask card is sent again until it lands, and the question owns it",
+	refusedCards >= 2 &&
+		cardSends() === refusedCards + 1 &&
+		lastCall("sendMessage").body.text.includes("Which backend?") &&
+		record(throttledCardSession.id).question === throttledCardId,
+);
+const throttledCardButton = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0];
+api.queued = [answerButton(9060, throttledCardId, throttledCardButton.callback_data)];
+await ownershipPoller.pump(250);
+await throttledCardSession.pump(250);
+check(
+	"the late card's buttons answer the question",
+	(await within(throttledCardAsk, 500))?.details.selectedOptions[0] === "SQLite",
+);
+rmSync(join(root, "notify-telegram/throttle.json"), { force: true });
 
 // A notice the poller owes waits out a throttle without holding up the button presses queued behind it.
 const blockedPollSession = spawn("01a07013-0000-0000-0000-000000000000", "/home/dev/work/blocked-poll");
@@ -9938,7 +10023,7 @@ rmSync(join(root, "notify-telegram/throttle.json"), { force: true });
 await blockedPollSession.pump(250);
 check(
 	"the delivered press answers its question",
-	(await Promise.race([blockedPollAsk, settle(500).then(() => null)]))?.details.selectedOptions[0] === "SQLite",
+	(await within(blockedPollAsk, 500))?.details.selectedOptions[0] === "SQLite",
 );
 ownershipPoller.heartbeat();
 // A tap on an earlier question of the ask or on an option that does not exist answers nothing, so it is
@@ -10078,7 +10163,7 @@ check(
 	feedbackLines().filter((entry) => entry.updateId === 9033).length === 1 && fb.steers.length === publishSteers + 1,
 );
 
-// A transient settlement failure requeues a redo because the user cannot resend the same update.
+// A redo answers the blocked ask while Telegram refuses the settlement edit, because the user cannot resend it.
 const redoRetrySession = spawn("01a07008-0000-0000-0000-000000000000", "/home/dev/work/redo-retry");
 await redoRetrySession.fire("session_start");
 const redoRetryState = {};
@@ -10092,21 +10177,16 @@ await ownershipPoller.pump(250);
 api.failMethods = ["editMessageText"];
 api.failStatus = 429;
 await redoRetrySession.pump(250);
+const redoRetryResult = await within(redoRetryAsk, 500);
 check(
-	"a redo survives a rejected settlement edit",
-	record(redoRetrySession.id).question === redoRetryMessageId &&
-		inboxCount(redoRetrySession.id) === 1 &&
-		redoRetryState.aborted !== true,
+	"a redo answers the blocked ask while Telegram refuses the settlement edit",
+	redoRetryResult?.details.customInput.includes("reacted") === true &&
+		inboxCount(redoRetrySession.id) === 0 &&
+		feedbackLines().filter((entry) => entry.updateId === 9034).length === 1,
 );
 api.failMethods = [];
 api.failStatus = undefined;
-await redoRetrySession.pump(250);
-const redoRetryResult = await redoRetryAsk;
-check(
-	"the requeued redo reaches the blocked ask after settlement recovers",
-	redoRetryResult.details.customInput.includes("reacted") &&
-		feedbackLines().filter((entry) => entry.updateId === 9034).length === 1,
-);
+await settle(2500);
 // A new turn can begin while Telegram is still accepting the previous turn's question.
 await fb.fire("input");
 let releaseStatusSend;
@@ -10243,24 +10323,17 @@ check(
 		lastCall("sendMessage").body.text.includes("session ended"),
 );
 
-// A redo being used to settle a native question remains visible to shutdown until it reaches the agent.
+// A redo on a native question answers it at once, even while Telegram holds the settlement edit, so a shutdown
+// right after has nothing left to reclassify.
 const settlementRaceSession = spawn("01a0700e-0000-0000-0000-000000000000", "/home/dev/work/settlement-race");
 await settlementRaceSession.fire("session_start");
-const settlementRaceState = {};
-const _settlementRaceAsk = settlementRaceSession.tools
+const settlementRaceAsk = settlementRaceSession.tools
 	.get("ask")
-	.execute(
-		"fb-settlement-race",
-		singleQuestion,
-		undefined,
-		undefined,
-		stubbornCtx(settlementRaceSession.ctx, settlementRaceState),
-	);
+	.execute("fb-settlement-race", singleQuestion, undefined, undefined, stubbornCtx(settlementRaceSession.ctx, {}));
 await settle(150);
 const settlementRaceQuestionId = record(settlementRaceSession.id).question;
 const settlementRaceInbox = inboxOf(settlementRaceSession.id);
 const settlementRaceEntry = join(settlementRaceInbox, "90375.json");
-const settlementRaceProcessing = `${settlementRaceEntry}.processing`;
 writeFileSync(
 	settlementRaceEntry,
 	JSON.stringify({
@@ -10278,24 +10351,18 @@ let releaseSettlementEdit;
 api.editMessageGate = new Promise((resolve) => {
 	releaseSettlementEdit = resolve;
 });
-const settlementRaceSteers = settlementRaceSession.steers.length;
-const settlingRaceRedo = settlementRaceSession.pump(250);
-await settle(50);
-check("a settling native redo remains visible in the inbox", existsSync(settlementRaceProcessing));
+await settlementRaceSession.pump(250);
+const settlementRaceResult = await within(settlementRaceAsk, 500);
 await settlementRaceSession.fire("session_shutdown");
 check(
-	"shutdown reclassifies a native redo whose settlement is in flight",
-	record(settlementRaceSession.id).heartbeat === 0 &&
+	"a redo answers its question while the settlement edit is held, leaving shutdown nothing queued",
+	settlementRaceResult?.details.customInput === "Restate the question after negative feedback." &&
 		!existsSync(settlementRaceEntry) &&
-		!existsSync(settlementRaceProcessing) &&
-		settlementRaceSession.steers.length === settlementRaceSteers &&
-		lastCall("sendMessage").body.text.includes("session ended") &&
-		settlementRaceSession.warns.some((warning) => warning.m.includes("queued shutdown redo")),
+		!existsSync(`${settlementRaceEntry}.processing`),
 );
 rmSync(unreadableSettlementEntry, { recursive: true, force: true });
 releaseSettlementEdit();
 api.editMessageGate = null;
-await settlingRaceRedo;
 await settle(50);
 
 // Commit and shutdown serialize through the same owner lock, then a retry records the now-dead route honestly.
