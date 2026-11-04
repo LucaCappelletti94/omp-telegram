@@ -3539,6 +3539,59 @@ check(
 	!called("answerCallbackQuery").some((c) => c.body.callback_query_id === "cbundeliverable"),
 );
 
+// An ask card still in flight when its process dies never reaches the record, so the reaper
+// never closes it, and the first tap on the dead card is where it is retired.
+{
+	// The jumps in this section aged the poller lock past its stale window, so a fresh heartbeat
+	// keeps it with the live session rather than handing it to the one that spawns next.
+	ux.heartbeat();
+	const orphan = spawn("01a04801-0000-0000-0000-0000-000000000000", "/home/dev/work/orphan-card");
+	await orphan.fire("session_start");
+	void orphan.tools.get("ask").execute("orphan-ask", singleQuestion, undefined, undefined, stubbornCtx(orphan.ctx, {}));
+	await settle(150);
+	const orphanCardId = api.nextMessage - 1;
+	const orphanTap = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data;
+	rmSync(join(sessionsDir, `${orphan.id}.json`), { force: true });
+	const liveStrips = () =>
+		called("editMessageReplyMarkup").filter(
+			(c) => c.body.message_id === 7 && c.body.reply_markup.inline_keyboard.length === 0,
+		).length;
+	const liveStripsBefore = liveStrips();
+	api.queued = [
+		{
+			update_id: 6125,
+			callback_query: {
+				id: "cborphan",
+				data: orphanTap,
+				from: { id: CHAT },
+				message: { message_id: orphanCardId, chat: { id: CHAT } },
+			},
+		},
+		{
+			update_id: 6126,
+			callback_query: {
+				id: "cblive",
+				data: `o:${record(ux.id).tag}-n2:0`,
+				from: { id: CHAT },
+				message: { message_id: 7, chat: { id: CHAT } },
+			},
+		},
+	];
+	await ux.pump(250);
+	await ux.pump(250);
+	const orphanToast = called("answerCallbackQuery").find((c) => c.body.callback_query_id === "cborphan");
+	check("a tap on a dead card says the session is gone", orphanToast?.body.text === "That question's session is gone.");
+	check(
+		"the dead card loses its buttons at first touch",
+		called("editMessageReplyMarkup").some(
+			(c) => c.body.message_id === orphanCardId && c.body.reply_markup.inline_keyboard.length === 0,
+		),
+	);
+	const liveToast = called("answerCallbackQuery").find((c) => c.body.callback_query_id === "cblive");
+	check("a tap on a live card still answers as sent", liveToast?.body.text === "Sent to that session.");
+	check("and it keeps its buttons", liveStrips() === liveStripsBefore);
+}
+
 // hidequestions closes the open buttons.
 await ux.fire("input");
 await ux.tools
