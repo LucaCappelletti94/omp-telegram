@@ -16,7 +16,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -1550,12 +1550,15 @@ function parentOf(pid: number): number {
 	}
 }
 
+/** The first three words of a command line, enough to tell omp's own children from anything else. */
+type ChildArgv = [program: string, flag: string, script: string];
+
 /**
- * For every parent the kernel currently knows, the argv0 of its children, in one scan of the root of
- * /proc, where a process's children live and not under its own directory.
+ * For every parent the kernel currently knows, the start of its children's command lines, in one scan of the
+ * root of /proc, where a process's children live and not under its own directory.
  */
-function childArgv0ByParent(): Map<number, string[]> {
-	const out = new Map<number, string[]>();
+function childArgvByParent(): Map<number, ChildArgv[]> {
+	const out = new Map<number, ChildArgv[]>();
 	let names: string[];
 	try {
 		names = readdirSync("/proc");
@@ -1567,15 +1570,25 @@ function childArgv0ByParent(): Map<number, string[]> {
 		const child = Number(name);
 		const parent = parentOf(child);
 		if (parent <= 0) continue;
-		let argv0 = "";
+		let words: string[] = [];
 		try {
-			argv0 = readFileSync(`/proc/${child}/cmdline`, "utf8").split("\0")[0] ?? "";
+			words = readFileSync(`/proc/${child}/cmdline`, "utf8").split("\0");
 		} catch {}
+		const [program = "", flag = "", script = ""] = words;
 		const children = out.get(parent) ?? [];
-		children.push(argv0);
+		children.push([program, flag, script]);
 		out.set(parent, children);
 	}
 	return out;
+}
+
+/**
+ * Whether a child is one of omp's own: a `__omp_worker_` process, or the Python eval kernel, which omp runs as
+ * `python -u <tmp>/omp-python-runner-<uid>/runner-<id>.py`.
+ */
+function isOmpWorker([program, flag, script]: ChildArgv): boolean {
+	if (program.startsWith("__omp_worker_")) return true;
+	return flag === "-u" && basename(dirname(script)).startsWith("omp-python-runner-");
 }
 
 /** Polls `probe` until it holds or `limitMs` is up, measured on the clock the tests advance. */
@@ -3889,14 +3902,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		record: SessionRecord,
 		id: string,
 		pane: string,
-		childArgv0: Map<number, string[]>,
+		childArgv: Map<number, ChildArgv[]>,
 	): Promise<{ kind: "pass" } | { kind: "busy" } | { kind: "fail"; reason: string }> {
 		const now = Date.now();
 		if (record.state !== "" && record.state !== "idle") return { kind: "busy" };
 		if (record.lastInputAt > 0 && now - record.lastInputAt < RESTART_INPUT_MS) return { kind: "busy" };
-		for (const argv0 of childArgv0.get(record.pid) ?? []) {
-			if (!argv0.startsWith("__omp_worker_")) return { kind: "busy" };
-		}
+		if ((childArgv.get(record.pid) ?? []).some((argv) => !isOmpWorker(argv))) return { kind: "busy" };
 		// Old code settles an open question on its own shutdown, so a restart would lose the answer.
 		if (record.codeStamp === "" && (record.standing !== null || record.closeOffer !== null)) return { kind: "busy" };
 		if (pane === "") return { kind: "fail", reason: "no pane for it" };
@@ -4040,10 +4051,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			const failures: Array<{ id: string; tab: string; reason: string }> = [];
 			// One /proc scan feeds the child gate of every candidate.
-			const childArgv0 = candidates.length > 0 ? childArgv0ByParent() : new Map<number, string[]>();
+			const childArgv = candidates.length > 0 ? childArgvByParent() : new Map<number, ChildArgv[]>();
 			for (const { id, record } of candidates) {
 				const pane = await paneOf(record);
-				const gate = await restartGate(record, id, pane, childArgv0);
+				const gate = await restartGate(record, id, pane, childArgv);
 				if (gate.kind === "busy") continue;
 				if (gate.kind === "fail") {
 					failures.push({ id, tab: restartTab(record), reason: gate.reason });
