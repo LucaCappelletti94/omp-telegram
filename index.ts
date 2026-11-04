@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	appendFileSync,
 	chmodSync,
@@ -73,6 +73,20 @@ const PENDING_UNPINS_DIR = join(STATE_DIR, "pending-unpins");
 const LOCK_FILE = join(STATE_DIR, "poller.lock");
 const LEGACY_LOCK_DIR = join(STATE_DIR, "poller.lock.d");
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
+/** Where omp keeps transcripts, one project subdirectory per working tree. */
+const OMP_SESSIONS_DIR = join(AGENT_DIR, "sessions");
+/** One marker per session a restart wave is killing, so the reaper cannot reap it mid-restart. */
+const RESTART_MARKER_DIR = join(STATE_DIR, "restart-pending");
+/** A marker protects its record for this long: the confirm wait, plus margin. */
+const RESTART_MARKER_MS = 5 * 60_000;
+/** How long a process has to exit after its SIGTERM before the wave gives up on it. */
+const RESTART_EXIT_WAIT_MS = 30_000;
+/** How long tmux has to reap the pane before the wave respawns into it. */
+const RESTART_PANE_DEAD_WAIT_MS = 30_000;
+/** User input or terminal activity this recent means the session is in use. */
+const RESTART_INPUT_MS = 120_000;
+/** How long a restart is given to be confirmed before the wave reports it. */
+const RESTART_CONFIRM_MS = 90_000;
 const DASHBOARD_FILE = join(STATE_DIR, "dashboard.json");
 const DASHBOARD_LOCK_FILE = join(STATE_DIR, "dashboard.lock");
 const INBOX_DIR = join(STATE_DIR, "inbox");
@@ -430,6 +444,33 @@ interface SessionRecord {
 	tmux: string;
 	/** Index of the tmux window the process ran in, so a restore reopens it at the same tab. */
 	tmuxWindow: number | null;
+	/** The tmux pane the process runs in, so a restart can drive it. */
+	tmuxPane: string;
+	/** The last user input, so a session the user is typing in is never restarted mid-sentence. */
+	lastInputAt: number;
+	/** The hash of the extension code the process loaded, so stale code yields the fleet locks. */
+	codeStamp: string;
+}
+
+/** How a restart wave reopens a session once its old process is gone. */
+type RestartMethod = "respawn" | "send-keys";
+
+/** One session a restart wave touched, and what it ended up as. */
+interface RestartEntry {
+	id: string;
+	/** The pid the wave sent SIGTERM to, so a confirmation must be another process. */
+	pid: number;
+	pane: string;
+	method: RestartMethod;
+	cwd: string;
+	transcript: string;
+	tmuxSession: string;
+	/** The tab line a notice needs, captured from the record the wave read. */
+	tab: string;
+	restartedAt: number;
+	outcome: "" | "confirmed" | "failed";
+	reason: string;
+	failNote: string;
 }
 
 interface TelegramMessage {
@@ -1485,6 +1526,71 @@ async function sleepMs(ms: number): Promise<void> {
 	await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * The hash of the extension files a process loaded. omp keeps the code of a merge from before in every
+ * process it started, so a process re-reads these files each tick and compares the hash with its own.
+ */
+function codeStampOfFiles(): string {
+	const hash = createHash("sha256");
+	for (const name of ["index.ts", "render.ts", "graph.ts"]) {
+		hash.update(readFileSync(new URL(`./${name}`, import.meta.url).pathname));
+	}
+	return hash.digest("hex");
+}
+
+/** The parent of `pid`, 0 when the kernel says none: the field after the last `)` of `/proc/pid/stat`. */
+function parentOf(pid: number): number {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		const ppid = Number(fields[1]);
+		return Number.isFinite(ppid) ? ppid : 0;
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * For every parent the kernel currently knows, the argv0 of its children, in one scan of the root of
+ * /proc, where a process's children live and not under its own directory.
+ */
+function childArgv0ByParent(): Map<number, string[]> {
+	const out = new Map<number, string[]>();
+	let names: string[];
+	try {
+		names = readdirSync("/proc");
+	} catch {
+		return out;
+	}
+	for (const name of names) {
+		if (!/^\d+$/u.test(name)) continue;
+		const child = Number(name);
+		const parent = parentOf(child);
+		if (parent <= 0) continue;
+		let argv0 = "";
+		try {
+			argv0 = readFileSync(`/proc/${child}/cmdline`, "utf8").split("\0")[0] ?? "";
+		} catch {}
+		const children = out.get(parent) ?? [];
+		children.push(argv0);
+		out.set(parent, children);
+	}
+	return out;
+}
+
+/** Polls `probe` until it holds or `limitMs` is up, measured on the clock the tests advance. */
+async function waitUntil(probe: () => Promise<boolean> | boolean, limitMs: number): Promise<boolean> {
+	const deadline = Date.now() + limitMs;
+	for (;;) {
+		if (await probe()) return true;
+		if (Date.now() >= deadline) return false;
+		await sleepMs(500);
+	}
+}
+
+/** Failures already announced, by id and reason, so a retried wave does not report the same trouble twice. */
+const reportedRestartFailures = new Map<string, string>();
+
 /** A remote url names `owner/name` whether it is ssh or https, with or without `.git`. */
 function sameRepo(url: string, repo: string): boolean {
 	const normalised = url
@@ -1940,6 +2046,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let badgeChosen = false;
 	const recentMessages: number[] = [];
 	let lastNotifiedAt = 0;
+	/** The pane this process runs in, so a restart can drive it; empty outside tmux. */
+	const tmuxPane = process.env.TMUX_PANE ?? "";
+	/** The hash of the code this process loaded; the disk is re-read each tick and compared against it. */
+	const codeStamp = codeStampOfFiles();
+	/** A restart wave this instance started, so a heartbeat cannot queue a second. */
+	let waveInFlight = false;
+	/** Every session a restart wave touched, and what it ended up as. */
+	const restartEntries = new Map<string, RestartEntry>();
 	let turnActive = false;
 	let sessionAlive = true;
 	/** Set by a session_shutdown that a reboot or poweroff caused, so the record stays restorable. */
@@ -2311,6 +2425,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			argv: launchSpec.argv,
 			tmux: launchSpec.tmuxSession,
 			tmuxWindow,
+			tmuxPane,
+			lastInputAt: lastLocalInput,
+			codeStamp,
 		};
 		writeFileAtomic(join(SESSIONS_DIR, `${sessionId}.json`), JSON.stringify(record), 0o600);
 	}
@@ -2390,6 +2507,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			argv: Array.isArray(raw.argv) ? raw.argv.filter((a) => typeof a === "string") : [],
 			tmux: text(raw.tmux),
 			tmuxWindow: typeof raw.tmuxWindow === "number" ? raw.tmuxWindow : null,
+			tmuxPane: text(raw.tmuxPane),
+			lastInputAt: count(raw.lastInputAt),
+			codeStamp: text(raw.codeStamp),
 		};
 	}
 
@@ -2644,6 +2764,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const record = readSessionRecord(id);
 			// A live session refreshes its heartbeat every 15 seconds, so a stale one is gone.
 			if (record !== null && Date.now() - record.heartbeat <= LOCK_STALE_MS) continue;
+			// A restart marker keeps a record the wave is mid-restart on until the marker ages out.
+			const marker = readJsonFile(join(RESTART_MARKER_DIR, `${id}.json`)) as { at?: unknown } | null;
+			if (marker !== null && typeof marker.at === "number" && Date.now() - marker.at < RESTART_MARKER_MS) continue;
 			const bootKnown = record !== null && record.boot.length > 0 && BOOT_ID.length > 0;
 			const restarted = bootKnown && record.boot !== BOOT_ID;
 			const halted = record !== null && record.heartbeat === 0 && record.systemShutdownAt > 0;
@@ -3640,17 +3763,24 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * One poller only, or Telegram 409s. Atomic `wx` create; ownership re-read, never cached. The owner is the
 	 * extension instance, because two omp processes can report one session id.
 	 */
-	function readLock(file: string = LOCK_FILE): { instance: string; pid: number; heartbeat: number } | null {
+	function readLock(file: string = LOCK_FILE): {
+		instance: string;
+		pid: number;
+		heartbeat: number;
+		code: string;
+	} | null {
 		if (!existsSync(file)) return null;
 		try {
 			const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
 			if (parsed === null || typeof parsed !== "object") return null;
-			const raw = parsed as { instance?: unknown; pid?: unknown; heartbeat?: unknown };
+			const raw = parsed as { instance?: unknown; pid?: unknown; heartbeat?: unknown; code?: unknown };
 			if (typeof raw.heartbeat !== "number") return null;
 			return {
 				instance: typeof raw.instance === "string" ? raw.instance : "",
 				pid: typeof raw.pid === "number" ? raw.pid : 0,
 				heartbeat: raw.heartbeat,
+				// A lock an older version wrote names no code, and its holder judges only by its own rules.
+				code: typeof raw.code === "string" ? raw.code : "",
 			};
 		} catch {
 			return null;
@@ -3658,7 +3788,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function acquireLock(file: string = LOCK_FILE): boolean {
-		const mine = JSON.stringify({ instance, sessionId, pid: process.pid, heartbeat: Date.now() });
+		const mine = JSON.stringify({ instance, sessionId, pid: process.pid, heartbeat: Date.now(), code: codeStamp });
 		try {
 			writeFileSync(file, mine, { flag: "wx" });
 		} catch {
@@ -3685,7 +3815,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	function refreshLock(file: string = LOCK_FILE): void {
 		if (!ownsLock(file)) return;
-		writeFileAtomic(file, JSON.stringify({ instance, sessionId, pid: process.pid, heartbeat: Date.now() }));
+		writeFileAtomic(
+			file,
+			JSON.stringify({ instance, sessionId, pid: process.pid, heartbeat: Date.now(), code: codeStamp }),
+		);
 	}
 
 	function releaseLock(file: string = LOCK_FILE): void {
@@ -3695,6 +3828,256 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		try {
 			unlinkSync(path);
 		} catch {}
+	}
+
+	/** The transcript a resume reopens: one `*_<id>.jsonl` under the project directories, first match. */
+	function transcriptPath(id: string): string {
+		if (!existsSync(OMP_SESSIONS_DIR)) return "";
+		for (const dir of readdirSync(OMP_SESSIONS_DIR, { withFileTypes: true })) {
+			if (!dir.isDirectory()) continue;
+			const base = join(OMP_SESSIONS_DIR, dir.name);
+			let entries: string[];
+			try {
+				entries = readdirSync(base);
+			} catch {
+				continue;
+			}
+			for (const entry of entries) {
+				if (new RegExp(`^.+_${id}\\.jsonl$`, "u").test(entry)) return join(base, entry);
+			}
+		}
+		return "";
+	}
+
+	/**
+	 * The pane a session's process runs in. A record names its own pane when it is a valid pane id;
+	 * older records name none, so the pane is found by pid, and a shell parent by its ppid.
+	 */
+	async function paneOf(record: SessionRecord): Promise<string> {
+		const candidates: string[] = [];
+		if (/^%\d+$/u.test(record.tmuxPane)) candidates.push(record.tmuxPane);
+		const self = record.pid;
+		const parent = parentOf(self);
+		const listed = await run("tmux", ["list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}\t#{pane_dead}"], 2_000);
+		for (const line of listed.stdout.split("\n")) {
+			const parts = line.split("\t");
+			const pane = parts[0] ?? "";
+			if (parts.length < 3 || !/^%\d+$/u.test(pane) || parts[2] !== "0") continue;
+			const pid = Number(parts[1]);
+			if (pid === self || (parent > 0 && pid === parent)) {
+				if (!candidates.includes(pane)) candidates.push(pane);
+			}
+		}
+		for (const pane of candidates) {
+			const alive = await run("tmux", ["display-message", "-p", "-t", pane, "#{pane_id}"], 2_000);
+			if (alive.ok) return pane;
+		}
+		return "";
+	}
+
+	/** The tab line a restart notice needs, captured from the record the wave read. */
+	function restartTab(record: SessionRecord): string {
+		const name = workNameOf(record.code, record.label, record.name);
+		return record.tmux === "" ? record.cwd : `${record.tmux}:${record.tmuxWindow} (${name})`;
+	}
+
+	/**
+	 * Whether a session can be restarted. `busy` is a silent skip for the next wave; `fail` is reported,
+	 * and the process is left exactly as found.
+	 */
+	async function restartGate(
+		record: SessionRecord,
+		id: string,
+		pane: string,
+		childArgv0: Map<number, string[]>,
+	): Promise<{ kind: "pass" } | { kind: "busy" } | { kind: "fail"; reason: string }> {
+		const now = Date.now();
+		if (record.state !== "" && record.state !== "idle") return { kind: "busy" };
+		if (record.lastInputAt > 0 && now - record.lastInputAt < RESTART_INPUT_MS) return { kind: "busy" };
+		for (const argv0 of childArgv0.get(record.pid) ?? []) {
+			if (!argv0.startsWith("__omp_worker_")) return { kind: "busy" };
+		}
+		// Old code settles an open question on its own shutdown, so a restart would lose the answer.
+		if (record.codeStamp === "" && (record.standing !== null || record.closeOffer !== null)) return { kind: "busy" };
+		if (pane === "") return { kind: "fail", reason: "no pane for it" };
+		const capture = await run("tmux", ["capture-pane", "-p", "-t", pane], 2_000);
+		if (capture.stdout.includes("\u23CE select") || capture.stdout.includes("\u238B cancel")) return { kind: "busy" };
+		if (record.lastInputAt === 0) {
+			// A record no version that wrote `lastInputAt` ever saw; the terminal's own clock says.
+			const activity = await run("tmux", ["display-message", "-p", "-t", pane, "#{window_activity}"], 2_000);
+			if (activity.ok && /^\d+$/u.test(activity.stdout) && now / 1000 - Number(activity.stdout) < 120) {
+				return { kind: "busy" };
+			}
+		}
+		if (!existsSync(record.cwd)) return { kind: "fail", reason: "its folder is gone" };
+		if (transcriptPath(id) === "") return { kind: "fail", reason: "no transcript" };
+		return { kind: "pass" };
+	}
+
+	/** Holds the pane open, kills the old process, and reopens the transcript where the pane will take it. */
+	async function performRestart(entry: RestartEntry): Promise<void> {
+		const quote = (text: string): string => `'${text.replaceAll("'", "'\\''")}'`;
+		const command = `omp --resume ${quote(entry.transcript)}`;
+		// Keys typed before the process is gone would land in its prompt and reach the agent as a message.
+		if (!(await waitUntil(() => !processRuns(entry.pid), RESTART_EXIT_WAIT_MS))) {
+			entry.outcome = "failed";
+			entry.reason = "did not exit after SIGTERM";
+			return;
+		}
+		if (entry.method === "send-keys") {
+			// The pane still owns the shell, so the resume runs where the process ran.
+			await run("tmux", ["send-keys", "-t", entry.pane, "-l", `cd ${quote(entry.cwd)} && ${command}`], 5_000);
+			await run("tmux", ["send-keys", "-t", entry.pane, "Enter"], 5_000);
+			return;
+		}
+		const paneDead = async (): Promise<boolean> =>
+			(await run("tmux", ["display-message", "-p", "-t", entry.pane, "#{pane_dead}"], 2_000)).stdout === "1";
+		const respawn = async (): Promise<boolean> =>
+			(await run("tmux", ["respawn-pane", "-k", "-t", entry.pane, "-c", entry.cwd, command], 10_000)).ok;
+		await waitUntil(paneDead, RESTART_PANE_DEAD_WAIT_MS);
+		if (await respawn()) return;
+		await waitUntil(paneDead, RESTART_PANE_DEAD_WAIT_MS);
+		if (await respawn()) return;
+		await run("tmux", ["set-option", "-p", "-t", entry.pane, "remain-on-exit", "off"], 2_000);
+		const target = entry.tmuxSession || "omp";
+		const title = `restart ${entry.id.slice(0, 8)}`;
+		if ((await run("tmux", ["has-session", "-t", `=${target}`], 2_000)).ok) {
+			await run("tmux", ["new-window", "-d", "-t", `=${target}`, "-n", title, "-c", entry.cwd, command], 10_000);
+		} else {
+			await run("tmux", ["new-session", "-d", "-s", target, "-n", title, "-c", entry.cwd, command], 10_000);
+		}
+		entry.failNote = "respawn failed, opened a new window";
+	}
+
+	/** Writes the reaper's marker, holds the pane, sends SIGTERM, then performs the restart. */
+	async function startRestart(entry: RestartEntry): Promise<void> {
+		writePrivateJson(RESTART_MARKER_DIR, `${entry.id}.json`, { at: Date.now(), pid: entry.pid });
+		if (entry.method === "respawn") {
+			// A dead process leaves the pane empty, and tmux closes an empty pane unless it is told to hold it.
+			await run("tmux", ["set-option", "-p", "-t", entry.pane, "remain-on-exit", "on"], 2_000);
+		}
+		try {
+			process.kill(entry.pid, "SIGTERM");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+				entry.outcome = "failed";
+				entry.reason = "the process was already gone";
+				return;
+			}
+			throw error;
+		}
+		detach(() => performRestart(entry), "restart perform");
+	}
+
+	/**
+	 * Confirms a restart by the record the resumed process wrote, or reports one the resume never
+	 * confirmed. A failure already announced, or a confirmed entry with a fail note, is not repeated.
+	 */
+	function restartConfirmations(stampNow: string): void {
+		const now = Date.now();
+		for (const entry of restartEntries.values()) {
+			if (entry.outcome !== "") continue;
+			const record = readSessionRecord(entry.id);
+			const confirmed =
+				record !== null &&
+				record.pid > 0 &&
+				record.pid !== entry.pid &&
+				record.codeStamp === stampNow &&
+				now - record.heartbeat <= LOCK_STALE_MS;
+			if (confirmed) {
+				entry.outcome = "confirmed";
+				reportedRestartFailures.delete(entry.id);
+				removeStatePath(RESTART_MARKER_DIR, `${entry.id}.json`);
+				continue;
+			}
+			if (now - entry.restartedAt <= RESTART_CONFIRM_MS) continue;
+			entry.outcome = "failed";
+			entry.reason = "the resume was not confirmed within 90 s";
+			removeStatePath(RESTART_MARKER_DIR, `${entry.id}.json`);
+		}
+		const toReport = [...restartEntries.values()].filter((entry) => {
+			const note = entry.reason !== "" ? entry.reason : entry.failNote;
+			return (
+				(entry.outcome === "failed" || entry.failNote !== "") &&
+				note !== "" &&
+				reportedRestartFailures.get(entry.id) !== note
+			);
+		});
+		if (toReport.length === 0) return;
+		pollerNotice(
+			`Some tabs could not be restarted\n${toReport
+				.map((entry) => `- ${entry.tab} — ${entry.reason !== "" ? entry.reason : entry.failNote}`)
+				.join("\n")}`,
+		);
+		for (const entry of toReport) {
+			reportedRestartFailures.set(entry.id, entry.reason !== "" ? entry.reason : entry.failNote);
+		}
+	}
+
+	/**
+	 * The restart wave of the current-code poller: every record that still names other code and a live
+	 * process gets its tab reopened on the current code. Runs only while the poller's own stamp matches
+	 * the disk, so a stale poller that won a lock hand cannot restart sessions.
+	 */
+	async function runRestartWave(stampNow: string): Promise<void> {
+		try {
+			if (codeStamp !== stampNow) return;
+			for (const [id, entry] of restartEntries) if (entry.outcome !== "") restartEntries.delete(id);
+			const candidates: Array<{ id: string; record: SessionRecord }> = [];
+			for (const { id, record } of allRecords()) {
+				if (id === sessionId || !isStateToken(id)) continue;
+				// A record on the current code needs no restart, however tempting its tab looks.
+				if (record.codeStamp === stampNow) continue;
+				if (restartEntries.has(id)) continue;
+				if (Date.now() - record.heartbeat > LOCK_STALE_MS) continue;
+				if (record.pid <= 0 || !processRuns(record.pid)) continue;
+				candidates.push({ id, record });
+			}
+			// A failure whose candidate is gone is announced once; a wave that sees it again is new trouble.
+			// An id with a restart still in flight keeps its note, whatever the candidate filter says.
+			for (const id of [...reportedRestartFailures.keys()]) {
+				if (!candidates.some((c) => c.id === id) && !restartEntries.has(id)) reportedRestartFailures.delete(id);
+			}
+			const failures: Array<{ id: string; tab: string; reason: string }> = [];
+			// One /proc scan feeds the child gate of every candidate.
+			const childArgv0 = candidates.length > 0 ? childArgv0ByParent() : new Map<number, string[]>();
+			for (const { id, record } of candidates) {
+				const pane = await paneOf(record);
+				const gate = await restartGate(record, id, pane, childArgv0);
+				if (gate.kind === "busy") continue;
+				if (gate.kind === "fail") {
+					failures.push({ id, tab: restartTab(record), reason: gate.reason });
+					continue;
+				}
+				const pidOut = await run("tmux", ["display-message", "-p", "-t", pane, "#{pane_pid}"], 2_000);
+				const method: RestartMethod = pidOut.ok && pidOut.stdout === String(record.pid) ? "respawn" : "send-keys";
+				const entry: RestartEntry = {
+					id,
+					pid: record.pid,
+					pane,
+					method,
+					cwd: record.cwd,
+					transcript: transcriptPath(id),
+					tmuxSession: record.tmux,
+					tab: restartTab(record),
+					restartedAt: Date.now(),
+					outcome: "",
+					reason: "",
+					failNote: "",
+				};
+				restartEntries.set(id, entry);
+				await startRestart(entry);
+			}
+			const freshFailures = failures.filter((f) => reportedRestartFailures.get(f.id) !== f.reason);
+			if (freshFailures.length > 0) {
+				pollerNotice(
+					`Some tabs could not be restarted\n${freshFailures.map((f) => `- ${f.tab} — ${f.reason}`).join("\n")}`,
+				);
+				for (const f of freshFailures) reportedRestartFailures.set(f.id, f.reason);
+			}
+		} finally {
+			waveInFlight = false;
+		}
 	}
 
 	/**
@@ -7944,12 +8327,29 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (ownsLock()) refreshLock();
 				else acquireLock();
 				syncOwnNode(ctx);
+				const stampNow = codeStampOfFiles();
+				// Code older than the disk yields the fleet locks while a session on the current code is live,
+				// so the newest poller drives the fleet and restarts the rest.
+				if (
+					codeStamp !== stampNow &&
+					allRecords().some(
+						({ record }) => record.codeStamp === stampNow && Date.now() - record.heartbeat <= LOCK_STALE_MS,
+					)
+				) {
+					releaseLock();
+					releaseLock(DASHBOARD_LOCK_FILE);
+				}
 				if (ownsLock()) {
 					graphTick();
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
 					detachBackground(() => redrawCrashCards(), "crash cards");
 					detach(() => retryMedia(), "media retry");
+					restartConfirmations(stampNow);
+					if (!waveInFlight) {
+						waveInFlight = true;
+						detachBackground(() => runRestartWave(stampNow), "restart wave");
+					}
 				}
 			} catch (error) {
 				pi.logger.warn("notify-telegram: heartbeat failed", {
@@ -8552,13 +8952,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (sessionCtx !== null && (await run("systemctl", ["is-system-running"], 1_000)).stdout === "stopping") {
 			systemShutdownAt = Date.now();
 		}
+		// A restart wave marked the kill it is about to send, so its resume adopts what this shutdown would retire.
+		const marker = readJsonFile(join(RESTART_MARKER_DIR, `${sessionId}.json`)) as { at?: unknown } | null;
+		const restartMarked =
+			marker !== null && typeof marker.at === "number" && Date.now() - marker.at < RESTART_MARKER_MS;
+		if (restartMarked) removeStatePath(RESTART_MARKER_DIR, `${sessionId}.json`);
+		const keepForRestore = systemShutdownAt > 0 || restartMarked;
 		const queuedRedos = await closeReactionRouteForShutdown();
 		if (queuedRedos > 0) {
 			await serviceNotice("Grade kept, but this session ended before its queued redo could reach the agent.", false);
 		}
 		unsubscribeInput?.();
 		unsubscribeInput = null;
-		retireCloseOffer(true);
+		if (!restartMarked) retireCloseOffer(true);
 		const ask = pendingAsk;
 		if (ask !== null) {
 			pendingAsk = null;
@@ -8568,8 +8974,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				detach(() => settleAskMessage(ask, messageId, "This question is no longer active."), "pending-question close");
 			}
 		}
-		// A restore after the reboot adopts the standing question and the red pin, and a dismiss retires them.
-		const standing = systemShutdownAt > 0 ? null : standingQuestion;
+		// A restore after the reboot or a restart adopts the standing question and the red pin, and a dismiss retires them.
+		const standing = keepForRestore ? null : standingQuestion;
 		if (standing !== null) {
 			standingQuestion = null;
 			if (sessionCtx !== null) writeSessionRecord(sessionCtx);
@@ -8581,7 +8987,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		}
 		const closingCtx = sessionCtx;
-		if (closingCtx !== null && systemShutdownAt === 0) detach(() => unpinRed(closingCtx), "shutdown unpin");
+		if (closingCtx !== null && !keepForRestore) detach(() => unpinRed(closingCtx), "shutdown unpin");
 		await Promise.allSettled(redPinOperations);
 		closeReplyQuestion();
 		sessionAlive = false;
