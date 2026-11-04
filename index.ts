@@ -2734,8 +2734,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		for (const dir of [SESSIONS_DIR, STATE_DIR]) {
 			if (!existsSync(dir)) continue;
 			for (const entry of readdirSync(dir)) {
+				if (!entry.endsWith(".tmp")) continue;
 				const path = resolve(dir, entry);
-				if (!entry.endsWith(".tmp") || !path.startsWith(root)) continue;
+				if (!path.startsWith(root)) continue;
 				try {
 					if (Date.now() - statSync(path).mtimeMs > 3_600_000) unlinkSync(path);
 				} catch {}
