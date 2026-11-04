@@ -12082,6 +12082,7 @@ heading("dependency graph across sessions");
 
 	renameSync(appDir, `${appDir}-gone`);
 	writeFileSync(tmuxLog, "");
+	const goneResumeSends = called("sendMessage").length;
 	api.queued = [
 		{
 			update_id: 9111,
@@ -12095,8 +12096,12 @@ heading("dependency graph across sessions");
 	];
 	await waiter.pump(250);
 	check(
-		"Resume on a session whose folder is gone opens nothing and names the folder",
-		!readFileSync(tmuxLog, "utf8").includes("new-window") && lastCall("answerCallbackQuery").body.text.includes(appDir),
+		"Resume on a session whose folder is gone answers at once and tells the user the error",
+		lastCall("answerCallbackQuery").body.text === "Resuming it in a new tmux window." &&
+			!readFileSync(tmuxLog, "utf8").includes("new-window") &&
+			called("sendMessage")
+				.slice(goneResumeSends)
+				.some((c) => String(c.body.text).includes("failed") && String(c.body.text).includes(appDir)),
 	);
 	renameSync(`${appDir}-gone`, appDir);
 
@@ -12176,6 +12181,7 @@ heading("dependency graph across sessions");
 		}),
 	);
 	writeFileSync(tmuxLog, "");
+	const orphanSends = called("sendMessage").length;
 	api.queued = [
 		{
 			update_id: 9109,
@@ -12189,11 +12195,107 @@ heading("dependency graph across sessions");
 	];
 	await waiter.pump(250);
 	check(
-		"Resume on a node with no omp session behind it opens nothing and says why",
+		"Resume on a node with no omp session behind it answers at once and says why",
 		!readFileSync(tmuxLog, "utf8").includes("new-window") &&
-			lastCall("answerCallbackQuery").body.text.includes("no omp session"),
+			lastCall("answerCallbackQuery").body.text === "Resuming it in a new tmux window." &&
+			called("sendMessage")
+				.slice(orphanSends)
+				.some((c) => String(c.body.text).includes("no omp session")),
 	);
 	rmSync(nodeFile(orphan));
+
+	// A slow tmux must not hold a Resume tap, so the answer lands at once and what is queued behind it
+	// moves on. A second tap while the first window is still opening starts nothing.
+	const slowId = "0c1a0007-0000-7000-8000-000000000007";
+	const slowBin = join(root, "graph-slow-bin");
+	mkdirSync(slowBin, { recursive: true });
+	const slowLog = join(root, "graph-slow-tmux.log");
+	writeFileSync(slowLog, "");
+	writeFileSync(
+		join(slowBin, "tmux"),
+		`#!/bin/sh\necho "$*" >> ${slowLog}\nsleep 1\ncase "$1" in\n  has-session) exit 0 ;;\n  new-window) echo @78 ;;\nesac\n`,
+		{ mode: 0o755 },
+	);
+	const slowPath = process.env.PATH;
+	process.env.PATH = `${slowBin}:${slowPath}`;
+	writeFileSync(
+		nodeFile(slowId),
+		JSON.stringify({
+			session: slowId,
+			label: "Slow widget",
+			emoji: "",
+			tag: "",
+			cwd: appDir,
+			status: "pushed",
+			note: "",
+			edges: [],
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+			launch: { argv: [], tmuxSession: "work" },
+		}),
+	);
+	const slowResumeSends = called("sendMessage").filter((c) => String(c.body.text).includes("updates waiting")).length;
+	api.queued = [
+		{
+			update_id: 9113,
+			callback_query: {
+				id: "gsr",
+				data: `r:${slowId}`,
+				from: { id: CHAT },
+				message: { message_id: 777001, chat: { id: CHAT } },
+			},
+		},
+		{
+			update_id: 9114,
+			message: { message_id: 9114, date: 1, chat: { id: CHAT }, text: "/resume" },
+		},
+	];
+	await waiter.pump(400);
+	check(
+		"a resume tap is answered before the window opens",
+		lastCall("answerCallbackQuery").body.text === "Resuming it in a new tmux window." &&
+			!readFileSync(slowLog, "utf8").includes("new-window"),
+	);
+	check(
+		"a text queued behind the tap is handled without waiting for tmux",
+		called("sendMessage").filter((c) => String(c.body.text).includes("updates waiting")).length === slowResumeSends + 1,
+	);
+	api.queued = [
+		{
+			update_id: 9115,
+			callback_query: {
+				id: "gsr1",
+				data: `r:${slowId}`,
+				from: { id: CHAT },
+				message: { message_id: 777002, chat: { id: CHAT } },
+			},
+		},
+		{
+			update_id: 9116,
+			callback_query: {
+				id: "gsr2",
+				data: `r:${slowId}`,
+				from: { id: CHAT },
+				message: { message_id: 777003, chat: { id: CHAT } },
+			},
+		},
+	];
+	await waiter.pump(400);
+	check(
+		"a second resume tap while the first window is still opening starts nothing",
+		lastCall("answerCallbackQuery").body.text === "That session is already starting." &&
+			!readFileSync(slowLog, "utf8").includes(`--resume ${slowId}`),
+	);
+	await settle(2_500);
+	const slowOpened = readFileSync(slowLog, "utf8");
+	check(
+		"the window opens once when the slow tmux answers",
+		slowOpened.includes(`new-window -d -t work:`) &&
+			slowOpened.includes(`omp --resume ${slowId}`) &&
+			slowOpened.split(`--resume ${slowId}`).length - 1 === 1,
+	);
+	process.env.PATH = slowPath;
+	rmSync(nodeFile(slowId));
 
 	mkdirSync(join(graphDir, "pending", parentId), { recursive: true });
 	writeFileSync(join(graphDir, "pending", parentId, "z-bad.json"), "{not json");
@@ -12710,9 +12812,12 @@ heading("sessions that died without shutting down");
 		!readFileSync(tmuxLog, "utf8").includes("omp") && twiceToast.includes("already starting"),
 	);
 	const goneToast = await tap(first, 9503, `kr:${goneId}`, cardId);
+	await settle(100);
+	first.heartbeat();
+	await settle(150);
 	check(
-		"restoring a session whose folder is gone opens nothing and names the folder",
-		!readFileSync(tmuxLog, "utf8").includes("omp") && goneToast.includes(goneDir),
+		"restoring a session whose folder is gone opens nothing and says it is reopening",
+		!readFileSync(tmuxLog, "utf8").includes("omp") && /restor/i.test(goneToast),
 	);
 	check(
 		"the card shows why it failed and keeps its button",
@@ -12797,10 +12902,8 @@ heading("sessions that died without shutting down");
 			!allOpened.includes(pinnedId),
 	);
 	check(
-		"the restore all toast counts what opened and names what could not",
-		allToast.startsWith("Restoring 1 session.") &&
-			allToast.includes("Folder removed") &&
-			allToast.includes("Pinned and gone"),
+		"the restore all toast counts what it started without claiming an outcome",
+		allToast === "Restoring 3 sessions.",
 	);
 	// A window that opened but whose omp never came live is offered again after a minute.
 	jump(61_000);
@@ -12859,6 +12962,14 @@ heading("sessions that died without shutting down");
 			cardButtons(loneCard).includes(`kr:${loneId}`),
 	);
 	const loneCardId = api.nextMessage - 1;
+	// A card with a single waiting session answers Restore all for that one session.
+	const loneBatchFile = readdirSync(join(crashDir, "batches")).find((f) =>
+		JSON.parse(readFileSync(join(crashDir, "batches", f), "utf8")).ids.includes(loneId),
+	);
+	check(
+		"restore all on a card with one waiting session answers for the single session",
+		(await tap(first, 9518, `ka:${loneBatchFile.slice(0, -5)}`, loneCardId)) === "Restoring 1 session.",
+	);
 
 	// omp killed under tmux can linger as a zombie its parent never reaps, which kill(pid, 0) still finds.
 	const holder = startProcess("sh", ["-c", "sleep 0 & echo $!; exec sleep 30"], {
@@ -13097,14 +13208,22 @@ heading("sessions that died without shutting down");
 			!/died/.test(offCard.text),
 	);
 	writeFileSync(tmuxFail, "new-session");
+	const lostToast = await tap(first, 9511, `kr:${offLostId}`, offCardId);
+	await settle(100);
+	first.heartbeat();
+	await settle(150);
 	check(
-		"a restore whose tmux session cannot be created says why",
-		(await tap(first, 9511, `kr:${offLostId}`, offCardId)).includes("tmux new-session failed"),
+		"a restore whose tmux session cannot be created says so on the card",
+		/restor/i.test(lostToast) && (lastCard()?.text ?? "").includes("tmux new-session failed"),
 	);
 	writeFileSync(tmuxFail, "new-window");
+	const workToast = await tap(first, 9512, `kr:${offWorkId}`, offCardId);
+	await settle(100);
+	first.heartbeat();
+	await settle(150);
 	check(
-		"a restore whose window cannot be opened at its tab or appended says why",
-		(await tap(first, 9512, `kr:${offWorkId}`, offCardId)).includes("tmux new-window failed"),
+		"a restore whose window cannot be opened says so on the card",
+		/restor/i.test(workToast) && (lastCard()?.text ?? "").includes("tmux new-window failed"),
 	);
 	writeFileSync(tmuxFail, "");
 
@@ -13123,6 +13242,121 @@ heading("sessions that died without shutting down");
 	check(
 		"a session whose omp ended unexpectedly on a running machine is told so",
 		/died without shutting down/i.test(lostNote) && /ended unexpectedly/i.test(lostNote),
+	);
+
+	// A slow tmux must not hold a Restore tap, so the answer lands at once and what is queued behind it
+	// moves on. A second tap while the first window is still opening starts nothing.
+	const slowA = "0c2a0017-0000-7000-8000-000000000017";
+	const slowB = "0c2a0018-0000-7000-8000-000000000018";
+	const slowC = "0c2a0019-0000-7000-8000-000000000019";
+	crashed(slowA, { cwd: folder("slow-a"), label: "Slow one", tmux: "work", tmuxWindow: 11 });
+	crashed(slowB, { cwd: folder("slow-b"), label: "Slow two", tmux: "work", tmuxWindow: 12 });
+	crashed(slowC, { cwd: folder("slow-c"), label: "Slow three", tmux: "work", tmuxWindow: 13 });
+	first.heartbeat();
+	await settle(150);
+	const slowCard = crashCalls().at(-1)?.body;
+	const slowCardId = api.nextMessage - 1;
+	const slowBatch =
+		cardButtons(slowCard)
+			.find((b) => b.startsWith("ka:"))
+			?.slice(3) ?? "";
+	check(
+		"the slow batch gets its own card with a restore all button",
+		slowCard.text.includes("Slow one") &&
+			slowCard.text.includes("Slow two") &&
+			slowCard.text.includes("Slow three") &&
+			slowBatch.length > 0,
+	);
+	const slowBin = join(root, "crash-slow-bin");
+	mkdirSync(slowBin, { recursive: true });
+	const slowLog = join(root, "crash-slow-tmux.log");
+	writeFileSync(slowLog, "");
+	writeFileSync(
+		join(slowBin, "tmux"),
+		`#!/bin/sh\necho "$*" >> ${slowLog}\nsleep 1\ncase "$1" in\n  has-session) [ "$3" = "=work" ] ;;\n  new-window) [ "$4" != "work:2" ] || { echo "create window failed: index 2 in use" >&2; exit 1; } ;;\n  display-message) cat ${tmuxWhere} ;;\n  *) exit 0 ;;\nesac\n`,
+		{ mode: 0o755 },
+	);
+	const slowPath = process.env.PATH;
+	process.env.PATH = `${slowBin}:${slowPath}`;
+	const slowResumeSends = called("sendMessage").filter((c) => String(c.body.text).includes("updates waiting")).length;
+	api.queued = [
+		{
+			update_id: 9513,
+			callback_query: {
+				id: "cb-9513",
+				from: { id: CHAT },
+				message: { message_id: slowCardId, chat: { id: CHAT } },
+				data: `ka:${slowBatch}`,
+			},
+		},
+		{
+			update_id: 9514,
+			message: { message_id: 9514, date: 1, chat: { id: CHAT }, text: "/resume" },
+		},
+	];
+	await first.pump(400);
+	check(
+		"restore all is answered before the windows open",
+		lastCall("answerCallbackQuery").body.text === "Restoring 3 sessions." &&
+			!readFileSync(slowLog, "utf8").includes("new-window"),
+	);
+	check(
+		"a text queued behind the tap is handled without waiting for tmux",
+		called("sendMessage").filter((c) => String(c.body.text).includes("updates waiting")).length === slowResumeSends + 1,
+	);
+	api.queued = [
+		{
+			update_id: 9515,
+			callback_query: {
+				id: "cb-9515",
+				from: { id: CHAT },
+				message: { message_id: slowCardId, chat: { id: CHAT } },
+				data: `kr:${slowC}`,
+			},
+		},
+		{
+			update_id: 9516,
+			callback_query: {
+				id: "cb-9516",
+				from: { id: CHAT },
+				message: { message_id: slowCardId, chat: { id: CHAT } },
+				data: `kr:${slowC}`,
+			},
+		},
+	];
+	await first.pump(400);
+	check(
+		"a second restore tap while the first is in flight starts nothing",
+		lastCall("answerCallbackQuery").body.text === "That session is already starting." &&
+			!readFileSync(slowLog, "utf8").includes(`--resume ${slowC}`),
+	);
+	// Every session of the batch still opens its window, so Restore all is refused as a whole.
+	api.queued = [
+		{
+			update_id: 9517,
+			callback_query: {
+				id: "cb-9517",
+				from: { id: CHAT },
+				message: { message_id: slowCardId, chat: { id: CHAT } },
+				data: `ka:${slowBatch}`,
+			},
+		},
+	];
+	await first.pump(400);
+	check(
+		"a second restore all tap while the first is in flight is refused and starts nothing",
+		lastCall("answerCallbackQuery").body.text === "That session is already starting.",
+	);
+	await settle(2_500);
+	process.env.PATH = slowPath;
+	const slowOpened = readFileSync(slowLog, "utf8");
+	check(
+		"the slow restores open exactly one window per session",
+		slowOpened.includes(`new-window -d -t work:11 -n Slow one -c`) &&
+			slowOpened.includes(`new-window -d -t work:12 -n Slow two -c`) &&
+			slowOpened.includes(`new-window -d -t work:13 -n Slow three -c`) &&
+			slowOpened.split("new-window").length - 1 === 3 &&
+			slowOpened.split(`--resume ${slowC}`).length - 1 === 1,
 	);
 
 	// Telegram calling the edit unchanged means the card already shows that text, so it is current.
