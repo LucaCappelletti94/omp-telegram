@@ -14255,22 +14255,29 @@ const vsRetire = (id) =>
 	old.kill("SIGKILL");
 }
 
-// The same shape with a worker child passes the gate, and a resume nobody confirms is reported once.
+// The same shape with omp's own children, a worker and the Python eval kernel, passes the gate, and a resume
+// nobody confirms is reported once.
 {
 	const folder = vsFolder("worker-child");
-	const old = dummy("bash", "-c", "( exec -a __omp_worker_test sleep 600 ) & wait");
+	const runnerDir = join(root, "omp-python-runner-1000");
+	mkdirSync(runnerDir, { recursive: true });
+	const runner = join(runnerDir, "runner-test.py");
+	writeFileSync(runner, "import time\ntime.sleep(600)\n");
+	const old = dummy("bash", "-c", `( exec -a __omp_worker_test sleep 600 ) & python3 -u '${runner}' & wait`);
 	const stale = spawn("01a1f117-0000-7000-8000-000000000017", folder, "Stale seven");
 	await stale.fire("session_start");
 	const transcript = vsTranscript(stale.id);
 	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: old.pid });
 	vsSet("pane_pid", String(old.pid));
 	vsSet("pane_dead", "1");
+	// The forked shells must have become the worker and the kernel before the wave reads them.
+	await settle(300);
 	vsLogReset();
 	vsPoller.heartbeat();
 	for (let i = 0; i < 40 && !vsLog().includes("omp --resume"); i++) await settle(100);
 	await stale.fire("session_shutdown");
 	await settle(100);
-	check("a worker child does not block the restart", vsLog().includes(`omp --resume '${transcript}'`));
+	check("omp's own children do not block the restart", vsLog().includes(`omp --resume '${transcript}'`));
 	jump(95_000);
 	vsPoller.heartbeat();
 	await settle(200);
