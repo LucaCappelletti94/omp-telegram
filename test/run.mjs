@@ -12802,6 +12802,14 @@ heading("sessions that died without shutting down");
 			cardButtons(loneCard).includes(`kr:${loneId}`),
 	);
 	const loneCardId = api.nextMessage - 1;
+	// A card with a single waiting session answers Restore all for that one session.
+	const loneBatchFile = readdirSync(join(crashDir, "batches")).find((f) =>
+		JSON.parse(readFileSync(join(crashDir, "batches", f), "utf8")).ids.includes(loneId),
+	);
+	check(
+		"restore all on a card with one waiting session answers for the single session",
+		(await tap(first, 9518, `ka:${loneBatchFile.slice(0, -5)}`, loneCardId)) === "Restoring 1 session.",
+	);
 
 	// omp killed under tmux can linger as a zombie its parent never reaps, which kill(pid, 0) still finds.
 	const holder = startProcess("sh", ["-c", "sleep 0 & echo $!; exec sleep 30"], {
