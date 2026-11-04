@@ -2828,12 +2828,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** The green-summary close button: strip the button, then let the ordinary shutdown path run. */
 	async function closeSessionFromTelegram(messageId: number | undefined): Promise<void> {
 		if (messageId !== undefined && closeOfferMessageId === messageId) closeOfferMessageId = null;
-		if (typeof messageId === "number" && standingQuestion?.messageId !== messageId) {
-			// A standing question is rewritten by session_shutdown; a plain summary only loses its button.
-			await stripKeyboard(messageId);
+		try {
+			if (typeof messageId === "number" && standingQuestion?.messageId !== messageId) {
+				// A standing question is rewritten by session_shutdown; a plain summary only loses its button.
+				await stripKeyboard(messageId);
+			}
+		} finally {
+			scheduleTmuxPaneKill();
+			sessionCtx?.shutdown();
 		}
-		scheduleTmuxPaneKill();
-		sessionCtx?.shutdown();
 	}
 
 	/** Removes this session's outgoing and routed incoming messages, reports the refusals, and shuts the pane down. */
@@ -2860,34 +2863,46 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		const messages = [...new Set([...outgoing, ...incoming])];
 		let refused = 0;
-		for (let offset = 0; offset < messages.length; offset += 100) {
-			const batch = messages.slice(offset, offset + 100);
-			const accepted = await callTelegram<boolean>(
-				cfg,
-				"deleteMessages",
-				{ chat_id: cfg.chatId, message_ids: batch },
-				15_000,
-			);
-			for (const id of batch) {
-				const deleted =
-					accepted === true ||
-					(await callTelegram<boolean>(cfg, "deleteMessage", { chat_id: cfg.chatId, message_id: id }, 10_000)) === true;
-				if (!deleted) {
-					refused += 1;
-					continue;
+		let removed = 0;
+		try {
+			for (let offset = 0; offset < messages.length; offset += 100) {
+				const batch = messages.slice(offset, offset + 100);
+				const accepted = await callTelegram<boolean>(
+					cfg,
+					"deleteMessages",
+					{ chat_id: cfg.chatId, message_ids: batch },
+					15_000,
+				);
+				for (const id of batch) {
+					const deleted =
+						accepted === true ||
+						(await callTelegram<boolean>(cfg, "deleteMessage", { chat_id: cfg.chatId, message_id: id }, 10_000)) ===
+							true;
+					if (!deleted) {
+						refused += 1;
+						continue;
+					}
+					removed += 1;
+					if (outgoing.has(id)) forgetSentMessage(id);
+					if (incoming.has(id)) writePrivateJson(INCOMING_DIR, `${id}.json`, null);
 				}
-				if (outgoing.has(id)) forgetSentMessage(id);
-				if (incoming.has(id)) writePrivateJson(INCOMING_DIR, `${id}.json`, null);
 			}
+		} catch (error) {
+			// The connection broke mid-clear, so whatever was not confirmed stays in the chat.
+			refused = messages.length - removed;
+			pi.logger.warn("notify-telegram: clearing the session's messages failed", { error: String(error) });
 		}
-		if (refused > 0 && sessionCtx !== null) {
-			await serviceNotice(
-				`${messageHead(sessionCtx)}\n\nCould not remove ${refused} of ${messages.length} tracked messages. Telegram's deletion limit is 48 hours. The session will close with those messages left in the chat.`,
-				false,
-			);
+		try {
+			if (refused > 0 && sessionCtx !== null) {
+				await serviceNotice(
+					`${messageHead(sessionCtx)}\n\nCould not remove ${refused} of ${messages.length} tracked messages. Telegram's deletion limit is 48 hours. The session will close with those messages left in the chat.`,
+					false,
+				);
+			}
+		} finally {
+			scheduleTmuxPaneKill();
+			sessionCtx?.shutdown();
 		}
-		scheduleTmuxPaneKill();
-		sessionCtx?.shutdown();
 	}
 
 	/** The close offer dies the moment new work starts; a stale destructive button invites accidents. */
