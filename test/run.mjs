@@ -10713,6 +10713,27 @@ check("a younger record stays", existsSync(freshRecord));
 check("downloaded media older than seven days is swept", !existsSync(staleMedia));
 check("younger downloaded media stays", existsSync(freshMedia));
 
+// A writer killed between the temp write and the rename leaves its temp behind, and the hourly sweep collects it.
+jump(3_600_000 + 60_000);
+const staleTmpSessions = join(sessionsDir, `${sweeper.id}.json.424242.deadbeef.tmp`);
+const staleTmpRoot = join(root, "notify-telegram/poller.lock.424242.deadbeef.tmp");
+writeFileSync(staleTmpSessions, "");
+writeFileSync(staleTmpRoot, "");
+const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000);
+utimesSync(staleTmpSessions, twoHoursAgo, twoHoursAgo);
+utimesSync(staleTmpRoot, twoHoursAgo, twoHoursAgo);
+const freshTmp = join(sessionsDir, `${sweeper.id}.json.424242.feedface.tmp`);
+writeFileSync(freshTmp, "");
+utimesSync(freshTmp, new Date(Date.now()), new Date(Date.now()));
+sweeper.heartbeat();
+await settle(150);
+check("a two-hour-old temp under sessions/ is swept", !existsSync(staleTmpSessions));
+check("a two-hour-old temp in the state root is swept", !existsSync(staleTmpRoot));
+check(
+	"a fresh temp and the session record survive the sweep",
+	existsSync(freshTmp) && existsSync(join(sessionsDir, `${sweeper.id}.json`)),
+);
+
 // ------------------------------------------------------------ upstream_launch
 heading("upstream_launch");
 {
