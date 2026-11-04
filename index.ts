@@ -797,6 +797,8 @@ const LAUNCH_STALE_MS = 3_600_000;
 const LAUNCH_ENV = "OMP_TELEGRAM_LAUNCH";
 /** How long a resumed session gets to come live before another Resume tap opens a window again. */
 const RESUME_START_MS = 60_000;
+/** What a tap gets when its window is already opening. */
+const ALREADY_STARTING = "That session is already starting.";
 const DEPENDENCY_MESSAGE_TYPE = "omp-telegram.dependency";
 const MMDC_TIMEOUT_MS = 60_000;
 const PHOTO_MAX_BYTES = 10 * 1024 * 1024;
@@ -6230,6 +6232,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return typeof raw?.messageId === "number" ? raw.messageId : null;
 	}
 
+	/** A Resume tap whose window open is still running, so a second tap during a slow tmux opens no second window. */
+	const resumeInFlight = new Set<string>();
+	/** A Restore tap whose window open is still running, so a second tap during a slow tmux opens no second window. */
+	const crashInFlight = new Set<string>();
+
 	/** When a Resume tap last opened a window, so a second tap before the session is live opens none. */
 	function readResumingAt(id: string): number {
 		const raw = readJsonFile(join(PENDING_DIR, id, "resuming.json")) as { at?: unknown } | null;
@@ -6365,18 +6372,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const text = `\u23F8\uFE0F ${updates(count)} for **${titleOf(id)}** ${count === 1 ? "is" : "are"} held until you resume it. /resume lists it.`;
 			detach(() => settleResumeCard(id, text, true), "resume card hold");
 			toast = "Held until you resume it.";
-		} else if (Date.now() - readResumingAt(id) < RESUME_START_MS) {
-			toast = "That session is already starting.";
+		} else if (resumeInFlight.has(id) || Date.now() - readResumingAt(id) < RESUME_START_MS) {
+			toast = ALREADY_STARTING;
 		} else {
-			const resumed = await resumeSession(id);
-			if (resumed.ok) {
-				writePrivateJson(join(PENDING_DIR, id), "resuming.json", { at: Date.now() });
-				const text = `\u25B6\uFE0F Resuming **${titleOf(id)}** in a new tmux window.`;
-				detach(() => settleResumeCard(id, text, true), "resume card resume");
-				toast = "Resuming in a new tmux window.";
-			} else {
-				toast = clip(resumed.error, 190);
-			}
+			// Stamp before the open so a second tap during a slow tmux opens no second window.
+			writePrivateJson(join(PENDING_DIR, id), "resuming.json", { at: Date.now() });
+			resumeInFlight.add(id);
+			const title = titleOf(id);
+			detach(async () => {
+				const resumed = await resumeSession(id);
+				resumeInFlight.delete(id);
+				if (resumed.ok) {
+					writePrivateJson(join(PENDING_DIR, id), "resuming.json", { at: Date.now() });
+					const text = `\u25B6\uFE0F Resuming **${title}** in a new tmux window.`;
+					await settleResumeCard(id, text, true);
+				} else {
+					removeStatePath(join(PENDING_DIR, id), "resuming.json");
+					pollerNotice(`Resuming ${title} failed: ${clip(resumed.error, 190)}`);
+				}
+			}, "resume start");
+			toast = "Resuming it in a new tmux window.";
 		}
 		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callback.id, text: toast }, 10_000);
 	}
@@ -6561,20 +6576,36 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** The toast for one Restore tap, or null when the crash is no longer on record. */
-	async function restoreCrashed(id: string): Promise<string | null> {
+	/**
+	 * The toast for one Restore tap, or null when the crash is no longer on record. The window opens
+	 * detached after the tap is answered, and the card shows a failure, so the toast never claims an
+	 * outcome it has not seen.
+	 */
+	function restoreCrashed(id: string): string | null {
 		const kept = readCrash(id);
 		if (kept === null) return null;
 		if (crashRestored(id, kept, kept.batch)) return "That session is already running.";
 		if (kept.dismissed) return "That session was dismissed. omp --resume still reopens it by hand.";
-		if (Date.now() - kept.restoringAt < RESUME_START_MS) return "That session is already starting.";
+		if (crashInFlight.has(id) || Date.now() - kept.restoringAt < RESUME_START_MS) return ALREADY_STARTING;
 		const { record } = kept;
-		const opened = await openOmp(id, record.cwd, record.argv, record.tmux, record.tmuxWindow, crashTitle(record));
-		const next: CrashRecord = opened.ok
-			? { ...kept, restoringAt: Date.now(), error: "" }
-			: { ...kept, restoringAt: 0, error: opened.error };
-		writePrivateJson(CRASH_DIR, `${id}.json`, next);
-		return opened.ok ? `Restoring ${crashTitle(record)} in tmux.` : clip(opened.error, 190);
+		const title = crashTitle(record);
+		// Stamp before the open so a second tap during a slow tmux opens no second window.
+		crashInFlight.add(id);
+		writePrivateJson(CRASH_DIR, `${id}.json`, { ...kept, restoringAt: Date.now(), error: "" });
+		detach(async () => {
+			const opened = await openOmp(id, record.cwd, record.argv, record.tmux, record.tmuxWindow, title);
+			crashInFlight.delete(id);
+			const current = readCrash(id);
+			if (current === null) return;
+			writePrivateJson(
+				CRASH_DIR,
+				`${id}.json`,
+				opened.ok
+					? { ...current, restoringAt: Date.now(), error: "" }
+					: { ...current, restoringAt: 0, error: opened.error },
+			);
+		}, "crash restore");
+		return `Restoring ${title}.`;
 	}
 
 	async function answerCrashCallback(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
@@ -6582,22 +6613,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const arg = data.slice(3);
 		let toast: string | null;
 		if (data.startsWith("kr:")) {
-			toast = await restoreCrashed(arg);
+			toast = restoreCrashed(arg);
 		} else {
 			const batch = readCrashBatch(arg);
 			if (batch === null) {
 				toast = null;
 			} else if (data.startsWith("ka:")) {
-				let opened = 0;
-				const failed: string[] = [];
+				let started = 0;
 				for (const id of batch.ids) {
 					const kept = readCrash(id);
 					if (kept === null || !crashWaiting(id, kept, arg)) continue;
-					await restoreCrashed(id);
-					if (readCrash(id)?.error) failed.push(crashTitle(kept.record));
-					else opened += 1;
+					// An in-flight restore outlives the minute the filter allows, and is refused rather than started.
+					if (restoreCrashed(id) !== ALREADY_STARTING) started += 1;
 				}
-				toast = `Restoring ${opened === 1 ? "1 session" : `${opened} sessions`}.${failed.length > 0 ? ` Could not open ${failed.join(", ")}.` : ""}`;
+				toast = started === 0 ? ALREADY_STARTING : `Restoring ${started === 1 ? "1 session" : `${started} sessions`}.`;
 			} else {
 				for (const id of batch.ids) {
 					const kept = readCrash(id);
