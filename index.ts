@@ -2221,7 +2221,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				pi.logger.warn("telegram: rich send rejected, retrying as plain text", { method, description: refusal });
 				const { message_effect_id: _effect, ...safe } = wireBody;
 				const fallback = plainStamps(source);
-				sent = await callTelegram<TelegramMessage>(cfg, method, { ...quiet, ...safe, [textField]: fallback }, 15_000);
+				sent = await callTelegramRaw<TelegramMessage>(
+					cfg,
+					method,
+					{ ...quiet, ...safe, [textField]: fallback },
+					15_000,
+					(failure) => {
+						refusal = failure.description;
+						failed = failure;
+					},
+				);
 				sentText = fallback;
 			} else if (sent === null) {
 				pi.logger.warn("telegram: send refused", { method, description: refusal });
@@ -3925,24 +3934,31 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		}
 		const omitted = rivals.length - listed.length;
-		await callTelegram(
-			cfg,
-			"sendMessage",
-			{
-				chat_id: cfg.chatId,
-				text: toTelegramHtml(fitToTelegram(omitted > 0 ? body + note(omitted) : body, "")),
-				parse_mode: "HTML",
-				link_preview_options: { is_disabled: true },
-				reply_markup: {
-					inline_keyboard: packRows(
-						listed.map(({ record }) => ({
-							text: buttonText(badgeOf(record)),
-							callback_data: `m:${update.update_id}:${record.tag}`,
-						})),
-					),
-				},
-			},
-			15_000,
+		// The picker is the held message's only way to the user, so it is sent until Telegram takes it.
+		const held = heldMessagePath(String(update.update_id));
+		await deliverUntilTaken(
+			(onRefused) =>
+				callTelegramRaw<TelegramMessage>(
+					cfg,
+					"sendMessage",
+					{
+						chat_id: cfg.chatId,
+						text: toTelegramHtml(fitToTelegram(omitted > 0 ? body + note(omitted) : body, "")),
+						parse_mode: "HTML",
+						link_preview_options: { is_disabled: true },
+						reply_markup: {
+							inline_keyboard: packRows(
+								listed.map(({ record }) => ({
+									text: buttonText(badgeOf(record)),
+									callback_data: `m:${update.update_id}:${record.tag}`,
+								})),
+							),
+						},
+					},
+					15_000,
+					onRefused,
+				),
+			() => existsSync(held),
 		);
 	}
 
@@ -5543,6 +5559,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						entry.targetPreEdit !== true
 					) {
 						rmSync(processing, { force: true });
+						staleNotice(owner, "That question is already closed, so the grade was not turned into a redo.");
 						continue;
 					}
 					if (entry.targetQuestion === true) closeReplyQuestion(entry.messageId);
@@ -6268,8 +6285,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			writeFileSync(cardFile(id), "{}", { flag: "wx", mode: 0o600 });
 		} catch {
 			const messageId = readCardId(id);
-			if (messageId !== null) await callTelegram(config, "editMessageText", { ...body, message_id: messageId }, 15_000);
-			return;
+			if (messageId === null) return;
+			let refusal = "";
+			const edited = await callTelegramRaw(
+				config,
+				"editMessageText",
+				{ ...body, message_id: messageId },
+				15_000,
+				(failure) => {
+					refusal = failure.description;
+					pi.logger.warn("telegram call failed", { ...failure });
+				},
+			);
+			if (edited !== null || editVerdict(refusal) !== "gone") return;
+			// The card was deleted, so a new one carries the offer.
+			writeFileAtomic(cardFile(id), "{}", 0o600);
 		}
 		const sent = await callTelegram<TelegramMessage>(config, "sendMessage", body, 15_000);
 		if (sent === null) {

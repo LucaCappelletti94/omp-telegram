@@ -106,6 +106,22 @@ globalThis.fetch = async (url, init) => {
 	if (api.rejectHtml && body.parse_mode === "HTML") {
 		return { ok: false, status: 400, json: async () => ({ ok: false, description: "can't parse entities" }) };
 	}
+	// A refusal only the plain retry sees, so a send refused twice reports the second refusal.
+	if (api.plainStatus !== undefined && method === "sendMessage" && body.parse_mode !== "HTML") {
+		return {
+			ok: false,
+			status: api.plainStatus,
+			json: async () => ({
+				ok: false,
+				description: api.plainDescription ?? "failed by test",
+				...(api.plainRetryAfter === undefined ? {} : { parameters: { retry_after: api.plainRetryAfter } }),
+			}),
+		};
+	}
+	// A per-message refusal for edits, so a deleted card's replacement can be proven without failing every edit.
+	if (method === "editMessageText" && (api.editRefusals ?? []).includes(body.message_id)) {
+		return { ok: false, status: 400, json: async () => ({ ok: false, description: "message to edit not found" }) };
+	}
 	if (method === "sendMessage" && api.sendMessageGate !== null) await api.sendMessageGate;
 	if (method === "editMessageText" && api.editMessageGate !== null) await api.editMessageGate;
 	if (method === "pinChatMessage") {
@@ -656,6 +672,41 @@ api.failMethods = [];
 api.failDescription = undefined;
 const markupAttempts = called("sendMessage").slice(beforeMarkup);
 check("a rejected keyboard is not re-sent unchanged", markupAttempts.length === 1);
+
+// A plain retry that is itself throttled must wait out the 429 it recorded, so the card still
+// lands once the retry_after has passed.
+api.plainStatus = 429;
+api.plainRetryAfter = 1;
+api.plainDescription = "Too Many Requests: retry after 1";
+const rp = spawn("01a06009-0000-0000-0000-000000000009", "/home/dev/work/refused-plain");
+await rp.fire("session_start");
+const rpState = {};
+void rp.tools.get("ask").execute("rp1", singleQuestion, undefined, undefined, stubbornCtx(rp.ctx, rpState));
+const rpFrom = called("sendMessage").length;
+const rpNext = api.nextMessage;
+await settle(400);
+check("the card is not delivered while its plain retry is throttled", api.nextMessage === rpNext);
+api.plainStatus = undefined;
+api.plainRetryAfter = undefined;
+api.plainDescription = undefined;
+jump(1_200);
+await settle(400);
+const rpCard = called("sendMessage")
+	.slice(rpFrom)
+	.filter((c) => c.body.parse_mode === undefined && (c.body.text ?? "").includes("Which backend?"))
+	.at(-1);
+check(
+	"a card whose plain retry was throttled lands after the retry_after",
+	rpCard !== undefined && api.nextMessage === rpNext + 1,
+);
+check(
+	"the record points at the delivered card",
+	rpCard !== undefined && api.nextMessage === rpNext + 1 && record(rp.id).question === rpNext,
+);
+rmSync(join(root, "notify-telegram/throttle.json"), { force: true });
+// A text answer closes the question so a later bare message is never held for it.
+writeFileSync(join(inboxOf(rp.id), "701.json"), JSON.stringify({ kind: "text", value: "SQLite" }));
+await rp.pump(150);
 api.rejectHtml = false;
 writeFileSync(join(inboxOf(two.id), "700.json"), JSON.stringify({ kind: "callback", value: `o:${richAskId}:0:0` }));
 await two.pump(150);
@@ -7787,6 +7838,54 @@ heading("ambiguous plain messages ask which session");
 	check("a list that fits whole omits nobody", brim?.text.includes("not listed") !== true);
 	check("a list that fits whole keeps every button", (brim?.reply_markup.inline_keyboard ?? []).flat().length === 2);
 	writeFileSync(rightPath, JSON.stringify(rightRecord));
+
+	// g. The picker is the held message's only route, so a 5xx on its first send must not lose it.
+	for (const entry of readdirSync(sessionsDir)) {
+		const path = join(sessionsDir, entry);
+		try {
+			const parsed = JSON.parse(readFileSync(path, "utf8"));
+			const mine = entry.startsWith(left.id) || entry.startsWith(right.id);
+			writeFileSync(
+				path,
+				JSON.stringify({ ...parsed, lastNotified: mine ? Date.now() - 10_000 : 0, heartbeat: Date.now() }),
+			);
+		} catch {}
+	}
+	api.failMethods = ["sendMessage"];
+	api.failStatus = 500;
+	const pickerFrom = api.calls.length;
+	api.queued = [
+		{ update_id: 964, message: { message_id: 964, date: 1, chat: { id: CHAT }, text: "which one of you" } },
+	];
+	await left.pump(300);
+	const pickerAttempts = () =>
+		api.calls
+			.slice(pickerFrom)
+			.filter(
+				(c) =>
+					c.method === "sendMessage" &&
+					(c.body.reply_markup?.inline_keyboard ?? []).flat().some((b) => b.callback_data === `m:964:${rightTag}`),
+			);
+	api.failMethods = [];
+	api.failStatus = undefined;
+	jump(3_000);
+	await left.pump(300);
+	check("a picker whose first send hit a 5xx is sent again", pickerAttempts().length === 2);
+	const pickedId = api.nextMessage - 1;
+	api.queued = [
+		{
+			update_id: 965,
+			callback_query: {
+				id: "cbpickg",
+				data: `m:964:${rightTag}`,
+				from: { id: CHAT },
+				message: { message_id: pickedId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await left.pump(250);
+	await right.pump(250);
+	check("the held message still lands after the picker's retry", right.steers.at(-1)?.text === "which one of you");
 }
 
 heading("stopping a turn from the chat");
@@ -9508,6 +9607,7 @@ const racedButton = lastCall("sendMessage")
 	.body.reply_markup.inline_keyboard.flat()
 	.find((button) => button.callback_data?.startsWith("o:"));
 const steersBeforeRace = fb.steers.length;
+const racedSends = called("sendMessage").length;
 api.queued = [
 	answerButton(9015, racedMessageId, racedButton.callback_data),
 	react(9016, racedMessageId, ["\u{1F44E}"]),
@@ -9517,6 +9617,13 @@ await fb.pump(250);
 const racedAnswer = await racedAsk;
 check("the earlier callback still answers the question", racedAnswer.details.selectedOptions.join() === "SQLite");
 check("the later queued redo cannot reopen it", fb.steers.length === steersBeforeRace);
+await settle(150);
+check(
+	"a committed redo dropped because its question closed tells the user so",
+	called("sendMessage")
+		.slice(racedSends)
+		.some((c) => (c.body.text ?? "").includes("grade was not turned into a redo")),
+);
 
 // Advancing a multi-question ask must publish the new message id before a prompt reaction arrives.
 const advancedState = {};
@@ -12241,6 +12348,52 @@ heading("dependency graph across sessions");
 	);
 	rmSync(nodeFile(quietId));
 	rmSync(join(graphDir, "pending", quietId), { recursive: true, force: true });
+
+	// A card the user deleted on Telegram cannot carry the next held item, so a new one replaces it.
+	const deletedId = "0c1a0007-0000-7000-8000-000000000007";
+	writeFileSync(
+		nodeFile(deletedId),
+		JSON.stringify({
+			session: deletedId,
+			label: "deleted card session",
+			emoji: "",
+			tag: "",
+			cwd: appDir,
+			status: "waiting",
+			note: "",
+			edges: [],
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+			launch: { argv: [], tmuxSession: "" },
+		}),
+	);
+	const sendDeleted = (body) =>
+		waiter.tools.get("session_message").execute("q", { to: deletedId, text: body }, undefined, undefined, waiter.ctx);
+	await sendDeleted("first try");
+	await settle(150);
+	const deletedCardFile = join(graphDir, "pending", deletedId, "card.json");
+	const firstDeletedCard = JSON.parse(readFileSync(deletedCardFile, "utf8")).messageId;
+	api.editRefusals = [firstDeletedCard];
+	const deletedSends = called("sendMessage").length;
+	const deletedEdits = called("editMessageText").length;
+	await sendDeleted("second try");
+	await settle(150);
+	check(
+		"a deleted resume card is replaced by a new one with the next held item",
+		called("editMessageText")
+			.slice(deletedEdits)
+			.some((c) => c.body.message_id === firstDeletedCard) &&
+			called("sendMessage")
+				.slice(deletedSends)
+				.some((c) => c.body.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data === `r:${deletedId}`)),
+	);
+	check(
+		"the card record points at the replacement card",
+		JSON.parse(readFileSync(deletedCardFile, "utf8")).messageId !== firstDeletedCard,
+	);
+	api.editRefusals = [];
+	rmSync(nodeFile(deletedId));
+	rmSync(join(graphDir, "pending", deletedId), { recursive: true, force: true });
 
 	// A pull request gh cannot read keeps its last known state and wakes nobody.
 	await graph(follower, { action: "status", status: "working", pr: "https://github.com/someorg/docs/pull/9" });
