@@ -204,15 +204,38 @@ export function buttonText(label: string, marker = ""): string {
 	return `${clip(label, Math.max(0, BUTTON_TEXT_MAX - marker.length))}${marker}`;
 }
 
+/** What Telegram counts once it parses entities: tags are free and each escape is one character. */
+export function parsedLength(html: string): number {
+	let count = 0;
+	let inTag = false;
+	for (let i = 0; i < html.length; i++) {
+		const ch = html[i];
+		if (inTag) {
+			if (ch === ">") inTag = false;
+			continue;
+		}
+		if (ch === "<") {
+			inTag = true;
+			continue;
+		}
+		if (ch === "&") {
+			const end = html.indexOf(";", i);
+			if (end > i && end - i <= 8) i = end;
+		}
+		count += 1;
+	}
+	return count;
+}
+
 /**
  * Telegram's 4096 applies to the text after its entities are parsed, verified against the live
  * API: HTML tags and escapes such as `&lt;` cost nothing, and the limit counts code points, so a
- * message of 4096 emoji goes through. The markdown source less its stamp markup is therefore the
- * budget, and measuring it in UTF-16 units leaves the fit a little conservative in both
- * directions rather than wrong. `keep` is a short tail, today the usage footer, that survives the cut.
+ * message of 4096 emoji goes through. The budget is what `toTelegramHtml` ships once parsed, since
+ * a stamp inside a code span ships escaped rather than as a tag. `keep` is a short tail, today the
+ * usage footer, that survives the cut.
  */
 export function fitToTelegram(plain: string, keep: string): string {
-	const budget = (text: string): number => plainStamps(text).length;
+	const budget = (text: string): number => parsedLength(toTelegramHtml(text));
 	const whole = plain + keep;
 	if (budget(whole) <= TELEGRAM_TEXT_MAX) return dropLoneHighSurrogate(whole);
 	// A cut inside a stamp would ship its tag as literal text, so a cut pulls back to its start.
