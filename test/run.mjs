@@ -14136,6 +14136,12 @@ const vsRetire = (id) =>
 			log.indexOf("remain-on-exit on") < log.indexOf("respawn-pane") &&
 			log.includes(`omp --resume '${transcript}'`),
 	);
+	const released = "set-option -p -u -t %9 remain-on-exit";
+	for (let i = 0; i < 20 && !vsLog().includes(released); i++) await settle(100);
+	check(
+		"the respawned pane is released, so quitting the resumed session closes it",
+		vsLog().indexOf(released) > vsLog().indexOf("respawn-pane"),
+	);
 	await stale.fire("session_shutdown");
 	await settle(150);
 	const after = record(stale.id);

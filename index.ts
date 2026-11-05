@@ -3945,10 +3945,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			(await run("tmux", ["display-message", "-p", "-t", entry.pane, "#{pane_dead}"], 2_000)).stdout === "1";
 		const respawn = async (): Promise<boolean> =>
 			(await run("tmux", ["respawn-pane", "-k", "-t", entry.pane, "-c", entry.cwd, command], 10_000)).ok;
+		// The hold only bridges the gap between the old process and the resume, so quitting the resume closes the pane.
+		const release = async (): Promise<void> => {
+			await run("tmux", ["set-option", "-p", "-u", "-t", entry.pane, "remain-on-exit"], 2_000);
+		};
 		await waitUntil(paneDead, RESTART_PANE_DEAD_WAIT_MS);
-		if (await respawn()) return;
+		if (await respawn()) return release();
 		await waitUntil(paneDead, RESTART_PANE_DEAD_WAIT_MS);
-		if (await respawn()) return;
+		if (await respawn()) return release();
 		await run("tmux", ["set-option", "-p", "-t", entry.pane, "remain-on-exit", "off"], 2_000);
 		const target = entry.tmuxSession || "omp";
 		const title = `restart ${entry.id.slice(0, 8)}`;
