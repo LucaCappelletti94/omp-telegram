@@ -13933,7 +13933,8 @@ case "$1" in
   list-panes) cat "$S/list_panes" ;;
   has-session) [ -e "$S/session_missing" ] && exit 1 || exit 0 ;;
   respawn-pane)
-    [ "$(cat "$S/respawn_fails" 2>/dev/null || echo 0)" = "0" ] || { echo "respawn refused" 1>&2; exit 1; }
+    F=$(cat "$S/respawn_fails" 2>/dev/null || echo 0)
+    [ "$F" = "0" ] || { echo $((F - 1)) > "$S/respawn_fails"; echo "respawn refused" 1>&2; exit 1; }
     printf '%s\n' "$@" >> "$S/argv" ;;
   *) exit 0 ;;
 esac
@@ -14135,6 +14136,12 @@ const vsRetire = (id) =>
 		log.includes("remain-on-exit on") &&
 			log.indexOf("remain-on-exit on") < log.indexOf("respawn-pane") &&
 			log.includes(`omp --resume '${transcript}'`),
+	);
+	const released = "set-option -p -u -t %9 remain-on-exit";
+	for (let i = 0; i < 20 && !vsLog().includes(released); i++) await settle(100);
+	check(
+		"the respawned pane is released, so quitting the resumed session closes it",
+		vsLog().indexOf(released) > vsLog().indexOf("respawn-pane"),
 	);
 	await stale.fire("session_shutdown");
 	await settle(150);
@@ -14412,7 +14419,7 @@ const vsRetire = (id) =>
 	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: old.pid });
 	vsSet("pane_pid", String(old.pid));
 	vsSet("pane_dead", "1");
-	vsSet("respawn_fails", "1");
+	vsSet("respawn_fails", "2");
 	vsLogReset();
 	vsPoller.heartbeat();
 	for (let i = 0; i < 40 && !vsLog().includes("new-window"); i++) await settle(100);
@@ -14433,6 +14440,40 @@ const vsRetire = (id) =>
 		"the new window is reported even though the resume confirmed",
 		vsWaveNotices() === 4 && lastVsNotice().includes("new window"),
 	);
+	await back.fire("session_shutdown");
+	vsRetire(stale.id);
+	vsSet("respawn_fails", "0");
+	old.kill("SIGKILL");
+}
+
+// A respawn that fails once succeeds on the retry, releases the pane and sends no notice.
+{
+	const folder = vsFolder("respawn-retry");
+	const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	const stale = spawn("01a1f1a0-0000-7000-8000-0000000000a0", folder, "Stale retried");
+	await stale.fire("session_start");
+	vsTranscript(stale.id);
+	vsCandidate(stale, folder, { codeStamp: "stale-stamp", pid: old.pid });
+	vsSet("pane_pid", String(old.pid));
+	vsSet("pane_dead", "1");
+	vsSet("respawn_fails", "1");
+	vsLogReset();
+	vsPoller.heartbeat();
+	const released = "set-option -p -u -t %9 remain-on-exit";
+	for (let i = 0; i < 40 && !vsLog().includes(released); i++) await settle(100);
+	const log = vsLog();
+	check(
+		"a respawn that fails once is retried in the same pane and the pane is released",
+		log.split("respawn-pane").length - 1 === 2 &&
+			log.indexOf(released) > log.lastIndexOf("respawn-pane") &&
+			!log.includes("new-window"),
+	);
+	const back = spawn(stale.id, folder, "Stale retried");
+	await back.fire("session_start");
+	await settle(100);
+	vsPoller.heartbeat();
+	await settle(200);
+	check("a respawn that succeeds on the retry sends no notice", vsWaveNotices() === 4);
 	await back.fire("session_shutdown");
 	vsRetire(stale.id);
 	vsSet("respawn_fails", "0");
@@ -14623,7 +14664,7 @@ const vsRetire = (id) =>
 	vsSet("pane_pid", String(old.pid));
 	vsSet("list_panes", `%9\t${old.pid}\t0\n`);
 	vsSet("pane_dead", "1");
-	vsSet("respawn_fails", "1");
+	vsSet("respawn_fails", "2");
 	writeFileSync(join(vsState, "session_missing"), "");
 	vsLogReset();
 	vsPoller.heartbeat();
