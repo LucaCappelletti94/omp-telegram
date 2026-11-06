@@ -69,7 +69,7 @@ Agents in different live sessions write to each other with `session_message`, ad
 
 Sessions record what they wait on with `session_graph`, and `upstream_launch` links a child to the session that launched it, so the graph keeps a year of dependency chains across restarts. Agents report their own status, and the session holding the Telegram connection polls each pull request on GitHub every ten minutes. An outcome such as a push, a merge or a fix found not needed wakes every session waiting on it, or, when that session has ended, is held and raises a Telegram card offering to resume it. `/deps` sends the graph as a Mermaid diagram rendered by [`mmdc`](https://github.com/mermaid-js/mermaid-cli) with the status of every node, and `/resume` lists the ended sessions with updates waiting.
 
-Resume reopens the session and delivers its held updates. Later keeps the offer open, and No closes it without buttons. Held updates remain available through `/resume` or a manual resume, and a new update raises a fresh card.
+The card names the tmux tab the session ran in. Resume reopens the session at that tab number in its tmux session, the same way Restore does, and delivers its held updates, and the card then names the tab it opened in. Later keeps the offer open, and No closes it without buttons. Held updates remain available through `/resume` or a manual resume, and a new update raises a fresh card.
 
 ## Restoring after a crash or reboot
 

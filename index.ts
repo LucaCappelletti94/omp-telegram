@@ -855,6 +855,8 @@ interface LaunchSpec {
 	/** Flags the session started with that a resume repeats, filtered by `resumeArgs`. */
 	argv: string[];
 	tmuxSession: string;
+	/** Index of the tmux window the session runs in, so a resume reopens it at the same tab. */
+	tmuxWindow: number | null;
 }
 
 interface LedgerNode extends GraphNode {
@@ -957,7 +959,11 @@ function parseNode(raw: unknown): LedgerNode | null {
 		updatedAt: n.updatedAt,
 		launch:
 			launch !== undefined && Array.isArray(launch.argv) && typeof launch.tmuxSession === "string"
-				? { argv: launch.argv.filter((a): a is string => typeof a === "string"), tmuxSession: launch.tmuxSession }
+				? {
+						argv: launch.argv.filter((a): a is string => typeof a === "string"),
+						tmuxSession: launch.tmuxSession,
+						tmuxWindow: typeof launch.tmuxWindow === "number" ? launch.tmuxWindow : null,
+					}
 				: undefined,
 	};
 }
@@ -2437,7 +2443,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			boot: BOOT_ID,
 			argv: launchSpec.argv,
 			tmux: launchSpec.tmuxSession,
-			tmuxWindow,
+			tmuxWindow: launchSpec.tmuxWindow,
 			tmuxPane,
 			lastInputAt: lastLocalInput,
 			codeStamp,
@@ -6469,8 +6475,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------------ dependency graph
 
-	const launchSpec: LaunchSpec = { argv: resumeArgs(process.argv.slice(2)), tmuxSession: "" };
-	let tmuxWindow: number | null = null;
+	const launchSpec: LaunchSpec = { argv: resumeArgs(process.argv.slice(2)), tmuxSession: "", tmuxWindow: null };
 
 	/** Where this pane sits, re-read on every heartbeat because windows move between tabs. */
 	async function readTmuxPlace(): Promise<void> {
@@ -6485,7 +6490,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!shown.ok) return;
 		const [name = "", index = ""] = shown.stdout.split("\t");
 		launchSpec.tmuxSession = name;
-		tmuxWindow = /^\d+$/u.test(index) ? Number(index) : null;
+		launchSpec.tmuxWindow = /^\d+$/u.test(index) ? Number(index) : null;
+	}
+
+	/** A tab as `session:window`, the way restart notices name it, or nothing when the place is unknown. */
+	function tabOf(place: LaunchSpec | undefined): string {
+		if (place === undefined || place.tmuxSession === "" || place.tmuxWindow === null) return "";
+		return `${place.tmuxSession}:${place.tmuxWindow}`;
+	}
+
+	/** ` in tmux `session:window``, or nothing when the tab is unknown. */
+	function inTab(tab: string): string {
+		return tab === "" ? "" : ` in tmux \`${tab}\``;
 	}
 
 	let lastGraphPoll = 0;
@@ -6545,7 +6561,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const node = readNode(sessionId);
 		if (node === null) return;
 		const relabel = badgeOverride.length > 0 && node.label !== workNameOf(badgeCode, badgeOverride, "");
-		if (relabel || node.emoji !== badgeEmoji || node.tag !== sessionTag || node.cwd !== ctx.cwd) saveOwnNode(ctx);
+		const moved =
+			node.launch?.tmuxSession !== launchSpec.tmuxSession || node.launch?.tmuxWindow !== launchSpec.tmuxWindow;
+		if (relabel || moved || node.emoji !== badgeEmoji || node.tag !== sessionTag || node.cwd !== ctx.cwd) {
+			saveOwnNode(ctx);
+		}
 	}
 
 	/** Ledger nodes, unclaimed launches, and edge ends that only the live registry knows. */
@@ -6684,10 +6704,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		removeStatePath(join(PENDING_DIR, id), "resuming.json");
 		if (items.length > 0) {
-			detach(
-				() => settleResumeCard(id, `\u2705 Delivered ${updates(items.length)} to **${titleOf(id)}**.`, false),
-				"resume card settle",
-			);
+			const text = `\u2705 Delivered ${updates(items.length)} to **${titleOf(id)}**${inTab(tabOf(launchSpec))}.`;
+			detach(() => settleResumeCard(id, text, false), "resume card settle");
 		}
 	}
 
@@ -6731,7 +6749,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						? `- ${item.summary}`
 						: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
 			);
-		const text = `\u23F8\uFE0F **${titleOf(id)}** has ended with ${updates(items.length)} waiting:\n${lines.join("\n")}\n\nResume it to deliver them?`;
+		const text = `\u23F8\uFE0F **${titleOf(id)}**${inTab(tabOf(readNode(id)?.launch))} has ended with ${updates(items.length)} waiting:\n${lines.join("\n")}\n\nResume it to deliver them?`;
 		const body = {
 			chat_id: config.chatId,
 			text: toTelegramHtml(fitToTelegram(text, "")),
@@ -6787,11 +6805,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	}
 
-	async function resumeSession(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
+	async function resumeSession(id: string): Promise<{ ok: true; tab: string } | { ok: false; error: string }> {
 		const node = readNode(id);
 		if (node === null) return { ok: false, error: "That session is not in the dependency graph." };
 		if (node.launch === undefined) return { ok: false, error: "That node has no omp session behind it to resume." };
-		return openOmp(id, node.cwd, node.launch.argv, node.launch.tmuxSession, null, nodePlace(node));
+		const { argv, tmuxSession, tmuxWindow } = node.launch;
+		return openOmp(id, node.cwd, argv, tmuxSession, tmuxWindow, nodePlace(node));
 	}
 
 	/**
@@ -6799,6 +6818,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * detached tmux session of that name when a reboot took it, so the poller needs no tmux of its
 	 * own. Detached, because a tap on the phone must not pull the terminal away from whoever sits at it.
 	 * A known `windowIndex` reopens the old tab number, or appends when another window holds it.
+	 * `tab` is where the window opened, as `session:window`.
 	 */
 	async function openOmp(
 		id: string,
@@ -6807,28 +6827,37 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		tmuxSession: string,
 		windowIndex: number | null,
 		name: string,
-	): Promise<{ ok: true } | { ok: false; error: string }> {
+	): Promise<{ ok: true; tab: string } | { ok: false; error: string }> {
 		if (!existsSync(cwd)) {
 			return { ok: false, error: `Its folder ${cwd} no longer exists, so omp would resume it somewhere else.` };
 		}
 		const target = tmuxSession || launchSpec.tmuxSession || "omp";
-		const window = ["-n", clip(name, 30), "-c", cwd, "omp", ...argv, "--resume", id];
+		const named = ["-n", clip(name, 30), "-c", cwd];
+		const command = ["omp", ...argv, "--resume", id];
+		const window = [...named, ...command];
 		if (!(await run("tmux", ["has-session", "-t", `=${target}`])).ok) {
 			const created = await run("tmux", ["new-session", "-d", "-s", target, "-P", "-F", "#{window_index}", ...window]);
 			if (!created.ok) return { ok: false, error: `tmux new-session failed: ${clip(created.stderr, 150)}` };
-			if (windowIndex !== null && created.stdout !== String(windowIndex)) {
-				await run("tmux", ["move-window", "-d", "-s", `${target}:${created.stdout}`, "-t", `${target}:${windowIndex}`]);
+			if (windowIndex === null || created.stdout === String(windowIndex)) {
+				return { ok: true, tab: `${target}:${created.stdout}` };
 			}
-			return { ok: true };
+			const moved = await run("tmux", [
+				"move-window",
+				"-d",
+				"-s",
+				`${target}:${created.stdout}`,
+				"-t",
+				`${target}:${windowIndex}`,
+			]);
+			return { ok: true, tab: `${target}:${moved.ok ? windowIndex : created.stdout}` };
 		}
-		if (
-			windowIndex !== null &&
-			(await run("tmux", ["new-window", "-d", "-t", `${target}:${windowIndex}`, ...window])).ok
-		) {
-			return { ok: true };
+		const placed = [...named, "-P", "-F", "#{session_name}:#{window_index}", ...command];
+		if (windowIndex !== null) {
+			const reopened = await run("tmux", ["new-window", "-d", "-t", `${target}:${windowIndex}`, ...placed]);
+			if (reopened.ok) return { ok: true, tab: reopened.stdout };
 		}
-		const opened = await run("tmux", ["new-window", "-d", "-t", `${target}:`, ...window]);
-		if (opened.ok) return { ok: true };
+		const opened = await run("tmux", ["new-window", "-d", "-t", `${target}:`, ...placed]);
+		if (opened.ok) return { ok: true, tab: opened.stdout };
 		return { ok: false, error: `tmux new-window failed: ${clip(opened.stderr, 150)}` };
 	}
 
@@ -6865,7 +6894,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				resumeInFlight.delete(id);
 				if (resumed.ok) {
 					writePrivateJson(join(PENDING_DIR, id), "resuming.json", { at: Date.now() });
-					const text = `\u25B6\uFE0F Resuming **${title}** in a new tmux window.`;
+					const text = `\u25B6\uFE0F Resuming **${title}**${inTab(resumed.tab)}.`;
 					await settleResumeCard(id, text, true);
 				} else {
 					removeStatePath(join(PENDING_DIR, id), "resuming.json");

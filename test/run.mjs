@@ -12039,9 +12039,15 @@ heading("dependency graph across sessions");
 		`#!/bin/sh\necho "$*" >> ${ghLog}\ncase "$1 $2" in\n  "pr view") if [ -f ${prGone} ]; then echo "GraphQL: Could not resolve to a Repository with the name 'someorg/docs'. (repository)" >&2; exit 1; fi; cat ${prJson} ;;\n  "pr list") printf '%s' "$GRAPH_PR_LIST" ;;\n  *) exit 1 ;;\nesac\n`,
 		{ mode: 0o755 },
 	);
+	// The pane sits where graphWhere says. A reopen at a tab prints that tab, unless graphTaken holds it,
+	// and an append lands on tab 6. The tmux session `gone` does not exist, so a resume there creates it,
+	// and graphTaken set to `move` refuses the move to the old tab.
+	const graphWhere = join(root, "graph-tmux-where");
+	const graphTaken = join(root, "graph-tmux-taken");
+	writeFileSync(graphWhere, "work\t4\n");
 	writeFileSync(
 		join(gBin, "tmux"),
-		`#!/bin/sh\necho "$*" >> ${tmuxLog}\ncase "$1" in\n  display-message) echo work ;;\n  has-session) exit 0 ;;\n  new-window) echo @77 ;;\nesac\n`,
+		`#!/bin/sh\necho "$*" >> ${tmuxLog}\ncase "$1" in\n  display-message) cat ${graphWhere} ;;\n  has-session) [ "$3" != "=gone" ] ;;\n  new-session) echo 0 ;;\n  move-window) [ "$(cat ${graphTaken} 2>/dev/null)" != "move" ] ;;\n  new-window) case "$4" in\n    *:) echo "\${4}6" ;;\n    *) [ "$4" = "$(cat ${graphTaken} 2>/dev/null)" ] && { echo "index in use" >&2; exit 1; }; echo "$4" ;;\n  esac ;;\nesac\n`,
 		{ mode: 0o755 },
 	);
 	const onePixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -12090,6 +12096,18 @@ heading("dependency graph across sessions");
 		"a status update writes the current code into the node label",
 		nodeOf(parentId).label === "WDG: wait on the widget fix",
 	);
+	check("the node records the tmux tab its session runs in", nodeOf(parentId).launch?.tmuxWindow === 4);
+	writeFileSync(graphWhere, "work\t5\n");
+	parent.heartbeat();
+	await settle(50);
+	parent.heartbeat();
+	await settle(50);
+	check("a session moved to another tab rewrites its node", nodeOf(parentId).launch?.tmuxWindow === 5);
+	writeFileSync(graphWhere, "work\t4\n");
+	parent.heartbeat();
+	await settle(50);
+	parent.heartbeat();
+	await settle(50);
 
 	const launchId = "0c1a1a00-0000-7000-8000-000000000001";
 	mkdirSync(join(graphDir, "launches"), { recursive: true });
@@ -12269,6 +12287,7 @@ heading("dependency graph across sessions");
 			.some((b) => b.text === "No" && b.callback_data === `n:${parentId}`) === true,
 	);
 	check("the card names what is waiting", card?.body.text.includes("merged") === true);
+	check("the card names the tmux tab the session ran in", card?.body.text.includes("<code>work:4</code>") === true);
 	jump(10 * 60_000 + 1_000);
 	beatAll(waiter, follower, child);
 	await settle(400);
@@ -12377,8 +12396,11 @@ heading("dependency graph across sessions");
 		"Resume opens a tmux window in the session's folder that resumes it",
 		resumed.includes("new-window") && resumed.includes(`-c ${appDir}`) && resumed.includes(`--resume ${parentId}`),
 	);
-	check("Resume targets the tmux session the node started in", resumed.includes("-t work:"));
-	check("the card says the session is resuming", lastCall("editMessageText").body.text.includes("Resuming"));
+	check("Resume reopens the session at the tab it ran in", resumed.includes("new-window -d -t work:4 "));
+	check(
+		"the card says the session is resuming in that tab",
+		/Resuming .*<code>work:4<\/code>/u.test(lastCall("editMessageText").body.text),
+	);
 	writeFileSync(tmuxLog, "");
 	api.queued = [
 		{
@@ -12457,6 +12479,94 @@ heading("dependency graph across sessions");
 				.some((c) => String(c.body.text).includes("no omp session")),
 	);
 	rmSync(nodeFile(orphan));
+
+	// Wherever the window lands, the card names the tab it got: the end of the tmux session when another
+	// window holds the old number, and the old number in a tmux session a reboot took, unless the move fails.
+	const landings = [
+		{
+			name: "a resume whose tab is taken appends the window",
+			tmux: "work",
+			window: 4,
+			never: "new-session",
+			taken: "work:4",
+			calls: ["new-window -d -t work:4 ", "new-window -d -t work: "],
+			tab: "work:6",
+		},
+		{
+			name: "a resume whose tmux session is gone recreates it at the old tab",
+			tmux: "gone",
+			window: 4,
+			never: "new-window",
+			taken: "",
+			calls: ["new-session -d -s gone ", "move-window -d -s gone:0 -t gone:4"],
+			tab: "gone:4",
+		},
+		{
+			name: "a recreated tmux session that refuses the move keeps the window where it opened",
+			tmux: "gone",
+			window: 4,
+			never: "new-window",
+			taken: "move",
+			calls: ["new-session -d -s gone ", "move-window -d -s gone:0 -t gone:4"],
+			tab: "gone:0",
+		},
+		{
+			name: "a node written before tabs were recorded reopens wherever its recreated tmux session starts",
+			tmux: "gone",
+			window: undefined,
+			taken: "",
+			calls: ["new-session -d -s gone "],
+			never: "move-window",
+			tab: "gone:0",
+		},
+	];
+	for (const [i, landing] of landings.entries()) {
+		const landId = `0c1a0008-0000-7000-8000-00000000000${i}`;
+		const landCard = 777010 + i;
+		writeFileSync(
+			nodeFile(landId),
+			JSON.stringify({
+				session: landId,
+				label: "Landing widget",
+				emoji: "",
+				tag: "",
+				cwd: appDir,
+				status: "pushed",
+				note: "",
+				edges: [],
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+				launch: { argv: [], tmuxSession: landing.tmux, tmuxWindow: landing.window },
+			}),
+		);
+		mkdirSync(join(graphDir, "pending", landId), { recursive: true });
+		writeFileSync(join(graphDir, "pending", landId, "card.json"), JSON.stringify({ messageId: landCard }));
+		writeFileSync(graphTaken, landing.taken);
+		writeFileSync(tmuxLog, "");
+		api.queued = [
+			{
+				update_id: 9117 + i,
+				callback_query: {
+					id: `gland${i}`,
+					data: `r:${landId}`,
+					from: { id: CHAT },
+					message: { message_id: landCard, chat: { id: CHAT } },
+				},
+			},
+		];
+		await waiter.pump(300);
+		const landLog = readFileSync(tmuxLog, "utf8");
+		const settled = called("editMessageText").findLast((c) => c.body.message_id === landCard);
+		check(
+			`${landing.name}, and the card names the tab it got`,
+			landing.calls.every((call) => landLog.includes(call)) &&
+				!landLog.includes(landing.never) &&
+				new RegExp(`Resuming .*<code>${landing.tab}</code>`, "u").test(settled?.body.text ?? ""),
+		);
+		rmSync(nodeFile(landId));
+		rmSync(join(graphDir, "pending", landId), { recursive: true });
+	}
+	rmSync(graphTaken);
 
 	// A slow tmux must not hold a Resume tap, so the answer lands at once and what is queued behind it
 	// moves on. A second tap while the first window is still opening starts nothing.
@@ -12564,7 +12674,10 @@ heading("dependency graph across sessions");
 	);
 	check("a held agent message keeps its agent attribution", back.customs[1].message.attribution === "agent");
 	check("a malformed held item is discarded with a warning", back.warns.length > 0 && pendingOf(parentId).length === 0);
-	check("the card says the items were delivered", lastCall("editMessageText").body.text.includes("Delivered"));
+	check(
+		"the card says the items were delivered, and where",
+		/Delivered .*<code>work:4<\/code>/u.test(lastCall("editMessageText").body.text),
+	);
 
 	// A launch nobody claimed shows as never started.
 	writeFileSync(
