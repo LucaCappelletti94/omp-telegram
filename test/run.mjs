@@ -104,7 +104,7 @@ globalThis.fetch = async (url, init) => {
 		(method === "deleteMessage" && (api.deleteRefusals ?? []).includes(body.message_id)) ||
 		(method === "deleteMessages" && body.message_ids.some((id) => (api.deleteRefusals ?? []).includes(id)))
 	) {
-		return { ok: false, status: 400, json: async () => ({ ok: false, description: "message can't be deleted" }) };
+		return { ok: false, status: 400, json: async () => ({ ok: false, description: "message to delete not found" }) };
 	}
 	if (api.rejectHtml && body.parse_mode === "HTML") {
 		return { ok: false, status: 400, json: async () => ({ ok: false, description: "can't parse entities" }) };
@@ -11044,9 +11044,10 @@ check(
 // ------------------------------------------------------------ upstream_launch
 heading("upstream_launch");
 {
-	const savedPath = process.env.PATH;
-	const savedHome = process.env.HOME;
-	const upBin = join(root, "up-bin");
+	const upId = "01a070f0-0000-0000-0000-000000000000";
+	const up2Id = "01a070f0-0000-0000-0000-000000000002";
+	const noCfgId = "01a070f1-0000-0000-0000-000000000000";
+	const upBin = join(root, "launch-bin");
 	mkdirSync(upBin, { recursive: true });
 	writeFileSync(
 		join(upBin, "gh"),
@@ -11054,8 +11055,9 @@ heading("upstream_launch");
 args="$*"
 [ -n "$GH_LOG" ] && echo "$args" >> "$GH_LOG"
 case "$args" in
-  "api user "*) if [ "$GH_NOLOGIN" = "1" ]; then exit 1; else echo "LucaCappelletti94"; fi ;;
-  *defaultBranchRef*) if [ "$GH_NODEFAULT" = "1" ]; then exit 1; else echo "main"; fi ;;
+  "api user "*)
+    if [ -n "$GH_SLOW" ]; then sleep 1; fi
+    if [ "$GH_NOLOGIN" = "1" ]; then exit 1; else echo "LucaCappelletti94"; fi ;;
   *"--method POST"*)
     if [ "$GH_FORKFAIL" = "1" ]; then echo "fork failed" 1>&2; exit 1
     elif [ -n "$GH_FORK_CREATED" ]; then echo "$GH_FORK_CREATED"
@@ -11066,6 +11068,8 @@ case "$args" in
   *".permissions.push"*)
     if [ "$GH_NOREPO" = "1" ]; then echo "Not Found (HTTP 404)" 1>&2; exit 1
     elif [ "$GH_PUSH" = "1" ]; then echo true; else echo false; fi ;;
+  *defaultBranchRef*) if [ "$GH_NODEFAULT" = "1" ]; then exit 1; else echo "main"; fi ;;
+  *"pr list"*) echo "no pr" ;;
   *) echo "unhandled gh $args" 1>&2; exit 1 ;;
 esac
 `,
@@ -11084,7 +11088,11 @@ case "$args" in
     done ;;
   *"show-ref"*) [ "$GIT_BRANCH_EXISTS" = "1" ] ;;
   *"remote add"*) if [ "$GIT_ADDFAIL" = "1" ]; then echo "add failed" 1>&2; exit 1; fi ;;
-  *clone*) if [ "$GIT_CLONEFAIL" = "1" ]; then echo "clone failed" 1>&2; exit 1; elif [ -n "$GIT_CLONE_FLAKY" ]; then if [ -f "$GIT_CLONE_FLAKY" ]; then exit 0; else : > "$GIT_CLONE_FLAKY"; echo "not ready" 1>&2; exit 1; fi; else exit 0; fi ;;
+  *clone*)
+    if [ "$GIT_CLONEFAIL" = "1" ]; then echo "clone failed" 1>&2; exit 1
+    elif [ -n "$GIT_CLONE_FLAKY" ]; then
+      if [ -f "$GIT_CLONE_FLAKY" ]; then exit 0; else : > "$GIT_CLONE_FLAKY"; echo "not ready" 1>&2; exit 1; fi
+    else exit 0; fi ;;
   *fetch*) if [ "$GIT_FETCHFAIL" = "1" ]; then echo "fetch failed" 1>&2; exit 1; else exit 0; fi ;;
   *"worktree add"*) if [ "$GIT_WTFAIL" = "1" ]; then echo "wt failed" 1>&2; exit 1; else exit 0; fi ;;
   *"worktree remove"*) last=""; for a in $args; do last="$a"; done; rm -rf "$last" ;;
@@ -11099,16 +11107,18 @@ esac
 [ -n "$TMUX_LOG" ] && echo "$*" >> "$TMUX_LOG"
 case "$1" in
   new-window) if [ "$TMUX_NEWWIN_FAIL" = "1" ]; then echo "nw failed" 1>&2; exit 1; else echo "@42"; fi ;;
-  display-message) printf 'work\\t3\\t1\\n' ;;
+  display-message) if [ "$TMUX_PLACE_FAIL" = "1" ]; then exit 1; fi; printf 'work\\t3\\t1\\n' ;;
   *) exit 0 ;;
 esac
 `,
 		{ mode: 0o755 },
 	);
-	process.env.PATH = `${upBin}:${savedPath}`;
-	const ghLog = join(root, "gh-invocations.log");
-	const gitLog = join(root, "git-invocations.log");
-	const tmuxLog = join(root, "tmux-invocations.log");
+	const ghLog = join(root, "launch-gh.log");
+	const gitLog = join(root, "launch-git.log");
+	const tmuxLog = join(root, "launch-tmux.log");
+	const oldPath = process.env.PATH;
+	const oldHome = process.env.HOME;
+	process.env.PATH = `${upBin}:${oldPath}`;
 	process.env.GH_LOG = ghLog;
 	process.env.GIT_LOG = gitLog;
 	process.env.TMUX_LOG = tmuxLog;
@@ -11119,116 +11129,215 @@ esac
 	process.env.HOME = root;
 	process.env.TMUX = "/tmp/fake-tmux,1,0";
 	process.env.TMUX_PANE = "%1";
-	writeConfig();
+	const requestsDir = join(root, "notify-telegram/graph/requests");
+	const launchesDir = join(root, "notify-telegram/graph/launches");
+	const nodesDir = join(root, "notify-telegram/graph/nodes");
+	const ghText = () => readFileSync(ghLog, "utf8");
+	const gitText = () => readFileSync(gitLog, "utf8");
+	const tmuxText = () => readFileSync(tmuxLog, "utf8");
+	const launchFiles = () =>
+		existsSync(launchesDir) ? readdirSync(launchesDir).filter((f) => f.endsWith(".json")) : [];
+	const requestOf = (id) => JSON.parse(readFileSync(join(requestsDir, `${id}.json`), "utf8"));
+	const cardOf = (id) =>
+		called("sendMessage")
+			.map((c) => c.body)
+			.find((b) => JSON.stringify(b).includes(`u:${id}:`));
+	const lastEdit = (id) =>
+		called("editMessageText")
+			.map((c) => c.body)
+			.filter((b) => b.message_id === id)
+			.at(-1);
+	const waitForEdit = async (id, predicate, timeout = 4_000) => {
+		const until = Date.now() + timeout;
+		while (Date.now() < until) {
+			const edited = lastEdit(id);
+			if (edited !== undefined && predicate(edited)) return edited;
+			await settle(50);
+		}
+		return lastEdit(id);
+	};
+	const cardKeyboard = (id) => (lastEdit(id)?.reply_markup ?? cardOf(id).reply_markup).inline_keyboard;
+	const toasts = () => called("answerCallbackQuery").map((c) => c.body.text ?? "");
+	const told = (needle) => up.customs.some((c) => String(c.message.content).includes(needle));
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
-
-	const workK = join(root, "work-K");
+	const workK = join(root, "work-L");
 	mkdirSync(workK, { recursive: true });
 	writeFileSync(join(workK, "req.md"), "# Problem\nThe parser rejects valid X.\n\n## Failure\nx\n\n## Corrected\ny\n");
-
-	const up = spawn("01a070f0-0000-0000-0000-000000000000", workK);
+	const up = spawn(upId, workK);
 	await up.fire("session_start");
-
-	const answerLaunch = async (session, choice) => {
-		await settle(90);
-		const button = lastCall("sendMessage")
-			.body.reply_markup.inline_keyboard.flat()
-			.find((b) => b.callback_data?.startsWith("o:"));
-		const askId = button.callback_data.split(":")[1];
-		mkdirSync(inboxOf(session.id), { recursive: true });
-		writeFileSync(
-			join(inboxOf(session.id), `${Date.now()}.json`),
-			JSON.stringify({ kind: "callback", value: `o:${askId}:0:${choice}` }),
-		);
-		await session.pump(160);
+	up.heartbeat();
+	await settle(100);
+	check(
+		"the poller lock is held by the requesting session",
+		JSON.parse(readFileSync(join(root, "notify-telegram/poller.lock"), "utf8")).sessionId === up.id,
+	);
+	const launchTool = (tag, params) =>
+		up.tools.get("upstream_launch").execute(tag, params, undefined, undefined, up.ctx);
+	let tapSeq = 0;
+	const tap = async (requestId, action) => {
+		const seq = ++tapSeq;
+		const cardId = requestOf(requestId).messageId;
+		api.queued = [
+			{
+				update_id: 9_000_000 + seq,
+				callback_query: {
+					id: `ltap${seq}`,
+					data: `u:${requestId}:${action}`,
+					from: { id: CHAT },
+					message: { message_id: cardId, chat: { id: CHAT } },
+				},
+			},
+		];
+		await up.pump(400);
+	};
+	const deliver = async () => {
+		await up.pump(200);
+		await up.pump(200);
+	};
+	const replyToCard = async (cardId, text) => {
+		api.queued = [
+			{
+				update_id: 17000 + ++tapSeq,
+				message: {
+					message_id: 17000 + tapSeq,
+					date: 1,
+					chat: { id: CHAT },
+					text,
+					reply_to_message: { message_id: cardId },
+				},
+			},
+		];
+		await deliver();
 	};
 
-	// a. The user's own repository: reuse an existing clone, fork nothing.
+	// a. A request returns at once and holds its work until the card is answered.
 	mkdirSync(join(root, "github", "dep", ".git", "info"), { recursive: true });
 	process.env.GIT_REMOTES = "origin git@github.com:LucaCappelletti94/dep.git";
-	const ownRun = up.tools
-		.get("upstream_launch")
-		.execute(
-			"u-own",
-			{ repo: "LucaCappelletti94/dep", document: "req.md", problem: "It rejects valid X." },
-			undefined,
-			undefined,
-			up.ctx,
-		);
-	await answerLaunch(up, 0);
-	const ownResult = await ownRun;
-	check("own-repo launch succeeds", ownResult.details?.launched === true);
+	const own = await launchTool("a", {
+		repo: "LucaCappelletti94/dep",
+		document: "req.md",
+		problem: "It rejects valid X.",
+	});
+	const ownId = own.details?.id;
 	check(
-		"own-repo launch uses the user's own repository",
-		ownResult.details?.mode === "own" && ownResult.details.created === false,
+		"a request does not block on the launch",
+		!own.isError && own.details?.requested === true && own.details?.state === "pending",
+		own.content[0].text,
 	);
 	check(
-		"launch cuts an upstream/ branch from the problem",
-		ownResult.details?.branch === "upstream/it-rejects-valid-x",
+		"a request tells the model the decision arrives as a message",
+		own.content[0].text.includes("Nothing launched yet") && own.content[0].text.includes("arrive as messages"),
+	);
+	const ownReq = requestOf(ownId);
+	check("the request file names the requester", ownReq.requester === upId);
+	check("the request file holds the document", ownReq.doc === readFileSync(join(workK, "req.md"), "utf8"));
+	check("the request file holds the requesting tmux session", ownReq.tmux === "work");
+	check("the request file names the card", typeof ownReq.messageId === "number");
+	check("the request file holds the requesting tmux window", ownReq.tmuxWindow === 3, String(ownReq.tmuxWindow));
+	check(
+		"the card names the repository and the problem",
+		cardOf(ownId).text.includes("LucaCappelletti94/dep") && cardOf(ownId).text.includes("It rejects valid X."),
 	);
 	check(
-		"launch carries the request into the worktree",
+		"the card carries the requester's head",
+		cardOf(ownId).text.includes("Task:") && cardOf(ownId).text.includes("Model:"),
+		cardOf(ownId).text,
+	);
+	check(
+		"the card names the requester's tab",
+		cardOf(ownId).text.includes("in tmux <code>work:3</code>. Nothing has launched yet."),
+		cardOf(ownId).text,
+	);
+	check("the card offers Launch, Cancel and already started", cardKeyboard(ownId).flat().length === 3);
+	freshLogs();
+	await settle(300);
+	check("nothing launches before the card is answered", ghText() === "" && gitText() === "" && tmuxText() === "");
+
+	// a2. The Launch tap runs the launch in the poller and settles the card.
+	await tap(ownId, "l");
+	check("the Launch tap toasts at once", toasts().at(-1) === "Starting it.", toasts().join("|"));
+	check(
+		"the Launch tap does not answer with a text message",
+		!called("sendMessage").some((c) => c.body.text === "Starting it."),
+	);
+	await settle(500);
+	const ownDone = requestOf(ownId);
+	check("the launch reaches the launched state", ownDone.state === "launched", ownDone.state);
+	check(
+		"the launch names the branch and the tab",
+		ownDone.branch === "upstream/it-rejects-valid-x" && ownDone.tab === "@42",
+		JSON.stringify(ownDone),
+	);
+	const ownCard = await waitForEdit(requestOf(ownId).messageId, (e) =>
+		String(e.text).includes("upstream/it-rejects-valid-x"),
+	);
+	check("the settled card names the branch", ownCard !== undefined, ownCard?.text);
+	check(
+		"the settled card keeps the requester's head",
+		String(ownCard?.text).includes("Task:") && String(ownCard?.text).includes("Model:"),
+		ownCard?.text,
+	);
+	check("the settled card carries no buttons", ownCard?.reply_markup.inline_keyboard.length === 0);
+	await deliver();
+	check("the requester is told the outcome", told("upstream/it-rejects-valid-x"));
+	const launchOutcome = up.customs.find((c) => String(c.message.content).includes("opened branch"));
+	check(
+		"the launch outcome reaches the requester written by no one",
+		launchOutcome !== undefined &&
+			launchOutcome.message.customType === "omp-telegram.dependency" &&
+			String(launchOutcome.message.content).includes("written by no one"),
+	);
+	check(
+		"the launch outcome is not attributed to the poller",
+		launchOutcome !== undefined && !String(launchOutcome.message.content).includes("from the agent of the omp session"),
+	);
+	check(
+		"the launch carries the request into the worktree",
 		existsSync(join(root, "github", "dep.upstreams", "it-rejects-valid-x", "upstream", "request.md")),
 	);
 	check(
-		"launch excludes upstream/ through the private exclude",
+		"the launch excludes upstream/ through the private exclude",
 		readFileSync(join(root, "github", "dep", ".git", "info", "exclude"), "utf8").includes("upstream/"),
 	);
-	check("launch reports the new tmux window", ownResult.details?.windowId === "@42");
-	check("launch notifies Telegram it opened", lastCall("sendMessage").body.text.includes("Upstream launched"));
-	check("case a neither lists nor creates a fork", !readFileSync(ghLog, "utf8").includes("forks"));
+	check("the own launch neither lists nor creates a fork", !ghText().includes("forks") && !ghText().includes("POST"));
+	check("the launching session gets a node so its dependency can reach it", existsSync(join(nodesDir, `${upId}.json`)));
+	const ownLaunch = launchFiles()
+		.map((f) => JSON.parse(readFileSync(join(launchesDir, f), "utf8")))
+		.find((l) => l.repo === "LucaCappelletti94/dep");
 	check(
-		"the launching session gets a node so its dependency can reach it",
-		existsSync(join(root, "notify-telegram/graph/nodes", `${up.id}.json`)),
-	);
-	const launchesDir = join(root, "notify-telegram/graph/launches");
-	const launchFiles = () =>
-		existsSync(launchesDir) ? readdirSync(launchesDir).filter((f) => f.endsWith(".json")) : [];
-	const ownLaunches = launchFiles().map((f) => JSON.parse(readFileSync(join(launchesDir, f), "utf8")));
-	const ownLaunch = ownLaunches.find((l) => l.repo === "LucaCappelletti94/dep");
-	check(
-		"launch records its parent, target and branch for the child to claim",
-		ownLaunch?.parent === up.id &&
+		"the launch records its parent, target and branch for the child to claim",
+		ownLaunch?.parent === upId &&
 			ownLaunch.branch === "upstream/it-rejects-valid-x" &&
 			ownLaunch.problem === "It rejects valid X.",
 	);
+	check("the launch window opens in the requesting session's tmux session", tmuxText().includes("new-window -t work:"));
 	check(
-		"the child window carries the launch id in its environment",
-		readFileSync(tmuxLog, "utf8").includes(`-e OMP_TELEGRAM_LAUNCH=${ownLaunch?.id}`),
+		"the launch window carries the launch id in its environment",
+		tmuxText().includes(`-e OMP_TELEGRAM_LAUNCH=${ownLaunch?.id}`),
 	);
-	check("the kickoff names the parent session to send doubts to", readFileSync(tmuxLog, "utf8").includes(up.id));
+	check("the kickoff names the parent session to send doubts to", tmuxText().includes(upId));
 	check(
 		"the launch file is private",
-		ownLaunch !== undefined && (statSync(join(launchesDir, `${ownLaunch.id}.json`)).mode & 0o077) === 0,
+		ownLaunch !== undefined && (statSync(join(launchesDir, `${ownLaunch.id}.json`)).mode & 0o777) === 0o600,
 	);
 
 	// b. A third-party repository with no fork yet: the fork is created, under whatever name GitHub gave it.
 	process.env.GH_FORK_CREATED = "LucaCappelletti94/widget-1";
 	freshLogs();
-	const forkRun = up.tools
-		.get("upstream_launch")
-		.execute(
-			"u-fork",
-			{ repo: "someorg/widget", document: "req.md", problem: "Widget mis-encodes Y." },
-			undefined,
-			undefined,
-			up.ctx,
-		);
-	await answerLaunch(up, 0);
-	const forkResult = await forkRun;
+	const fork = await launchTool("b", { repo: "someorg/widget", document: "req.md", problem: "Widget mis-encodes Y." });
+	const forkId = fork.details?.id;
+	await tap(forkId, "l");
+	await settle(500);
+	const forkDone = requestOf(forkId);
+	check("the forked launch reaches the launched state", forkDone.state === "launched", forkDone.state);
+	check("the forked launch names the branch", forkDone.branch === "upstream/widget-mis-encodes-y", forkDone.branch);
 	check(
-		"third-party launch creates a fork",
-		forkResult.details?.launched === true && forkResult.details.mode === "fork" && forkResult.details.created === true,
-	);
-	check(
-		"a created fork's real name is carried as the push repository",
-		forkResult.details?.pushRepo === "LucaCappelletti94/widget-1",
+		"the fork POST names the forked head",
+		ghText().includes("--method POST") && ghText().includes("repos/someorg/widget/forks"),
 	);
 	check(
 		"a created fork is cloned by its real name",
-		readFileSync(gitLog, "utf8").includes(
-			`clone git@github.com:LucaCappelletti94/widget-1.git ${join(root, "github", "widget")}`,
-		),
+		gitText().includes(`clone git@github.com:LucaCappelletti94/widget-1.git ${join(root, "github", "widget")}`),
 	);
 	check(
 		"the created fork's worktree holds the request",
@@ -11243,294 +11352,261 @@ esac
 	);
 	delete process.env.GH_FORK_CREATED;
 
-	// c. A third-party repository already forked: reuse it, fork nothing, and never re-point a remote
-	// that already names something else.
+	// c. A third-party repository already forked: reuse it, fork nothing, and never re-point a remote.
 	process.env.GH_FORK_EXISTING = "LucaCappelletti94/gadget";
 	mkdirSync(join(root, "github", "gadget", ".git", "info"), { recursive: true });
 	process.env.GIT_REMOTES =
 		"origin git@github.com:LucaCappelletti94/gadget.git;upstream git@github.com:someoneelse/gadget.git";
 	freshLogs();
-	const reuseRun = up.tools
-		.get("upstream_launch")
-		.execute(
-			"u-reuse",
-			{ repo: "someorg/gadget", document: "req.md", problem: "Gadget drops Z." },
-			undefined,
-			undefined,
-			up.ctx,
-		);
-	await answerLaunch(up, 0);
-	const reuseResult = await reuseRun;
-	check(
-		"an existing fork is reused without a new fork",
-		reuseResult.details?.launched === true &&
-			reuseResult.details.mode === "fork" &&
-			reuseResult.details.created === false,
-	);
-	check("case c reuses without forking", !readFileSync(ghLog, "utf8").includes("--method POST"));
-	const gadgetGit = readFileSync(gitLog, "utf8");
-	check("case c never re-points an existing remote", !gadgetGit.includes("set-url") && !gadgetGit.includes("rename"));
+	const reuse = await launchTool("c", { repo: "someorg/gadget", document: "req.md", problem: "Gadget drops Z." });
+	await tap(reuse.details?.id, "l");
+	await settle(500);
+	check("an existing fork is reused without a new fork", requestOf(reuse.details?.id).state === "launched");
+	check("case c reuses without forking", !ghText().includes("--method POST"));
+	check("case c never re-points an existing remote", !gitText().includes("set-url") && !gitText().includes("rename"));
 	check(
 		"case c adds the target under a free remote name and branches from it",
-		gadgetGit.includes("remote add someorg git@github.com:someorg/gadget.git") &&
-			/worktree add .* someorg\/main$/mu.test(gadgetGit),
+		gitText().includes("remote add someorg git@github.com:someorg/gadget.git") &&
+			/worktree add .* someorg\/main$/mu.test(gitText()),
 	);
 	delete process.env.GH_FORK_EXISTING;
+	process.env.GIT_REMOTES = "origin git@github.com:LucaCappelletti94/dep.git";
 
-	// d. Cancel forks, clones, and opens nothing.
-	const cancelRun = up.tools
-		.get("upstream_launch")
-		.execute(
-			"u-cancel",
-			{ repo: "someorg/thing", document: "req.md", problem: "Thing breaks." },
-			undefined,
-			undefined,
-			up.ctx,
-		);
-	await answerLaunch(up, 1);
-	const cancelResult = await cancelRun;
-	check("Cancel launches nothing", cancelResult.details?.launched === false);
+	// d. A Cancel tap closes the request without launching.
+	freshLogs();
+	const cancel = await launchTool("d", { repo: "someorg/thing", document: "req.md", problem: "Thing breaks." });
+	const cancelId = cancel.details?.id;
+	await tap(cancelId, "c");
+	await settle(300);
+	check("a Cancel tap closes the request", requestOf(cancelId).state === "cancelled");
+	const cancelCard = await waitForEdit(requestOf(cancelId).messageId, (e) => String(e.text).includes("Cancelled"));
+	check(
+		"the cancelled card settles without buttons",
+		cancelCard !== undefined && cancelCard.reply_markup.inline_keyboard.length === 0,
+		cancelCard?.text,
+	);
+	check("no tool runs for a cancelled request", ghText() === "" && gitText() === "" && tmuxText() === "");
+	await deliver();
+	check("the requester is told the cancel", told("cancelled on Telegram"));
 
-	const replyPeer = spawn("cc010001-0000-0000-0000-000000000000", workK);
-	await replyPeer.fire("session_start");
-	for (const [index, reply] of ["Another session is already fixing this.\nUse its result.", "Launch"].entries()) {
-		freshLogs();
-		const requestId = `u-reply-${index}`;
-		const replyRun = up.tools
-			.get("upstream_launch")
-			.execute(
-				requestId,
-				{ repo: "someorg/reply-only", document: "req.md", problem: "The parser rejects X." },
-				AbortSignal.timeout(3000),
-				undefined,
-				up.ctx,
-			);
-		await settle(90);
-		const questionId = record(up.id).question;
-		await replyPeer.tools
-			.get("notify_status")
-			.execute(
-				"u-peer-note",
-				{ summary: "Other work is waiting.", urgency: "orange" },
-				undefined,
-				undefined,
-				replyPeer.ctx,
-			);
-		await replyPeer.fire("session_stop");
-		await settle(90);
-		const peerSteers = replyPeer.steers.length;
-		const parentSteers = up.steers.length;
-		api.queued = [
-			{
-				update_id: 17000 + index,
-				message: {
-					message_id: 17000 + index,
-					date: 1,
-					chat: { id: CHAT },
-					text: reply,
-					reply_to_message: { message_id: questionId },
-				},
-			},
-		];
-		await up.pump(200);
-		await up.pump(200);
-		const replied = await replyRun;
-		check(
-			"a launch-confirmation reply reaches the model verbatim",
-			replied.details?.reason === "reply" &&
-				replied.details.reply === reply &&
-				replied.content.some((part) => part.text.includes(reply)),
-		);
-		check(
-			"free text never authorizes upstream work, including the word Launch",
-			replied.details?.launched === false &&
-				readFileSync(ghLog, "utf8") === "" &&
-				readFileSync(gitLog, "utf8") === "" &&
-				!readFileSync(tmuxLog, "utf8").includes("new-window"),
-		);
-		check(
-			"the reply stays with its requesting tool without a duplicate or foreign steer",
-			replyPeer.steers.length === peerSteers && up.steers.length === parentSteers,
-		);
-	}
-	await replyPeer.fire("session_shutdown");
+	// d2. A text reply to a card is the user's word, held for the requesting session and steered to it.
+	freshLogs();
+	const replyRes = await launchTool("d2", {
+		repo: "someorg/reply-only",
+		document: "req.md",
+		problem: "The parser rejects X.",
+	});
+	const replyId = replyRes.details?.id;
+	const replyText = "Another session is already fixing this.\nUse its result.";
+	await replyToCard(requestOf(replyId).messageId, replyText);
+	await settle(300);
+	check(
+		"a text reply to a card reaches the session as a user message",
+		up.steers.some((s) => steerText(s) === replyText),
+		JSON.stringify(up.steers.map((s) => steerText(s))),
+	);
+	check(
+		"a reply to a card is not an aside",
+		!up.customs.some((c) => String(c.message.content).includes("Use its result.")),
+	);
+	check("a text reply does not change the request state", requestOf(replyId).state === "pending");
+	check(
+		"a text reply does not launch",
+		ghText() === "" && gitText() === "" && !tmuxText().includes("new-window") && !tmuxText().includes("new-session"),
+	);
+	await launchTool("d2cancel", { action: "retract", id: replyId });
 
+	// d3. An already started tap closes the request with no launch.
 	freshLogs();
 	const launchesBeforeExisting = launchFiles().sort().join(",");
-	const existingAbort = new AbortController();
-	const existingTimeout = setTimeout(() => existingAbort.abort(), 1500);
-	const existingRun = up.tools
-		.get("upstream_launch")
-		.execute(
-			"u-already-started",
-			{ repo: "someorg/existing-work", document: "req.md", problem: "This upstream fix is already underway." },
-			existingAbort.signal,
-			undefined,
-			up.ctx,
-		);
-	await settle(90);
-	check(
-		"the confirmation offers existing upstream work",
-		lastCall("sendMessage")
-			.body.reply_markup.inline_keyboard.flat()
-			.some((button) => button.text === "Upstreaming has already started"),
+	const existing = await launchTool("d3", {
+		repo: "someorg/existing-work",
+		document: "req.md",
+		problem: "This upstream fix is already underway.",
+	});
+	const existingId = existing.details?.id;
+	await tap(existingId, "a");
+	await settle(300);
+	check("an already started tap closes the request", requestOf(existingId).state === "already-started");
+	const existingCard = await waitForEdit(requestOf(existingId).messageId, (e) =>
+		/already started/.test(String(e.text)),
 	);
-	await answerLaunch(up, 2);
-	const existingResult = await existingRun;
-	clearTimeout(existingTimeout);
+	check("the already started card settles", existingCard !== undefined, existingCard?.text);
 	check(
-		"existing upstream work is reported distinctly to the model",
-		existingResult.details?.launched === false &&
-			existingResult.details.reason === "already-started" &&
-			existingResult.content.some((part) => part.text.includes("already started")),
-	);
-	check(
-		"choosing existing work creates no duplicate upstream session",
-		readFileSync(ghLog, "utf8") === "" &&
-			readFileSync(gitLog, "utf8") === "" &&
-			!readFileSync(tmuxLog, "utf8").includes("new-window") &&
+		"an already started tap launches nothing and records nothing",
+		ghText() === "" &&
+			gitText() === "" &&
+			tmuxText() === "" &&
 			launchFiles().sort().join(",") === launchesBeforeExisting,
 	);
+	await deliver();
+	check("the requester is told the already started outcome", told("closed as already started"));
 
-	// e. Validation refuses before any confirmation is even shown.
-	const badRepo = await up.tools
-		.get("upstream_launch")
-		.execute("u-bad", { repo: "not-a-repo", document: "req.md", problem: "x" }, undefined, undefined, up.ctx);
-	check("a malformed repo is refused", badRepo.isError === true);
-	const noDoc = await up.tools
-		.get("upstream_launch")
-		.execute("u-nodoc", { repo: "a/b", document: "missing.md", problem: "x" }, undefined, undefined, up.ctx);
-	check("a missing request document is refused", noDoc.isError === true);
+	// e. Validation refuses before any request file or card.
+	const badRepo = await launchTool("e1", { repo: "not-a-repo", document: "req.md", problem: "x" });
+	check("a malformed repo is refused", badRepo.isError === true && badRepo.content[0].text.includes("owner/name"));
+	const noDoc = await launchTool("e2", { repo: "a/b", document: "missing.md", problem: "x" });
+	check(
+		"a missing request document is refused",
+		noDoc.isError === true && noDoc.content[0].text.includes("no request document"),
+	);
 	delete process.env.TMUX;
-	const noTmux = await up.tools
-		.get("upstream_launch")
-		.execute("u-notmux", { repo: "a/b", document: "req.md", problem: "x" }, undefined, undefined, up.ctx);
-	check("a launch without tmux is refused", noTmux.isError === true);
-
-	// f. Every failure path returns an error and opens nothing.
+	const noTmux = await launchTool("e3", { repo: "a/b", document: "req.md", problem: "x" });
 	process.env.TMUX = "/tmp/fake-tmux,1,0";
-	const errLaunch = async (tag, repo, problem, extra) => {
+	check(
+		"a request without tmux is refused",
+		noTmux.isError === true && noTmux.content[0].text.includes("no tmux session"),
+	);
+
+	// f. Every failure lands in the request file and keeps the card open.
+	const failLaunch = async (tag, repo, problem, extra, slug) => {
 		const prev = {};
-		for (const key of Object.keys(extra)) {
+		for (const [key, value] of Object.entries(extra)) {
 			prev[key] = process.env[key];
-			process.env[key] = extra[key];
+			process.env[key] = value;
 		}
-		const runp = up.tools
-			.get("upstream_launch")
-			.execute(tag, { repo, document: "req.md", problem }, undefined, undefined, up.ctx);
-		await answerLaunch(up, 0);
-		const res = await runp;
+		const res = await launchTool(tag, { repo, document: "req.md", problem, ...(slug === undefined ? {} : { slug }) });
+		const id = res.details?.id;
+		await tap(id, "l");
+		await settle(300);
 		for (const key of Object.keys(extra)) {
 			if (prev[key] === undefined) delete process.env[key];
 			else process.env[key] = prev[key];
 		}
-		return res;
+		return { id, res };
 	};
-
-	const noLogin = await errLaunch("e-login", "LucaCappelletti94/dep", "P.", { GH_NOLOGIN: "1" });
-	check("an unreadable gh login is refused", noLogin.isError === true);
-
-	const noTarget = await errLaunch("e-notarget", "someorg/gone", "P.", { GH_NOREPO: "1" });
-	check("an unreadable target repository is refused", noTarget.isError === true);
-
+	const checkFailed = (label, id, needle) => {
+		const r = requestOf(id);
+		check(`${label}: the state is failed`, r.state === "failed", r.state);
+		check(`${label}: the error names the cause`, String(r.error).includes(needle), r.error);
+		check(`${label}: the card keeps the Launch and Cancel buttons`, cardKeyboard(id).flat().length === 3);
+	};
+	{
+		const { id } = await failLaunch("e-login", "LucaCappelletti94/dep", "P.", { GH_NOLOGIN: "1" });
+		checkFailed("an unreadable gh login", id, "could not read your GitHub login");
+		freshLogs();
+		await tap(id, "l");
+		await settle(600);
+		check(
+			"a retry tap on a failed request relaunches",
+			requestOf(id).state === "launched" &&
+				gitText().includes("worktree add") &&
+				tmuxText().includes("new-window -t work:"),
+		);
+		await deliver();
+	}
+	const { id: noTargetId } = await failLaunch("e-notarget", "someorg/gone", "P.", { GH_NOREPO: "1" });
+	checkFailed("an unreadable target repository", noTargetId, "from GitHub");
 	freshLogs();
-	const forksFail = await errLaunch("e-forksfail", "someorg/unlisted", "P.", { GH_FORKSFAIL: "1" });
-	check(
-		"a fork lookup that fails is refused without forking",
-		forksFail.isError === true && !readFileSync(ghLog, "utf8").includes("--method POST"),
-	);
-
+	const { id: forksFailId } = await failLaunch("e-forksfail", "someorg/unlisted", "P.", { GH_FORKSFAIL: "1" });
+	checkFailed("a failing fork lookup", forksFailId, "could not look up your fork");
+	check("a failing fork lookup does not fork", !ghText().includes("--method POST"));
 	mkdirSync(join(root, "github", "diffrepo", ".git", "info"), { recursive: true });
-	const wrongRepo = await errLaunch("e-wrong", "LucaCappelletti94/diffrepo", "P.", {
+	const { id: wrongForkId } = await failLaunch("e-wrong", "LucaCappelletti94/diffrepo", "P.", {
 		GIT_REMOTES: "origin git@github.com:someoneelse/other.git",
 	});
-	check("a clone holding a different repository is refused", wrongRepo.isError === true);
-
-	const forkFail = await errLaunch("e-forkfail", "someorg/ff", "P.", { GH_FORKFAIL: "1" });
-	check("a failed fork is reported", forkFail.isError === true);
-
-	const cloneFail = await errLaunch("e-clonefail", "LucaCappelletti94/clonefail", "P.", { GIT_CLONEFAIL: "1" });
-	check("a failed clone is reported", cloneFail.isError === true);
-
+	checkFailed("a clone holding a different repository", wrongForkId, "no remote pointing at");
+	const { id: forkFailId } = await failLaunch("e-forkfail", "someorg/ff", "P.", { GH_FORKFAIL: "1" });
+	checkFailed("a refused fork creation", forkFailId, "forking someorg/ff failed");
+	const { id: cloneFailId } = await failLaunch("e-clonefail", "LucaCappelletti94/clonefail", "P.", {
+		GIT_CLONEFAIL: "1",
+	});
+	checkFailed("a failing clone", cloneFailId, "git clone");
 	mkdirSync(join(root, "github", "fetchfail", ".git", "info"), { recursive: true });
-	const fetchFail = await errLaunch("e-fetchfail", "LucaCappelletti94/fetchfail", "P.", {
+	const { id: fetchFailId } = await failLaunch("e-fetchfail", "LucaCappelletti94/fetchfail", "P.", {
 		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/fetchfail.git",
 		GIT_FETCHFAIL: "1",
 	});
-	check("a failed fetch is reported", fetchFail.isError === true);
-
+	checkFailed("a failing fetch", fetchFailId, "git fetch");
 	mkdirSync(join(root, "github", "deffail", ".git", "info"), { recursive: true });
-	const defFail = await errLaunch("e-deffail", "LucaCappelletti94/deffail", "P.", {
+	const { id: defFailId } = await failLaunch("e-deffail", "LucaCappelletti94/deffail", "P.", {
 		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/deffail.git",
 		GH_NODEFAULT: "1",
 	});
-	check("an unreadable default branch is reported", defFail.isError === true);
-
+	checkFailed("a missing default branch", defFailId, "default branch");
 	mkdirSync(join(root, "github", "wtfail", ".git", "info"), { recursive: true });
-	const wtFail = await errLaunch("e-wtfail", "LucaCappelletti94/wtfail", "P.", {
+	const { id: wtFailId } = await failLaunch("e-wtfail", "LucaCappelletti94/wtfail", "P.", {
 		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/wtfail.git",
 		GIT_WTFAIL: "1",
 	});
-	check("a failed worktree add is reported", wtFail.isError === true);
-
+	checkFailed("a failing worktree add", wtFailId, "git worktree add failed");
 	mkdirSync(join(root, "github", "wtexists", ".git", "info"), { recursive: true });
 	mkdirSync(join(root, "github", "wtexists.upstreams", "edge-case"), { recursive: true });
-	const wtExists = await errLaunch("e-wtexists", "LucaCappelletti94/wtexists", "Edge case.", {
+	const { id: wtExistsId } = await failLaunch("e-wtexists", "LucaCappelletti94/wtexists", "Edge case.", {
 		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/wtexists.git",
 	});
-	check("an existing worktree is refused", wtExists.isError === true);
+	checkFailed("an existing worktree", wtExistsId, "a worktree already exists");
+	await deliver();
+	check("the requester is told the failure", told("a worktree already exists"));
 
-	// g. Document that exists but cannot be read as text (a directory), and an empty one.
-	const dirDoc = await up.tools
-		.get("upstream_launch")
-		.execute("e-dirdoc", { repo: "a/b", document: ".", problem: "P." }, undefined, undefined, up.ctx);
+	// g. A directory or an empty document is refused.
+	const dirDoc = await launchTool("g1", { repo: "a/b", document: ".", problem: "P." });
 	check("a document that is a directory is refused", dirDoc.isError === true);
 	writeFileSync(join(workK, "empty.md"), "   \n");
-	const emptyDoc = await up.tools
-		.get("upstream_launch")
-		.execute("e-empty", { repo: "a/b", document: "empty.md", problem: "P." }, undefined, undefined, up.ctx);
+	const emptyDoc = await launchTool("g2", { repo: "a/b", document: "empty.md", problem: "P." });
 	check("an empty request document is refused", emptyDoc.isError === true);
 
 	// h. A session with no Telegram config refuses before anything else.
 	const cfgBackup = readFileSync(join(root, "notify-telegram.json"), "utf8");
 	writeFileSync(join(root, "notify-telegram.json"), "");
-	const noCfg = spawn("01a070f1-0000-0000-0000-000000000000", workK);
+	const noCfg = spawn(noCfgId, workK);
 	await noCfg.fire("session_start");
-	const noCfgResult = await noCfg.tools
+	const requestsBeforeNoCfg = existsSync(requestsDir) ? readdirSync(requestsDir).length : 0;
+	const noCfgRes = await noCfg.tools
 		.get("upstream_launch")
-		.execute("e-nocfg", { repo: "a/b", document: "req.md", problem: "P." }, undefined, undefined, noCfg.ctx);
-	check("a session without Telegram config is refused", noCfgResult.isError === true);
+		.execute("h", { repo: "a/b", document: "req.md", problem: "P." }, undefined, undefined, noCfg.ctx);
+	check(
+		"a session without a bot config refuses the request",
+		noCfgRes.isError === true && noCfgRes.content[0].text.includes("Telegram is not configured"),
+	);
+	check("a refused request writes no request file", readdirSync(requestsDir).length === requestsBeforeNoCfg);
 	writeFileSync(join(root, "notify-telegram.json"), cfgBackup);
 
-	// i. A confirmation card that cannot be sent refuses instead of hanging.
+	// i. A card that cannot be sent is refused without a request file.
+	const requestsBeforeSend = readdirSync(requestsDir).length;
 	api.failMethods = ["sendMessage"];
-	const undelivered = await up.tools
-		.get("upstream_launch")
-		.execute("e-undelivered", { repo: "a/b", document: "req.md", problem: "P." }, undefined, undefined, up.ctx);
+	api.failDescription = "telegram down";
+	const sendFail = await launchTool("i", { repo: "a/b", document: "req.md", problem: "P." });
 	api.failMethods = [];
-	check("an undelivered confirmation card is refused, not hung", undelivered.isError === true);
+	check(
+		"an unsent card refuses the request",
+		sendFail.isError === true && sendFail.content[0].text.includes("could not send the launch card"),
+	);
+	check("an unsent card writes no request file", readdirSync(requestsDir).length === requestsBeforeSend);
 
-	// j. A signal already aborted before the wait cancels instead of hanging forever.
-	const preAborted = new AbortController();
-	preAborted.abort();
-	const aborted = await up.tools
-		.get("upstream_launch")
-		.execute("e-aborted", { repo: "a/b", document: "req.md", problem: "P." }, preAborted.signal, undefined, up.ctx);
-	check("a pre-aborted signal cancels without hanging", aborted.details?.launched === false);
-
-	// k. A fresh fork whose first clone is not ready yet is retried to success.
+	// j. A fresh fork whose first clone is not ready yet is retried to success.
 	const flakyMarker = join(root, "flaky-clone-marker");
 	rmSync(flakyMarker, { force: true });
-	const flaky = await errLaunch("e-flaky", "someorg/flaky", "P.", { GIT_CLONE_FLAKY: flakyMarker });
-	check("a fork whose first clone is not ready is retried to success", flaky.details?.launched === true);
+	const flaky = await launchTool("j", { repo: "someorg/flaky", document: "req.md", problem: "P." });
+	process.env.GIT_CLONE_FLAKY = flakyMarker;
+	await tap(flaky.details?.id, "l");
+	await settle(2_800);
+	delete process.env.GIT_CLONE_FLAKY;
+	check(
+		"a fork whose first clone is not ready is retried to success",
+		requestOf(flaky.details?.id).state === "launched",
+		requestOf(flaky.details?.id).state,
+	);
+	check("the flaky clone ran twice", (gitText().match(/clone /g) ?? []).length >= 2);
 
-	// l. A launch that cannot open its tmux window rolls the worktree back and reports it.
+	// k. A launch that cannot open its tmux window rolls the worktree back and reports it.
 	mkdirSync(join(root, "github", "rollback", ".git", "info"), { recursive: true });
-	const rolledBack = await errLaunch("e-rollback", "LucaCappelletti94/rollback", "P.", {
-		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/rollback.git",
-		TMUX_NEWWIN_FAIL: "1",
+	const rolledBack = await launchTool("k", {
+		repo: "LucaCappelletti94/rollback",
+		document: "req.md",
+		problem: "P.",
+		slug: "p",
 	});
-	check("a failed tmux window rolls the launch back and reports it", rolledBack.isError === true);
+	process.env.GIT_REMOTES = "origin git@github.com:LucaCappelletti94/rollback.git";
+	process.env.TMUX_NEWWIN_FAIL = "1";
+	await tap(rolledBack.details?.id, "l");
+	await settle(400);
+	delete process.env.TMUX_NEWWIN_FAIL;
+	check(
+		"a failed tmux window fails the launch",
+		requestOf(rolledBack.details?.id).state === "failed" &&
+			String(requestOf(rolledBack.details?.id).error).includes("tmux new-window failed"),
+	);
 	check("the rolled-back worktree is gone", !existsSync(join(root, "github", "rollback.upstreams", "p")));
 	check(
 		"a rolled-back launch leaves no launch record",
@@ -11538,262 +11614,1093 @@ esac
 			(f) => JSON.parse(readFileSync(join(launchesDir, f), "utf8")).repo === "LucaCappelletti94/rollback",
 		),
 	);
+	check("the failed window card keeps its buttons", cardKeyboard(rolledBack.details?.id).flat().length === 3);
+	await deliver();
+
+	// l..y the launch mechanics, each through its own request.
+	const entry = async (tag, params, env) => {
+		const prev = {};
+		for (const [key, value] of Object.entries(env)) {
+			prev[key] = process.env[key];
+			process.env[key] = value;
+		}
+		freshLogs();
+		const res = await launchTool(tag, params);
+		const id = res.details?.id;
+		await tap(id, "l");
+		await settle(400);
+		for (const key of Object.keys(env)) {
+			if (prev[key] === undefined) delete process.env[key];
+			else process.env[key] = prev[key];
+		}
+		return { id, git: gitText(), gh: ghText(), tmux: tmuxText() };
+	};
 
 	// m. A fork named differently from its parent is found by its parent and used by its real name.
-	freshLogs();
-	const renamed = await errLaunch("m-renamed", "upstreamorg/longname-rs", "P.", {
-		GH_FORK_EXISTING: "LucaCappelletti94/shortname-rs",
-	});
-	const renamedGit = readFileSync(gitLog, "utf8");
-	const renamedKickoff = readFileSync(tmuxLog, "utf8");
-	check(
-		"a differently named fork is reused without forking again",
-		renamed.details?.launched === true &&
-			renamed.details.created === false &&
-			renamed.details.pushRepo === "LucaCappelletti94/shortname-rs" &&
-			!readFileSync(ghLog, "utf8").includes("--method POST"),
-	);
-	check(
-		"a differently named fork is cloned by its real name",
-		renamedGit.includes(
-			`clone git@github.com:LucaCappelletti94/shortname-rs.git ${join(root, "github", "longname-rs")}`,
-		),
-	);
-	check(
-		"the fresh fork clone gains the target remote and branches from it",
-		renamedGit.includes("remote add upstream git@github.com:upstreamorg/longname-rs.git") &&
-			/worktree add .* upstream\/main$/mu.test(renamedGit),
-	);
-	check(
-		"the kickoff names the fork's push remote and its real compare page",
-		renamedKickoff.includes("`origin`") &&
-			renamedKickoff.includes(
+	{
+		const { id, git, gh, tmux } = await entry(
+			"m",
+			{ repo: "upstreamorg/longname-rs", document: "req.md", problem: "P." },
+			{
+				GH_FORK_EXISTING: "LucaCappelletti94/shortname-rs",
+			},
+		);
+		check(
+			"a differently named fork is reused without forking again",
+			requestOf(id).state === "launched" && !gh.includes("--method POST"),
+		);
+		check(
+			"a differently named fork is cloned by its real name",
+			git.includes(`clone git@github.com:LucaCappelletti94/shortname-rs.git ${join(root, "github", "longname-rs")}`),
+		);
+		check(
+			"the fresh fork clone gains the target remote and branches from it",
+			git.includes("remote add upstream git@github.com:upstreamorg/longname-rs.git") &&
+				/worktree add .* upstream\/main$/mu.test(git),
+		);
+		check(
+			"the kickoff names the fork's real compare page",
+			tmux.includes(
 				"https://github.com/upstreamorg/longname-rs/compare/main...LucaCappelletti94:shortname-rs:upstream/p",
 			),
-	);
+		);
+		await deliver();
+	}
 
 	// n. A clone whose origin is the target and whose fork sits on another remote is used as it stands.
-	const splitPath = join(root, "github", "sqlish-rs");
-	mkdirSync(join(splitPath, ".git", "info"), { recursive: true });
-	freshLogs();
-	const split = await errLaunch("n-split", "upstreamorg/sqlish-rs", "P.", {
-		GH_FORK_EXISTING: "LucaCappelletti94/sqlish",
-		GIT_REMOTES: "origin git@github.com:upstreamorg/sqlish-rs.git;fork git@github.com:LucaCappelletti94/sqlish.git",
-	});
-	const splitGit = readFileSync(gitLog, "utf8");
-	const splitKickoff = readFileSync(tmuxLog, "utf8");
-	check(
-		"a clone with the target on origin launches",
-		split.details?.launched === true && split.details.mode === "fork",
-	);
-	check(
-		"a clone with both remotes present is neither re-cloned nor re-wired",
-		!/^(?:clone |.*remote (?:add|set-url|rename|remove))/mu.test(splitGit),
-	);
-	check(
-		"the branch is cut from the remote that points at the target",
-		splitGit.includes(`-C ${splitPath} fetch origin`) && /worktree add .* origin\/main$/mu.test(splitGit),
-	);
-	check(
-		"the kickoff names the remote that points at the fork",
-		splitKickoff.includes("`fork`") &&
-			splitKickoff.includes(
-				"https://github.com/upstreamorg/sqlish-rs/compare/main...LucaCappelletti94:sqlish:upstream/p",
-			),
-	);
+	{
+		const splitPath = join(root, "github", "sqlish-rs");
+		mkdirSync(join(splitPath, ".git", "info"), { recursive: true });
+		const { id, git, tmux } = await entry(
+			"n",
+			{ repo: "upstreamorg/sqlish-rs", document: "req.md", problem: "P." },
+			{
+				GH_FORK_EXISTING: "LucaCappelletti94/sqlish",
+				GIT_REMOTES: "origin git@github.com:upstreamorg/sqlish-rs.git;fork git@github.com:LucaCappelletti94/sqlish.git",
+			},
+		);
+		check("a clone with the target on origin launches", requestOf(id).state === "launched");
+		check(
+			"a clone with both remotes present is neither re-cloned nor re-wired",
+			!/^(?:clone |.*remote (?:add|set-url|rename|remove))/mu.test(git),
+		);
+		check(
+			"the branch is cut from the remote that points at the target",
+			git.includes(`-C ${splitPath} fetch origin`) && /worktree add .* origin\/main$/mu.test(git),
+		);
+		check(
+			"the kickoff names the remote that points at the fork",
+			tmux.includes("`fork`") &&
+				tmux.includes("https://github.com/upstreamorg/sqlish-rs/compare/main...LucaCappelletti94:sqlish:upstream/p"),
+		);
+		await deliver();
+	}
 
-	// o. With push permission on the target, the branch goes to the target itself and no fork is involved.
-	mkdirSync(join(root, "github", "maintained", ".git", "info"), { recursive: true });
-	freshLogs();
-	const maintained = await errLaunch("o-push", "upstreamorg/maintained", "P.", {
-		GH_PUSH: "1",
-		GIT_REMOTES:
-			"origin git@github.com:upstreamorg/maintained.git;fork git@github.com:LucaCappelletti94/maintained-fork.git",
-	});
-	const maintainedGit = readFileSync(gitLog, "utf8");
-	const maintainedKickoff = readFileSync(tmuxLog, "utf8");
-	check(
-		"push permission launches against the target itself",
-		maintained.details?.launched === true &&
-			maintained.details.mode === "maintainer" &&
-			maintained.details.pushRepo === "upstreamorg/maintained",
-	);
-	check("push permission never looks for or makes a fork", !readFileSync(ghLog, "utf8").includes("forks"));
-	check(
-		"push permission branches from the target remote without re-wiring",
-		/worktree add .* origin\/main$/mu.test(maintainedGit) && !/remote (add|set-url|rename|remove)/u.test(maintainedGit),
-	);
-	check(
-		"the kickoff sends the push to the target remote",
-		maintainedKickoff.includes("`origin`") &&
-			maintainedKickoff.includes("https://github.com/upstreamorg/maintained/compare/main...upstream/p"),
-	);
+	// o. With push permission on the target, the branch goes to the target itself.
+	{
+		mkdirSync(join(root, "github", "maintained", ".git", "info"), { recursive: true });
+		const { id, git, gh, tmux } = await entry(
+			"o",
+			{ repo: "upstreamorg/maintained", document: "req.md", problem: "P." },
+			{
+				GH_PUSH: "1",
+				GIT_REMOTES:
+					"origin git@github.com:upstreamorg/maintained.git;fork git@github.com:LucaCappelletti94/maintained-fork.git",
+			},
+		);
+		check("push permission launches against the target itself", requestOf(id).state === "launched");
+		check("push permission never looks for or makes a fork", !gh.includes("forks"));
+		check(
+			"push permission branches from the target remote without re-wiring",
+			/worktree add .* origin\/main$/mu.test(git) && !/remote (add|set-url|rename|remove)/u.test(git),
+		);
+		check(
+			"the kickoff sends the push to the target remote",
+			tmux.includes("`origin`") && tmux.includes("https://github.com/upstreamorg/maintained/compare/main...upstream/p"),
+		);
+		await deliver();
+	}
 
 	// p. A clone with no remote pointing at the target or the fork is refused and left untouched.
-	const strangerPath = join(root, "github", "stranger");
-	mkdirSync(join(strangerPath, ".git", "info"), { recursive: true });
-	freshLogs();
-	const stranger = await errLaunch("p-stranger", "upstreamorg/stranger", "P.", {
-		GH_FORK_EXISTING: "LucaCappelletti94/stranger-fork",
-		GIT_REMOTES: "origin git@github.com:someoneelse/other.git;upstream git@github.com:third/party.git",
-	});
-	const strangerText = stranger.content?.[0]?.text ?? "";
-	const strangerGit = readFileSync(gitLog, "utf8")
-		.split("\n")
-		.filter((line) => line.length > 0);
-	check("a clone pointing at neither repository is refused", stranger.isError === true);
-	check(
-		"the refusal names both repositories it looked for",
-		strangerText.includes("upstreamorg/stranger") && strangerText.includes("LucaCappelletti94/stranger-fork"),
-	);
-	check(
-		"the refused clone is only read, never touched",
-		strangerGit.length > 0 && strangerGit.every((line) => line === `-C ${strangerPath} remote -v`),
-	);
-	check("no worktree is cut for a refused clone", !existsSync(join(root, "github", "stranger.upstreams")));
+	{
+		const strangerPath = join(root, "github", "stranger");
+		mkdirSync(join(strangerPath, ".git", "info"), { recursive: true });
+		const { id, git } = await entry(
+			"p",
+			{ repo: "upstreamorg/stranger", document: "req.md", problem: "P." },
+			{
+				GH_FORK_EXISTING: "LucaCappelletti94/stranger-fork",
+				GIT_REMOTES: "origin git@github.com:someoneelse/other.git;upstream git@github.com:third/party.git",
+			},
+		);
+		const r = requestOf(id);
+		check("a clone pointing at neither repository is refused", r.state === "failed");
+		check(
+			"the refusal names both repositories it looked for",
+			String(r.error).includes("upstreamorg/stranger") && String(r.error).includes("LucaCappelletti94/stranger-fork"),
+			r.error,
+		);
+		check(
+			"the refused clone is only read, never touched",
+			git
+				.split("\n")
+				.filter((line) => line.length > 0)
+				.every((line) => line === `-C ${strangerPath} remote -v`),
+		);
+		check("no worktree is cut for a refused clone", !existsSync(join(root, "github", "stranger.upstreams")));
+		await deliver();
+	}
 
 	// q. A branch left by an earlier launch is refused, never reset over its commits.
-	mkdirSync(join(root, "github", "branchy", ".git", "info"), { recursive: true });
-	freshLogs();
-	const branchy = await errLaunch("q-branchy", "LucaCappelletti94/branchy", "P.", {
-		GIT_REMOTES: "origin git@github.com:LucaCappelletti94/branchy.git",
-		GIT_BRANCH_EXISTS: "1",
-	});
-	check(
-		"an existing upstream branch is refused by name",
-		branchy.isError === true && (branchy.content?.[0]?.text ?? "").includes("upstream/p"),
-	);
-	check("an existing upstream branch is never reset", !readFileSync(gitLog, "utf8").includes("worktree add"));
+	{
+		mkdirSync(join(root, "github", "branchy", ".git", "info"), { recursive: true });
+		const { id, git } = await entry(
+			"q",
+			{ repo: "LucaCappelletti94/branchy", document: "req.md", problem: "P." },
+			{
+				GIT_REMOTES: "origin git@github.com:LucaCappelletti94/branchy.git",
+				GIT_BRANCH_EXISTS: "1",
+			},
+		);
+		check(
+			"an existing upstream branch is refused by name",
+			requestOf(id).state === "failed" && String(requestOf(id).error).includes("upstream/p"),
+		);
+		check("an existing upstream branch is never reset", !git.includes("worktree add"));
+		await deliver();
+	}
 
 	// r. When every preferred remote name is held by something else, the target gets a numbered one.
-	mkdirSync(join(root, "github", "crowded", ".git", "info"), { recursive: true });
-	freshLogs();
-	const crowded = await errLaunch("r-crowded", "crowdorg/crowded", "P.", {
-		GH_FORK_EXISTING: "LucaCappelletti94/crowded",
-		GIT_REMOTES:
-			"origin git@github.com:LucaCappelletti94/crowded.git;upstream git@github.com:x/crowded.git;crowdorg git@github.com:y/crowded.git",
-	});
-	const crowdedGit = readFileSync(gitLog, "utf8");
-	check(
-		"a crowded clone gains the target under a numbered name and branches from it",
-		crowded.details?.launched === true &&
-			crowdedGit.includes("remote add upstream-2 git@github.com:crowdorg/crowded.git") &&
-			/worktree add .* upstream-2\/main$/mu.test(crowdedGit),
-	);
+	{
+		mkdirSync(join(root, "github", "crowded", ".git", "info"), { recursive: true });
+		const { id, git } = await entry(
+			"r",
+			{ repo: "crowdorg/crowded", document: "req.md", problem: "P." },
+			{
+				GH_FORK_EXISTING: "LucaCappelletti94/crowded",
+				GIT_REMOTES:
+					"origin git@github.com:LucaCappelletti94/crowded.git;upstream git@github.com:x/crowded.git;crowdorg git@github.com:y/crowded.git",
+			},
+		);
+		check(
+			"a crowded clone gains the target under a numbered name and branches from it",
+			requestOf(id).state === "launched" &&
+				git.includes("remote add upstream-2 git@github.com:crowdorg/crowded.git") &&
+				/worktree add .* upstream-2\/main$/mu.test(git),
+		);
+		await deliver();
+	}
 
 	// s. A fork creation that answers without a repository name is refused before anything is cloned.
-	freshLogs();
-	const nameless = await errLaunch("s-nameless", "someorg/nameless", "P.", { GH_FORK_CREATED: "null" });
-	check(
-		"a fork creation without a name is refused before cloning",
-		nameless.isError === true && !readFileSync(gitLog, "utf8").includes("clone"),
-	);
+	{
+		const { id, git } = await entry(
+			"s",
+			{ repo: "someorg/nameless", document: "req.md", problem: "P." },
+			{ GH_FORK_CREATED: "null" },
+		);
+		check(
+			"a fork creation without a name is refused before cloning",
+			requestOf(id).state === "failed" && !git.includes("clone"),
+		);
+		await deliver();
+	}
 
 	// t. A directory at the clone path that is not a git checkout is refused.
-	mkdirSync(join(root, "github", "notrepo"), { recursive: true });
-	freshLogs();
-	const notRepo = await errLaunch("t-notrepo", "LucaCappelletti94/notrepo", "P.", { GIT_NOTREPO: "1" });
-	check(
-		"a clone path that is not a git checkout is refused",
-		notRepo.isError === true && !readFileSync(gitLog, "utf8").includes("worktree add"),
-	);
+	{
+		mkdirSync(join(root, "github", "notrepo"), { recursive: true });
+		const { id, git } = await entry(
+			"t",
+			{ repo: "LucaCappelletti94/notrepo", document: "req.md", problem: "P." },
+			{ GIT_NOTREPO: "1" },
+		);
+		check(
+			"a clone path that is not a git checkout is refused",
+			requestOf(id).state === "failed" && String(requestOf(id).error).includes("not a git checkout"),
+		);
+		check("a non git checkout adds no worktree", !git.includes("worktree add"));
+		await deliver();
+	}
 
 	// u. A target remote that cannot be added stops the launch before it fetches.
-	freshLogs();
-	const baseAdd = await errLaunch("u-baseadd", "someorg/baseadd", "P.", { GIT_ADDFAIL: "1" });
-	check(
-		"a failed target remote add stops the launch before fetching",
-		baseAdd.isError === true && !readFileSync(gitLog, "utf8").includes("fetch"),
-	);
+	{
+		const { id, git } = await entry(
+			"u",
+			{ repo: "someorg/baseadd", document: "req.md", problem: "P." },
+			{ GIT_ADDFAIL: "1" },
+		);
+		check(
+			"a failed target remote add stops the launch before fetching",
+			requestOf(id).state === "failed" && !git.includes("fetch"),
+		);
+		await deliver();
+	}
 
-	// v. A fork remote that cannot be added stops the launch too, after choosing a name origin does not hold.
-	mkdirSync(join(root, "github", "pushadd", ".git", "info"), { recursive: true });
-	freshLogs();
-	const pushAdd = await errLaunch("v-pushadd", "someorg/pushadd", "P.", {
-		GH_FORK_EXISTING: "LucaCappelletti94/pushadd",
-		GIT_REMOTES: "origin git@github.com:someorg/pushadd.git",
-		GIT_ADDFAIL: "1",
-	});
-	const pushAddGit = readFileSync(gitLog, "utf8");
-	check(
-		"a failed fork remote add stops the launch before any worktree",
-		pushAdd.isError === true &&
-			pushAddGit.includes("remote add fork git@github.com:LucaCappelletti94/pushadd.git") &&
-			!pushAddGit.includes("worktree add"),
-	);
+	// v. A fork remote that cannot be added stops the launch too.
+	{
+		mkdirSync(join(root, "github", "pushadd", ".git", "info"), { recursive: true });
+		const { id, git } = await entry(
+			"v",
+			{ repo: "someorg/pushadd", document: "req.md", problem: "P." },
+			{
+				GH_FORK_EXISTING: "LucaCappelletti94/pushadd",
+				GIT_REMOTES: "origin git@github.com:someorg/pushadd.git",
+				GIT_ADDFAIL: "1",
+			},
+		);
+		check(
+			"a failed fork remote add stops the launch before any worktree",
+			requestOf(id).state === "failed" &&
+				git.includes("remote add fork git@github.com:LucaCappelletti94/pushadd.git") &&
+				!git.includes("worktree add"),
+		);
+		await deliver();
+	}
 
 	// w. A remote that fetches the target but pushes elsewhere is not where a maintainer's branch goes.
-	mkdirSync(join(root, "github", "pushurl", ".git", "info"), { recursive: true });
-	freshLogs();
-	const pushUrl = await errLaunch("w-pushurl", "upstreamorg/pushurl", "P.", {
-		GH_PUSH: "1",
-		GIT_REMOTES: "origin git@github.com:upstreamorg/pushurl.git git@github.com:LucaCappelletti94/pushurl.git",
-	});
-	const pushUrlGit = readFileSync(gitLog, "utf8");
-	const pushUrlKickoff = readFileSync(tmuxLog, "utf8");
-	check(
-		"a remote pushing away from the target is not the maintainer's push remote",
-		pushUrl.details?.launched === true &&
-			pushUrl.details.pushRemote === "upstream" &&
-			pushUrlGit.includes("remote add upstream git@github.com:upstreamorg/pushurl.git") &&
-			pushUrlKickoff.includes("`upstream`"),
-	);
-	check(
-		"the maintainer's branch is still cut from the fetching remote",
-		/worktree add .* origin\/main$/mu.test(pushUrlGit),
-	);
+	{
+		mkdirSync(join(root, "github", "pushurl", ".git", "info"), { recursive: true });
+		const { id, git, tmux } = await entry(
+			"w",
+			{ repo: "upstreamorg/pushurl", document: "req.md", problem: "P." },
+			{
+				GH_PUSH: "1",
+				GIT_REMOTES: "origin git@github.com:upstreamorg/pushurl.git git@github.com:LucaCappelletti94/pushurl.git",
+			},
+		);
+		check(
+			"a remote pushing away from the target is not the maintainer's push remote",
+			requestOf(id).state === "launched" &&
+				git.includes("remote add upstream git@github.com:upstreamorg/pushurl.git") &&
+				tmux.includes("`upstream`"),
+		);
+		check("the maintainer's branch is still cut from the fetching remote", /worktree add .* origin\/main$/mu.test(git));
+		await deliver();
+	}
 
 	// x. A remote that fetches the target and pushes to the fork serves as both, with nothing added.
-	mkdirSync(join(root, "github", "triangle", ".git", "info"), { recursive: true });
-	freshLogs();
-	const triangle = await errLaunch("x-triangle", "upstreamorg/triangle", "P.", {
-		GH_FORK_EXISTING: "LucaCappelletti94/triangle-fork",
-		GIT_REMOTES: "origin git@github.com:upstreamorg/triangle.git git@github.com:LucaCappelletti94/triangle-fork.git",
-	});
-	const triangleGit = readFileSync(gitLog, "utf8");
-	check(
-		"a remote fetching the target and pushing to the fork is used for both",
-		triangle.details?.launched === true &&
-			triangle.details.pushRemote === "origin" &&
-			!triangleGit.includes("remote add") &&
-			/worktree add .* origin\/main$/mu.test(triangleGit),
-	);
+	{
+		mkdirSync(join(root, "github", "triangle", ".git", "info"), { recursive: true });
+		const { id, git } = await entry(
+			"x",
+			{ repo: "upstreamorg/triangle", document: "req.md", problem: "P." },
+			{
+				GH_FORK_EXISTING: "LucaCappelletti94/triangle-fork",
+				GIT_REMOTES:
+					"origin git@github.com:upstreamorg/triangle.git git@github.com:LucaCappelletti94/triangle-fork.git",
+			},
+		);
+		check(
+			"a remote fetching the target and pushing to the fork is used for both",
+			requestOf(id).state === "launched" && !git.includes("remote add") && /worktree add .* origin\/main$/mu.test(git),
+		);
+		await deliver();
+	}
 
 	// x2. A remote that fetches a mirror but pushes to the fork makes the clone usable, not refused.
-	mkdirSync(join(root, "github", "mirrored", ".git", "info"), { recursive: true });
-	freshLogs();
-	const mirrored = await errLaunch("x2-mirrored", "upstreamorg/mirrored", "P.", {
-		GH_FORK_EXISTING: "LucaCappelletti94/mirrored",
-		GIT_REMOTES: "origin git@github.com:mirrororg/mirrored.git git@github.com:LucaCappelletti94/mirrored.git",
-	});
-	const mirroredGit = readFileSync(gitLog, "utf8");
-	check(
-		"a clone known only by a push url launches, pushing there and branching from the added target",
-		mirrored.details?.launched === true &&
-			mirrored.details.pushRemote === "origin" &&
-			mirroredGit.includes("remote add upstream git@github.com:upstreamorg/mirrored.git") &&
-			/worktree add .* upstream\/main$/mu.test(mirroredGit),
-	);
+	{
+		mkdirSync(join(root, "github", "mirrored", ".git", "info"), { recursive: true });
+		const { id, git } = await entry(
+			"x2",
+			{ repo: "upstreamorg/mirrored", document: "req.md", problem: "P." },
+			{
+				GH_FORK_EXISTING: "LucaCappelletti94/mirrored",
+				GIT_REMOTES: "origin git@github.com:mirrororg/mirrored.git git@github.com:LucaCappelletti94/mirrored.git",
+			},
+		);
+		check(
+			"a clone known only by a push url launches, pushing there and branching from the added target",
+			requestOf(id).state === "launched" &&
+				git.includes("remote add upstream git@github.com:upstreamorg/mirrored.git") &&
+				/worktree add .* upstream\/main$/mu.test(git),
+		);
+		await deliver();
+	}
 
 	// y. A checkout with no remotes at all is refused and left as it is.
-	mkdirSync(join(root, "github", "bare", ".git", "info"), { recursive: true });
-	freshLogs();
-	const bare = await errLaunch("y-bare", "LucaCappelletti94/bare", "P.", { GIT_REMOTES: "" });
-	check(
-		"a checkout without remotes is refused untouched",
-		bare.isError === true &&
-			(bare.content?.[0]?.text ?? "").includes("no remotes") &&
-			!readFileSync(gitLog, "utf8").includes("remote add"),
-	);
+	{
+		mkdirSync(join(root, "github", "bare", ".git", "info"), { recursive: true });
+		const { id, git } = await entry(
+			"y",
+			{ repo: "LucaCappelletti94/bare", document: "req.md", problem: "P." },
+			{ GIT_REMOTES: "" },
+		);
+		check(
+			"a checkout without remotes is refused untouched",
+			requestOf(id).state === "failed" &&
+				String(requestOf(id).error).includes("no remotes") &&
+				!git.includes("remote add"),
+		);
+		await deliver();
+	}
 
-	process.env.PATH = savedPath;
-	process.env.HOME = savedHome;
+	// z. Two Launch taps on the same card run the launch once.
+	{
+		freshLogs();
+		const dbl = await launchTool("z", { repo: "someorg/double", document: "req.md", problem: "double tap" });
+		const dblId = dbl.details?.id;
+		const dblCard = requestOf(dblId).messageId;
+		api.queued = [
+			{
+				update_id: 9_001_000,
+				callback_query: {
+					id: "ud1",
+					data: `u:${dblId}:l`,
+					from: { id: CHAT },
+					message: { message_id: dblCard, chat: { id: CHAT } },
+				},
+			},
+			{
+				update_id: 9_001_001,
+				callback_query: {
+					id: "ud2",
+					data: `u:${dblId}:l`,
+					from: { id: CHAT },
+					message: { message_id: dblCard, chat: { id: CHAT } },
+				},
+			},
+		];
+		await up.pump(400);
+		await settle(600);
+		check("the first Launch tap toasts", toasts().includes("Starting it."));
+		check("the second Launch tap is refused", toasts().includes("That request is already starting."));
+		check(
+			"only one window opens for two Launch taps",
+			(tmuxText().match(/new-window/g) ?? []).length === 1,
+			tmuxText(),
+		);
+		check("the double-tapped request is launched once", requestOf(dblId).state === "launched");
+		await deliver();
+	}
+
+	// z2. A slow launch holds the card in the launching state.
+	{
+		freshLogs();
+		const slow = await launchTool("z2", { repo: "someorg/slow", document: "req.md", problem: "slow launch" });
+		const slowId = slow.details?.id;
+		process.env.GH_SLOW = "1";
+		await tap(slowId, "l");
+		const slowLaunching = requestOf(slowId);
+		check(
+			"a slow launch is in the launching state",
+			slowLaunching.state === "launching" && slowLaunching.launchPid > 0,
+			JSON.stringify(slowLaunching),
+		);
+		await tap(slowId, "c");
+		check(
+			"a Cancel tap on a running launch is refused",
+			toasts().at(-1) === "That request is already starting.",
+			toasts().join("|"),
+		);
+		check("the running launch keeps launching", requestOf(slowId).state === "launching");
+		await settle(1_500);
+		delete process.env.GH_SLOW;
+		check("the slow launch settles as launched", requestOf(slowId).state === "launched");
+		await deliver();
+	}
+
+	// z3. A launch whose poller is gone is marked interrupted.
+	{
+		freshLogs();
+		const interrupted = await launchTool("z3", { repo: "someorg/interrupt", document: "req.md", problem: "interrupt" });
+		const intId = interrupted.details?.id;
+		// Model a poller that died mid launch. The request is stuck in the launching state with a dead
+		// pid, and no launch is running in this process to settle it.
+		const intFile = join(requestsDir, `${intId}.json`);
+		const intBefore = requestOf(intId);
+		writeFileSync(
+			intFile,
+			JSON.stringify({ ...intBefore, state: "launching", stateAt: Date.now(), launchPid: deadPid }),
+		);
+		up.heartbeat();
+		await settle(300);
+		const intDone = requestOf(intId);
+		check(
+			"an interrupted launch is failed",
+			intDone.state === "failed" && String(intDone.error).includes("interrupted"),
+			JSON.stringify(intDone),
+		);
+		const intCard = await waitForEdit(requestOf(intId).messageId, (e) => String(e.text).includes("interrupted"));
+		check(
+			"the interrupted card names the error and keeps the buttons",
+			intCard !== undefined && intCard.reply_markup.inline_keyboard.flat().length === 3,
+		);
+		await deliver();
+		check(
+			"the requester is told the interruption written by no one",
+			up.customs.some(
+				(c) =>
+					String(c.message.content).includes("written by no one") && String(c.message.content).includes("interrupted"),
+			),
+		);
+	}
+
+	// r. The retract action.
+	const retract = (tag, id) => launchTool(tag, { action: "retract", id });
+	{
+		const rePending = await launchTool("r1", {
+			repo: "someorg/repend",
+			document: "req.md",
+			problem: "retract pending",
+		});
+		const rePendingId = rePending.details?.id;
+		const rePendingCard = requestOf(rePendingId).messageId;
+		const rePendingRes = await retract("r1b", rePendingId);
+		check(
+			"a retract on a pending request closes it",
+			!rePendingRes.isError && requestOf(rePendingId).state === "retracted",
+			rePendingRes.content[0].text,
+		);
+		check(
+			"a retract deletes the card",
+			called("deleteMessage").some((c) => c.body.message_id === rePendingCard),
+		);
+		const { id: reFailedId } = await failLaunch("r2", "someorg/refailed", "P.", { GH_NOLOGIN: "1" });
+		const reFailedCard = requestOf(reFailedId).messageId;
+		const reFailedRes = await retract("r2b", reFailedId);
+		check(
+			"a retract on a failed request closes it",
+			!reFailedRes.isError && requestOf(reFailedId).state === "retracted",
+		);
+		check(
+			"a retract deletes the failed card",
+			called("deleteMessage").some((c) => c.body.message_id === reFailedCard),
+		);
+		const reNoId = await launchTool("r3", { action: "retract" });
+		check(
+			"a retract without an id is refused",
+			reNoId.isError === true && reNoId.content[0].text.includes("retract needs"),
+		);
+		const reUnknown = await retract("r4", "01a070f9-0000-0000-0000-00000000dead");
+		check(
+			"a retract of an unknown id is refused",
+			reUnknown.isError === true && reUnknown.content[0].text.includes("no request"),
+		);
+		const reClosed = await retract("r5", cancelId);
+		check(
+			"a retract of a cancelled request is refused",
+			reClosed.isError === true && reClosed.content[0].text.includes("cancelled"),
+		);
+		const reLaunched = await retract("r6", ownId);
+		check(
+			"a retract of a launched request is refused",
+			reLaunched.isError === true && reLaunched.content[0].text.includes("launched"),
+		);
+		const reExisting = await retract("r7", existingId);
+		check(
+			"a retract of an already started request is refused",
+			reExisting.isError === true && reExisting.content[0].text.includes("already-started"),
+		);
+		const reAgain = await retract("r8", rePendingId);
+		check(
+			"a second retract of the same request is refused",
+			reAgain.isError === true && reAgain.content[0].text.includes("retracted"),
+		);
+		freshLogs();
+		const reRunning = await launchTool("r9", { repo: "someorg/rerun", document: "req.md", problem: "retract running" });
+		const reRunningId = reRunning.details?.id;
+		process.env.GH_SLOW = "1";
+		await tap(reRunningId, "l");
+		const reRunningRes = await retract("r9b", reRunningId);
+		check(
+			"a retract of a running launch is refused",
+			reRunningRes.isError === true && reRunningRes.content[0].text.includes("already starting"),
+		);
+		await settle(1_500);
+		delete process.env.GH_SLOW;
+	}
+
+	// h2. An ended requester is told through the held queue and the resume card.
+	const up2 = spawn(up2Id, workK);
+	await up2.fire("session_start");
+	up2.heartbeat();
+	await settle(100);
+	const up2Tool = (tag, params) => up2.tools.get("upstream_launch").execute(tag, params, undefined, undefined, up2.ctx);
+	const heldOf = (id) => {
+		const dir = join(root, "notify-telegram/graph/pending", id);
+		return existsSync(dir)
+			? readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "card.json" && f !== "resuming.json")
+			: [];
+	};
+	{
+		const foreign = await up2Tool("h2", { repo: "someorg/foreign", document: "req.md", problem: "foreign" });
+		const foreignId = foreign.details?.id;
+		const foreignCard = requestOf(foreignId).messageId;
+		const reOther = await retract("h2b", foreignId);
+		check(
+			"another session cannot retract a request",
+			reOther.isError === true && reOther.content[0].text.includes("only the requesting session"),
+		);
+		api.deleteRefusals = [foreignCard];
+		const re48 = await up2.tools
+			.get("upstream_launch")
+			.execute("h2c", { action: "retract", id: foreignId }, undefined, undefined, up2.ctx);
+		check(
+			"a retract whose delete is refused settles the request",
+			!re48.isError && requestOf(foreignId).state === "retracted",
+			re48.content[0].text,
+		);
+		check(
+			"a refused delete settles the card instead",
+			(lastEdit(foreignCard)?.text ?? "").includes("Retracted") &&
+				lastEdit(foreignCard)?.reply_markup.inline_keyboard.length === 0,
+		);
+		api.deleteRefusals = [];
+		api.failMethods = ["deleteMessage"];
+		api.failDescription = "telegram down";
+		const reTransient = await launchTool("r12", {
+			repo: "someorg/transient",
+			document: "req.md",
+			problem: "transient delete",
+		});
+		const reTransientId = reTransient.details?.id;
+		const reTransientRes = await retract("r12b", reTransientId);
+		api.failMethods = [];
+		check(
+			"a transient delete refusal does not fail the retract",
+			!reTransientRes.isError && requestOf(reTransientId).state === "retracted",
+			reTransientRes.content[0].text,
+		);
+		check(
+			"the transient card keeps its buttons",
+			lastEdit(requestOf(reTransientId).messageId) === undefined && cardKeyboard(reTransientId).flat().length === 3,
+		);
+		const cardlessId = "01a070f9-0000-0000-0000-000000000003";
+		const now = Date.now();
+		writeFileSync(
+			join(requestsDir, `${cardlessId}.json`),
+			JSON.stringify({
+				id: cardlessId,
+				requester: upId,
+				owner: "someorg",
+				name: "cardless",
+				slug: "cardless",
+				problem: "no card",
+				doc: "# doc",
+				docPath: "/doc.md",
+				tmux: "work",
+				messageId: null,
+				state: "pending",
+				at: now,
+				stateAt: now,
+				error: "",
+				branch: "",
+				tab: "",
+				launchPid: 0,
+			}),
+		);
+		const deletesBeforeCardless = called("deleteMessage").length;
+		const reCardless = await retract("r13", cardlessId);
+		check(
+			"a retract of a cardless request succeeds",
+			!reCardless.isError && requestOf(cardlessId).state === "retracted",
+		);
+		check("a cardless retract deletes nothing", called("deleteMessage").length === deletesBeforeCardless);
+	}
+	{
+		const ended = await up2Tool("h3", { repo: "someorg/ended", document: "req.md", problem: "ended requester" });
+		const endedId = ended.details?.id;
+		const endedCard = requestOf(endedId).messageId;
+		await up2.fire("session_shutdown");
+		await settle(200);
+		check("an ended requester keeps a pending request", requestOf(endedId).state === "pending");
+		await tap(endedId, "l");
+		await settle(600);
+		check("the ended requester's launch proceeds", requestOf(endedId).state === "launched", requestOf(endedId).state);
+		check("the ended requester's outcome is held", heldOf(up2Id).length === 1, heldOf(up2Id).join(","));
+		const heldPendingDir = join(root, "notify-telegram/graph/pending", up2Id);
+		const heldLaunchFile = heldOf(up2Id).find((f) => f.startsWith("l-"));
+		const heldLaunch =
+			heldLaunchFile !== undefined ? JSON.parse(readFileSync(join(heldPendingDir, heldLaunchFile), "utf8")) : null;
+		check(
+			"the held outcome is a launch item for the launched state",
+			heldLaunch !== null && heldLaunch.kind === "launch" && heldLaunch.state === "launched",
+			JSON.stringify(heldLaunch),
+		);
+		check(
+			"a resume card is raised naming the held launch outcome",
+			called("sendMessage").some(
+				(c) =>
+					JSON.stringify(c.body).includes(`r:${up2Id}`) &&
+					String(c.body.text).includes("the upstream launch for someorg/ended opened a branch"),
+			),
+		);
+		await replyToCard(endedCard, "note the branch name");
+		check("a reply to an ended requester's card is held", heldOf(up2Id).length === 2);
+		const heldReplyFile = heldOf(up2Id).find((f) => f.startsWith("i-"));
+		const heldReply =
+			heldReplyFile !== undefined ? JSON.parse(readFileSync(join(heldPendingDir, heldReplyFile), "utf8")) : null;
+		check(
+			"the held reply is a text inbox entry",
+			heldReply !== null &&
+				heldReply.kind === "inbox" &&
+				heldReply.entry?.kind === "text" &&
+				heldReply.entry?.value === "note the branch name",
+			JSON.stringify(heldReply),
+		);
+		const dropped = await up2Tool("h4", { repo: "someorg/dropped", document: "req.md", problem: "dropped" });
+		const droppedId = dropped.details?.id;
+		await tap(droppedId, "c");
+		await settle(300);
+		check("a cancelled ended request is not held", heldOf(up2Id).length === 2);
+		check("the cancelled ended request is closed", requestOf(droppedId).state === "cancelled");
+		// A hand-edited or corrupt launch item with a state the code never writes is discarded by the
+		// resume card, so its text is never shown to the user.
+		writeFileSync(
+			join(heldPendingDir, "malformed-launch.json"),
+			JSON.stringify({
+				kind: "launch",
+				at: Date.now(),
+				requestId: "not-a-state-token",
+				state: "bogus",
+				text: "malformed launch text",
+				summary: "malformed summary",
+			}),
+		);
+		check("a malformed launch item is on disk", heldOf(up2Id).includes("malformed-launch.json"));
+		const h5 = await up2Tool("h5", { repo: "someorg/valid", document: "req.md", problem: "valid" });
+		await tap(h5.details?.id ?? "", "l");
+		await settle(400);
+		check(
+			"a malformed launch item is discarded by the resume card",
+			!called("sendMessage").some((c) => String(c.body.text).includes("malformed launch text")),
+		);
+		// A held message whose sender has no emoji is shown on the resume card by its tag.
+		writeFileSync(
+			join(heldPendingDir, "no-emoji-message.json"),
+			JSON.stringify({
+				kind: "message",
+				at: Date.now(),
+				message: {
+					id: "abcdef012345",
+					text: "a no-emoji message",
+					hop: 1,
+					from: {
+						session: "01a0e000-0000-7000-8000-000000000000",
+						emoji: "",
+						label: "",
+						cwd: "/home/dev/work/noemoji",
+						tag: "01a0d000-0000-7000-8000-000000000000",
+					},
+				},
+			}),
+		);
+		const h6 = await up2Tool("h6", { repo: "someorg/msg", document: "req.md", problem: "msg" });
+		await tap(h6.details?.id ?? "", "l");
+		await settle(400);
+		const resumeTexts = [...called("sendMessage"), ...called("editMessageText")].map((c) => String(c.body.text));
+		check(
+			"a held message from a no-emoji session is shown by its tag",
+			resumeTexts.some((t) => t.includes("a message from") && t.includes("01a0d000")),
+		);
+	}
+
+	// g2. A tap on a gone or a closed request is closed.
+	{
+		const gone = await launchTool("g3", { repo: "someorg/gone", document: "req.md", problem: "gone" });
+		const goneId = gone.details?.id;
+		const goneCard = requestOf(goneId).messageId;
+		unlinkSync(join(requestsDir, `${goneId}.json`));
+		api.queued = [
+			{
+				update_id: 9_002_000,
+				callback_query: {
+					id: "ltapg",
+					data: `u:${goneId}:l`,
+					from: { id: CHAT },
+					message: { message_id: goneCard, chat: { id: CHAT } },
+				},
+			},
+		];
+		await up.pump(400);
+		check("a tap on a gone request is closed", toasts().at(-1) === "That request is closed.", toasts().join("|"));
+		check(
+			"the gone card keyboard is stripped",
+			called("editMessageReplyMarkup").some(
+				(c) => c.body.message_id === goneCard && c.body.reply_markup.inline_keyboard.length === 0,
+			),
+		);
+		await tap(cancelId, "l");
+		check("a tap on a closed request is closed", toasts().at(-1) === "That request is closed.");
+		api.queued = [
+			{
+				update_id: 9_002_002,
+				callback_query: {
+					id: "ltapg2",
+					data: `u:${goneId}:l`,
+					from: { id: CHAT },
+				},
+			},
+		];
+		await up.pump(400);
+		check("a tap without a message still says the request is closed", toasts().at(-1) === "That request is closed.");
+		api.queued = [
+			{
+				update_id: 9_002_003,
+				callback_query: {
+					id: "ltapg3",
+					data: "u:",
+					from: { id: CHAT },
+					message: { message_id: goneCard, chat: { id: CHAT } },
+				},
+			},
+		];
+		await up.pump(400);
+		check("a tap with no request id is closed", toasts().at(-1) === "That request is closed.", toasts().join("|"));
+	}
+
+	// g3. A malformed request file reads as absent.
+	{
+		const malformed = (id, patch) => {
+			writeFileSync(
+				join(requestsDir, `${id}.json`),
+				JSON.stringify({
+					id,
+					requester: upId,
+					owner: "someorg",
+					name: "malformed",
+					slug: "malformed",
+					problem: "P.",
+					doc: "# d",
+					docPath: "/d.md",
+					tmux: "work",
+					messageId: null,
+					state: "pending",
+					at: Date.now(),
+					stateAt: Date.now(),
+					error: "",
+					branch: "",
+					tab: "",
+					launchPid: 0,
+					...patch,
+				}),
+			);
+		};
+		const badStateId = "01a070f9-0000-0000-0000-00000000f001";
+		const badPidId = "01a070f9-0000-0000-0000-00000000f002";
+		const badMessageId = "01a070f9-0000-0000-0000-00000000f003";
+		const badContentId = "01a070f9-0000-0000-0000-00000000f004";
+		const badFieldId = "01a070f9-0000-0000-0000-00000000f005";
+		malformed(badStateId, { state: "bogus" });
+		malformed(badPidId, { launchPid: "x" });
+		malformed(badMessageId, { messageId: 0 });
+		malformed(badContentId, { id: "not a token" });
+		malformed(badFieldId, { owner: 123 });
+		const reState = await retract("g4", badStateId);
+		check(
+			"a file with an unknown state reads as absent",
+			reState.isError === true && reState.content[0].text.includes("no request"),
+		);
+		const rePid = await retract("g5", badPidId);
+		check(
+			"a file with a bad launch pid reads as absent",
+			rePid.isError === true && rePid.content[0].text.includes("no request"),
+		);
+		const reMessage = await retract("g6", badMessageId);
+		check(
+			"a file with a nonpositive message id reads as absent",
+			reMessage.isError === true && reMessage.content[0].text.includes("no request"),
+		);
+		const reContent = await retract("g8", badContentId);
+		check(
+			"a file whose content id is no state token reads as absent",
+			reContent.isError === true && reContent.content[0].text.includes("no request"),
+		);
+		const reField = await retract("g9", badFieldId);
+		check(
+			"a file with a non-string field reads as absent",
+			reField.isError === true && reField.content[0].text.includes("no request"),
+		);
+		const reToken = await retract("g7", "not a token");
+		check(
+			"an unparseable id reads as absent",
+			reToken.isError === true && reToken.content[0].text.includes("no request"),
+		);
+	}
+
+	// g5. A request file that predates the head redraws its card without one.
+	{
+		const legacyId = "01a070f9-0000-0000-0000-00000000f006";
+		const legacyCard = 88_800_001;
+		writeFileSync(
+			join(requestsDir, `${legacyId}.json`),
+			JSON.stringify({
+				id: legacyId,
+				requester: upId,
+				owner: "someorg",
+				name: "legacy",
+				slug: "legacy",
+				problem: "legacy problem",
+				doc: "# d",
+				docPath: "/d.md",
+				tmux: "work",
+				messageId: legacyCard,
+				state: "pending",
+				at: Date.now(),
+				stateAt: Date.now(),
+				error: "",
+				branch: "",
+				tab: "",
+				launchPid: 0,
+			}),
+		);
+		api.queued = [
+			{
+				update_id: 9_002_004,
+				callback_query: {
+					id: "ltaplegacy",
+					data: `u:${legacyId}:c`,
+					from: { id: CHAT },
+					message: { message_id: legacyCard, chat: { id: CHAT } },
+				},
+			},
+		];
+		await up.pump(400);
+		await settle(300);
+		const legacyEdit = lastEdit(legacyCard);
+		check(
+			"a headless request redraws its card without a head",
+			legacyEdit !== undefined &&
+				String(legacyEdit.text).includes("Cancelled") &&
+				!String(legacyEdit.text).includes("Task:"),
+			legacyEdit?.text,
+		);
+	}
+
+	// g4. A request from a session with no known tmux place opens the tab in the default session.
+	{
+		const ntId = "01a070f0-0000-0000-0000-000000000003";
+		process.env.TMUX_PLACE_FAIL = "1";
+		const nt = spawn(ntId, workK);
+		await nt.fire("session_start");
+		nt.heartbeat();
+		await settle(100);
+		const ntReq = await nt.tools
+			.get("upstream_launch")
+			.execute(
+				"h-nt",
+				{ repo: "someorg/notmux", document: "req.md", problem: "no tmux place" },
+				undefined,
+				undefined,
+				nt.ctx,
+			);
+		delete process.env.TMUX_PLACE_FAIL;
+		await nt.pump(400);
+		const ntReqId = ntReq.details?.id;
+		check(
+			"a request without a tmux place names no session",
+			!ntReq.isError && requestOf(ntReqId).tmux === "",
+			ntReq.content[0].text,
+		);
+		check(
+			"the card of a request without a place names no tab",
+			!String(cardOf(ntReqId).text).includes("in tmux"),
+			cardOf(ntReqId).text,
+		);
+		freshLogs();
+		await tap(ntReqId, "l");
+		await settle(400);
+		const newWin = tmuxText()
+			.split("\n")
+			.find((l) => l.startsWith("new-window"));
+		check("the no place launch reaches tmux", newWin !== undefined);
+		check(
+			"the tab opens without a target session",
+			newWin === undefined || newWin.startsWith("new-window -c "),
+			newWin,
+		);
+		check("the no place request is launched", requestOf(ntReqId).state === "launched");
+		await nt.pump(200);
+		await nt.pump(200);
+		await settle(100);
+		check(
+			"the no place requester hears the outcome written by no one",
+			nt.customs.some(
+				(c) =>
+					String(c.message.content).includes("written by no one") &&
+					String(c.message.content).includes("opened branch"),
+			),
+		);
+	}
+
+	// i2. The list action.
+	{
+		writeFileSync(
+			join(nodesDir, "01a070f3-0000-0000-0000-000000000000.json"),
+			JSON.stringify({
+				session: "01a070f3-0000-0000-0000-000000000000",
+				label: "upstream dep",
+				emoji: "\u{1F680}",
+				tag: "depwork",
+				cwd: "/home/dev/work/depwork",
+				repo: "LucaCappelletti94/dep",
+				branch: "upstream/it-rejects-valid-x",
+				status: "working",
+				note: "",
+				edges: [],
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			}),
+		);
+		writeFileSync(
+			join(nodesDir, "01a070f3-0000-0000-0000-000000000009.json"),
+			JSON.stringify({
+				session: "01a070f3-0000-0000-0000-000000000009",
+				label: "branch without a repository",
+				emoji: "\u{1F680}",
+				tag: "norepo",
+				cwd: "/home/dev/work/norepo",
+				branch: "upstream/no-repo-branch",
+				status: "working",
+				note: "",
+				edges: [],
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			}),
+		);
+		const agedId = "01a070f9-0000-0000-0000-000000000004";
+		const twodayId = "01a070f9-0000-0000-0000-000000000005";
+		const listNow = Date.now();
+		for (const [id, owner, name, at] of [
+			[agedId, "agedorg", "aged", listNow - 2 * 3_600_000],
+			[twodayId, "twodayorg", "twoday", listNow - 2 * 24 * 3_600_000],
+		]) {
+			writeFileSync(
+				join(requestsDir, `${id}.json`),
+				JSON.stringify({
+					id,
+					requester: "01a070f9-0000-0000-0000-000000000000",
+					owner,
+					name,
+					slug: `${name}-slug`,
+					problem: "aged problem",
+					doc: "# d",
+					docPath: "/d.md",
+					tmux: "work",
+					messageId: null,
+					state: "pending",
+					at,
+					stateAt: at,
+					error: "",
+					branch: "",
+					tab: "",
+					launchPid: 0,
+				}),
+			);
+		}
+		const listWidget = await launchTool("i1", { action: "list", repo: "someorg/widget" });
+		check(
+			"a list names the repository's request",
+			listWidget.content[0].text.includes(forkId) && listWidget.content[0].text.includes("widget-mis-encodes-y"),
+		);
+		check("a list shows the requester", listWidget.content[0].text.includes(upId));
+		check(
+			"a list shows the not started work with its branch",
+			listWidget.content[0].text.includes("LucaCappelletti94:upstream/widget-mis-encodes-y") &&
+				listWidget.content[0].text.includes("not started"),
+		);
+		const listDep = await launchTool("i2", { action: "list", repo: "LucaCappelletti94/dep" });
+		check(
+			"a list shows the session branch and status",
+			listDep.content[0].text.includes("upstream/it-rejects-valid-x") && listDep.content[0].text.includes("working"),
+		);
+		const listAll = await launchTool("i3", { action: "list" });
+		check(
+			"a list without a repository shows the launch repositories",
+			listAll.content[0].text.includes("someorg/widget") && listAll.content[0].text.includes("LucaCappelletti94/dep"),
+		);
+		check(
+			"a list names a session branch without a repository",
+			listAll.content[0].text.includes("upstream/no-repo-branch"),
+			listAll.content[0].text,
+		);
+		check(
+			"a list shows request ages",
+			listAll.content[0].text.includes("pending, 2h") && listAll.content[0].text.includes("pending, 2d"),
+		);
+		const listNone = await launchTool("i4", { action: "list", repo: "nope/nothing" });
+		check(
+			"a list without work shows two none lines",
+			(listNone.content[0].text.match(/- none/g) ?? []).length === 2,
+			listNone.content[0].text,
+		);
+		const listBogus = await launchTool("i5", { action: "bogus" });
+		check(
+			"an unknown action is refused",
+			listBogus.isError === true && listBogus.content[0].text.includes("unknown action"),
+		);
+	}
+
+	// j2. A request older than a week is expired by the sweep.
+	{
+		const expire = await launchTool("j1", { repo: "someorg/expire", document: "req.md", problem: "expire" });
+		const expireId = expire.details?.id;
+		const { id: expireFailId } = await failLaunch("j2", "someorg/expfail", "P.", { GH_NOLOGIN: "1" });
+		const oldId = "01a070f9-0000-0000-0000-000000000001";
+		const crashedId = "01a070f9-0000-0000-0000-000000000002";
+		const oldAt = Date.now() - 366 * 24 * 3_600_000;
+		const crashedAt = Date.now() - 8 * 24 * 3_600_000;
+		for (const [id, owner, name, at] of [
+			[oldId, "oldorg", "old", oldAt],
+			[crashedId, "crashedorg", "crash", crashedAt],
+		]) {
+			writeFileSync(
+				join(requestsDir, `${id}.json`),
+				JSON.stringify({
+					id,
+					requester: "01a070f9-0000-0000-0000-000000000000",
+					owner,
+					name,
+					slug: `${name}-slug`,
+					problem: "old problem",
+					doc: "# d",
+					docPath: "/d.md",
+					tmux: "work",
+					messageId: null,
+					state: "pending",
+					at,
+					stateAt: at,
+					error: "",
+					branch: "",
+					tab: "",
+					launchPid: 0,
+				}),
+			);
+		}
+		jump(7 * 24 * 3_600_000 + 10_000);
+		up.heartbeat();
+		await settle(300);
+		check("a week old pending request is expired", requestOf(expireId).state === "expired", requestOf(expireId).state);
+		check("a week old failed request is expired", requestOf(expireFailId).state === "expired");
+		const expireCard = await waitForEdit(requestOf(expireId).messageId, (e) =>
+			String(e.text).includes("expired after seven days"),
+		);
+		check(
+			"an expired card greys out without buttons",
+			expireCard !== undefined && expireCard.reply_markup.inline_keyboard.length === 0,
+		);
+		check("a year old request file is pruned with the graph", !existsSync(join(requestsDir, `${oldId}.json`)));
+		check("a crashed card expires without a send", requestOf(crashedId).state === "expired");
+		await deliver();
+		check("the requester is told the expiry", told("expired after seven days"));
+		const reExpired = await retract("j3", expireId);
+		check(
+			"a retract of an expired request is refused",
+			reExpired.isError === true && reExpired.content[0].text.includes("expired"),
+		);
+		await deliver();
+	}
+
+	// end of section: restore the environment and the clock.
+	process.env.PATH = oldPath;
+	process.env.HOME = oldHome;
 	delete process.env.TMUX;
 	delete process.env.TMUX_PANE;
 	delete process.env.GH_LOG;
 	delete process.env.GIT_LOG;
 	delete process.env.TMUX_LOG;
 	delete process.env.GIT_REMOTES;
+	api.deleteRefusals = [];
+	clockSkew = 0; // The expiry jumped the clock seven days; the next sections measure staleness against it.
 }
 
 heading("session_message between live sessions");

@@ -832,6 +832,7 @@ const NODES_DIR = join(GRAPH_DIR, "nodes");
 const PR_DIR = join(GRAPH_DIR, "pr");
 const LAUNCHES_DIR = join(GRAPH_DIR, "launches");
 const PENDING_DIR = join(GRAPH_DIR, "pending");
+const REQUESTS_DIR = join(GRAPH_DIR, "requests");
 const RENDER_DIR = join(GRAPH_DIR, "render");
 const GRAPH_POLL_MS = 10 * 60_000;
 const GRAPH_PRUNE_MS = 24 * 3_600_000;
@@ -842,6 +843,8 @@ const LAUNCH_ENV = "OMP_TELEGRAM_LAUNCH";
 const RESUME_START_MS = 60_000;
 /** What a tap gets when its window is already opening. */
 const ALREADY_STARTING = "That session is already starting.";
+/** A pending or failed launch request is answered by expiry seven days after it was made. */
+const REQUEST_EXPIRY_MS = 7 * 24 * 3_600_000;
 const DEPENDENCY_MESSAGE_TYPE = "omp-telegram.dependency";
 const MMDC_TIMEOUT_MS = 60_000;
 const PHOTO_MAX_BYTES = 10 * 1024 * 1024;
@@ -896,6 +899,95 @@ interface LaunchRecord {
 	at: number;
 }
 
+type LaunchRequestState =
+	| "pending"
+	| "launching"
+	| "launched"
+	| "failed"
+	| "cancelled"
+	| "already-started"
+	| "retracted"
+	| "expired";
+
+/** The settled states a launch request reaches when its outcome is reported to the requester. */
+type LaunchOutcomeState = "launched" | "failed" | "cancelled" | "already-started" | "expired";
+
+const LAUNCH_REQUEST_STATES: readonly LaunchRequestState[] = [
+	"pending",
+	"launching",
+	"launched",
+	"failed",
+	"cancelled",
+	"already-started",
+	"retracted",
+	"expired",
+];
+
+/**
+ * A launch request the card answers. The requesting tool writes it, and the poller owns the card,
+ * answers its taps and runs the launch, so the request outlives both the tool call and the session.
+ */
+interface LaunchRequest {
+	id: string;
+	/** The session that requested the launch, the card's answer route and the launch's parent. */
+	requester: string;
+	owner: string;
+	name: string;
+	slug: string;
+	problem: string;
+	/** The request document's text as read at request time, which the launch carries into the worktree. */
+	doc: string;
+	/** The document's path at request time, shown on the card. */
+	docPath: string;
+	/** The requester's tmux session, where the launch tab opens. */
+	tmux: string;
+	/** The card's message id once it is sent. */
+	messageId: number | null;
+	state: LaunchRequestState;
+	/** When the request was made. */
+	at: number;
+	/** When the state was set. */
+	stateAt: number;
+	/** The last launch's error, shown on the card while the state is `failed`. */
+	error: string;
+	/** The branch the launch cut, empty until one did. */
+	branch: string;
+	/** The tmux tab the launch opened, as `session:window`, empty until one did. */
+	tab: string;
+	/** The requester's tmux window at request time, so the card names the requester's tab. */
+	tmuxWindow: number | null;
+	/** The requester's message head at the moment the card was first sent, kept on every redraw. */
+	head: string;
+	/** The poller's pid at the last move to `launching`, so a new holder sees the interruption. */
+	launchPid: number;
+}
+
+function parseLaunchRequest(raw: unknown): LaunchRequest | null {
+	if (raw === null || typeof raw !== "object") return null;
+	const r = raw as Record<string, unknown>;
+	if (!isStateToken(r.id) || !isStateToken(r.requester)) return null;
+	for (const key of ["owner", "name", "slug", "problem", "doc", "docPath", "tmux", "error", "branch", "tab"]) {
+		if (typeof r[key] !== "string") return null;
+	}
+	if (!LAUNCH_REQUEST_STATES.includes(r.state as LaunchRequestState)) return null;
+	if (typeof r.at !== "number" || typeof r.stateAt !== "number" || typeof r.launchPid !== "number") return null;
+	if (r.messageId !== null && (!Number.isSafeInteger(r.messageId) || (r.messageId as number) <= 0)) return null;
+	// Request files that predate the tab and the head still read, with both defaulted.
+	const tmuxWindow = r.tmuxWindow === null || typeof r.tmuxWindow === "number" ? r.tmuxWindow : null;
+	const head = typeof r.head === "string" ? r.head : "";
+	return { ...r, tmuxWindow, head } as unknown as LaunchRequest;
+}
+
+function readLaunchRequest(id: string): LaunchRequest | null {
+	return isStateToken(id) ? parseLaunchRequest(readJsonFile(join(REQUESTS_DIR, `${id}.json`))) : null;
+}
+
+function allLaunchRequests(): LaunchRequest[] {
+	return listJson(REQUESTS_DIR)
+		.map((entry) => parseLaunchRequest(readJsonFile(join(REQUESTS_DIR, entry))))
+		.filter((request): request is LaunchRequest => request !== null);
+}
+
 type PendingItem =
 	| {
 			kind: "outcome";
@@ -910,7 +1002,9 @@ type PendingItem =
 	  }
 	| { kind: "message"; at: number; message: AgentMessage }
 	/** What the user sent a session that died before reading it, delivered as if it had just arrived. */
-	| { kind: "inbox"; at: number; updateId: number; summary: string; entry: InboxEntry };
+	| { kind: "inbox"; at: number; updateId: number; summary: string; entry: InboxEntry }
+	/** A launch request's outcome, delivered to its requester as an aside, written by no one. */
+	| { kind: "launch"; at: number; requestId: string; state: LaunchRequestState; text: string; summary: string };
 
 function readJsonFile(path: string): unknown {
 	try {
@@ -1070,6 +1164,14 @@ function pendingItemOf(raw: unknown): PendingItem | null {
 			(entry.kind === "text" || entry.kind === "file");
 		return valid ? (item as unknown as PendingItem) : null;
 	}
+	if (item.kind === "launch") {
+		const valid =
+			isStateToken(item.requestId) &&
+			typeof item.text === "string" &&
+			typeof item.summary === "string" &&
+			(LAUNCH_REQUEST_STATES as readonly unknown[]).includes(item.state);
+		return valid ? (item as unknown as PendingItem) : null;
+	}
 	if (item.kind !== "outcome") return null;
 	if (!isStateToken(item.source) || typeof item.outcome !== "string" || typeof item.title !== "string") return null;
 	if (typeof item.place !== "string" || !(EDGE_TYPES as readonly unknown[]).includes(item.edge)) return null;
@@ -1102,6 +1204,28 @@ function outcomeText(item: Extract<PendingItem, { kind: "outcome" }>): string {
 		"Call session_graph for the whole picture. This is a status update, not a message, so there is no one to reply to.",
 	);
 	return lines.join("\n");
+}
+
+/** What the requester's model reads when a launch request it made reaches an outcome. */
+function launchText(item: Extract<PendingItem, { kind: "launch" }>): string {
+	return `Automatic upstream-launch update, written by no one: ${item.text} This is a status update, not a message, so there is no one to reply to.`;
+}
+
+/** The short line a launch outcome gets on its requester's resume card. */
+function launchSummary(owner: string, name: string, state: LaunchOutcomeState): string {
+	const repo = `${owner}/${name}`;
+	switch (state) {
+		case "launched":
+			return `the upstream launch for ${repo} opened a branch`;
+		case "failed":
+			return `the upstream launch for ${repo} failed`;
+		case "cancelled":
+			return `the upstream launch request for ${repo} was cancelled`;
+		case "already-started":
+			return `the upstream launch request for ${repo} was closed as already started`;
+		case "expired":
+			return `the upstream launch request for ${repo} expired`;
+	}
 }
 
 /** A PNG's width and height from its IHDR chunk, or null when the bytes are not a PNG. */
@@ -1702,7 +1826,8 @@ type LaunchOutcome =
 			clonePath: string;
 			worktreePath: string;
 			branch: string;
-			windowId: string;
+			/** Where the tab opened, as `session:window`. */
+			tab: string;
 	  }
 	| { ok: false; error: string };
 
@@ -1923,7 +2048,8 @@ async function openWorktree(
 	target: LaunchTarget,
 	clone: PreparedClone,
 	parent: string,
-): Promise<{ ok: true; worktreePath: string; branch: string; windowId: string } | { ok: false; error: string }> {
+	tmuxSession: string,
+): Promise<{ ok: true; worktreePath: string; branch: string; tab: string } | { ok: false; error: string }> {
 	const { clonePath, base } = clone;
 	const branch = `upstream/${a.slug}`;
 	const worktreeParent = join(homedir(), "github", `${a.name}.upstreams`);
@@ -1964,8 +2090,10 @@ async function openWorktree(
 		at: Date.now(),
 	};
 	writePrivateJson(LAUNCHES_DIR, `${launch.id}.json`, launch);
-	const window = await run("tmux", [
+	// The tab opens in the requester's tmux session, which the poller that runs the launch may not sit in.
+	const windowArgs = [
 		"new-window",
+		...(tmuxSession.length > 0 ? ["-t", `${tmuxSession}:`] : []),
 		"-c",
 		worktreePath,
 		"-n",
@@ -1974,17 +2102,18 @@ async function openWorktree(
 		`${LAUNCH_ENV}=${launch.id}`,
 		"-P",
 		"-F",
-		"#{window_id}",
+		"#{session_name}:#{window_index}",
 		"omp",
 		"@upstream/request.md",
 		kickoff,
-	]);
+	];
+	const window = await run("tmux", windowArgs);
 	if (!window.ok) {
 		rmSync(join(LAUNCHES_DIR, `${launch.id}.json`), { force: true });
 		await rollback();
 		return { ok: false, error: `tmux new-window failed: ${window.stderr}` };
 	}
-	return { ok: true, worktreePath, branch, windowId: window.stdout };
+	return { ok: true, worktreePath, branch, tab: window.stdout };
 }
 
 /**
@@ -1992,13 +2121,13 @@ async function openWorktree(
  * the branch goes, ensure the clone, cut a worktree off the latest default branch, carry the request in, and
  * open a new omp session in a tmux tab. It writes only to GitHub repositories the user may push to and under `~/github`.
  */
-async function performUpstreamLaunch(a: LaunchArgs, parent: string): Promise<LaunchOutcome> {
+async function performUpstreamLaunch(a: LaunchArgs, parent: string, tmuxSession: string): Promise<LaunchOutcome> {
 	const resolved = await resolveTarget(a);
 	if (!resolved.ok) return { ok: false, error: resolved.error };
 	const { target } = resolved;
 	const prepared = await prepareClone(a, target);
 	if (!prepared.ok) return { ok: false, error: prepared.error };
-	const opened = await openWorktree(a, target, prepared, parent);
+	const opened = await openWorktree(a, target, prepared, parent, tmuxSession);
 	if (!opened.ok) return { ok: false, error: opened.error };
 	return {
 		ok: true,
@@ -2012,7 +2141,7 @@ async function performUpstreamLaunch(a: LaunchArgs, parent: string): Promise<Lau
 		clonePath: prepared.clonePath,
 		worktreePath: opened.worktreePath,
 		branch: opened.branch,
-		windowId: opened.windowId,
+		tab: opened.tab,
 	};
 }
 
@@ -3166,17 +3295,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * The two lines every message from this session opens with: which session is speaking, then
-	 * what it is working on, with which model, and where its terminal is. One shape everywhere, so
-	 * a notification read on a phone never needs the terminal to be identified.
+	 * The two lines every message from this session opens with, which session is speaking, then what it is
+	 * working on, with which model, and where its terminal is. Pass the session's known tmux tab to pin the
+	 * location without re-reading tmux, which matters when the head is stored rather than sent at once.
 	 */
-	function messageHead(ctx: ExtensionContext): string {
-		return `${badge(ctx)}\n${sessionContextLine(ctx)}`;
+	function messageHead(ctx: ExtensionContext, tmux?: string | null): string {
+		return `${badge(ctx)}\n${sessionContextLine(ctx, tmux)}`;
 	}
 
-	function sessionContextLine(ctx: ExtensionContext): string {
+	function sessionContextLine(ctx: ExtensionContext, tmux?: string | null): string {
 		const model = ctx.model === undefined ? "unavailable" : `${ctx.model.provider}/${ctx.model.id}`;
-		return `Task: ${taskName(ctx)} | Model: ${model} | Tmux: ${tmuxLocation() ?? "not attached"}`;
+		const location = tmux === undefined ? tmuxLocation() : tmux;
+		return `Task: ${taskName(ctx)} | Model: ${model} | Tmux: ${location ?? "not attached"}`;
 	}
 
 	function lastAssistantTail(ctx: ExtensionContext): string {
@@ -4913,6 +5043,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await answerResumeCallback(cfg, callback);
 				return;
 			}
+			if (callback.data.startsWith("u:")) {
+				await answerLaunchCallback(cfg, callback, callback.data);
+				return;
+			}
 			// A press on a settled question's dead buttons is not a routing failure, and saying the
 			// session is gone claims something alarming and untrue.
 			if (callback.data === SETTLED_CALLBACK) {
@@ -5123,6 +5257,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				"That message type does not reach the agent. Send text, a photo, a voice note, an audio file, or a document.",
 			);
 			return;
+		}
+
+		// A reply to a launch card is the user's own word, held for the request's requester, live or ended.
+		if (replyTo !== undefined) {
+			const allReqs = allLaunchRequests();
+			const requested = allReqs.find((entry) => entry.messageId === replyTo);
+			if (requested !== undefined) {
+				holdReply(requested, text, message.message_id, update.update_id, replyTo);
+				trackIncoming(message.message_id, requested.requester);
+				return;
+			}
 		}
 
 		const target = routeMessage(replyTo);
@@ -6494,7 +6639,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/** A tab as `session:window`, the way restart notices name it, or nothing when the place is unknown. */
-	function tabOf(place: LaunchSpec | undefined): string {
+	function tabOf(place: { tmuxSession: string; tmuxWindow: number | null } | undefined): string {
 		if (place === undefined || place.tmuxSession === "" || place.tmuxWindow === null) return "";
 		return `${place.tmuxSession}:${place.tmuxWindow}`;
 	}
@@ -6697,6 +6842,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				deliver(id, item.updateId, item.entry);
 				continue;
 			}
+			// A launch outcome is a status update, so it is written by no one and answers to no one.
+			if (item.kind === "launch") {
+				pi.sendMessage(
+					{ customType: DEPENDENCY_MESSAGE_TYPE, content: launchText(item), display: true, details: item },
+					{ deliverAs: "aside", triggerTurn: true },
+				);
+				continue;
+			}
 			pi.sendMessage(
 				{ customType: DEPENDENCY_MESSAGE_TYPE, content: outcomeText(item), display: true, details: item },
 				{ deliverAs: "aside", triggerTurn: true },
@@ -6745,9 +6898,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			.map(({ item }) =>
 				item.kind === "outcome"
 					? `- ${outcomeSummary(item)}`
-					: item.kind === "inbox"
+					: item.kind === "launch"
 						? `- ${item.summary}`
-						: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
+						: item.kind === "inbox"
+							? `- ${item.summary}`
+							: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
 			);
 		const text = `\u23F8\uFE0F **${titleOf(id)}**${inTab(tabOf(readNode(id)?.launch))} has ended with ${updates(items.length)} waiting:\n${lines.join("\n")}\n\nResume it to deliver them?`;
 		const body = {
@@ -7316,6 +7471,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		for (const launch of allLaunches()) {
 			if (now - launch.at > GRAPH_RETENTION_MS) rmSync(join(LAUNCHES_DIR, `${launch.id}.json`), { force: true });
 		}
+		for (const request of allLaunchRequests()) {
+			if (now - request.at > GRAPH_RETENTION_MS) removeStatePath(REQUESTS_DIR, `${request.id}.json`);
+		}
 	}
 
 	/** Run by the Telegram lock holder only, so one process polls GitHub and prunes. */
@@ -7350,6 +7508,299 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		});
 		rmSync(file, { force: true });
+	}
+
+	/** A request's age for a listing, as minutes, hours or days. */
+	function requestAge(at: number): string {
+		const min = Math.floor(Math.max(0, Date.now() - at) / 60_000);
+		if (min < 60) return `${Math.max(1, min)}m`;
+		const hour = Math.floor(min / 60);
+		if (hour < 48) return `${hour}h`;
+		return `${Math.floor(hour / 24)}d`;
+	}
+
+	/** The card's buttons while its request is still open. */
+	function launchRequestButtons(request: LaunchRequest): InlineButton[][] {
+		const open = request.state === "pending" || request.state === "failed" || request.state === "launching";
+		if (!open) return [];
+		return [
+			[
+				{ text: "Launch", callback_data: `u:${request.id}:l`, style: "success" },
+				{ text: "Cancel", callback_data: `u:${request.id}:c` },
+				{ text: "Upstreaming has already started", callback_data: `u:${request.id}:a` },
+			],
+		];
+	}
+
+	/** What the card shows for a request's state. */
+	function launchCardBody(request: LaunchRequest): string {
+		const repo = `${request.owner}/${request.name}`;
+		const tab = inTab(tabOf({ tmuxSession: request.tmux, tmuxWindow: request.tmuxWindow }));
+		switch (request.state) {
+			case "pending":
+				return `⬆️ **Upstream launch request**\n${repo} — ${request.problem}\nRequest document \`${request.docPath}\`, requested by ${titleOf(request.requester)}${tab}. Nothing has launched yet.`;
+			case "launching":
+				return `⬆️ **Upstream launch**\n${repo} — ${request.problem}\nLaunching \`${request.slug}\`${tab}.`;
+			case "launched":
+				return `✅ **Upstream launched**\n${repo} — ${request.problem}\nBranch \`${request.branch}\` in tmux \`${request.tab}\`.`;
+			case "failed":
+				return `❌ **Upstream launch failed**\n${repo} — ${request.problem}\n${clip(request.error, 300)}\nLaunch again, or cancel.`;
+			case "cancelled":
+				return `Cancelled. Nothing was launched for ${repo}.`;
+			case "already-started":
+				return `Upstreaming has already started. Nothing was launched for ${repo}.`;
+			case "retracted":
+				return `Retracted. Nothing was launched for ${repo}.`;
+			case "expired":
+				return `This request expired after seven days. Nothing was launched for ${repo}.`;
+		}
+	}
+
+	/** The card's full text, the requester's head on top and the state body below. */
+	function launchRequestText(request: LaunchRequest): string {
+		const body = launchCardBody(request);
+		return request.head.length > 0 ? `${request.head}\n\n${body}` : body;
+	}
+
+	/** Edits the request's card to its current state. The card's send happens once, in the request action. */
+	async function redrawLaunchCard(cfg: Config, request: LaunchRequest): Promise<void> {
+		const messageId = request.messageId;
+		if (messageId === null) return;
+		await callTelegram(
+			cfg,
+			"editMessageText",
+			{
+				chat_id: cfg.chatId,
+				message_id: messageId,
+				text: toTelegramHtml(fitToTelegram(launchRequestText(request), "")),
+				parse_mode: "HTML",
+				reply_markup: { inline_keyboard: launchRequestButtons(request) },
+			},
+			15_000,
+		);
+	}
+
+	/**
+	 * What a request's requester hears when it reaches an outcome. The word is a status update written
+	 * by no one. A live requester's own drain delivers it as an aside, and an ended one holds it until
+	 * its resume card delivers it, where it gets its own line. A `quiet` word for an ended requester drops.
+	 */
+	function tellRequester(request: LaunchRequest, text: string, quiet = false): void {
+		const requester = request.requester;
+		if (quiet && !isLiveSession(requester)) return;
+		const item: PendingItem = {
+			kind: "launch",
+			at: Date.now(),
+			requestId: request.id,
+			state: request.state,
+			text,
+			summary: launchSummary(request.owner, request.name, request.state as LaunchOutcomeState),
+		};
+		writePrivateJson(
+			join(PENDING_DIR, requester),
+			`l-${Date.now()}-${randomUUID().replaceAll("-", "").slice(0, 12)}.json`,
+			item,
+		);
+		if (!isLiveSession(requester)) detach(() => raiseResumeCard(requester), "resume card");
+	}
+
+	/**
+	 * Routes a reply to a launch card back to the requester as the user's own words, the way a plain reply
+	 * does. A live requester takes it straight into the inbox, and an ended one keeps it held until a resume,
+	 * where its word wakes the resume card.
+	 */
+	function holdReply(request: LaunchRequest, text: string, messageId: number, updateId: number, cardId: number): void {
+		const requester = request.requester;
+		const entry: InboxEntry = {
+			kind: "text",
+			value: text,
+			messageId,
+			replyTo: cardId,
+		};
+		if (isLiveSession(requester)) {
+			deliver(requester, updateId, entry);
+			return;
+		}
+		const item: PendingItem = {
+			kind: "inbox",
+			at: Date.now(),
+			updateId,
+			summary: `your reply to the upstream launch request for ${request.owner}/${request.name}: ${clip(text, 60)}`,
+			entry,
+		};
+		writePrivateJson(join(PENDING_DIR, requester), `i-${updateId}.json`, item);
+		detach(() => raiseResumeCard(requester), "resume card");
+	}
+
+	/**
+	 * Runs the launch from the request the Launch tap wrote and settles the card and the requester from
+	 * its outcome. The tap blocked every other move of a `launching` request, and the interrupted sweep
+	 * only fires when the launch's own process is dead, so the passed request still names this launch.
+	 */
+	async function runLaunch(cfg: Config, launching: LaunchRequest): Promise<void> {
+		const outcome = await performUpstreamLaunch(
+			{
+				owner: launching.owner,
+				name: launching.name,
+				slug: launching.slug,
+				doc: launching.doc,
+				problem: launching.problem,
+			},
+			launching.requester,
+			launching.tmux,
+		);
+		const id = launching.id;
+		if (outcome.ok) {
+			const done: LaunchRequest = {
+				...launching,
+				state: "launched",
+				stateAt: Date.now(),
+				branch: outcome.branch,
+				tab: outcome.tab,
+			};
+			writePrivateJson(REQUESTS_DIR, `${id}.json`, done);
+			detach(() => redrawLaunchCard(cfg, done), "launch card");
+			tellRequester(
+				done,
+				`The upstream launch for ${done.owner}/${done.name} opened branch \`${outcome.branch}\` in tmux \`${outcome.tab}\`.`,
+			);
+		} else {
+			const failed: LaunchRequest = {
+				...launching,
+				state: "failed",
+				stateAt: Date.now(),
+				error: clip(outcome.error, 400),
+			};
+			writePrivateJson(REQUESTS_DIR, `${id}.json`, failed);
+			detach(() => redrawLaunchCard(cfg, failed), "launch card");
+			tellRequester(
+				failed,
+				`The upstream launch for ${failed.owner}/${failed.name} failed: ${clip(outcome.error, 300)}`,
+			);
+		}
+	}
+
+	/** The card's taps, answered from the request file by whoever holds the poller lock. */
+	async function answerLaunchCallback(cfg: Config, callback: TelegramCallbackQuery, data: string): Promise<void> {
+		const rest = data.slice(2);
+		const sep = rest.indexOf(":");
+		const request = readLaunchRequest(sep === -1 ? rest : rest.slice(0, sep));
+		const action = sep === -1 ? "" : rest.slice(sep + 1);
+		if (request === null) {
+			const messageId = callback.message?.message_id;
+			if (typeof messageId === "number") detach(() => stripKeyboard(messageId), "launch card retire");
+			await callTelegram(
+				cfg,
+				"answerCallbackQuery",
+				{ callback_query_id: callback.id, text: "That request is closed." },
+				10_000,
+			);
+			return;
+		}
+		if (request.state === "launching") {
+			await callTelegram(
+				cfg,
+				"answerCallbackQuery",
+				{ callback_query_id: callback.id, text: "That request is already starting." },
+				10_000,
+			);
+			return;
+		}
+		const open = request.state === "pending" || request.state === "failed";
+		if (!open || (action !== "l" && action !== "c" && action !== "a")) {
+			const messageId = callback.message?.message_id;
+			if (typeof messageId === "number") detach(() => stripKeyboard(messageId), "launch card retire");
+			await callTelegram(
+				cfg,
+				"answerCallbackQuery",
+				{ callback_query_id: callback.id, text: "That request is closed." },
+				10_000,
+			);
+			return;
+		}
+		const now = Date.now();
+		if (action === "l") {
+			// The state write lands before the launch runs, so a tap queued behind it sees `launching`.
+			const launching: LaunchRequest = {
+				...request,
+				state: "launching",
+				stateAt: now,
+				launchPid: process.pid,
+				error: "",
+			};
+			writePrivateJson(REQUESTS_DIR, `${request.id}.json`, launching);
+			detach(() => runLaunch(cfg, launching), "upstream launch");
+			detach(() => redrawLaunchCard(cfg, launching), "launch card");
+			await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callback.id, text: "Starting it." }, 10_000);
+			return;
+		}
+		const state: LaunchRequestState = action === "c" ? "cancelled" : "already-started";
+		const settled: LaunchRequest = { ...request, state, stateAt: now, error: "" };
+		writePrivateJson(REQUESTS_DIR, `${request.id}.json`, settled);
+		tellRequester(
+			settled,
+			state === "cancelled"
+				? `The upstream launch request for ${settled.owner}/${settled.name} was cancelled on Telegram.`
+				: `The upstream launch request for ${settled.owner}/${settled.name} was closed as already started.`,
+			true,
+		);
+		detach(() => redrawLaunchCard(cfg, settled), "launch card");
+		await callTelegram(
+			cfg,
+			"answerCallbackQuery",
+			{ callback_query_id: callback.id, text: state === "cancelled" ? "Cancelled." : "Nothing will be launched." },
+			10_000,
+		);
+	}
+
+	/** The poller's sweep of the request files, covering interrupted launches and the seven-day expiry. */
+	function launchRequestTick(): void {
+		const now = Date.now();
+		for (const request of allLaunchRequests()) {
+			if (request.state === "launching" && !processRuns(request.launchPid)) {
+				// The worktree may be half made, so a retry that hits it reports the collision on the card.
+				const failed: LaunchRequest = { ...request, state: "failed", stateAt: now, error: "interrupted" };
+				writePrivateJson(REQUESTS_DIR, `${request.id}.json`, failed);
+				tellRequester(
+					failed,
+					`The upstream launch for ${failed.owner}/${failed.name} was interrupted while starting and is not running.`,
+				);
+				const cfg = config;
+				if (cfg !== null) detach(() => redrawLaunchCard(cfg, failed), "launch card");
+				continue;
+			}
+			if (request.state === "pending" || request.state === "failed") {
+				if (now - request.at <= REQUEST_EXPIRY_MS) continue;
+				const expired: LaunchRequest = { ...request, state: "expired", stateAt: now };
+				writePrivateJson(REQUESTS_DIR, `${request.id}.json`, expired);
+				tellRequester(
+					expired,
+					`The upstream launch request for ${expired.owner}/${expired.name} expired after seven days.`,
+					true,
+				);
+				const cfg = config;
+				if (cfg !== null) detach(() => redrawLaunchCard(cfg, expired), "launch card");
+			}
+		}
+	}
+
+	/** Removes a retracted request's card, editing it to its closure when Telegram will not delete it. */
+	async function deleteLaunchCard(cfg: Config, request: LaunchRequest): Promise<void> {
+		const messageId = request.messageId;
+		if (messageId === null) return;
+		let refusal = "";
+		const deleted = await callTelegramRaw(
+			cfg,
+			"deleteMessage",
+			{ chat_id: cfg.chatId, message_id: messageId },
+			10_000,
+			(failure) => {
+				refusal = failure.description;
+				pi.logger.warn("telegram call failed", { ...failure });
+			},
+		);
+		if (deleted !== null || editVerdict(refusal) !== "gone") return;
+		await redrawLaunchCard(cfg, request);
 	}
 
 	const EDGE_WORDS: Record<EdgeType, string> = {
@@ -8095,203 +8546,164 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
-	/** Only the explicit Launch button authorizes upstream work. */
-	async function confirmUpstreamLaunch(
-		ctx: ExtensionContext,
-		question: string,
-		context: string,
-		signal: AbortSignal | undefined,
-	): Promise<{ action: "launch" | "cancel" | "already-started" | "unavailable" } | { action: "reply"; text: string }> {
-		askSequence += 1;
-		const remote = Promise.withResolvers<AskResult[]>();
-		const ask: PendingAsk = {
-			askId: `${sessionTag}-${askSequence.toString(36)}`,
-			ctx,
-			context,
-			questions: [
-				{
-					id: "upstream-launch",
-					question,
-					options: [
-						{
-							label: "Launch",
-							description:
-								"Fork or reuse the repository, open a new omp session in a tmux tab, and start the upstream work.",
-						},
-						{ label: "Cancel", description: "Do nothing. Stay in this session and drop the upstream launch." },
-						{
-							label: "Upstreaming has already started",
-							description:
-								"Agent will skip launching a duplicate because another session is already handling the upstream work.",
-						},
-					],
-					recommended: 0,
-				},
-			],
-			index: 0,
-			messageId: null,
-			renders: 0,
-			outcome: "Launch cancelled.",
-			selected: [new Set<string>()],
-			custom: [undefined],
-			finish: remote.resolve,
-		};
-		const previous = pendingAsk;
-		pendingAsk = ask;
-		// The card is the only place to answer, so it is sent until Telegram takes it, unless the call is aborted.
-		const stopCard = (): void => {
-			if (pendingAsk === ask) pendingAsk = previous;
-		};
-		signal?.addEventListener("abort", stopCard);
-		if (signal?.aborted) stopCard();
-		try {
-			await presentQuestion(ask, false);
-		} catch (error) {
-			// A network throw from the send must not leave pendingAsk bound to a card that never showed.
-			if (pendingAsk === ask) pendingAsk = previous;
-			noteState();
-			pi.logger.warn("upstream: the launch confirmation card failed to send", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-			return { action: "unavailable" };
-		} finally {
-			signal?.removeEventListener("abort", stopCard);
-		}
-		if (signal?.aborted === true) {
-			// Aborted before or while the card went out, which cancels the launch as an abort during the wait does.
-			// The abort already restored the previous question, and a card that landed is closed.
-			detach(() => settleAskMessage(ask, ask.messageId, ask.outcome), "upstream-confirm close");
-			noteState();
-			return { action: "cancel" };
-		}
-		if (ask.messageId === null) {
-			// Telegram refused the card for good, so there is nothing to answer.
-			if (pendingAsk === ask) pendingAsk = previous;
-			noteState();
-			return { action: "unavailable" };
-		}
-		lastNotifiedAt = Date.now();
-		writeSessionRecord(ctx);
-		const onAbort = (): void => remote.resolve([]);
-		signal?.addEventListener("abort", onAbort);
-		// An AbortSignal fires "abort" once; if it is already aborted the listener never runs, so settle now.
-		if (signal?.aborted) onAbort();
-		try {
-			const results = await remote.promise;
-			const answer = results[0];
-			if (answer?.customInput !== undefined) return { action: "reply", text: answer.customInput };
-			const choice = answer?.selectedOptions[0];
-			if (choice === "Launch") return { action: "launch" };
-			if (choice === "Upstreaming has already started") return { action: "already-started" };
-			return { action: "cancel" };
-		} finally {
-			signal?.removeEventListener("abort", onAbort);
-			if (pendingAsk === ask) {
-				pendingAsk = previous;
-				if (ask.messageId !== null)
-					detach(() => settleAskMessage(ask, ask.messageId, "Launch cancelled."), "upstream-confirm close");
-			}
-			noteState();
-		}
-	}
-
 	registerTool({
 		name: "upstream_launch",
 		label: "Upstream Launch",
 		description:
-			"Start an upstream fix after writing the request document and obtaining the user's agreement that it is needed. The Telegram card offers Launch, Cancel and Upstreaming has already started. Only tapping Launch starts work. Text replies return verbatim to the requesting model without starting a session, and choosing existing work reports that outcome without starting a duplicate. Launch uses the target repository when the user can push there, otherwise finds or creates the user's fork by its parent. It preserves existing remotes in `~/github/<name>`, creates a worktree on `upstream/<slug>` from the target's default branch, carries the request document and opens an `omp` session in its own `tmux` tab with the push remote. It operates under `~/github` and leaves this repository untouched. `repo` names the upstream repository as `owner/name`, `document` is the request path relative to this session's working directory, `problem` is the one-sentence defect shown on the card, and optional `slug` names the branch and worktree, defaulting from `problem`.",
+			"Request, list and retract upstream fixes through a Telegram card that the poller answers, so this call never blocks. `action` `request` (the default) validates the request, records it and sends the card offering Launch, Cancel and Upstreaming has already started. It returns the request's id at once with nothing launched yet, the decision and the launch's result arrive as messages, so end or continue the turn. Call `list` for the repository before requesting, and when another session has already started or requested the same upstream fix, retract your own request with `retract`. `action` `list` reports every request and every started upstream session for `repo`, or for all repositories when it is omitted. `action` `retract` withdraws this session's own request by `id`, which deletes its card. A failed launch keeps Launch and Cancel on its card, so a retry is one tap, and a pending or failed request expires after seven days. Launch uses the target repository when the user can push there, otherwise finds or creates the user's fork by its parent. It preserves existing remotes in `~/github/<name>`, creates a worktree on `upstream/<slug>` from the target's default branch, carries the request document and opens an `omp` session in a `tmux` tab of the requesting session's tmux session with the push remote. It operates under `~/github` and leaves this repository untouched. `repo` names the upstream repository as `owner/name`, `document` is the request path relative to this session's working directory, `problem` is the one-sentence defect shown on the card, and optional `slug` names the branch and worktree, defaulting from `problem`.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
-			repo: z.string(),
-			document: z.string(),
-			problem: z.string(),
+			action: z.string().optional(),
+			repo: z.string().optional(),
+			document: z.string().optional(),
+			problem: z.string().optional(),
 			slug: z.string().optional(),
+			id: z.string().optional(),
 		}),
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const p = params as { repo?: unknown; document?: unknown; problem?: unknown; slug?: unknown };
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const p = params as {
+				action?: unknown;
+				repo?: unknown;
+				document?: unknown;
+				problem?: unknown;
+				slug?: unknown;
+				id?: unknown;
+			};
 			const fail = (text: string): { content: { type: "text"; text: string }[]; isError: true } => ({
 				content: [{ type: "text", text: `Error: ${text}` }],
 				isError: true,
 			});
+			const arg = (key: "action" | "repo" | "document" | "problem" | "slug" | "id"): string =>
+				typeof p[key] === "string" ? (p[key] as string).trim() : "";
 			if (config === null) {
 				return fail(
 					"Telegram is not configured, and this procedure runs through the bot; start it from a session paired with the Telegram bot.",
 				);
 			}
-			if (process.env.TMUX === undefined) {
-				return fail("no tmux session is attached, so a new tab cannot be opened; run omp inside tmux");
-			}
-			const validated = validateLaunchParams(p, ctx.cwd);
-			if (!validated.ok) return fail(validated.error);
-			const { args, docPath } = validated;
-
-			const context = `Upstream target: ${args.owner}/${args.name}\nProblem: ${args.problem}\nRequest document: ${docPath}`;
-			const decision = await confirmUpstreamLaunch(
-				ctx,
-				`Launch the upstream procedure for \`${args.owner}/${args.name}\`?`,
-				context,
-				signal,
-			);
-			if (decision.action === "unavailable") {
-				return fail(
-					"could not send the Launch confirmation to Telegram, so nothing was launched; check the bot connection and retry",
-				);
-			}
-			if (decision.action !== "launch") {
-				if (decision.action === "reply") {
+			const cfg = config;
+			const action = arg("action").length > 0 ? arg("action") : "request";
+			if (action === "retract") {
+				const requestId = arg("id");
+				if (requestId.length === 0) return fail("retract needs the request's `id`");
+				const request = readLaunchRequest(requestId);
+				if (request === null) return fail(`no request ${requestId} on record`);
+				if (request.requester !== sessionId) return fail("only the requesting session may retract its request");
+				if (request.state === "launching") return fail("it is already starting");
+				if (request.state === "pending" || request.state === "failed") {
+					const retracted: LaunchRequest = { ...request, state: "retracted", stateAt: Date.now() };
+					writePrivateJson(REQUESTS_DIR, `${request.id}.json`, retracted);
+					await deleteLaunchCard(cfg, retracted);
 					return {
 						content: [
 							{
 								type: "text",
-								text: `The user replied to the upstream launch confirmation. No upstream session was launched.\n\n${decision.text}`,
+								text: `Retracted request ${request.id} for ${request.owner}/${request.name}. Nothing was launched, and its card is deleted.`,
 							},
 						],
-						details: { launched: false, reason: "reply", reply: decision.text },
+						details: { retracted: true, id: request.id },
 					};
 				}
-				const alreadyStarted = decision.action === "already-started";
+				return fail(`it is already ${request.state === "retracted" ? "retracted" : request.state}`);
+			}
+			if (action === "list") {
+				const repo = arg("repo");
+				const wants = (r: string): boolean => repo.length === 0 || r === repo;
+				const requests = allLaunchRequests().filter((entry) => wants(`${entry.owner}/${entry.name}`));
+				const started = allNodes().filter((node) => node.branch !== undefined && wants(node.repo ?? ""));
+				const notStarted = allLaunches().filter((entry) => wants(entry.repo));
+				const requestLines =
+					requests.length === 0
+						? ["- none"]
+						: requests.map(
+								(entry) =>
+									`- ${entry.id} — ${entry.requester} — ${entry.slug} — ${entry.problem} — ${entry.state}, ${requestAge(entry.at)}`,
+							);
+				const sessionLines =
+					started.length + notStarted.length === 0
+						? ["- none"]
+						: [
+								...started.map(
+									(node) =>
+										`- ${node.session} — ${node.repo ?? ""} — branch \`${node.branch}\` — ${displayedStatus(node)}`,
+								),
+								...notStarted.map(
+									(launch) =>
+										`- ${launch.id} — ${launch.repo} — branch \`${launch.branch}\` — not started, claimed by no session yet`,
+								),
+							];
 				return {
 					content: [
 						{
 							type: "text",
-							text: alreadyStarted
-								? "Upstreaming has already started in another session. No duplicate session was launched."
-								: "Upstream launch cancelled. Nothing was forked, cloned or opened.",
+							text: `Requests${repo.length > 0 ? ` for ${repo}` : ""}:\n${requestLines.join("\n")}\nUpstream sessions:\n${sessionLines.join("\n")}`,
 						},
 					],
-					details: { launched: false, reason: alreadyStarted ? "already-started" : "cancelled" },
+					details: { requests: requests.length, sessions: started.length + notStarted.length },
 				};
 			}
-
-			const outcome = await performUpstreamLaunch(args, sessionId);
-			if (!outcome.ok) return fail(outcome.error);
+			if (action !== "request") return fail(`unknown action "${action}"`);
+			if (process.env.TMUX === undefined) {
+				return fail("no tmux session is attached, so the launch tab has nowhere to open; run omp inside tmux");
+			}
+			const validated = validateLaunchParams(p, ctx.cwd);
+			if (!validated.ok) return fail(validated.error);
+			const { args, docPath } = validated;
+			const id = randomUUID();
+			const at = Date.now();
+			const tab = tabOf(launchSpec);
+			const request: LaunchRequest = {
+				id,
+				requester: sessionId,
+				owner: args.owner,
+				name: args.name,
+				slug: args.slug,
+				problem: args.problem,
+				doc: args.doc,
+				docPath,
+				tmux: launchSpec.tmuxSession,
+				tmuxWindow: launchSpec.tmuxWindow,
+				// The head is stored on the request, so its tab is the one read at session start, not a fresh read.
+				head: messageHead(ctx, tab === "" ? null : tab),
+				messageId: null,
+				state: "pending",
+				at,
+				stateAt: at,
+				error: "",
+				branch: "",
+				tab: "",
+				launchPid: 0,
+			};
+			writePrivateJson(REQUESTS_DIR, `${id}.json`, request);
 			saveOwnNode(ctx);
-			const where = {
-				own: "your own repository",
-				maintainer: `${outcome.pushRepo} itself, where you have push access`,
-				fork: `${outcome.created ? "a new fork" : "your existing fork"} ${outcome.pushRepo}`,
-			}[outcome.mode];
-			detach(
-				() =>
-					notify(
-						ctx,
-						"notice",
-						"\u2B06\uFE0F Upstream launched",
-						`${outcome.owner}/${outcome.name} \u2014 ${args.problem}\nBranch \`${outcome.branch}\` in ${where}. It runs in its own tmux tab now.`,
-					),
-				"upstream launch notice",
+			const card = await callTelegram<TelegramMessage>(
+				cfg,
+				"sendMessage",
+				{
+					chat_id: cfg.chatId,
+					text: toTelegramHtml(fitToTelegram(launchRequestText(request), "")),
+					parse_mode: "HTML",
+					reply_markup: { inline_keyboard: launchRequestButtons(request) },
+				},
+				15_000,
 			);
+			if (card === null) {
+				removeStatePath(REQUESTS_DIR, `${id}.json`);
+				return fail(
+					"could not send the launch card to Telegram, so nothing was requested; check the bot connection and retry",
+				);
+			}
+			writePrivateJson(REQUESTS_DIR, `${id}.json`, { ...request, messageId: card.message_id });
 			lastNotifiedAt = Date.now();
 			writeSessionRecord(ctx);
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Launched the upstream session for ${outcome.owner}/${outcome.name} in ${where}. Worktree ${outcome.worktreePath} on branch ${outcome.branch}, tmux window ${outcome.windowId}. Your work here is done: the new session carries the fix from here.`,
+						text: `Nothing launched yet. Request ${id} is pending on its Telegram card, which offers Launch, Cancel and Upstreaming has already started. The decision and the launch's result arrive as messages, so end or continue the turn. Call \`list\` for the repository to see other requests and started upstream sessions, and retract this one with \`retract\` when another session covers the same fix.`,
 					},
 				],
-				details: { launched: true, ...outcome },
+				details: { requested: true, id, state: "pending", card: card.message_id },
 			};
 		},
 	});
@@ -8385,6 +8797,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 				if (ownsLock()) {
 					graphTick();
+					launchRequestTick();
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
 					detachBackground(() => redrawCrashCards(), "crash cards");
