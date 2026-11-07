@@ -22,11 +22,14 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
 	AGENT_STATUSES,
 	blockingPath,
+	buildWatchQuery,
 	classifyPr,
 	dependentsOf,
+	diffWatch,
 	displayedStatus,
 	EDGE_TYPES,
 	type EdgeType,
+	failingCheckNames,
 	type GhPr,
 	GRAPH_RETENTION_MS,
 	type GraphNode,
@@ -34,12 +37,21 @@ import {
 	type Outcome,
 	outcomeOfPr,
 	outcomeOfStatus,
+	PR_EVENTS,
+	type PrEvent,
 	type PrRecord,
 	type PrState,
+	type PrWatch,
+	parseWatchQuery,
+	prWatchName,
 	resumeArgs,
 	selectNodes,
 	statusList,
 	toMermaid,
+	verdictOf,
+	type WatchFetch,
+	type WatchQueryAnswer,
+	type WatchQueryEntry,
 } from "./graph.ts";
 import {
 	type AskOption,
@@ -832,9 +844,11 @@ const NODES_DIR = join(GRAPH_DIR, "nodes");
 const PR_DIR = join(GRAPH_DIR, "pr");
 const LAUNCHES_DIR = join(GRAPH_DIR, "launches");
 const PENDING_DIR = join(GRAPH_DIR, "pending");
+const WATCH_DIR = join(GRAPH_DIR, "watches");
 const REQUESTS_DIR = join(GRAPH_DIR, "requests");
 const RENDER_DIR = join(GRAPH_DIR, "render");
 const GRAPH_POLL_MS = 10 * 60_000;
+const WATCH_POLL_MS = 60_000;
 const GRAPH_PRUNE_MS = 24 * 3_600_000;
 /** A launch its child has not claimed within this long is shown as never started. */
 const LAUNCH_STALE_MS = 3_600_000;
@@ -852,7 +866,22 @@ const PHOTO_MAX_BYTES = 10 * 1024 * 1024;
 const STATUS_CHUNK_MAX = 3_800;
 /** Telegram shrinks a photo to 2560 pixels on its longer side, which leaves a larger diagram unreadable. */
 const PHOTO_MAX_SIDE = 2560;
-const GITHUB_PR_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/u;
+const GITHUB_PR_URL = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)$/u;
+/** A GitHub owner, which starts with a letter or digit, so a watch file name never starts with a dot. */
+const OWNER_PART = /^[A-Za-z0-9][A-Za-z0-9-]*$/u;
+/** A GitHub repository name, which may start with a dot, as `.github` does, but is never `.` or `..`. */
+const NAME_PART = /^(?!\.{1,2}$)[\w.-]+$/u;
+
+/** The validated owner, name and number of a pull request URL, for a watch file name. */
+function prWatchKeyOf(url: string): { owner: string; name: string; number: number } | null {
+	const match = GITHUB_PR_URL.exec(url);
+	if (match === null) return null;
+	const owner = match[1] as string;
+	const name = match[2] as string;
+	if (!OWNER_PART.test(owner) || !NAME_PART.test(name)) return null;
+	const number = Number(match[3] as string);
+	return Number.isSafeInteger(number) && number > 0 ? { owner, name, number } : null;
+}
 
 interface LaunchSpec {
 	/** Flags the session started with that a resume repeats, filtered by `resumeArgs`. */
@@ -1004,7 +1033,28 @@ type PendingItem =
 	/** What the user sent a session that died before reading it, delivered as if it had just arrived. */
 	| { kind: "inbox"; at: number; updateId: number; summary: string; entry: InboxEntry }
 	/** A launch request's outcome, delivered to its requester as an aside, written by no one. */
-	| { kind: "launch"; at: number; requestId: string; state: LaunchRequestState; text: string; summary: string };
+	| { kind: "launch"; at: number; requestId: string; state: LaunchRequestState; text: string; summary: string }
+	/** A watched pull request's news, delivered to its watcher as an aside, written by no one. */
+	| {
+			kind: "pr";
+			at: number;
+			owner: string;
+			name: string;
+			number: number;
+			event: Exclude<PrEvent, "review" | "ci-red">;
+	  }
+	| { kind: "pr"; at: number; owner: string; name: string; number: number; event: "ci-red"; checks: string[] }
+	| {
+			kind: "pr";
+			at: number;
+			owner: string;
+			name: string;
+			number: number;
+			event: "review";
+			reviewer: string;
+			verdict: string;
+			body: string;
+	  };
 
 function readJsonFile(path: string): unknown {
 	try {
@@ -1172,6 +1222,25 @@ function pendingItemOf(raw: unknown): PendingItem | null {
 			(LAUNCH_REQUEST_STATES as readonly unknown[]).includes(item.state);
 		return valid ? (item as unknown as PendingItem) : null;
 	}
+	if (item.kind === "pr") {
+		const owner = item.owner as string;
+		const name = item.name as string;
+		const number = item.number as number;
+		const base = OWNER_PART.test(owner) && NAME_PART.test(name) && Number.isSafeInteger(number) && number > 0;
+		if (!base) return null;
+		if (item.event === "review") {
+			return typeof item.reviewer === "string" && typeof item.verdict === "string" && typeof item.body === "string"
+				? (item as unknown as PendingItem)
+				: null;
+		}
+		if (item.event === "ci-red") {
+			const checks = item.checks;
+			return Array.isArray(checks) && checks.length > 0 && checks.every((check) => typeof check === "string")
+				? (item as unknown as PendingItem)
+				: null;
+		}
+		return (PR_EVENTS as readonly unknown[]).includes(item.event) ? (item as unknown as PendingItem) : null;
+	}
 	if (item.kind !== "outcome") return null;
 	if (!isStateToken(item.source) || typeof item.outcome !== "string" || typeof item.title !== "string") return null;
 	if (typeof item.place !== "string" || !(EDGE_TYPES as readonly unknown[]).includes(item.edge)) return null;
@@ -1209,6 +1278,38 @@ function outcomeText(item: Extract<PendingItem, { kind: "outcome" }>): string {
 /** What the requester's model reads when a launch request it made reaches an outcome. */
 function launchText(item: Extract<PendingItem, { kind: "launch" }>): string {
 	return `Automatic upstream-launch update, written by no one: ${item.text} This is a status update, not a message, so there is no one to reply to.`;
+}
+
+const PR_EVENT_PHRASE: Record<Exclude<PrEvent, "review">, string> = {
+	merged: "was merged",
+	closed: "was closed without merging",
+	"ci-red": "has CI red on its head commit",
+	"ci-green": "has CI green on its head commit",
+	gone: "is gone from GitHub, which no longer finds it or its repository",
+};
+
+function prLink(owner: string, name: string, number: number): string {
+	return `https://github.com/${owner}/${name}/pull/${number}`;
+}
+
+/** The short line a PR-watch event gets on its watcher's resume card. */
+function prSummary(item: Extract<PendingItem, { kind: "pr" }>): string {
+	const link = prLink(item.owner, item.name, item.number);
+	return item.event === "review"
+		? `pull request ${link} got a review from ${item.reviewer}`
+		: `pull request ${link} ${PR_EVENT_PHRASE[item.event]}`;
+}
+
+/** What the watcher's model reads when a watched pull request reaches an event. */
+function prText(item: Extract<PendingItem, { kind: "pr" }>): string {
+	const lines = [`Automatic PR-watch update, written by no one: ${prSummary(item)}.`];
+	if (item.event === "review") {
+		lines.push(`Verdict: ${item.verdict}.`);
+		if (item.body.length > 0) lines.push(`Review body: ${item.body}`);
+	}
+	if (item.event === "ci-red") lines.push(`Failing checks: ${item.checks.join(", ")}.`);
+	lines.push("This is a status update, not a message, so there is no one to reply to.");
+	return lines.join("\n");
 }
 
 /** The short line a launch outcome gets on its requester's resume card. */
@@ -6652,6 +6753,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastGraphPoll = 0;
 	let lastGraphPrune = 0;
 	let graphPollInFlight = false;
+	let lastWatchPoll = 0;
+	let lastWatchPrune = 0;
+	let watchPollInFlight = false;
 
 	function isLiveSession(id: string): boolean {
 		if (id === sessionId) return sessionAlive;
@@ -6850,6 +6954,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				);
 				continue;
 			}
+			// A PR-watch event is a status update, so it is written by no one and answers to no one.
+			if (item.kind === "pr") {
+				pi.sendMessage(
+					{ customType: DEPENDENCY_MESSAGE_TYPE, content: prText(item), display: true, details: item },
+					{ deliverAs: "aside", triggerTurn: true },
+				);
+				continue;
+			}
 			pi.sendMessage(
 				{ customType: DEPENDENCY_MESSAGE_TYPE, content: outcomeText(item), display: true, details: item },
 				{ deliverAs: "aside", triggerTurn: true },
@@ -6902,7 +7014,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						? `- ${item.summary}`
 						: item.kind === "inbox"
 							? `- ${item.summary}`
-							: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
+							: item.kind === "pr"
+								? `- ${prSummary(item)}`
+								: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
 			);
 		const text = `\u23F8\uFE0F **${titleOf(id)}**${inTab(tabOf(readNode(id)?.launch))} has ended with ${updates(items.length)} waiting:\n${lines.join("\n")}\n\nResume it to deliver them?`;
 		const body = {
@@ -7410,6 +7524,199 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** The session directories under `watches/`, each holding one session's watch files. */
+	function listWatchDirs(): string[] {
+		if (!existsSync(WATCH_DIR)) return [];
+		return readdirSync(WATCH_DIR, { withFileTypes: true })
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => entry.name);
+	}
+
+	/** The stored state of a watch file, or null when it does not hold one. */
+	function prWatchOf(raw: unknown): PrWatch | null {
+		if (raw === null || typeof raw !== "object") return null;
+		const w = raw as Record<string, unknown>;
+		if (typeof w.owner !== "string" || typeof w.name !== "string") return null;
+		if (!OWNER_PART.test(w.owner) || !NAME_PART.test(w.name)) return null;
+		if (!Number.isSafeInteger(w.number) || (w.number as number) <= 0) return null;
+		if (typeof w.url !== "string" || !isStateToken(w.by) || typeof w.at !== "number") return null;
+		if (typeof w.seeded !== "boolean") return null;
+		if (w.head !== null && typeof w.head !== "string") return null;
+		if (typeof w.redSent !== "boolean" || typeof w.greenSent !== "boolean") return null;
+		if (!Array.isArray(w.reviews) || !w.reviews.every((id) => typeof id === "string")) return null;
+		return {
+			url: w.url as string,
+			owner: w.owner,
+			name: w.name,
+			number: w.number as number,
+			by: w.by as string,
+			at: w.at as number,
+			seeded: w.seeded as boolean,
+			head: w.head as string | null,
+			redSent: w.redSent as boolean,
+			greenSent: w.greenSent as boolean,
+			reviews: w.reviews as string[],
+		};
+	}
+
+	/** Makes a session watch the pull request at `url`, seeded on the first poll. */
+	function ensureWatch(session: string, url: string): void {
+		const key = prWatchKeyOf(url);
+		if (key === null) return;
+		const dir = join(WATCH_DIR, session);
+		const name = prWatchName(key.owner, key.name, key.number);
+		if (existsSync(join(dir, `${name}.json`))) return;
+		writePrivateJson(dir, `${name}.json`, {
+			url,
+			owner: key.owner,
+			name: key.name,
+			number: key.number,
+			by: session,
+			at: Date.now(),
+			seeded: false,
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: [],
+		});
+	}
+
+	/** Removes the watch directories whose session has gone stale, at most once a day. */
+	function sweepWatches(): void {
+		const now = Date.now();
+		if (now - lastWatchPrune < GRAPH_PRUNE_MS) return;
+		lastWatchPrune = now;
+		for (const session of listWatchDirs()) {
+			if (isLiveSession(session)) continue;
+			const dir = join(WATCH_DIR, session);
+			const newest = Math.max(
+				readNode(session)?.updatedAt ?? 0,
+				readPr(session)?.changedAt ?? 0,
+				// The poll that runs the sweep has just discarded every malformed watch file.
+				...listJson(dir).map((entry) => (readJsonFile(join(dir, entry)) as PrWatch).at),
+			);
+			if (now - newest > GRAPH_RETENTION_MS) removeStatePath(WATCH_DIR, session);
+		}
+	}
+
+	/** Reads every watch, fetches every watched pull request in one batched query and sends each new event once. */
+	async function pollWatches(): Promise<void> {
+		if (watchPollInFlight) return;
+		watchPollInFlight = true;
+		try {
+			const unique = new Map<string, { owner: string; name: string; number: number }>();
+			const watches: { session: string; entry: string; watch: PrWatch }[] = [];
+			for (const session of listWatchDirs()) {
+				for (const entry of listJson(join(WATCH_DIR, session))) {
+					const watch = prWatchOf(readJsonFile(join(WATCH_DIR, session, entry)));
+					if (watch === null) {
+						removeStatePath(join(WATCH_DIR, session), entry);
+						pi.logger.warn("notify-telegram: discarded a malformed pr watch", {
+							file: join(WATCH_DIR, session, entry),
+						});
+						continue;
+					}
+					const key = `${watch.owner}\u0000${watch.name}\u0000${watch.number}`;
+					if (!unique.has(key)) unique.set(key, { owner: watch.owner, name: watch.name, number: watch.number });
+					watches.push({ session, entry, watch });
+				}
+			}
+			if (watches.length === 0) {
+				sweepWatches();
+				return;
+			}
+			// Sorted so the same set of watches always gets the same aliases, across ticks and processes.
+			const keyOf = (pr: { owner: string; name: string; number: number }) =>
+				`${pr.owner}\u0000${pr.name}\u0000${String(pr.number).padStart(20, "0")}`;
+			const entries: WatchQueryEntry[] = [...unique.values()]
+				.sort((a, b) => keyOf(a).localeCompare(keyOf(b)))
+				.map((pr, i) => ({ alias: `w${i}`, owner: pr.owner, name: pr.name, number: pr.number }));
+			const queried = await run("gh", ["api", "graphql", "-f", `query=${buildWatchQuery(entries)}`], 120_000);
+			let answer: WatchQueryAnswer = {};
+			try {
+				answer = JSON.parse(queried.stdout);
+			} catch {}
+			const fetched = parseWatchQuery(
+				answer,
+				entries.map((entry) => entry.alias),
+			);
+			if (fetched === null) {
+				pi.logger.warn("notify-telegram: the pr watch query failed, so every stored state is kept", {
+					stderr: clip(queried.stderr, 200),
+				});
+				sweepWatches();
+				return;
+			}
+			// One fetch per unique pull request, shared by every session that watches it. The parse fills
+			// every alias of the query, so the lookups below always land.
+			const byKey = new Map<string, WatchFetch>();
+			for (const entry of entries)
+				byKey.set(`${entry.owner}\u0000${entry.name}\u0000${entry.number}`, fetched.get(entry.alias) as WatchFetch);
+			let order = 0;
+			for (const { session, entry, watch } of watches) {
+				const got = byKey.get(`${watch.owner}\u0000${watch.name}\u0000${watch.number}`) as WatchFetch;
+				// A per-PR error that is not a disappearance keeps this watch's state.
+				if (got.data === null && !got.gone) continue;
+				const { events, next } = diffWatch(watch, got.data);
+				events.forEach((event) => {
+					const item: PendingItem =
+						event.event === "review"
+							? {
+									kind: "pr",
+									at: Date.now() + order,
+									owner: watch.owner,
+									name: watch.name,
+									number: watch.number,
+									event: "review",
+									reviewer: event.reviewer,
+									verdict: event.verdict,
+									body: clip(event.body, 500),
+								}
+							: event.event === "ci-red"
+								? {
+										kind: "pr",
+										at: Date.now() + order,
+										owner: watch.owner,
+										name: watch.name,
+										number: watch.number,
+										event: "ci-red",
+										checks: event.checks,
+									}
+								: {
+										kind: "pr",
+										at: Date.now() + order,
+										owner: watch.owner,
+										name: watch.name,
+										number: watch.number,
+										event: event.event,
+									};
+					order += 1;
+					// The item is written before the watch state, so a crash in between repeats an event rather than losing one.
+					writePrivateJson(
+						join(PENDING_DIR, session),
+						`p-${Date.now()}-${randomUUID().replaceAll("-", "").slice(0, 12)}.json`,
+						item,
+					);
+					if (!isLiveSession(session)) detach(() => raiseResumeCard(session), "resume card");
+				});
+				if (next !== null) writePrivateJson(join(WATCH_DIR, session), entry, next);
+				else removeStatePath(join(WATCH_DIR, session), entry);
+			}
+			sweepWatches();
+		} finally {
+			watchPollInFlight = false;
+		}
+	}
+
+	/** Run by the Telegram lock holder only, so one process polls the watched pull requests. */
+	function watchTick(): void {
+		const now = Date.now();
+		if (now - lastWatchPoll >= WATCH_POLL_MS) {
+			lastWatchPoll = now;
+			detach(() => pollWatches(), "PR watch poll");
+		}
+	}
+
 	/** Refreshes the PR state of every unfinished node, emitting each PR outcome once. */
 	async function pollGraph(): Promise<void> {
 		if (graphPollInFlight) return;
@@ -7420,6 +7727,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (isFinished(displayedStatus(node, previous ?? undefined))) continue;
 				const url = node.pr ?? previous?.url ?? (await findPr(node));
 				if (url === undefined) continue;
+				// A node without a launch, such as an imported worktree, has no session to hear the news.
+				if (node.launch !== undefined) ensureWatch(node.session, url);
 				const viewed = await run("gh", [
 					"pr",
 					"view",
@@ -7467,6 +7776,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			rmSync(join(NODES_DIR, `${node.session}.json`), { force: true });
 			rmSync(join(PR_DIR, `${node.session}.json`), { force: true });
 			rmSync(join(PENDING_DIR, node.session), { recursive: true, force: true });
+			// A watch outlives nothing once the session's node is gone.
+			removeStatePath(WATCH_DIR, node.session);
 		}
 		for (const launch of allLaunches()) {
 			if (now - launch.at > GRAPH_RETENTION_MS) rmSync(join(LAUNCHES_DIR, `${launch.id}.json`), { force: true });
@@ -7921,6 +8232,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					n.note = clip(arg("note"), 500);
 					if (pr.length > 0) n.pr = pr;
 				});
+				if (pr.length > 0) ensureWatch(self, pr);
 				const outcome = outcomeOfStatus(before, status as (typeof AGENT_STATUSES)[number]);
 				const woken = outcome === null ? 0 : emitOutcome(node, outcome, node.pr ?? readPr(self)?.url);
 				return reply(
@@ -7978,6 +8290,128 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				return reply(`Recorded: this session ${EDGE_WORDS[type]} ${describe(target)}.`, { to: target, type });
 			}
 			return refuse("`action` must be show, status, link, unlink or find.");
+		},
+	});
+
+	registerTool({
+		name: "pr_watch",
+		label: "PR Watch",
+		description: `Watch pull requests so their news reaches you without polling GitHub. \`action\` \`add\` takes a GitHub pull request URL in \`url\` and answers with the pull request's current state, so you never wait for news you already have. \`remove\` stops watching one you added, and \`list\` shows what this session watches. Every watched pull request wakes you with an aside written by no one when it is merged or closed, when any review lands, bots and comment-only ones included, and when the head commit's CI turns red or fully green. Your own pull requests are watched without asking, so only other people's need \`add\`.`,
+		approval: "read",
+		parameters: z.object({
+			action: z.string().optional(),
+			url: z.string().optional(),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const p = params as Record<string, unknown>;
+			const arg = (key: string): string => (typeof p[key] === "string" ? (p[key] as string).trim() : "");
+			const reply = (text: string, details: Record<string, unknown> = {}) => ({
+				content: [{ type: "text" as const, text }],
+				details,
+			});
+			const refuse = (text: string) => ({ ...reply(text), isError: true });
+			if (config === null) {
+				return refuse(
+					"PR watches ride the omp-telegram session registry, which starts only once the bot is paired with `node setup.mjs`.",
+				);
+			}
+			const self = sessionId;
+			const dir = join(WATCH_DIR, self);
+			const action = arg("action").length > 0 ? arg("action") : "list";
+			if (action === "list") {
+				const rows: string[] = [];
+				for (const entry of listJson(dir)) {
+					const watch = prWatchOf(readJsonFile(join(dir, entry)));
+					if (watch === null) continue;
+					rows.push(`- ${watch.url} \u2014 watched for ${requestAge(watch.at)}`);
+				}
+				return reply(
+					rows.length === 0
+						? "This session watches no pull requests. Your own pull requests are watched without asking, so only other people's need `add`."
+						: rows.join("\n"),
+				);
+			}
+			const url = arg("url");
+			if (url.length === 0) return refuse("Pass the GitHub pull request URL in `url`.");
+			const key = prWatchKeyOf(url);
+			if (key === null) {
+				return refuse("`url` must be a GitHub pull request URL, such as https://github.com/owner/repo/pull/12.");
+			}
+			if (action === "remove") {
+				const name = prWatchName(key.owner, key.name, key.number);
+				if (!existsSync(join(dir, `${name}.json`))) {
+					return refuse(`This session does not watch ${key.owner}/${key.name}#${key.number}.`);
+				}
+				removeStatePath(dir, `${name}.json`);
+				return reply(`Stopped watching ${key.owner}/${key.name}#${key.number}.`, { url });
+			}
+			if (action !== "add") return refuse("`action` must be add, remove or list.");
+			const name = prWatchName(key.owner, key.name, key.number);
+			if (existsSync(join(dir, `${name}.json`))) {
+				return reply(`Already watching ${key.owner}/${key.name}#${key.number}.`, { url });
+			}
+			const alias = "w0";
+			const queried = await run(
+				"gh",
+				[
+					"api",
+					"graphql",
+					"-f",
+					`query=${buildWatchQuery([{ alias, owner: key.owner, name: key.name, number: key.number }])}`,
+				],
+				60_000,
+			);
+			let answer: WatchQueryAnswer = {};
+			try {
+				answer = JSON.parse(queried.stdout);
+			} catch {}
+			const fetched = parseWatchQuery(answer, [alias]);
+			if (fetched === null) {
+				return refuse(
+					`Could not read the pull request from GitHub (${clip(queried.stderr, 200) || "no output"}); check that gh is authenticated and can read ${key.owner}/${key.name}.`,
+				);
+			}
+			const got = fetched.get(alias) as WatchFetch;
+			if (got.data === null) {
+				return refuse(
+					`GitHub does not find pull request ${key.owner}/${key.name}#${key.number}, so there is nothing to watch (${clip(got.error, 200)}).`,
+				);
+			}
+			const data = got.data;
+			if (data.state !== "OPEN") {
+				return reply(
+					`Pull request ${key.owner}/${key.name}#${key.number} is already ${data.state === "MERGED" ? "merged" : "closed"}, so there is nothing to watch.`,
+					{ state: data.state.toLowerCase() },
+				);
+			}
+			// The watch is seeded with what add saw, so the first poll reports only what is new.
+			const verdict = verdictOf(data);
+			const watchCount = data.reviews.length;
+			writePrivateJson(dir, `${name}.json`, {
+				url,
+				owner: key.owner,
+				name: key.name,
+				number: key.number,
+				by: self,
+				at: Date.now(),
+				seeded: true,
+				head: data.headRefOid,
+				redSent: verdict === "red",
+				greenSent: verdict === "green",
+				reviews: data.reviews.map((review) => review.id),
+			});
+			const state = data.isDraft ? "open (draft)" : "open";
+			const ci =
+				verdict === "red"
+					? `CI red on ${failingCheckNames(data.contexts).join(", ")}`
+					: verdict === "green"
+						? "CI green"
+						: "CI still running";
+			const seen = watchCount === 1 ? "1 review" : `${watchCount} reviews`;
+			return reply(
+				`Watching ${key.owner}/${key.name}#${key.number} (${url}).\nCurrent state: ${state}, ${ci}, ${seen} already seen.\nA merge or close, a new review, or the CI turning red or green on a new head wakes you with an aside written by no one.`,
+				{ url, state },
+			);
 		},
 	});
 
@@ -8797,6 +9231,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 				if (ownsLock()) {
 					graphTick();
+					watchTick();
 					launchRequestTick();
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");

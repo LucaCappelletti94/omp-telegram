@@ -1,0 +1,61 @@
+{
+	"data": {
+		"w0": {
+			"pullRequest": {
+				"number": 2829,
+				"state": "OPEN",
+				"isDraft": false,
+				"headRefOid": "878c355d83ba57098e0239b9f6a1c3720ff96e00",
+				"reviews": {
+					"nodes": [
+						{
+							"id": "PRR_kwDOBy9GHc8AAAABWSRzQA",
+							"author": { "login": "LucaCappelletti94" },
+							"state": "CHANGES_REQUESTED",
+							"body": "`SQLiteDialect::prec_value` matches every variant, so it needs the new one too. \n\n```diff\n-            Precedence::MulDivModOp => 40,\n+            Precedence::MulDivModOp | Precedence::UnaryPlusMinus => 40,\n```\n\nI have looked into whether this precedence bug applies also to the other dialects, and it does in some, so it will need to be addressed. DuckDB, MySQL and MariaDB all bind `^` tighter than `*` (`2 * 3 ^ 2` is 18 in DuckDB 1.4.4, and `2 * 3 ^ 1` is 4 in MySQL 8.4 and MariaDB 11.8), while the DuckDB and MySQL dialects parse `(2 * 3) ^ n`. The DuckDB dialect also parses `^` as `BitwiseXor`, although it is exponentiation there. Those fixes are outside this PR and can follow separately once the new level lands, since their tables need `UnaryPlusMinus` above `Caret`. If you happen to have time, such PRs would be welcomed.",
+							"submittedAt": "2026-11-05T19:17:50Z"
+						},
+						{
+							"id": "PRR_kwDOBy9GHc8AAAABWdLEtA",
+							"author": { "login": "LucaCappelletti94" },
+							"state": "CHANGES_REQUESTED",
+							"body": "In a little while I will open a PR adding a fuzzer exactly aimed at finding these issues, do use it before the next review round as I think it could be useful. It unfortunately finds still several expression priority issues.",
+							"submittedAt": "2026-11-06T14:57:21Z"
+						}
+					]
+				},
+				"statusCheckRollup": {
+					"commit": { "oid": "878c355d83ba57098e0239b9f6a1c3720ff96e00" },
+					"contexts": {
+						"nodes": [
+							{ "__typename": "CheckRun", "name": "codestyle", "status": "COMPLETED", "conclusion": "SUCCESS" },
+							{ "__typename": "CheckRun", "name": "Label dialects", "status": "COMPLETED", "conclusion": "SUCCESS" },
+							{
+								"__typename": "CheckRun",
+								"name": "Release Audit Tool (RAT)",
+								"status": "COMPLETED",
+								"conclusion": "SUCCESS"
+							},
+							{ "__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS" },
+							{ "__typename": "CheckRun", "name": "docs", "status": "COMPLETED", "conclusion": "SUCCESS" },
+							{ "__typename": "CheckRun", "name": "compile-no-std", "status": "COMPLETED", "conclusion": "SUCCESS" },
+							{ "__typename": "CheckRun", "name": "test (stable)", "status": "COMPLETED", "conclusion": "FAILURE" },
+							{ "__typename": "CheckRun", "name": "test (beta)", "status": "COMPLETED", "conclusion": "CANCELLED" },
+							{ "__typename": "CheckRun", "name": "test (nightly)", "status": "COMPLETED", "conclusion": "CANCELLED" },
+							{ "__typename": "CheckRun", "name": "coverage", "status": "COMPLETED", "conclusion": "FAILURE" }
+						]
+					}
+				}
+			}
+		},
+		"w1": { "pullRequest": null }
+	},
+	"errors": [
+		{
+			"type": "NOT_FOUND",
+			"path": ["w1", "pullRequest"],
+			"locations": [{ "line": 1, "column": 447 }],
+			"message": "Could not resolve to a PullRequest with the number of 999999."
+		}
+	]
+}

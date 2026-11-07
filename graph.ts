@@ -107,6 +107,267 @@ export function outcomeOfPr(before: PrState | undefined, after: PrState, emitted
 	return outcome;
 }
 
+/** A check run or status context on a head commit, typed by GitHub's GraphQL schema. */
+export interface WatchCheckRun {
+	__typename: "CheckRun";
+	name: string;
+	status: string;
+	/** Null until the run completes. */
+	conclusion: string | null;
+}
+export interface WatchStatusContext {
+	__typename: "StatusContext";
+	context: string;
+	state: string;
+}
+export type WatchContext = WatchCheckRun | WatchStatusContext;
+
+export interface WatchReview {
+	id: string;
+	/** Null when the reviewer's account was deleted. */
+	author: string | null;
+	state: string;
+	body: string;
+	submittedAt: string;
+}
+
+export interface WatchPrData {
+	number: number;
+	state: string;
+	isDraft: boolean;
+	headRefOid: string;
+	/** The commit the checks belong to, null when the pull request has no checks. */
+	commitOid: string | null;
+	reviews: WatchReview[];
+	contexts: WatchContext[];
+}
+
+export const PR_EVENTS = ["merged", "closed", "review", "ci-red", "ci-green", "gone"] as const;
+export type PrEvent = (typeof PR_EVENTS)[number];
+
+/** The stored state of one watch, one file per watching session per pull request. */
+export interface PrWatch {
+	url: string;
+	owner: string;
+	name: string;
+	number: number;
+	by: string;
+	at: number;
+	seeded: boolean;
+	head: string | null;
+	redSent: boolean;
+	greenSent: boolean;
+	reviews: string[];
+}
+
+export type WatchEvent =
+	| { event: "merged" }
+	| { event: "closed" }
+	| { event: "gone" }
+	| { event: "ci-green" }
+	| { event: "ci-red"; checks: string[] }
+	| { event: "review"; reviewer: string; verdict: string; body: string };
+
+const OK_CONCLUSIONS: Record<string, true> = { SUCCESS: true, NEUTRAL: true, SKIPPED: true };
+
+/** The verdict of the checks on a head commit, where null is nothing red and not fully green yet. */
+export function ciVerdict(contexts: readonly WatchContext[]): "red" | "green" | null {
+	if (contexts.length === 0) return null;
+	let pending = false;
+	for (const context of contexts) {
+		if (context.__typename === "StatusContext") {
+			if (context.state === "FAILURE" || context.state === "ERROR") return "red";
+			if (context.state === "PENDING" || context.state === "EXPECTED") pending = true;
+			continue;
+		}
+		if (context.status !== "COMPLETED") {
+			pending = true;
+			continue;
+		}
+		if (FAILED_CONCLUSIONS[String(context.conclusion)] === true) return "red";
+		if (OK_CONCLUSIONS[String(context.conclusion)] !== true) pending = true;
+	}
+	return pending ? null : "green";
+}
+
+/** The CI verdict of a fetched pull request, counted only when its checks belong to its head commit. */
+export function verdictOf(data: WatchPrData): "red" | "green" | null {
+	if (data.commitOid !== data.headRefOid) return null;
+	return ciVerdict(data.contexts);
+}
+
+/** The names of the checks that concluded a failure, for the red event. */
+export function failingCheckNames(contexts: readonly WatchContext[]): string[] {
+	const names: string[] = [];
+	for (const context of contexts) {
+		if (context.__typename === "StatusContext") {
+			if (context.state === "FAILURE" || context.state === "ERROR") names.push(context.context);
+		} else if (FAILED_CONCLUSIONS[String(context.conclusion)] === true) {
+			names.push(context.name);
+		}
+	}
+	return names;
+}
+
+export interface WatchQueryEntry {
+	alias: string;
+	owner: string;
+	name: string;
+	number: number;
+}
+
+/** One batched GraphQL query, with an aliased `repository { pullRequest }` per watched pull request. */
+export function buildWatchQuery(entries: readonly WatchQueryEntry[]): string {
+	const fields = [
+		"number",
+		"state",
+		"isDraft",
+		"headRefOid",
+		"reviews(last: 50) { nodes { id author { login } state body submittedAt } }",
+		"statusCheckRollup { commit { oid } contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } }",
+	].join("\n");
+	const aliases = entries.map(
+		(entry) =>
+			`${entry.alias}: repository(owner: "${entry.owner}", name: "${entry.name}") { pullRequest(number: ${entry.number}) { ${fields} } }`,
+	);
+	return `query {\n${aliases.join("\n")}\n}`;
+}
+
+export interface WatchFetch {
+	/** The pull request, null when GitHub did not return it. */
+	data: WatchPrData | null;
+	/** GitHub no longer finds the pull request or its repository. */
+	gone: boolean;
+	/** GitHub's message for this alias, empty when it reported none. */
+	error: string;
+}
+
+/** One pull request as the watch query returns it. */
+interface GqlPullRequest {
+	number: number;
+	state: string;
+	isDraft: boolean;
+	headRefOid: string;
+	reviews: {
+		nodes: { id: string; author: { login: string } | null; state: string; body: string; submittedAt: string | null }[];
+	};
+	statusCheckRollup: { commit: { oid: string }; contexts: { nodes: WatchContext[] } } | null;
+}
+
+/** A GraphQL error. A query-level one, such as a rate limit, carries no path. */
+interface GqlError {
+	type?: string;
+	path?: (string | number)[];
+	message: string;
+}
+
+/** The answer of `gh api graphql`, absent `data` when the query as a whole failed. */
+export interface WatchQueryAnswer {
+	data?: Record<string, { pullRequest: GqlPullRequest | null } | null> | null;
+	errors?: GqlError[];
+}
+
+/**
+ * The per-alias result of one batched query, or null when the query as a whole failed and no stored state
+ * may be trusted. An alias GitHub returned no pull request for keeps its stored state unless its error
+ * says the pull request or its repository is gone.
+ */
+export function parseWatchQuery(answer: WatchQueryAnswer, aliases: readonly string[]): Map<string, WatchFetch> | null {
+	const data = answer.data;
+	if (!data) return null;
+	const errors = answer.errors ?? [];
+	const out = new Map<string, WatchFetch>();
+	for (const alias of aliases) {
+		const pr = data[alias]?.pullRequest ?? null;
+		const error = errors.find((candidate) => candidate.path?.[0] === alias);
+		out.set(alias, {
+			data: pr === null ? null : watchPrOf(pr),
+			gone: error?.type === "NOT_FOUND",
+			error: error?.message ?? "",
+		});
+	}
+	return out;
+}
+
+/** The pull request of one alias, without the reviews still pending, which only their author can see. */
+function watchPrOf(pr: GqlPullRequest): WatchPrData {
+	const reviews: WatchReview[] = [];
+	for (const review of pr.reviews.nodes) {
+		if (review.submittedAt === null) continue;
+		reviews.push({
+			id: review.id,
+			author: review.author?.login ?? null,
+			state: review.state,
+			body: review.body,
+			submittedAt: review.submittedAt,
+		});
+	}
+	return {
+		number: pr.number,
+		state: pr.state,
+		isDraft: pr.isDraft,
+		headRefOid: pr.headRefOid,
+		commitOid: pr.statusCheckRollup?.commit.oid ?? null,
+		reviews,
+		contexts: pr.statusCheckRollup?.contexts.nodes ?? [],
+	};
+}
+
+/**
+ * The new events of one poll of a watch and the stored state after them. A `data` of null is a pull
+ * request GitHub no longer finds, and a merged or closed pull request ends the watch, so the state
+ * comes back null.
+ */
+export function diffWatch(watch: PrWatch, data: WatchPrData | null): { events: WatchEvent[]; next: PrWatch | null } {
+	if (data === null) return { events: [{ event: "gone" }], next: null };
+	if (data.state === "MERGED") return { events: [{ event: "merged" }], next: null };
+	if (data.state === "CLOSED") return { events: [{ event: "closed" }], next: null };
+	const events: WatchEvent[] = [];
+	const next: PrWatch = { ...watch, reviews: [...watch.reviews] };
+	// The first poll of an unseeded watch only records what is already true.
+	if (!watch.seeded) {
+		next.seeded = true;
+		next.head = data.headRefOid;
+		next.reviews = data.reviews.map((review) => review.id);
+		const verdict = verdictOf(data);
+		next.redSent = verdict === "red";
+		next.greenSent = verdict === "green";
+		return { events, next };
+	}
+	if (data.headRefOid !== watch.head) {
+		next.head = data.headRefOid;
+		next.redSent = false;
+		next.greenSent = false;
+	}
+	const fresh = data.reviews
+		.filter((review) => !next.reviews.includes(review.id))
+		.sort((a, b) => a.submittedAt.localeCompare(b.submittedAt));
+	for (const review of fresh) {
+		events.push({
+			event: "review",
+			reviewer: review.author ?? "an unknown author",
+			verdict: review.state,
+			body: review.body,
+		});
+		next.reviews.push(review.id);
+	}
+	const verdict = verdictOf(data);
+	if (verdict === "red" && !next.redSent) {
+		events.push({ event: "ci-red", checks: failingCheckNames(data.contexts) });
+		next.redSent = true;
+	}
+	if (verdict === "green" && !next.greenSent) {
+		events.push({ event: "ci-green" });
+		next.greenSent = true;
+	}
+	return { events, next };
+}
+
+/** The base name of a watch file, from the pull request's validated parts. `+` keeps the parts apart, since GitHub names may hold dashes. */
+export function prWatchName(owner: string, name: string, number: number): string {
+	return `${owner}+${name}+${number}`;
+}
+
 interface GhCheck {
 	__typename?: string;
 	status?: string;
