@@ -7658,7 +7658,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				// A per-PR error that is not a disappearance keeps this watch's state.
 				if (got.data === null && !got.gone) continue;
 				const { events, next } = diffWatch(watch, got.data);
-				events.forEach((event) => {
+				const live = isLiveSession(session);
+				// CI turning red or green is news only while the session runs, so an ended one is not woken for it.
+				const told = live ? events : events.filter((event) => event.event !== "ci-red" && event.event !== "ci-green");
+				told.forEach((event) => {
 					const item: PendingItem =
 						event.event === "review"
 							? {
@@ -7697,7 +7700,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						`p-${Date.now()}-${randomUUID().replaceAll("-", "").slice(0, 12)}.json`,
 						item,
 					);
-					if (!isLiveSession(session)) detach(() => raiseResumeCard(session), "resume card");
+					if (!live) detach(() => raiseResumeCard(session), "resume card");
 				});
 				if (next !== null) writePrivateJson(join(WATCH_DIR, session), entry, next);
 				else removeStatePath(join(WATCH_DIR, session), entry);
