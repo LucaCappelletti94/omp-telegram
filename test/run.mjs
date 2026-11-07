@@ -11985,6 +11985,12 @@ esac
 			slowLaunching.state === "launching" && slowLaunching.launchPid > 0,
 			JSON.stringify(slowLaunching),
 		);
+		const launchingCard = await waitForEdit(slowLaunching.messageId, (e) => String(e.text).includes("Launching"));
+		check(
+			"the launching card drops its buttons with its text",
+			launchingCard !== undefined && launchingCard.reply_markup.inline_keyboard.length === 0,
+			JSON.stringify(launchingCard?.reply_markup),
+		);
 		await tap(slowId, "c");
 		check(
 			"a Cancel tap on a running launch is refused",

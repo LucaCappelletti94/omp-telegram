@@ -7519,9 +7519,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return `${Math.floor(hour / 24)}d`;
 	}
 
-	/** The card's buttons while its request is still open. */
+	/** The card's buttons while its request waits on a tap. A running launch shows none until it settles. */
 	function launchRequestButtons(request: LaunchRequest): InlineButton[][] {
-		const open = request.state === "pending" || request.state === "failed" || request.state === "launching";
+		const open = request.state === "pending" || request.state === "failed";
 		if (!open) return [];
 		return [
 			[
