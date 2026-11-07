@@ -16582,6 +16582,29 @@ echo done >> ${wghLog}
 		cardsFor(w5Id).length === 1 && heldCardText().includes("got a review from hugh"),
 		heldCardText(),
 	);
+	// CI turning red or green is news only for a live session, so an ended one holds nothing for it.
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+		"someorg/widget/16": pr(16, "OPEN", {
+			head: "z2",
+			reviews: [review("ra", "gwen", "COMMENTED", "First hold."), review("rb", "hugh", "APPROVED", "Second hold.")],
+			contexts: [checkRun("ci", "FAILURE")],
+		}),
+	});
+	const editsBeforeRed = called("editMessageText").length;
+	await tick(w3, [w3], [w3]);
+	await settle(300);
+	check(
+		"an ended session holds nothing when its pull request's CI turns red",
+		pendingFiles(w5Id).length === 2 &&
+			called("editMessageText").length === editsBeforeRed &&
+			watchOf(w5Id, "someorg", "widget", 16).head === "z2" &&
+			watchOf(w5Id, "someorg", "widget", 16).redSent === true,
+	);
 
 	// A pr pending item the drain cannot validate is discarded.
 	const pdir = join(root, "notify-telegram/graph/pending", w3Id);
