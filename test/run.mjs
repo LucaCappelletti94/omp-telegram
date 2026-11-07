@@ -15878,6 +15878,1228 @@ check(
 	"the extension files are left as they were",
 	readFileSync(stampFiles[1], "utf8") === renderBytes.toString("utf8"),
 );
+
+heading("PR watch");
+{
+	const savedPath = process.env.PATH;
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const wBin = join(root, "watch-bin");
+	mkdirSync(wBin, { recursive: true });
+	const wghLog = join(root, "watch-gh.log");
+	const ghTable = join(root, "watch-gh-table.json");
+	const ghRaw = join(root, "watch-gh-raw.json");
+	const ghServe = new URL("./watch-gh-serve.mjs", import.meta.url).pathname;
+	const prView = join(root, "watch-pr-view.json");
+	writeFileSync(wghLog, "");
+	writeFileSync(ghTable, "{}");
+	writeFileSync(ghRaw, "");
+	writeFileSync(
+		prView,
+		JSON.stringify({
+			state: "OPEN",
+			isDraft: false,
+			reviewDecision: "",
+			latestReviews: [],
+			statusCheckRollup: [],
+			url: "https://github.com/someorg/widget/pull/7",
+			number: 7,
+		}),
+	);
+	writeFileSync(
+		join(wBin, "gh"),
+		`#!/bin/sh
+echo "$*" >> ${wghLog}
+case "$1 $2" in
+  "api graphql")
+    if [ "$WGH_FAIL" = "1" ]; then echo "HTTP 500" 1>&2; exit 1; fi
+    if [ -n "$WGH_RAW" ]; then cat ${ghRaw}; exit 0; fi
+    if [ -n "$WGH_SLOW" ]; then sleep 2; fi
+    node ${ghServe} ${ghTable} "$4" ;;
+  "pr view") cat ${prView} ;;
+  "pr list") printf '%s' "$WGH_PR_LIST" ;;
+  *) exit 1 ;;
+esac
+echo done >> ${wghLog}
+`,
+		{ mode: 0o755 },
+	);
+	process.env.PATH = `${wBin}:${savedPath}`;
+	process.env.WGH_PR_LIST = "[]";
+	const watchesDir = join(root, "notify-telegram/graph/watches");
+	const nodesDir = join(root, "notify-telegram/graph/nodes");
+	const watchOf = (session, owner, name, number) =>
+		JSON.parse(readFileSync(join(watchesDir, session, `${owner}+${name}+${number}.json`), "utf8"));
+	const pendingFiles = (id) => {
+		const dir = join(root, "notify-telegram/graph/pending", id);
+		return existsSync(dir)
+			? readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "card.json" && f !== "resuming.json")
+			: [];
+	};
+	const ghLogText = () => readFileSync(wghLog, "utf8");
+	const prOf = (s, args) =>
+		s.tools.get("pr_watch")
+			? s.tools.get("pr_watch").execute("w", args, undefined, undefined, s.ctx)
+			: Promise.resolve({ content: [{ type: "text", text: "tool missing" }], isError: true });
+	const prText = (result) => result.content[0].text;
+	const cardsFor = (id) =>
+		called("sendMessage").filter((c) =>
+			c.body.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data === `r:${id}`),
+		);
+	// The fake gh appends a line when a call finishes, so a stable log means no poll is mid-query.
+	const ghQuiet = async () => {
+		await settle(300);
+		let last = -1;
+		let stable = 0;
+		while (stable < 2) {
+			const len = ghLogText().length;
+			stable = len === last ? stable + 1 : 0;
+			last = len;
+			await settle(100);
+		}
+	};
+	const tick = async (holder, live, pumpers) => {
+		await ghQuiet();
+		jump(61_000);
+		holder.heartbeat();
+		for (const s of live) s.heartbeat();
+		await ghQuiet();
+		for (const s of pumpers) await s.pump(200);
+	};
+	// The pull request fields of one alias, in the exact shape a real `gh api graphql` answer carries.
+	const pr = (number, state, extra = {}) => ({
+		number,
+		state,
+		isDraft: extra.isDraft === true,
+		headRefOid: extra.head ?? "h1",
+		reviews: { nodes: extra.reviews ?? [] },
+		statusCheckRollup: {
+			commit: { oid: extra.commitOid ?? extra.head ?? "h1" },
+			contexts: { nodes: extra.contexts ?? [] },
+		},
+	});
+	const review = (id, login, state, body, submittedAt = "2026-11-07T10:00:00Z") => ({
+		id,
+		author: { login },
+		state,
+		body,
+		submittedAt,
+	});
+	const checkRun = (name, conclusion, status = "COMPLETED") => ({ __typename: "CheckRun", name, conclusion, status });
+	const statusCtx = (context, state) => ({ __typename: "StatusContext", context, state });
+	// The table the fake gh serves, keyed by owner/name/number, plus the gone markers.
+	const setGhTable = (table) => writeFileSync(ghTable, JSON.stringify(table));
+	const setGhRaw = (raw) => writeFileSync(ghRaw, raw);
+	const URL9 = "https://github.com/someorg/widget/pull/9";
+	const URL11 = "https://github.com/someorg/widget/pull/11";
+	const URL12 = "https://github.com/someorg/widget/pull/12";
+	const URL13 = "https://github.com/someorg/widget/pull/13";
+
+	const w1Id = "0d1b0001-0000-7000-8000-000000000001";
+	const w2Id = "0d1b0002-0000-7000-8000-000000000002";
+	const w3Id = "0d1b0003-0000-7000-8000-000000000003";
+	const authorId = "0d1b0004-0000-7000-8000-000000000004";
+	const w4Id = "0d1b0005-0000-7000-8000-000000000005";
+	const autoId = "0d1b0007-0000-7000-8000-000000000007";
+	const w1 = spawn(w1Id, "/home/dev/work/w1");
+	await w1.fire("session_start");
+	check("pr_watch is registered", w1.tools.has("pr_watch"));
+	w1.heartbeat();
+	await settle(150);
+	check(
+		"the first session holds the lock that drives the watch poll",
+		JSON.parse(readFileSync(lockPath, "utf8")).sessionId === w1Id,
+	);
+	const noWatchTick = w1.customs.length;
+	await tick(w1, [], [w1]);
+	check(
+		"a tick with nothing watched sends nothing and queries nothing",
+		w1.customs.length === noWatchTick && !ghLogText().includes("api graphql"),
+	);
+
+	// A session without the pairing gets the refusal, and the tool refuses URLs it cannot validate.
+	unlinkSync(join(root, "notify-telegram.json"));
+	const noCfgId = "0d1b0006-0000-7000-8000-000000000006";
+	const noCfg = spawn(noCfgId, "/home/dev/work/nocfg");
+	await noCfg.fire("session_start");
+	check("a session without the pairing is told pr_watch needs it", (await prOf(noCfg, {})).isError === true);
+	writeConfig();
+	check(
+		"add refuses a URL that is not a GitHub pull request",
+		(await prOf(w1, { action: "add", url: "https://example.com/pull/9" })).isError === true,
+	);
+	check(
+		"add refuses a repository name the file name would not accept",
+		(await prOf(w1, { action: "add", url: "https://github.com/.secret/widget/pull/9" })).isError === true,
+	);
+	setGhTable({ "someorg/.github/2": pr(2, "OPEN") });
+	check(
+		"add watches a repository whose name starts with a dot",
+		!(await prOf(w1, { action: "add", url: "https://github.com/someorg/.github/pull/2" })).isError &&
+			existsSync(join(watchesDir, w1Id, "someorg+.github+2.json")),
+	);
+	await prOf(w1, { action: "remove", url: "https://github.com/someorg/.github/pull/2" });
+	check(
+		"add refuses pull request zero",
+		(await prOf(w1, { action: "add", url: "https://github.com/someorg/widget/pull/0" })).isError === true,
+	);
+
+	// add returns the current state and seeds the watch with it, so nothing repeats on the first tick.
+	setGhTable({
+		"someorg/widget/9": pr(9, "OPEN", {
+			reviews: [review("r1", "alice", "COMMENTED", "Looks mostly right.")],
+			contexts: [checkRun("ci/build", "FAILURE"), statusCtx("codecov/patch", "SUCCESS")],
+		}),
+	});
+	const added = await prOf(w1, { action: "add", url: URL9 });
+	check(
+		"add answers with the pull request's current state",
+		!added.isError &&
+			prText(added).includes("Watching someorg/widget#9") &&
+			prText(added).includes("CI red on ci/build") &&
+			prText(added).includes("1 review already seen"),
+	);
+	const addedWatch = watchOf(w1Id, "someorg", "widget", 9);
+	check(
+		"the watch is written seeded with the state add saw",
+		addedWatch.url === URL9 &&
+			addedWatch.by === w1Id &&
+			addedWatch.seeded === true &&
+			addedWatch.head === "h1" &&
+			addedWatch.redSent === true &&
+			addedWatch.greenSent === false &&
+			addedWatch.reviews.join(",") === "r1",
+	);
+	check(
+		"a second add of the same pull request says it is already watched",
+		prText(await prOf(w1, { action: "add", url: URL9 })).includes("Already watching"),
+	);
+	check(
+		"list names the watched pull request",
+		prText(await prOf(w1, { action: "list" })).includes("someorg/widget/pull/9"),
+	);
+	const before = w1.customs.length;
+	await tick(w1, [w1], [w1]);
+	check("the first tick after add fires nothing that add already reported", w1.customs.length === before);
+
+	// A new review and fully green CI on the same head both reach the live watcher.
+	setGhTable({
+		"someorg/widget/9": pr(9, "OPEN", {
+			reviews: [
+				review("r1", "alice", "COMMENTED", "Looks mostly right."),
+				review("r2", "CodeRabbit", "APPROVED", "LGTM."),
+			],
+			contexts: [checkRun("ci/build", "SUCCESS")],
+		}),
+	});
+	await tick(w1, [w1], [w1]);
+	const news = w1.customs.slice(before);
+	check(
+		"the new review reaches the watcher with reviewer, verdict and body",
+		news.length === 2 &&
+			news[0].message.content.includes("review from CodeRabbit") &&
+			news[0].message.content.includes("APPROVED") &&
+			news[0].message.content.includes("LGTM."),
+	);
+	check("fully green CI reaches the watcher", news[1].message.content.includes("CI green on its head commit"));
+	check(
+		"the event is an aside written by no one that wakes the session",
+		news[0].options.deliverAs === "aside" && news[0].options.triggerTurn === true,
+	);
+	const afterReview = w1.customs.length;
+	check(
+		"the watch remembers the review and the green verdict",
+		watchOf(w1Id, "someorg", "widget", 9).reviews.join(",") === "r1,r2" &&
+			watchOf(w1Id, "someorg", "widget", 9).greenSent === true,
+	);
+	await tick(w1, [w1], [w1]);
+	check("repeating the same state sends nothing twice", w1.customs.length === afterReview);
+
+	// A second session watches the same pull request, then ends: its events are held and raise its resume card.
+	const w2 = spawn(w2Id, "/home/dev/work/w2");
+	await w2.fire("session_start");
+	w1.heartbeat();
+	w2.heartbeat();
+	await settle(150);
+	check(
+		"a call without an action lists what the session watches",
+		prText(await prOf(w2, {})).includes("watches no pull requests"),
+	);
+	setGhTable({
+		"someorg/widget/9": pr(9, "OPEN", {
+			reviews: [
+				review("r1", "alice", "COMMENTED", "Looks mostly right."),
+				review("r2", "CodeRabbit", "APPROVED", "LGTM."),
+			],
+			contexts: [statusCtx("ci", "PENDING")],
+		}),
+	});
+	const w2Added = await prOf(w2, { action: "add", url: URL9 });
+	check("a second watcher's add reports CI still running", prText(w2Added).includes("CI still running"));
+	await w2.fire("session_shutdown");
+	setGhTable({
+		"someorg/widget/9": pr(9, "OPEN", {
+			reviews: [
+				review("r1", "alice", "COMMENTED", "Looks mostly right."),
+				review("r2", "CodeRabbit", "APPROVED", "LGTM."),
+				review("r3", "bob", "CHANGES_REQUESTED", "Fix the test."),
+			],
+			contexts: [statusCtx("ci", "PENDING")],
+		}),
+	});
+	const sendsBefore = called("sendMessage").length;
+	await tick(w1, [w1], [w1]);
+	const w1News = w1.customs.slice(afterReview);
+	check(
+		"each watcher of the same pull request gets its own review event",
+		w1News.length === 1 &&
+			w1News[0].message.content.includes("review from bob") &&
+			w1News[0].message.content.includes("CHANGES_REQUESTED"),
+	);
+	check("the ended watcher's review is held for it", pendingFiles(w2Id).length === 1);
+	check(
+		"the ended watcher's held review raises a resume card",
+		cardsFor(w2Id).length === 1 && cardsFor(w2Id)[0].body.text.includes("got a review from bob"),
+	);
+	check(
+		"the only Telegram trace of a live event is the ended session's resume card",
+		called("sendMessage").length === sendsBefore + 1,
+	);
+	setGhTable({ "someorg/widget/9": pr(9, "MERGED") });
+	const editsBefore = called("editMessageText").length;
+	await tick(w1, [w1], [w1]);
+	check("the merge reaches the live watcher", w1.customs.at(-1).message.content.includes("was merged"));
+	check("the merge is held for the ended watcher", pendingFiles(w2Id).length === 2);
+	check(
+		"the merged pull request ends every watch of it",
+		!existsSync(join(watchesDir, w1Id, "someorg+widget+9.json")) &&
+			!existsSync(join(watchesDir, w2Id, "someorg+widget+9.json")),
+	);
+	check(
+		"the second held event edits the open card instead of sending another",
+		cardsFor(w2Id).length === 1 &&
+			called("editMessageText").length === editsBefore + 1 &&
+			called("editMessageText").at(-1).body.text.includes("was merged"),
+	);
+
+	// A new pull request's CI: red then green on one head, red again on the next, nothing for a push that is pending.
+	const w3 = spawn(w3Id, "/home/dev/work/w3");
+	await w3.fire("session_start");
+	w1.heartbeat();
+	w3.heartbeat();
+	await settle(150);
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/lint", "FAILURE")],
+		}),
+	});
+	const c1 = await prOf(w1, { action: "add", url: URL11 });
+	check(
+		"add of a draft-free red pull request reports both reviews",
+		prText(c1).includes("open, CI red on ci/lint") && prText(c1).includes("2 reviews already seen"),
+	);
+	// w3's own single pull request, queried with its own alias.
+	setGhTable({
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			isDraft: true,
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	const w3Add = await prOf(w3, { action: "add", url: URL12 });
+	check(
+		"add of a draft reports the draft state and green CI",
+		prText(w3Add).includes("open (draft)") && prText(w3Add).includes("CI green"),
+	);
+	// The lock moves to w3, and the new holder compares with the stored state on disk.
+	// The world still matches the stored state, so the move itself reports nothing.
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/lint", "FAILURE")],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			isDraft: true,
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	rmSync(lockPath, { force: true });
+	await tick(w3, [w1, w3], [w1]);
+	check("the lock moved to the third session", JSON.parse(readFileSync(lockPath, "utf8")).sessionId === w3Id);
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k2",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "FAILURE")],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	const c2 = w1.customs.length;
+	await tick(w3, [w1, w3], [w1]);
+	check(
+		"a new head may fire red again, from the new lock holder",
+		w1.customs.length === c2 + 1 &&
+			w1.customs.at(-1).message.content.includes("CI red on its head commit") &&
+			w1.customs.at(-1).message.content.includes("Failing checks: ci/test"),
+	);
+	check(
+		"the stored head moved with the verdict",
+		watchOf(w1Id, "someorg", "widget", 11).head === "k2" && watchOf(w1Id, "someorg", "widget", 11).redSent === true,
+	);
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k2",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	await tick(w3, [w1, w3], [w1]);
+	const greenAt = w1.customs.findIndex((c, i) => i > c2 && c.message.content.includes("CI green"));
+	check(
+		"green after red on the same head is sent in order",
+		greenAt === c2 + 1 && w1.customs[greenAt].message.content.includes("CI green on its head commit"),
+	);
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	const c3 = w1.customs.length;
+	await tick(w3, [w1, w3], [w1]);
+	check(
+		"a push whose checks are pending sends nothing for the push itself",
+		w1.customs.length === c3 &&
+			watchOf(w1Id, "someorg", "widget", 11).head === "k3" &&
+			watchOf(w1Id, "someorg", "widget", 11).redSent === false,
+	);
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one."), review("r6", "dave", "APPROVED", "Fine now.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	const c4 = w1.customs.length;
+	const c4w3 = w3.customs.length;
+	await tick(w3, [w1, w3], [w1, w3]);
+	check(
+		"green fires again on the new head",
+		w1.customs.length === c4 + 1 && w1.customs.at(-1).message.content.includes("CI green"),
+	);
+	check(
+		"w3's own new review reaches w3 written by no one",
+		w3.customs.length === c4w3 + 1 &&
+			w3.customs.at(-1).message.content.includes("review from dave") &&
+			w3.customs.at(-1).message.content.includes("Fine now."),
+	);
+
+	// An errored status counts as red, an expected one keeps the verdict open, and a check that has
+	// not completed is not a verdict. Checks belonging to a head the pull request no longer has are
+	// not the head's verdict.
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "SUCCESS"), statusCtx("deploy", "ERROR")],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one."), review("r6", "dave", "APPROVED", "Fine now.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	await tick(w3, [w1, w3], [w1]);
+	check(
+		"an errored status context counts as red",
+		w1.customs.at(-1).message.content.includes("CI red on its head commit") &&
+			w1.customs.at(-1).message.content.includes("Failing checks: deploy"),
+	);
+	const redState = w1.customs.length;
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [
+				checkRun("ci/test", "SUCCESS"),
+				statusCtx("deploy", "EXPECTED"),
+				checkRun("flake", "SUCCESS", "IN_PROGRESS"),
+			],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one."), review("r6", "dave", "APPROVED", "Fine now.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	await tick(w3, [w1, w3], [w1]);
+	check("an expected status and a check that has not completed keep the verdict open", w1.customs.length === redState);
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k4",
+			commitOid: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one."), review("r6", "dave", "APPROVED", "Fine now.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	await tick(w3, [w1, w3], [w1]);
+	check(
+		"checks on a head the pull request no longer has send nothing",
+		w1.customs.length === redState &&
+			watchOf(w1Id, "someorg", "widget", 11).head === "k4" &&
+			watchOf(w1Id, "someorg", "widget", 11).greenSent === false,
+	);
+	// Back to the state the gone phase expects: k3, green, the two seen reviews.
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one."), review("r6", "dave", "APPROVED", "Fine now.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	await tick(w3, [w1, w3], [w1]);
+
+	// A pull request that disappears is reported once, and its watch ends.
+	setGhTable({
+		"someorg/widget/13": pr(13, "OPEN", { head: "n1", contexts: [checkRun("ci", "SUCCESS")] }),
+	});
+	const d1 = await prOf(w1, { action: "add", url: URL13 });
+	check(
+		"add of an open pull request watches it",
+		!d1.isError && existsSync(join(watchesDir, w1Id, "someorg+widget+13.json")),
+	);
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one."), review("r6", "dave", "APPROVED", "Fine now.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+		"someorg/widget/13": { __gone: "pr" },
+	});
+	const d2 = w1.customs.length;
+	await tick(w3, [w1, w3], [w1]);
+	check(
+		"a pull request GitHub no longer finds is reported once",
+		w1.customs.length === d2 + 1 && w1.customs.at(-1).message.content.includes("is gone from GitHub"),
+	);
+	check(
+		"the gone pull request ends its watch while the others keep theirs",
+		!existsSync(join(watchesDir, w1Id, "someorg+widget+13.json")) &&
+			existsSync(join(watchesDir, w1Id, "someorg+widget+11.json")) &&
+			existsSync(join(watchesDir, w3Id, "someorg+widget+12.json")),
+	);
+
+	// A failed query keeps every stored state, and the next tick retries.
+	const elevenBefore = watchOf(w1Id, "someorg", "widget", 11);
+	process.env.WGH_FAIL = "1";
+	const e1 = w1.customs.length;
+	await tick(w3, [w1, w3], [w1]);
+	check(
+		"a failed query sends nothing and keeps every stored state",
+		w1.customs.length === e1 && JSON.stringify(watchOf(w1Id, "someorg", "widget", 11)) === JSON.stringify(elevenBefore),
+	);
+	delete process.env.WGH_FAIL;
+	setGhTable({
+		"someorg/widget/11": { __error: "Something else broke." },
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one."), review("r6", "dave", "APPROVED", "Fine now.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	await tick(w3, [w1, w3], [w1]);
+	check(
+		"an error that is not a disappearance keeps that pull request's state",
+		w1.customs.length === e1 && JSON.stringify(watchOf(w1Id, "someorg", "widget", 11)) === JSON.stringify(elevenBefore),
+	);
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [
+				review("r9a", "carol", "COMMENTED", "First pass."),
+				review("r9b", "dave", "COMMENTED", "Second pass."),
+				review("r11", "erin", "COMMENTED", "Retry worked."),
+			],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+		"someorg/widget/12": pr(12, "OPEN", {
+			head: "m1",
+			reviews: [review("r5", "carol", "COMMENTED", "Watch this one."), review("r6", "dave", "APPROVED", "Fine now.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	await tick(w3, [w1, w3], [w1]);
+	check(
+		"the next tick retries and delivers the new review",
+		w1.customs.length === e1 + 1 && w1.customs.at(-1).message.content.includes("review from erin"),
+	);
+
+	// A tick while the previous poll still waits on GitHub starts no second query.
+	const queriesBefore = ghLogText()
+		.split("\n")
+		.filter((line) => line.startsWith("api graphql")).length;
+	process.env.WGH_SLOW = "1";
+	jump(61_000);
+	w3.heartbeat();
+	await settle(300);
+	jump(61_000);
+	w3.heartbeat();
+	await settle(2_500);
+	delete process.env.WGH_SLOW;
+	await ghQuiet();
+	check(
+		"a tick during a running poll starts no second query",
+		ghLogText()
+			.split("\n")
+			.filter((line) => line.startsWith("api graphql")).length ===
+			queriesBefore + 1,
+	);
+
+	// Terminal pull requests are reported by add without a watch, and so is a repository the token cannot read.
+	setGhTable({ "someorg/widget/14": pr(14, "MERGED") });
+	check(
+		"add of an already merged pull request writes no watch",
+		prText(await prOf(w1, { action: "add", url: "https://github.com/someorg/widget/pull/14" })).includes(
+			"already merged",
+		) && !existsSync(join(watchesDir, w1Id, "someorg+widget+14.json")),
+	);
+	setGhTable({ "someorg/widget/15": pr(15, "CLOSED") });
+	check(
+		"add of an already closed pull request writes no watch",
+		prText(await prOf(w1, { action: "add", url: "https://github.com/someorg/widget/pull/15" })).includes(
+			"already closed",
+		) && !existsSync(join(watchesDir, w1Id, "someorg+widget+15.json")),
+	);
+	setGhTable({ "ghostorg/ghost/1": { __gone: "repo" } });
+	check(
+		"add of a pull request GitHub cannot find is refused with the error",
+		(await prOf(w1, { action: "add", url: "https://github.com/ghostorg/ghost/pull/1" })).isError === true,
+	);
+	check(
+		"remove stops a watch and only the caller's goes",
+		prText(await prOf(w3, { action: "remove", url: URL12 })).includes("Stopped watching") &&
+			!existsSync(join(watchesDir, w3Id, "someorg+widget+12.json")),
+	);
+	check(
+		"remove of an unwatched pull request says so",
+		(await prOf(w3, { action: "remove", url: URL12 })).isError === true,
+	);
+	check("a bogus action is refused", (await prOf(w1, { action: "peel", url: URL9 })).isError === true);
+	check(
+		"add without a URL asks for one",
+		prText(await prOf(w1, { action: "add" })).includes("Pass the GitHub pull request URL"),
+	);
+
+	// Two reviews in two ticks for an ended session are held beside each other, and both name the card.
+	const w5Id = "0d1b0008-0000-7000-8000-000000000008";
+	const w5 = spawn(w5Id, "/home/dev/work/w5");
+	await w5.fire("session_start");
+	w3.heartbeat();
+	w5.heartbeat();
+	await settle(150);
+	setGhTable({
+		"someorg/widget/16": pr(16, "OPEN", { head: "z1", contexts: [checkRun("ci", "SUCCESS")] }),
+	});
+	check(
+		"add of an open pull request the session keeps watches it",
+		!(await prOf(w5, { action: "add", url: "https://github.com/someorg/widget/pull/16" })).isError &&
+			existsSync(join(watchesDir, w5Id, "someorg+widget+16.json")),
+	);
+	await w5.fire("session_shutdown");
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+		"someorg/widget/16": pr(16, "OPEN", {
+			head: "z1",
+			reviews: [review("ra", "gwen", "COMMENTED", "First hold.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	await tick(w3, [w3], [w3]);
+	check("the first review of an ended watcher is held", pendingFiles(w5Id).length === 1);
+	setGhTable({
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+		"someorg/widget/16": pr(16, "OPEN", {
+			head: "z1",
+			reviews: [review("ra", "gwen", "COMMENTED", "First hold."), review("rb", "hugh", "APPROVED", "Second hold.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	await tick(w3, [w3], [w3]);
+	check("a second review in a later tick is held beside the first", pendingFiles(w5Id).length === 2);
+	const heldCardText = () =>
+		called("editMessageText")
+			.map((c) => String(c.body.text ?? ""))
+			.findLast((text) => text.includes("got a review from gwen")) ?? "";
+	await settle(300);
+	check(
+		"the resume card is sent once and edited to name both held reviews",
+		cardsFor(w5Id).length === 1 && heldCardText().includes("got a review from hugh"),
+		heldCardText(),
+	);
+
+	// A pr pending item the drain cannot validate is discarded.
+	const pdir = join(root, "notify-telegram/graph/pending", w3Id);
+	mkdirSync(pdir, { recursive: true });
+	writeFileSync(
+		join(pdir, "p-malformed-1.json"),
+		JSON.stringify({
+			kind: "pr",
+			at: Date.now(),
+			owner: "bad owner",
+			name: "r",
+			number: 1,
+			event: "review",
+			reviewer: "x",
+			verdict: "y",
+			body: "z",
+		}),
+	);
+	writeFileSync(
+		join(pdir, "p-malformed-2.json"),
+		JSON.stringify({
+			kind: "pr",
+			at: Date.now(),
+			owner: "o",
+			name: "r",
+			number: 1,
+			event: "review",
+			verdict: "y",
+			body: "z",
+		}),
+	);
+	writeFileSync(
+		join(pdir, "p-malformed-3.json"),
+		JSON.stringify({ kind: "pr", at: Date.now(), owner: "o", name: "r", number: 1, event: "ci-red", checks: [] }),
+	);
+	writeFileSync(
+		join(pdir, "p-malformed-4.json"),
+		JSON.stringify({ kind: "pr", at: Date.now(), owner: "o", name: "r", number: 1, event: "peeled" }),
+	);
+	const malformedBefore = w3.customs.length;
+	w3.heartbeat();
+	await w3.pump(200);
+	check(
+		"a malformed pr pending item is discarded by the drain",
+		w3.customs.length === malformedBefore &&
+			!existsSync(join(pdir, "p-malformed-1.json")) &&
+			!existsSync(join(pdir, "p-malformed-4.json")),
+	);
+
+	// A validation error is a whole-query failure, so every stored state is kept.
+	process.env.WGH_RAW = "1";
+	setGhRaw(
+		JSON.stringify({
+			errors: [
+				{
+					type: "Validation",
+					path: ["query"],
+					locations: [{ line: 1, column: 1 }],
+					message: "Field 'pullRequest' does not exist on type 'Repository'.",
+				},
+			],
+		}),
+	);
+	const validationBefore = w1.customs.length;
+	const elevenAtValidation = JSON.stringify(watchOf(w1Id, "someorg", "widget", 11));
+	await tick(w3, [w1, w3], [w1]);
+	delete process.env.WGH_RAW;
+	check(
+		"a validation error sends nothing and keeps every stored state",
+		w1.customs.length === validationBefore &&
+			JSON.stringify(watchOf(w1Id, "someorg", "widget", 11)) === elevenAtValidation,
+	);
+
+	// A repository GitHub no longer resolves is reported as gone, and its watch ends.
+	const w6Id = "0d1b0009-0000-7000-8000-000000000009";
+	const w6 = spawn(w6Id, "/home/dev/work/w6");
+	await w6.fire("session_start");
+	w3.heartbeat();
+	w6.heartbeat();
+	await settle(150);
+	mkdirSync(join(watchesDir, w6Id), { recursive: true });
+	writeFileSync(
+		join(watchesDir, w6Id, "someorg+ghost+1.json"),
+		JSON.stringify({
+			url: "https://github.com/someorg/ghost/pull/1",
+			owner: "someorg",
+			name: "ghost",
+			number: 1,
+			by: w6Id,
+			at: Date.now(),
+			seeded: true,
+			head: "h1",
+			redSent: false,
+			greenSent: false,
+			reviews: [],
+		}),
+	);
+	setGhTable({
+		"someorg/ghost/1": { __gone: "repo" },
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [review("r9a", "carol", "COMMENTED", "First pass."), review("r9b", "dave", "COMMENTED", "Second pass.")],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+		"someorg/widget/16": pr(16, "OPEN", {
+			head: "z1",
+			reviews: [review("ra", "gwen", "COMMENTED", "First hold."), review("rb", "hugh", "APPROVED", "Second hold.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+	});
+	const ghostBefore = w6.customs.length;
+	await tick(w3, [w3, w6], [w6]);
+	check(
+		"a repository GitHub no longer resolves is reported as gone and ends the watch",
+		w6.customs.length === ghostBefore + 1 &&
+			w6.customs.at(-1).message.content.includes("is gone from GitHub") &&
+			!existsSync(join(watchesDir, w6Id, "someorg+ghost+1.json")),
+	);
+
+	// add with no readable GitHub output is refused.
+	process.env.WGH_FAIL = "1";
+	check(
+		"add with no readable GitHub output is refused",
+		(await prOf(w1, { action: "add", url: "https://github.com/someorg/widget/pull/18" })).isError === true,
+	);
+	delete process.env.WGH_FAIL;
+	process.env.WGH_RAW = "1";
+	setGhRaw("not json");
+	const silent = await prOf(w1, { action: "add", url: "https://github.com/someorg/widget/pull/18" });
+	check(
+		"add whose GitHub answer is unreadable and silent says there was no output",
+		silent.isError === true && prText(silent).includes("no output"),
+	);
+	delete process.env.WGH_RAW;
+
+	// The session's own pull request is watched without asking, from its node and from the poller's lookup.
+	const author = spawn(authorId, "/home/dev/work/notes");
+	await author.fire("session_start");
+	w3.heartbeat();
+	author.heartbeat();
+	await settle(150);
+	await author.tools
+		.get("session_graph")
+		.execute(
+			"g",
+			{ action: "status", status: "waiting", pr: "https://github.com/someorg/notes/pull/0" },
+			undefined,
+			undefined,
+			author.ctx,
+		);
+	check(
+		"a pull request number GitHub never hands out gets no watch",
+		!existsSync(join(watchesDir, authorId, "someorg+notes+0.json")),
+	);
+	await author.tools
+		.get("session_graph")
+		.execute(
+			"g",
+			{ action: "status", status: "waiting", pr: "https://github.com/someorg/notes/pull/3" },
+			undefined,
+			undefined,
+			author.ctx,
+		);
+	check(
+		"a session that names its pull request is watched automatically",
+		existsSync(join(watchesDir, authorId, "someorg+notes+3.json")),
+	);
+	check(
+		"the automatic watch is unseeded until the first poll",
+		watchOf(authorId, "someorg", "notes", 3).seeded === false,
+	);
+	writeFileSync(
+		join(nodesDir, `${autoId}.json`),
+		JSON.stringify({
+			session: autoId,
+			label: "widget fix",
+			emoji: "",
+			tag: "auto",
+			cwd: "/home/dev/widget",
+			repo: "someorg/widget",
+			branch: "LucaCappelletti94:upstream/fix-y",
+			status: "working",
+			note: "",
+			edges: [],
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+			launch: { argv: [], tmuxSession: "work", tmuxWindow: null },
+		}),
+	);
+	// A node no omp session stands behind, such as an imported worktree, gets no watch for its pull request.
+	writeFileSync(
+		join(nodesDir, "import-notes-fix.json"),
+		JSON.stringify({
+			session: "import-notes-fix",
+			label: "imported notes fix",
+			emoji: "",
+			tag: "",
+			cwd: "/home/dev/notes.upstreams/fix",
+			status: "pushed",
+			note: "",
+			pr: "https://github.com/someorg/notes/pull/3",
+			edges: [],
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+		}),
+	);
+	process.env.WGH_PR_LIST = JSON.stringify([
+		{ number: 7, url: "https://github.com/someorg/widget/pull/7", headRepositoryOwner: { login: "LucaCappelletti94" } },
+	]);
+	setGhTable({
+		"someorg/notes/3": pr(3, "OPEN", { head: "g1", contexts: [checkRun("ci", "SUCCESS")] }),
+		"someorg/widget/7": pr(7, "OPEN", {
+			head: "p1",
+			reviews: [review("r7", "eve", "COMMENTED", "On the branch PR.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [
+				review("r9a", "carol", "COMMENTED", "First pass."),
+				review("r9b", "dave", "COMMENTED", "Second pass."),
+				review("r11", "erin", "COMMENTED", "Retry worked."),
+			],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+	});
+	jump(10 * 60_000 + 1_000);
+	w3.heartbeat();
+	author.heartbeat();
+	await ghQuiet();
+	check(
+		"the poller looks the pull request up by the branch's head",
+		ghLogText().includes("pr list --repo someorg/widget --head upstream/fix-y"),
+	);
+	check(
+		"the poller watches the pull request it finds for a branch",
+		existsSync(join(watchesDir, autoId, "someorg+widget+7.json")),
+	);
+	check("an imported node's pull request gets no watch", !existsSync(join(watchesDir, "import-notes-fix")));
+	const seedTable = {
+		"someorg/notes/3": pr(3, "OPEN", { head: "g1", contexts: [checkRun("ci", "SUCCESS")] }),
+		"someorg/widget/7": pr(7, "OPEN", {
+			head: "p1",
+			reviews: [review("r7", "eve", "COMMENTED", "On the branch PR.")],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [
+				review("r9a", "carol", "COMMENTED", "First pass."),
+				review("r9b", "dave", "COMMENTED", "Second pass."),
+				review("r11", "erin", "COMMENTED", "Retry worked."),
+			],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+	};
+	setGhTable(seedTable);
+	await tick(w3, [w3, author], [w3, author]);
+	check(
+		"the found pull request's first poll seeds without an event",
+		watchOf(autoId, "someorg", "widget", 7).seeded === true && watchOf(authorId, "someorg", "notes", 3).seeded === true,
+	);
+	check(
+		"the seeded pull requests fire nothing for sessions that already know their state",
+		pendingFiles(autoId).length === 0 && cardsFor(autoId).length === 0,
+	);
+	const r8Table = JSON.parse(JSON.stringify(seedTable));
+	r8Table["someorg/widget/7"].reviews.nodes.push(
+		review("r8", "frank", "CHANGES_REQUESTED", "Rename the helper.", "2026-11-07T12:00:00Z"),
+	);
+	setGhTable(r8Table);
+	await tick(w3, [w3, author], [w3, author]);
+	check(
+		"a review on an automatically watched pull request is held for the ended session",
+		pendingFiles(autoId).length === 1,
+	);
+	check(
+		"its resume card names the review",
+		cardsFor(autoId).length === 1 && cardsFor(autoId)[0].body.text.includes("got a review from frank"),
+	);
+
+	// A watch outlives its session for the graph's year, and malformed watch files are discarded.
+	const w4 = spawn(w4Id, "/home/dev/work/w4");
+	await w4.fire("session_start");
+	w3.heartbeat();
+	w4.heartbeat();
+	await settle(150);
+	setGhTable({ "someorg/notes/4": pr(4, "OPEN", { head: "q1", contexts: [checkRun("ci", "SUCCESS")] }) });
+	await prOf(w4, { action: "add", url: "https://github.com/someorg/notes/pull/4" });
+	await w4.fire("session_shutdown");
+	await author.fire("session_shutdown");
+	const w1w = join(watchesDir, w1Id);
+	const bad = [
+		"null",
+		"42",
+		JSON.stringify({}),
+		JSON.stringify({ owner: 3, name: "r" }),
+		JSON.stringify({ owner: "bad owner", name: "r" }),
+		JSON.stringify({ owner: "o", name: "x y" }),
+		JSON.stringify({ owner: "o", name: "r", number: "9" }),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 0,
+			url: "u",
+			by: w1Id,
+			at: 1,
+			seeded: false,
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: [],
+		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			by: w1Id,
+			at: 1,
+			seeded: false,
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: [],
+		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			url: "u",
+			by: "!!",
+			at: 1,
+			seeded: false,
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: [],
+		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			url: "u",
+			by: w1Id,
+			seeded: false,
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: [],
+		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			url: "u",
+			by: w1Id,
+			at: 1,
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: [],
+		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			url: "u",
+			by: w1Id,
+			at: 1,
+			seeded: false,
+			head: 42,
+			redSent: false,
+			greenSent: false,
+			reviews: [],
+		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			url: "u",
+			by: w1Id,
+			at: 1,
+			seeded: false,
+			head: null,
+			greenSent: false,
+			reviews: [],
+		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			url: "u",
+			by: w1Id,
+			at: 1,
+			seeded: false,
+			head: null,
+			redSent: false,
+			reviews: [],
+		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			url: "u",
+			by: w1Id,
+			at: 1,
+			seeded: false,
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: "x",
+		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			url: "u",
+			by: w1Id,
+			at: 1,
+			seeded: false,
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: [1],
+		}),
+	];
+	bad.forEach((content, i) => {
+		writeFileSync(join(w1w, `bad-${i}.json`), content);
+	});
+	check(
+		"list skips a malformed watch file",
+		prText(await prOf(w1, { action: "list" })).includes("someorg/widget/pull/11") &&
+			!prText(await prOf(w1, { action: "list" })).includes("bad-"),
+	);
+	setGhTable({
+		"someorg/notes/3": pr(3, "OPEN", { head: "g1", contexts: [checkRun("ci", "SUCCESS")] }),
+		"someorg/notes/4": pr(4, "OPEN", { head: "q1", contexts: [checkRun("ci", "SUCCESS")] }),
+		"someorg/notes/5": pr(5, "OPEN", { head: "q5", contexts: [checkRun("ci", "SUCCESS")] }),
+		"someorg/widget/7": pr(7, "OPEN", {
+			head: "p1",
+			reviews: [
+				review("r7", "eve", "COMMENTED", "On the branch PR."),
+				review("r8", "frank", "CHANGES_REQUESTED", "Rename the helper."),
+			],
+			contexts: [checkRun("ci", "SUCCESS")],
+		}),
+		"someorg/widget/11": pr(11, "OPEN", {
+			head: "k3",
+			reviews: [
+				review("r9a", "carol", "COMMENTED", "First pass."),
+				review("r9b", "dave", "COMMENTED", "Second pass."),
+				review("r11", "erin", "COMMENTED", "Retry worked."),
+			],
+			contexts: [checkRun("ci/test", "SUCCESS")],
+		}),
+	});
+	jump(366 * 24 * 3_600_000);
+	// A fresh watch of the ended w2 with one malformed neighbour, so the year sweep reads both.
+	mkdirSync(join(watchesDir, w2Id), { recursive: true });
+	writeFileSync(
+		join(watchesDir, w2Id, "someorg+notes+5.json"),
+		JSON.stringify({
+			url: "https://github.com/someorg/notes/pull/5",
+			owner: "someorg",
+			name: "notes",
+			number: 5,
+			by: w2Id,
+			at: Date.now(),
+			seeded: false,
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: [],
+		}),
+	);
+	writeFileSync(join(watchesDir, w2Id, "bad-0.json"), "not json");
+	// The author's graph presence is fresh through its PR record, so its watch outlives the year.
+	writeFileSync(
+		join(root, "notify-telegram/graph/pr", `${authorId}.json`),
+		JSON.stringify({
+			url: "https://github.com/someorg/notes/pull/3",
+			number: 3,
+			state: "pr-open",
+			checkedAt: Date.now(),
+			changedAt: Date.now(),
+			emitted: [],
+		}),
+	);
+	w3.heartbeat();
+	w1.heartbeat();
+	await ghQuiet();
+	await w3.pump(200);
+	await w1.pump(200);
+	check(
+		"malformed watch files are discarded by the poll",
+		readdirSync(w1w).filter((f) => f.startsWith("bad-")).length === 0 &&
+			existsSync(join(w1w, "someorg+widget+11.json")),
+	);
+	check("a live session's watch survives the year", existsSync(join(watchesDir, w1Id, "someorg+widget+11.json")));
+	check(
+		"a watch whose graph presence is fresh through its PR record survives the year",
+		existsSync(join(watchesDir, authorId, "someorg+notes+3.json")),
+	);
+	check(
+		"a year-old watch of an ended session without a fresh record is pruned",
+		!existsSync(join(watchesDir, autoId)) && !existsSync(join(watchesDir, w4Id)),
+	);
+	check(
+		"a fresh watch of an ended session survives the year",
+		existsSync(join(watchesDir, w2Id, "someorg+notes+5.json")) && !existsSync(join(watchesDir, w2Id, "bad-0.json")),
+	);
+
+	for (const s of [w1, w3, w4, w6]) await s.fire("session_shutdown");
+	process.env.PATH = savedPath;
+	delete process.env.WGH_PR_LIST;
+	delete process.env.WGH_FAIL;
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
