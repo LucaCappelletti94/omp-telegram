@@ -2891,6 +2891,138 @@ check(
 	blockedAgain.some((r) => r?.decision === "block"),
 );
 
+heading("turn ends that wait on a background job");
+const JOB_WAIT = { willContinue: true, awaitingAsyncWork: true };
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const bj = spawn("01a04450-0000-7000-8000-000000000000", "/home/dev/work/ciwatch");
+	await bj.fire("session_start");
+
+	await bj.fire("input");
+	await bj.tools
+		.get("notify_status")
+		.execute(
+			"bj1",
+			{ summary: "Pushed, CI still running.", urgency: "green", effect: "none" },
+			undefined,
+			undefined,
+			bj.ctx,
+		);
+	const sentBefore = called("sendMessage").length;
+	await bj.fire("agent_end", JOB_WAIT);
+	await settle(150);
+	const waitMsg = lastCall("sendMessage").body;
+	check(
+		"a turn that ends waiting on a background job sends its recorded status at once",
+		called("sendMessage").length === sentBefore + 1 && waitMsg.text.includes("CI still running"),
+	);
+	check("the message says the session waits on a background job", waitMsg.text.includes("waits on a background job"));
+	check(
+		"a green status sent while a job runs offers no Close buttons",
+		waitMsg.text.includes("CI still running") && (waitMsg.reply_markup?.inline_keyboard ?? []).flat().length === 0,
+	);
+	await bj.fire("agent_start");
+	await bj.fire("session_stop");
+	await settle(150);
+	check(
+		"the stop after the job wakes the session does not send the status twice",
+		!called("sendMessage")
+			.slice(sentBefore + 1)
+			.some((c) => String(c.body.text).includes("CI still running")),
+	);
+
+	await bj.fire("input");
+	await bj.tools.get("notify_status").execute(
+		"bj2",
+		{
+			summary: "Pushed, CI running.",
+			urgency: "orange",
+			question: "Reword the commit?",
+			options: opts("Reword", "Leave it"),
+		},
+		undefined,
+		undefined,
+		bj.ctx,
+	);
+	await bj.fire("agent_end", JOB_WAIT);
+	await settle(150);
+	const choiceMsg = lastCall("sendMessage").body;
+	check(
+		"a recorded choice goes out as a question when the turn ends waiting on a job",
+		choiceMsg.text.includes("Reword the commit?") &&
+			choiceMsg.text.includes("waits on a background job") &&
+			choiceMsg.reply_markup.inline_keyboard.flat().length === 2,
+	);
+
+	await bj.fire("input");
+	await bj.tools.get("notify_status").execute(
+		"bj3",
+		{
+			summary: "All green, nothing left.",
+			urgency: "green",
+			effect: "none",
+			question: "Anything else?",
+			options: opts("Stop", "Go on"),
+		},
+		undefined,
+		undefined,
+		bj.ctx,
+	);
+	await bj.fire("agent_end", JOB_WAIT);
+	await settle(150);
+	check(
+		"a green choice sent while a job runs offers no Close buttons",
+		lastCall("sendMessage").body.text.includes("All green, nothing left") &&
+			lastCall("sendMessage").body.reply_markup.inline_keyboard.flat().length === 2,
+	);
+
+	await bj.fire("input");
+	const silentBefore = called("sendMessage").length;
+	const ends = await bj.fire("agent_end", JOB_WAIT);
+	await settle(150);
+	const fallback = lastCall("sendMessage").body.text;
+	check(
+		"a turn waiting on a job with nothing recorded sends the fallback message",
+		!ends.some((r) => r?.decision === "block") &&
+			called("sendMessage").length === silentBefore + 1 &&
+			fallback.includes("Turn finished") &&
+			fallback.includes("waits on a background job"),
+	);
+	const laterStop = await bj.fire("session_stop");
+	check(
+		"the terminal stop after a job wait still asks for a status",
+		laterStop.some((r) => r?.decision === "block"),
+	);
+
+	await bj.fire("input");
+	await bj.tools
+		.get("notify_status")
+		.execute(
+			"bj4",
+			{ summary: "Continuing on my own.", urgency: "green", effect: "none" },
+			undefined,
+			undefined,
+			bj.ctx,
+		);
+	const continueBefore = called("sendMessage").length;
+	await bj.fire("agent_end", { willContinue: true });
+	await settle(150);
+	check(
+		"an automatic continuation sends nothing and keeps the status for its stop",
+		called("sendMessage").length === continueBefore,
+	);
+	await bj.fire("session_stop");
+	await settle(150);
+	check("the kept status goes out at the stop", lastCall("sendMessage").body.text.includes("Continuing on my own"));
+
+	await bj.fire("input");
+	const plainBefore = called("sendMessage").length;
+	await bj.fire("agent_end");
+	await settle(150);
+	check("a plain agent end sends nothing by itself", called("sendMessage").length === plainBefore);
+	await bj.fire("session_shutdown");
+}
+
 // ------------------------------------------------------------- turn-end choice questions
 heading("turn-end choice questions");
 rmSync(join(root, "notify-telegram/poller.lock"), { force: true });

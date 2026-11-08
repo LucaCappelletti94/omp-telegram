@@ -188,6 +188,8 @@ const SPINNER_FRAMES = new Set([
 	"\u280F",
 ]);
 const STATUS_SUMMARY_MAX = 160;
+/** Closes a turn-end message whose turn ended while one of the session's background jobs still runs. */
+const JOB_WAIT_LINE = "\u23F3 This session waits on a background job and wakes when it finishes.";
 const CAPTION_MAX = 1024;
 /** A snippet's purpose is one line above the block, not a second summary. */
 const SNIPPET_PURPOSE_MAX = 120;
@@ -5666,6 +5668,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		quiet: boolean,
 		pinGeneration: number,
 		keep = "",
+		offerClose = true,
 	): Promise<void> {
 		if (config === null || recorded.options === undefined) return;
 		const closeGeneration = closeOfferGeneration;
@@ -5694,7 +5697,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				return button;
 			}),
 		);
-		if (recorded.urgency === "green") keyboard.push(...closeSessionButtons());
+		const offersClose = offerClose && recorded.urgency === "green";
+		if (offersClose) keyboard.push(...closeSessionButtons());
 		const labels = recorded.options.map((option) => option.label);
 		// A newer input, agent start, turn end, or shutdown moves the pin generation. Only the
 		// newest turn end may still publish or settle the standing slot.
@@ -5702,7 +5706,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const publishStanding = (messageId: number): void => {
 			if (!ownsSlot()) return;
 			standingQuestion = { id, messageId, labels, head: settlementHead };
-			if (recorded.urgency === "green") {
+			if (offersClose) {
 				if (closeGeneration === closeOfferGeneration && !turnActive && !closing) {
 					closeOfferMessageId = messageId;
 					writeSessionRecord(ctx);
@@ -9514,7 +9518,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		noteState();
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", async (event, ctx) => {
 		turnActive = false;
 		replyOwedAt = 0;
 		turnEndedAt = Date.now();
@@ -9527,6 +9531,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		noteState();
 		// omp titles a session during its first turn, after a badge may already have been chosen.
 		await syncSessionName(ctx, "");
+		// omp stops a turn that waits on a background job without `session_stop`, yet the turn has ended for the user.
+		if (event.awaitingAsyncWork === true) await endTurn(ctx, true);
 	});
 
 	pi.on("message_update", async (event) => {
@@ -9677,7 +9683,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	});
 
-	pi.on("session_stop", async (_event, ctx) => {
+	pi.on("session_stop", async (_event, ctx) => endTurn(ctx, false));
+
+	/**
+	 * Reports a finished turn to Telegram. A turn that waits on a background job cannot be held back for a
+	 * status, offers no Close buttons, since closing would end the job, and says the session waits on it.
+	 */
+	async function endTurn(ctx: ExtensionContext, waitsOnJob: boolean) {
 		turnActive = false;
 		replyOwedAt = 0;
 		approvalWaiting = false;
@@ -9698,17 +9710,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				orange: "\u{1F7E0} Reply wanted",
 				red: "\u{1F534} Action required",
 			};
-			const recorded = turnSummary;
+			const recorded = waitsOnJob ? { ...turnSummary, text: `${turnSummary.text}\n\n${JOB_WAIT_LINE}` } : turnSummary;
 			detach(() => unpinRed(ctx), "status unpin");
 			const pinGeneration = redPinGeneration;
 			turnSummary = null;
 			// The record keeps the headline only: `/status` lists it beside every other session.
 			lastSummary = clip(recorded.text.split("\n")[0]?.trim() ?? "", STATUS_SUMMARY_MAX);
+			const offersClose = recorded.urgency === "green" && !waitsOnJob;
 			lastSummaryAt = Date.now();
 			if (recorded.options === undefined) {
 				const closeGeneration = closeOfferGeneration;
 				const extra: Record<string, unknown> = { ...urgencyExtras(recorded, quiet) };
-				if (recorded.urgency === "green") extra.reply_markup = { inline_keyboard: closeSessionButtons() };
+				if (offersClose) extra.reply_markup = { inline_keyboard: closeSessionButtons() };
 				// With no buttons the question would otherwise vanish, and a plain reply answers it fine.
 				const body = recorded.question === undefined ? recorded.text : `${recorded.text}\n\n${recorded.question}`;
 				const replyQuestionToken = recorded.question === undefined ? null : ++replyQuestionGeneration;
@@ -9731,7 +9744,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					() => pinGeneration === redPinGeneration,
 				).then((sent) => {
 					const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
-					if (recorded.urgency === "green") {
+					if (offersClose) {
 						if (closeGeneration === closeOfferGeneration && !turnActive && !closing) {
 							closeOfferMessageId = messageId;
 							writeSessionRecord(ctx);
@@ -9746,13 +9759,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				return;
 			}
 			detach(
-				() => sendStandingQuestion(ctx, heads[recorded.urgency], recorded, quiet, pinGeneration, usageFooter()),
+				() =>
+					sendStandingQuestion(
+						ctx,
+						heads[recorded.urgency],
+						recorded,
+						quiet,
+						pinGeneration,
+						usageFooter(),
+						!waitsOnJob,
+					),
 				"turn-end question",
 			);
 			return;
 		}
 
-		if (!statusBlockUsed) {
+		if (!statusBlockUsed && !waitsOnJob) {
 			statusBlockUsed = true;
 			if (pendingAsk === null && /\?\s*$/.test(lastAssistantTail(ctx))) {
 				return { decision: "block" as const, reason: QUESTION_STOP_REASON };
@@ -9767,7 +9789,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const tail = lastAssistantTail(ctx);
 		const wantsReply = /\?\s*$/.test(tail);
 		const title = wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished";
-		const body =
+		const tailBody =
 			tail.length === 0
 				? "Awaiting your next instruction."
 				: tail.length <= 600
@@ -9775,6 +9797,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					: wantsReply
 						? `...${clipEnd(tail, 600)}`
 						: `${clip(tail, 600)}...`;
+		const body = waitsOnJob ? `${tailBody}\n\n${JOB_WAIT_LINE}` : tailBody;
 		const generation = redPinGeneration;
 		detach(
 			() =>
@@ -9795,7 +9818,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				),
 			"turn-end notice",
 		);
-	});
+	}
 
 	pi.on("tool_approval_requested", async (event, ctx) => {
 		approvalWaiting = true;
