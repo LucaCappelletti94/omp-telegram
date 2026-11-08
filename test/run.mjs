@@ -17254,6 +17254,533 @@ echo done >> ${wghLog}
 	delete process.env.WGH_PR_LIST;
 	delete process.env.WGH_FAIL;
 }
+// ---------------------------------------------------------- pane state for the bar
+heading("pane state for the tmux bar");
+{
+	// The PR watch section walked the clock a year forward; make every record fresh so this
+	// section's reaper has no stale material.
+	clockSkew = 0;
+	writeConfig();
+	mkdirSync(sessionsDir, { recursive: true });
+	for (const f of readdirSync(sessionsDir)) {
+		const id = f.slice(0, -5);
+		try {
+			writeFileSync(join(sessionsDir, f), JSON.stringify({ ...record(id), heartbeat: Date.now() }));
+		} catch {}
+	}
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	rmSync(join(root, "notify-telegram/dashboard.lock"), { force: true });
+	const crashDirPath = join(root, "notify-telegram/crashed");
+	rmSync(crashDirPath, { recursive: true, force: true });
+	const bootId = (() => {
+		try {
+			return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+		} catch {
+			return "";
+		}
+	})();
+	// A fake tmux that records every call and keeps each pane's option value in a file, so a
+	// clear can be checked against what the pane still reads. Pane %83 refuses to be read.
+	const paneBin = join(root, "pane-bin");
+	mkdirSync(paneBin, { recursive: true });
+	const paneLog = join(root, "pane-tmux.log");
+	const paneStateDir = join(root, "pane-state");
+	mkdirSync(paneStateDir, { recursive: true });
+	const paneFail = join(root, "pane-tmux-fail");
+	writeFileSync(paneLog, "");
+	writeFileSync(
+		join(paneBin, "tmux"),
+		`#!/bin/sh
+echo "$*" >> ${paneLog}
+[ -e ${paneFail} ] && [ "$1" = set-option ] && { echo "set-option refused by test" >&2; exit 1; }
+case "$1" in
+  set-option)
+    P=""; U=0; V=""; shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -t) shift; P="$1" ;;
+        -u) U=1 ;;
+        -p) ;;
+        @*) ;;
+        *) V="$1" ;;
+      esac
+      shift
+    done
+    if [ "$U" = 1 ]; then rm -f ${paneStateDir}/"$P"; else printf '%s\\n' "$V" > ${paneStateDir}/"$P"; fi
+    ;;
+  display-message)
+    P=""; F=""; shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -t) shift; P="$1" ;;
+        *) F="$1" ;;
+      esac
+      shift
+    done
+    case "$F" in
+      *omp_state*)
+        [ -n "$P" ] || exit 1
+        [ "$P" = "%83" ] && exit 1
+        [ -f ${paneStateDir}/"$P" ] && cat ${paneStateDir}/"$P"
+        ;;
+      *) printf 'work\\t3\\n' ;;
+    esac
+    ;;
+  *) exit 0 ;;
+esac
+`,
+		{ mode: 0o755 },
+	);
+	writeFileSync(join(paneBin, "gh"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+	const paneSavedPath = process.env.PATH;
+	process.env.PATH = `${paneBin}:${paneSavedPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	const paneLogText = () => (existsSync(paneLog) ? readFileSync(paneLog, "utf8") : "");
+	const paneLogReset = () => writeFileSync(paneLog, "");
+	const paneValue = (pane) =>
+		existsSync(join(paneStateDir, pane)) ? readFileSync(join(paneStateDir, pane), "utf8").trim() : "";
+
+	process.env.TMUX_PANE = "%78";
+	const psId = "0c2c0002-0000-7000-8000-000000000002";
+	const ps = spawn(psId, "/home/dev/work/panestate");
+	let tail = "";
+	ps.ctx.sessionManager.getBranch = () => [
+		{ type: "message", message: { role: "user", content: [{ type: "text", text: "do the thing" }] } },
+		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: tail }] } },
+	];
+	const notify = (name, params) => ps.tools.get("notify_status").execute(name, params, undefined, undefined, ps.ctx);
+	const freshTurn = async () => {
+		await ps.fire("input");
+		await settle(50);
+		paneLogReset();
+	};
+	const stopTurn = async () => {
+		await ps.fire("session_stop");
+		await settle(150);
+	};
+	const gtId = "0c2c000a-0000-7000-8000-00000000000a";
+	const fakeId = "0c2c9999-9999-9999-9999-999999999999";
+	const gtNode = (status) =>
+		writeFileSync(
+			join(root, "notify-telegram/graph/nodes", `${gtId}.json`),
+			JSON.stringify({
+				session: gtId,
+				label: "The target",
+				emoji: "",
+				tag: "gttgt",
+				cwd: "/nowhere",
+				status,
+				note: "",
+				edges: [],
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			}),
+		);
+	const ownNode = (edges) =>
+		writeFileSync(
+			join(root, "notify-telegram/graph/nodes", `${psId}.json`),
+			JSON.stringify({
+				session: psId,
+				label: "Pane state",
+				emoji: "",
+				tag: record(psId).tag,
+				cwd: "/home/dev/work/panestate",
+				status: "working",
+				note: "",
+				edges,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			}),
+		);
+
+	writeFileSync(join(paneStateDir, "%78"), "crashed\n");
+	await ps.fire("session_start");
+	await settle(150);
+	check(
+		"session start clears a crashed an earlier omp left in the pane",
+		paneLogText().includes("set-option -p -u -t %78 @omp_state") && paneValue("%78") === "",
+	);
+	paneLogReset();
+	await ps.fire("input");
+	await settle(100);
+	check(
+		"a new input clears the pane state",
+		paneLogText().includes("set-option -p -u -t %78 @omp_state") && paneValue("%78") === "",
+	);
+	paneLogReset();
+	await ps.fire("agent_start");
+	await settle(100);
+	check(
+		"agent start clears the pane state",
+		paneLogText().includes("set-option -p -u -t %78 @omp_state") && paneValue("%78") === "",
+	);
+	paneLogReset();
+
+	await freshTurn();
+	await notify("p1", { summary: "Blocked on the database.", urgency: "red" });
+	await stopTurn();
+	check(
+		"a red turn end marks the pane urgent",
+		paneLogText().includes("set-option -p -t %78 @omp_state urgent") && paneValue("%78") === "urgent",
+	);
+
+	await freshTurn();
+	await notify("p2", { summary: "Where to next.", urgency: "orange" });
+	await stopTurn();
+	check(
+		"an orange turn end asks the pane for a reply",
+		paneLogText().includes("set-option -p -t %78 @omp_state reply") && paneValue("%78") === "reply",
+	);
+
+	await freshTurn();
+	await notify("p3", { summary: "Which backend?", urgency: "orange", options: opts("SQLite", "Postgres") });
+	await stopTurn();
+	check(
+		"an orange turn end with choices still asks for a reply",
+		paneLogText().includes("set-option -p -t %78 @omp_state reply") && paneValue("%78") === "reply",
+	);
+
+	await freshTurn();
+	await notify("p4", { summary: "Pick a direction.", urgency: "green", effect: "none", options: opts("A", "B") });
+	await stopTurn();
+	check(
+		"a green turn end with choices asks the pane for a reply",
+		paneLogText().includes("set-option -p -t %78 @omp_state reply") && paneValue("%78") === "reply",
+	);
+
+	await freshTurn();
+	await notify("p5", { summary: "All done.", urgency: "green", effect: "none" });
+	await stopTurn();
+	check(
+		"a green turn end that waits on nothing marks the pane done",
+		paneLogText().includes("set-option -p -t %78 @omp_state done") && paneValue("%78") === "done",
+	);
+
+	gtNode("working");
+	ownNode([
+		{ from: psId, to: gtId, type: "related", at: Date.now() },
+		{ from: psId, to: fakeId, type: "upstream", at: Date.now() },
+		{ from: psId, to: gtId, type: "waits-on", at: Date.now() },
+	]);
+	await freshTurn();
+	await notify("p6", { summary: "The graph is green.", urgency: "green", effect: "none" });
+	await stopTurn();
+	check(
+		"a green turn end that waits on an unfinished session sleeps the pane",
+		paneLogText().includes("set-option -p -t %78 @omp_state sleeping") && paneValue("%78") === "sleeping",
+	);
+
+	gtNode("done");
+	await freshTurn();
+	await notify("p7", { summary: "The target finished.", urgency: "green", effect: "none" });
+	await stopTurn();
+	check(
+		"a green turn end whose target is finished marks the pane done",
+		paneLogText().includes("set-option -p -t %78 @omp_state done") && paneValue("%78") === "done",
+	);
+
+	tail = "Should I delete the legacy shim?";
+	await freshTurn();
+	await stopTurn();
+	check(
+		"a fallback turn end that ends on a question asks the pane for a reply",
+		paneLogText().includes("set-option -p -t %78 @omp_state reply") && paneValue("%78") === "reply",
+	);
+
+	ownNode([]);
+	tail = "All tests pass and the branch is ready.";
+	await freshTurn();
+	await stopTurn();
+	check(
+		"a fallback turn end that waits on nothing marks the pane done",
+		paneLogText().includes("set-option -p -t %78 @omp_state done") && paneValue("%78") === "done",
+	);
+
+	gtNode("working");
+	ownNode([{ from: psId, to: gtId, type: "waits-on", at: Date.now() }]);
+	tail = "The build is green.";
+	await freshTurn();
+	await stopTurn();
+	check(
+		"a fallback turn end that waits on an unfinished session sleeps the pane",
+		paneLogText().includes("set-option -p -t %78 @omp_state sleeping") && paneValue("%78") === "sleeping",
+	);
+
+	ownNode([]);
+	writeFileSync(paneFail, "");
+	tail = "Done for today.";
+	await freshTurn();
+	await stopTurn();
+	check(
+		"a failed pane write is ignored and the pane keeps its value",
+		paneLogText().includes("set-option -p -t %78 @omp_state done") && paneValue("%78") === "sleeping",
+	);
+	unlinkSync(paneFail);
+	await freshTurn();
+	await notify("p8", { summary: "Blocked again.", urgency: "red" });
+	await stopTurn();
+	check(
+		"the next turn end writes again after a failure",
+		paneLogText().includes("set-option -p -t %78 @omp_state urgent") && paneValue("%78") === "urgent",
+	);
+
+	await freshTurn();
+	await notify("p9", { summary: "The job is still running.", urgency: "red" });
+	await ps.fire("agent_end", { awaitingAsyncWork: true });
+	await settle(150);
+	check(
+		"an async end recorded red marks the pane urgent",
+		paneLogText().includes("set-option -p -t %78 @omp_state urgent") && paneValue("%78") === "urgent",
+	);
+
+	await freshTurn();
+	await notify("p10", { summary: "Waiting on the answer.", urgency: "orange" });
+	await ps.fire("agent_end", { awaitingAsyncWork: true });
+	await settle(150);
+	check(
+		"an async end recorded orange asks the pane for a reply",
+		paneLogText().includes("set-option -p -t %78 @omp_state reply") && paneValue("%78") === "reply",
+	);
+
+	await freshTurn();
+	await notify("p11", {
+		summary: "The job runs, pick a path.",
+		urgency: "green",
+		effect: "none",
+		options: opts("A", "B"),
+	});
+	await ps.fire("agent_end", { awaitingAsyncWork: true });
+	await settle(150);
+	check(
+		"an async end with choices asks the pane for a reply",
+		paneLogText().includes("set-option -p -t %78 @omp_state reply") && paneValue("%78") === "reply",
+	);
+
+	await freshTurn();
+	await notify("p12", { summary: "The job runs on its own.", urgency: "green", effect: "none" });
+	await ps.fire("agent_end", { awaitingAsyncWork: true });
+	await settle(150);
+	check(
+		"an async end that reported green sleeps the pane on its job",
+		paneLogText().includes("set-option -p -t %78 @omp_state sleeping") && paneValue("%78") === "sleeping",
+	);
+
+	tail = "Wait for the job before cleaning up?";
+	await freshTurn();
+	await ps.fire("agent_end", { awaitingAsyncWork: true });
+	await settle(150);
+	check(
+		"a fallback async end that ends on a question asks the pane for a reply",
+		paneLogText().includes("set-option -p -t %78 @omp_state reply") && paneValue("%78") === "reply",
+	);
+
+	tail = "The job runs in the background.";
+	await freshTurn();
+	await ps.fire("agent_end", { awaitingAsyncWork: true });
+	await settle(150);
+	check(
+		"a fallback async end that reported nothing sleeps the pane",
+		paneLogText().includes("set-option -p -t %78 @omp_state sleeping") && paneValue("%78") === "sleeping",
+	);
+
+	paneLogReset();
+	await ps.fire("session_shutdown");
+	await settle(150);
+	check(
+		"session shutdown clears the pane state",
+		paneLogText().includes("set-option -p -u -t %78 @omp_state") && paneValue("%78") === "",
+	);
+	rmSync(join(root, "notify-telegram/graph/nodes", `${psId}.json`), { force: true });
+
+	delete process.env.TMUX_PANE;
+	const np = spawn("0c2c0003-0000-7000-8000-000000000003", "/home/dev/work/outside-tmux");
+	await np.fire("session_start");
+	await np.fire("input");
+	await settle(100);
+	paneLogReset();
+	await np.fire("session_stop");
+	await settle(150);
+	check("a session outside tmux writes no pane option", !paneLogText().includes("@omp_state"));
+	await np.fire("session_shutdown");
+
+	process.env.TMUX_PANE = "%78";
+	const pc = spawn("0c2c0001-0000-7000-8000-000000000001", "/home/dev/work/panepoller");
+	await pc.fire("session_start");
+	await settle(150);
+	paneLogReset();
+	const victimDir = join(root, "pane-crash");
+	mkdirSync(victimDir, { recursive: true });
+	const died = Date.now() - 10 * 60_000;
+	const victim = (id, fields) =>
+		writeFileSync(
+			join(sessionsDir, `${id}.json`),
+			JSON.stringify({
+				pid: deadPid,
+				tag: id.slice(0, 5),
+				name: "",
+				cwd: victimDir,
+				emoji: "",
+				emojiChosen: false,
+				label: "",
+				lastNotified: died,
+				recent: [],
+				question: null,
+				replyQuestion: null,
+				standing: null,
+				closeOffer: null,
+				pinned: null,
+				state: "idle",
+				health: "",
+				summary: "",
+				summaryAt: 0,
+				messaging: 1,
+				heartbeat: died,
+				boot: bootId,
+				argv: ["--model", "opus"],
+				tmux: "work",
+				tmuxWindow: null,
+				tmuxPane: "%79",
+				...fields,
+			}),
+		);
+	const crashCards = () => called("sendMessage").filter((c) => String(c.body.text).includes("\u{1F691}"));
+
+	const v0Id = "0c2c0004-0000-7000-8000-000000000004";
+	victim(v0Id, { label: "No pane", tmuxPane: "" });
+	pc.heartbeat();
+	await settle(400);
+	check(
+		"a crash record that names no pane writes nothing to tmux",
+		existsSync(join(crashDirPath, `${v0Id}.json`)) && !paneLogText().includes("@omp_state"),
+	);
+
+	const v1Id = "0c2c0005-0000-7000-8000-000000000005";
+	const v2Id = "0c2c0006-0000-7000-8000-000000000006";
+	const v3Id = "0c2c0007-0000-7000-8000-000000000007";
+	victim(v1Id, { label: "Died in pane seventy-nine" });
+	victim(v2Id, { label: "Overwritten by another producer", tmuxPane: "%80" });
+	victim(v3Id, { label: "Restored from the card", tmuxPane: "%81" });
+	const cardsBefore = crashCards().length;
+	paneLogReset();
+	pc.heartbeat();
+	await settle(500);
+	check(
+		"each dead session's pane is marked crashed while its card is open",
+		paneLogText().includes("set-option -p -t %79 @omp_state crashed") &&
+			paneValue("%79") === "crashed" &&
+			paneValue("%80") === "crashed" &&
+			paneValue("%81") === "crashed",
+	);
+	const card = crashCards().at(-1)?.body;
+	check("the poller posts one card for the batch", crashCards().length === cardsBefore + 1);
+	const cardId = api.nextMessage - 1;
+	const buttons = (card?.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.callback_data);
+	const batchId = buttons.find((b) => typeof b === "string" && b.startsWith("ka:"))?.slice(3);
+
+	paneLogReset();
+	api.queued = [
+		{
+			update_id: 9601,
+			callback_query: {
+				id: "cb-9601",
+				from: { id: CHAT },
+				message: { message_id: cardId, chat: { id: CHAT } },
+				data: `kr:${v3Id}`,
+			},
+		},
+	];
+	await pc.pump(500);
+	check(
+		"restore reopens the session in its tmux session, resuming it with its flags",
+		paneLogText().includes("new-window -d -t work:") && paneLogText().includes(`omp --model opus --resume ${v3Id}`),
+	);
+	const v3Crash = JSON.parse(readFileSync(join(crashDirPath, `${v3Id}.json`), "utf8"));
+	writeFileSync(
+		join(sessionsDir, `${v3Id}.json`),
+		JSON.stringify({
+			...v3Crash.record,
+			instance: "pane-test",
+			leased: false,
+			pid: process.pid,
+			heartbeat: Date.now(),
+			systemShutdownAt: 0,
+		}),
+	);
+	pc.heartbeat();
+	await settle(500);
+	check(
+		"a session that comes back unsets crashed on its pane",
+		paneLogText().includes("display-message -p -t %81 #{@omp_state}") &&
+			paneLogText().includes("set-option -p -u -t %81 @omp_state") &&
+			paneValue("%81") === "",
+	);
+
+	writeFileSync(join(paneStateDir, "%80"), "urgent\n");
+	paneLogReset();
+	api.queued = [
+		{
+			update_id: 9602,
+			callback_query: {
+				id: "cb-9602",
+				from: { id: CHAT },
+				message: { message_id: cardId, chat: { id: CHAT } },
+				data: `kd:${batchId}`,
+			},
+		},
+	];
+	await pc.pump(500);
+	await settle(300);
+	check(
+		"a dismissed crash unsets crashed on the pane that still reads it",
+		paneLogText().includes("set-option -p -u -t %79 @omp_state") && paneValue("%79") === "",
+	);
+	check(
+		"a pane another producer overwrote is left alone on dismiss",
+		!paneLogText().includes("set-option -p -u -t %80 @omp_state") && paneValue("%80") === "urgent",
+	);
+
+	const v4Id = "0c2c0008-0000-7000-8000-000000000008";
+	const v5Id = "0c2c000b-0000-7000-8000-00000000000b";
+	victim(v4Id, { label: "Expired a week later", tmuxPane: "%82" });
+	victim(v5Id, { label: "Pane that cannot be read", tmuxPane: "%83" });
+	paneLogReset();
+	pc.heartbeat();
+	await settle(400);
+	check(
+		"the newest dead sessions mark their panes too",
+		paneValue("%82") === "crashed" && paneValue("%83") === "crashed",
+	);
+	writeFileSync(join(crashDirPath, "bad.json"), "not json");
+	jump(8 * 24 * 3_600_000);
+	paneLogReset();
+	pc.heartbeat();
+	await settle(500);
+	check(
+		"an expired crash record unsets crashed on its pane",
+		!existsSync(join(crashDirPath, `${v4Id}.json`)) &&
+			!existsSync(join(crashDirPath, "bad.json")) &&
+			paneLogText().includes("set-option -p -u -t %82 @omp_state") &&
+			paneValue("%82") === "",
+	);
+	check(
+		"the expiry leaves an overwritten pane alone",
+		!paneLogText().includes("set-option -p -u -t %80 @omp_state") && paneValue("%80") === "urgent",
+	);
+	check(
+		"a pane tmux refuses to read keeps its value when the clear cannot confirm it",
+		paneValue("%83") === "crashed" && !paneLogText().includes("set-option -p -u -t %83 @omp_state"),
+	);
+	check(
+		"every crash record expired with the file age",
+		readdirSync(crashDirPath).filter((f) => f.endsWith(".json")).length === 0,
+	);
+
+	await pc.fire("session_shutdown");
+	process.env.PATH = paneSavedPath;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+	clockSkew = 0;
+}
 
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
