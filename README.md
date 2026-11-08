@@ -49,6 +49,7 @@ Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops om
 - While a turn runs, the answer streams into an ephemeral draft bubble with the same head and the tool activity.
 - `/stop` aborts the running turn: sent bare it reaches the one session mid-turn and offers a button per session when several are, sent as a reply it stops the session that message belongs to.
 - Turn-end summaries report tokens and cost per model, with green summaries offering close-only and close-and-clear actions for the session and its tmux pane. Clearing removes that session's tracked messages and uniquely routed user messages, leaving other sessions and shared messages alone. Telegram's [48-hour deletion limit](https://core.telegram.org/bots/api/methods/deletemessage.md) applies, and anything left behind is reported.
+- A turn that ends while one of the session's background jobs still runs is reported at once, says the session waits on that job, and offers no close actions, since closing would end the job.
 - A green summary plays the Telegram send effect its agent chose for how the turn went, one of 🎉 🔥 👍 ❤️ 👎 💩, or none at all.
 - `/status` reports session state, `/fleet` lists omp tmux windows, and all commands sit in the bot menu.
 - Context compaction announces itself; retries and model fallbacks show as a provider note on the board and in `/status` rather than a message per session.
