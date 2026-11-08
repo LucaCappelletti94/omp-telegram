@@ -3059,6 +3059,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (restorable) {
 					const kept: CrashRecord = { record, batch, machine: restarted, restoringAt: 0, error: "", dismissed: false };
 					writePrivateJson(CRASH_DIR, `${id}.json`, kept);
+					markCrashedPane(record.tmuxPane);
 					crashed.push(id);
 					machine ||= restarted;
 					// The ask died with its process. The restored agent asks again if it still needs to.
@@ -3112,7 +3113,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					if (dir === CRASH_DIR && entry.endsWith(".json")) {
 						const id = entry.slice(0, -5);
 						const kept = readCrash(id);
-						if (kept !== null && !crashRestored(id, kept, kept.batch)) retireRecordedPin(kept.record);
+						if (kept !== null) {
+							if (!crashRestored(id, kept, kept.batch)) retireRecordedPin(kept.record);
+							clearCrashedPane(kept.record.tmuxPane);
+						}
 					}
 					unlinkSync(path);
 				} catch {}
@@ -3170,6 +3174,36 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {
 			return null;
 		}
+	}
+
+	/** The bar state the pane advertises for this session, written fire-and-forget so a slow tmux never holds a turn end. */
+	function setPaneState(value: "urgent" | "reply" | "sleeping" | "done"): void {
+		const pane = process.env.TMUX_PANE;
+		if (pane === undefined) return;
+		detach(() => run("tmux", ["set-option", "-p", "-t", pane, "@omp_state", value], 2_000), "pane state");
+	}
+
+	/** Clears the pane state, which also drops a crashed an earlier omp left behind in this pane. */
+	function clearPaneState(): void {
+		const pane = process.env.TMUX_PANE;
+		if (pane === undefined) return;
+		detach(() => run("tmux", ["set-option", "-p", "-u", "-t", pane, "@omp_state"], 2_000), "pane state clear");
+	}
+
+	/** Marks the dead session's pane crashed, which the bar shows while its Restore card is open. */
+	function markCrashedPane(pane: string): void {
+		if (pane.length === 0) return;
+		detach(() => run("tmux", ["set-option", "-p", "-t", pane, "@omp_state", "crashed"], 2_000), "crashed pane");
+	}
+
+	/** Drops crashed from a pane only while it still reads crashed, so a value another producer set is kept. */
+	function clearCrashedPane(pane: string): void {
+		if (pane.length === 0) return;
+		detach(async () => {
+			const read = await run("tmux", ["display-message", "-p", "-t", pane, "#{@omp_state}"], 2_000);
+			if (read.ok && read.stdout === "crashed")
+				await run("tmux", ["set-option", "-p", "-u", "-t", pane, "@omp_state"], 2_000);
+		}, "crashed pane clear");
 	}
 
 	/** Puts this session's pane in front for the user's return, but never while they are typing elsewhere.
@@ -6856,6 +6890,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return { nodes, prs };
 	}
 
+	/** True while the session's own node has an upstream or waits-on edge to a node that is not finished. */
+	function waitsOnUnfinishedSession(): boolean {
+		const { nodes, prs } = graphSnapshot();
+		const own = nodes.find((node) => node.session === sessionId);
+		if (own === undefined) return false;
+		const byId = new Map(nodes.map((node) => [node.session, node]));
+		return own.edges.some((edge) => {
+			if (edge.type !== "upstream" && edge.type !== "waits-on") return false;
+			const target = byId.get(edge.to);
+			return target !== undefined && !isFinished(displayedStatus(target, prs.get(edge.to)));
+		});
+	}
+
 	/** A badge or tag of a live session, or an id prefix of any live session or graph node, when unambiguous. */
 	function resolveSession(to: string): string | null {
 		const live = allRecords().filter(({ record }) => routable(record));
@@ -7283,7 +7330,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				lastSeen = Math.max(lastSeen, record.heartbeat, record.systemShutdownAt);
 				if (record.systemShutdownAt > 0) shut += 1;
 				const held = listPending(id).items.length;
-				const outcome = crashRestored(id, kept, batchId)
+				const restored = crashRestored(id, kept, batchId);
+				if (restored || kept.dismissed) clearCrashedPane(record.tmuxPane);
+				const outcome = restored
 					? "\u2705 restored"
 					: kept.dismissed
 						? "dismissed"
@@ -9150,6 +9199,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		clearPaneState();
 		config = loadConfig();
 		if (config === null && existsSync(CONFIG_PATH)) {
 			// The file exists but did not parse, which is what a write race looks like. One retry.
@@ -9465,6 +9515,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	pi.on("input", async (_event, ctx) => {
+		clearPaneState();
 		turnSummary = null;
 		chainHop = null;
 		statusBlockUsed = false;
@@ -9485,6 +9536,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	// The agent loop is the only truthful "working" signal: `input` also fires for
 	// submissions that never start a turn, which left the typing status stuck on.
 	pi.on("agent_start", async (_event, ctx) => {
+		clearPaneState();
 		if (sessionCtx !== null) await followSession(ctx);
 		turnActive = true;
 		statusBlockUsed = false;
@@ -9685,6 +9737,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	pi.on("session_stop", async (_event, ctx) => endTurn(ctx, false));
 
+	/** The pane state a turn end leaves, red asking for action, orange or a choice or a question asking for a reply. */
+	function endTurnPaneState(
+		urgency: "green" | "orange" | "red" | null,
+		offersChoice: boolean,
+		asksReply: boolean,
+		waitsOnJob: boolean,
+	): "urgent" | "reply" | "sleeping" | "done" {
+		if (urgency === "red") return "urgent";
+		if (urgency === "orange") return "reply";
+		if (offersChoice || asksReply) return "reply";
+		return waitsOnJob || waitsOnUnfinishedSession() ? "sleeping" : "done";
+	}
+
 	/**
 	 * Reports a finished turn to Telegram. A turn that waits on a background job cannot be held back for a
 	 * status, offers no Close buttons, since closing would end the job, and says the session waits on it.
@@ -9693,6 +9758,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnActive = false;
 		replyOwedAt = 0;
 		approvalWaiting = false;
+		// A turn that ends while a background job runs sleeps on it unless it asked for something.
+		if (waitsOnJob) {
+			const summary = turnSummary;
+			const asksReply = summary === null && /\?\s*$/.test(lastAssistantTail(ctx));
+			setPaneState(endTurnPaneState(summary?.urgency ?? null, summary?.options !== undefined, asksReply, waitsOnJob));
+		}
 		if (recoveryTurn) {
 			recoveryTurn = false;
 			// Nothing left to do after a crash is not news. Only a request to continue reaches Telegram.
@@ -9711,6 +9782,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				red: "\u{1F534} Action required",
 			};
 			const recorded = waitsOnJob ? { ...turnSummary, text: `${turnSummary.text}\n\n${JOB_WAIT_LINE}` } : turnSummary;
+			if (!waitsOnJob) setPaneState(endTurnPaneState(recorded.urgency, recorded.options !== undefined, false, false));
 			detach(() => unpinRed(ctx), "status unpin");
 			const pinGeneration = redPinGeneration;
 			turnSummary = null;
@@ -9788,6 +9860,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 		const tail = lastAssistantTail(ctx);
 		const wantsReply = /\?\s*$/.test(tail);
+		if (!waitsOnJob) setPaneState(endTurnPaneState(null, false, wantsReply, false));
 		const title = wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished";
 		const tailBody =
 			tail.length === 0
@@ -9865,6 +9938,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", async () => {
 		// omp allows this handler two seconds, so nothing in it may wait out a Telegram throttle.
+		clearPaneState();
 		lifetime.abort();
 		// systemd says `stopping` once a reboot or poweroff is queued.
 		if (sessionCtx !== null && (await run("systemctl", ["is-system-running"], 1_000)).stdout === "stopping") {
