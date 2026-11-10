@@ -126,6 +126,38 @@ export function fenceFor(text: string): string {
 	return "`".repeat(Math.max(3, longest + 1));
 }
 
+function escapeHtml(text: string): string {
+	return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+/** Renders structured questions for the native HTML form dialog. */
+export function askFormHtml(questions: readonly AskQuestion[], context = ""): string {
+	const attribute = (text: string): string => escapeHtml(text).replaceAll('"', "&quot;");
+	const parts = ["<form>"];
+	if (context.length > 0) parts.push(`<div>${toTelegramHtml(context)}</div>`);
+	for (const question of questions) {
+		const name = attribute(question.id);
+		parts.push(`<fieldset><legend>${toTelegramHtml(question.header || question.question)}</legend>`);
+		if (question.header) parts.push(`<div>${toTelegramHtml(question.question)}</div>`);
+		if (question.options.length === 0) {
+			parts.push(`<textarea name="${name}" aria-label="${attribute(question.question)}"></textarea>`);
+		}
+		for (const [index, option] of question.options.entries()) {
+			const stance = stanceOf(question, option, index);
+			const checked = question.recommended === index ? " checked" : "";
+			parts.push(
+				`<label><input type="${question.multi ? "checkbox" : "radio"}" name="${name}" value="${attribute(option.label)}"${checked}>${toTelegramHtml(option.label)}${stance === null ? "" : ` ${stance.marker}`}`,
+			);
+			if (option.description) parts.push(`<br>${toTelegramHtml(option.description)}`);
+			if (option.preview) parts.push(`<pre>${escapeHtml(option.preview)}</pre>`);
+			parts.push("</label>");
+		}
+		parts.push("</fieldset>");
+	}
+	parts.push("</form>");
+	return parts.join("\n");
+}
+
 /**
  * Markdown subset to Telegram HTML. Code is stashed first so emphasis cannot touch it, and so is
  * Telegram's own `tg-time` tag, the one piece of HTML the source may carry.
@@ -136,8 +168,6 @@ export function toTelegramHtml(source: string): string {
 		blocks.push(html);
 		return `\u0000${blocks.length - 1}\u0000`;
 	};
-	const escapeHtml = (text: string): string =>
-		text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
 	// NUL is the stash marker below; hostile input must not be able to forge or collide with it.
 	let work = source

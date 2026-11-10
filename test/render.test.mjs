@@ -1,6 +1,7 @@
 // The pure rendering helpers, called directly. No fake server, no session, no sleeping.
 
 import {
+	askFormHtml,
 	BUTTON_TEXT_MAX,
 	badgeLine,
 	buttonText,
@@ -56,6 +57,68 @@ check(
 );
 check("a stash marker in the input cannot be forged", !toTelegramHtml("\u00000\u0000 `x`").includes("\u0000"));
 check("ampersands escape before anything else", toTelegramHtml("a & b") === "a &amp; b");
+
+heading("native ask forms");
+{
+	const html = askFormHtml(
+		[
+			{
+				id: 'storage"&',
+				header: "Storage",
+				question: "Choose **storage**",
+				recommended: 1,
+				options: [
+					{ label: 'Agent uses "<local>" & disk', description: "One file", discouraged: true },
+					{ label: "Agent uses Postgres", description: "Shared **storage**", preview: "SELECT 1" },
+				],
+			},
+			{
+				id: "targets",
+				question: "Targets?",
+				multi: true,
+				options: [{ label: "Linux", description: "Server", lukewarm: true }],
+			},
+			{ id: "notes", question: "Any notes?", options: [] },
+		],
+		"Context with `x < y`",
+	);
+	check(
+		"context and question markup reach the form",
+		html.includes("<code>x &lt; y</code>") && html.includes("<b>storage</b>"),
+	);
+	check("a question header reaches the form", html.includes("Storage"));
+	check(
+		"labels and question ids cannot inject form controls",
+		html.includes('name="storage&quot;&amp;"') &&
+			html.includes('value="Agent uses &quot;&lt;local&gt;&quot; &amp; disk"'),
+	);
+	check("the recommendation is preselected", html.includes('value="Agent uses Postgres" checked'));
+	check(
+		"descriptions and previews reach the terminal",
+		html.includes("Shared <b>storage</b>") && html.includes("SELECT 1"),
+	);
+	check("stance labels reach the terminal", html.includes("(discouraged)") && html.includes("(lukewarm)"));
+	check("multiple selections use checkboxes", html.includes('type="checkbox" name="targets"'));
+	check(
+		"a question without choices accepts labeled text",
+		html.includes('<textarea name="notes" aria-label="Any notes?"'),
+	);
+	const hostile = askFormHtml(
+		[
+			{
+				id: "safe",
+				question: "</legend><input name=extra>",
+				options: [{ label: "</label><input name=extra>", description: "<script>bad</script>" }],
+			},
+		],
+		"</form><input name=extra>",
+	);
+	check(
+		"prose cannot inject controls or scripts",
+		!hostile.includes("<input name=extra>") && !hostile.includes("<script>"),
+	);
+	check("an unmarked choice is not preselected", !hostile.includes(" checked"));
+}
 
 heading("fitting a message to the telegram limit");
 {
