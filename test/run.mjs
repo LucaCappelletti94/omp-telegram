@@ -328,6 +328,7 @@ const spawn = (id, cwd, title = "") => {
 const stubbornCtx = (ctx, state) => ({
 	...ctx,
 	invokeTool: (params, options) => {
+		if (typeof params.html !== "string") throw new TypeError("Native ask requires an HTML form");
 		state.params = params;
 		const { promise, reject } = Promise.withResolvers();
 		options.signal.addEventListener("abort", () => {
@@ -1596,13 +1597,9 @@ const ctxAsk = {
 };
 const ctxRun = ctxSession.tools.get("ask").execute("cx", ctxAsk, undefined, undefined, withCapture);
 await settle(150);
-check("context is not passed as a field to the strict native tool", !("context" in seen.params));
-check(
-	"context is prepended to the first question so the terminal shows it",
-	seen.params.questions[0].question.startsWith("The rebuild takes 40 minutes"),
-);
-check("the original question text survives", seen.params.questions[0].question.includes("Rebuild now?"));
-check("later questions are untouched", seen.params.questions[1].question === "Notify on completion?");
+check("the terminal form includes the shared context", seen.params.html.includes("The rebuild takes 40 minutes"));
+check("the terminal form includes the first question", seen.params.html.includes("Rebuild now?"));
+check("the terminal form includes later questions", seen.params.html.includes("Notify on completion?"));
 check("the caller's objects are not mutated", ctxAsk.questions[0].question === "Rebuild now?");
 check("context still appears on Telegram", lastCall("sendMessage").body.text.includes("40 minutes"));
 const ctxAskId = lastCall("sendMessage").body.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
@@ -2485,30 +2482,13 @@ check(
 	"every option gets its own section in the body",
 	stBody.text.includes("<b>another neutral</b>\nalso no strong view"),
 );
-check(
-	"the terminal sees the discouraged marker too",
-	stanceParams.params.questions[0].options[2].description.startsWith("(discouraged)"),
-);
-check(
-	"the terminal sees the lukewarm marker too",
-	stanceParams.params.questions[0].options[4].description.startsWith("\u{1F7E0} (lukewarm)"),
-);
+check("the terminal sees the discouraged marker too", stanceParams.params.html.includes("(discouraged)"));
+check("the terminal sees the lukewarm marker too", stanceParams.params.html.includes("\u{1F7E0} (lukewarm)"));
 check(
 	"an unmarked option reaches the native tool with its description untouched",
-	stanceParams.params.questions[0].options[3].description === "also no strong view",
+	stanceParams.params.html.includes("also no strong view"),
 );
-check(
-	"discouraged never reaches the strict native tool",
-	stanceParams.params.questions[0].options.every((o) => !("discouraged" in o)),
-);
-check(
-	"lukewarm never reaches the strict native tool",
-	stanceParams.params.questions[0].options.every((o) => !("lukewarm" in o)),
-);
-check(
-	"neutral descriptions are untouched",
-	stanceParams.params.questions[0].options[0].description === "no strong view",
-);
+check("neutral descriptions are untouched", stanceParams.params.html.includes("no strong view"));
 check(
 	"the caller's option objects are not mutated",
 	stanceAsk.questions[0].options[2].description === "here for contrast",

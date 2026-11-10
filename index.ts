@@ -56,6 +56,7 @@ import {
 import {
 	type AskOption,
 	type AskQuestion,
+	askFormHtml,
 	badgeLine,
 	buttonText,
 	clip,
@@ -69,7 +70,6 @@ import {
 	packRows,
 	plainStamps,
 	relativeTime,
-	STANCE,
 	type StatusOption,
 	stanceFor,
 	stanceOf,
@@ -6415,20 +6415,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const invoke = ctx.invokeTool;
 			if (invoke === undefined) throw new Error("Ask tool requires interactive mode");
 			const context = typeof p.context === "string" ? p.context.trim() : "";
-			// The native tool is strict: `context` rides inside the first question instead.
-			const nativeParams = {
-				questions: questions.map((question, index) => ({
-					...question,
-					question: index === 0 && context.length > 0 ? `${context}\n\n${question.question}` : question.question,
-					options: question.options.map((option, optionIndex) => {
-						const { discouraged, lukewarm, ...rest } = option;
-						if (discouraged !== true && lukewarm !== true) return rest;
-						const stance = stanceOf(question, option, optionIndex);
-						if (stance === null || stance === STANCE.preferable) return rest;
-						return { ...rest, description: `${stance.marker} ${rest.description.trim()}` };
-					}),
-				})),
-			};
+			const nativeParams = { html: askFormHtml(questions, context) };
 			if (config === null) return await invoke(nativeParams, { signal, onUpdate });
 
 			askSequence += 1;

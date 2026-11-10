@@ -10,7 +10,7 @@ Parallel sessions share one bot. Every message opens with the session's badge an
 
 ## Setup
 
-Create a bot with [@BotFather](https://t.me/BotFather), then:
+Use `omp 18.18.3` or newer. Create a bot with [@BotFather](https://t.me/BotFather), then run the setup.
 
 ```
 git clone https://github.com/LucaCappelletti94/omp-telegram
