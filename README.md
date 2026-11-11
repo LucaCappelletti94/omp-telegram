@@ -67,6 +67,10 @@ Every change of reaction appends one line to `~/.omp/agent/notify-telegram/feedb
 
 Agents in different live sessions write to each other with `session_message`, addressing a peer by its badge emoji, or by its tag when it has none, and a bare call lists the live sessions. A message reaches a busy peer at its next step without interrupting its tool calls, wakes an idle one, carries an id that an answer quotes in `reply_to`, and appears only in the two transcripts. A chain stops after twenty hops unless the user prompts one of the sessions in between.
 
+## Priority vote
+
+Every turn end ranks the other live sessions twice through `notify_status`, once for your attention and once for CPU, and `priority_vote` updates either ranking mid-turn. The session holding the Telegram connection tallies the live ballots every thirty seconds with a modified Borda count in which no session ranks itself, and the attention order sorts `/status`, `/fleet` and the pinned board. A window marked `@omp_priority high` in omp-tmux lists above every vote.
+
 ## Dependencies between sessions
 
 Sessions record what they wait on with `session_graph`, and `upstream_launch` links a child to the session that launched it, so the graph keeps a year of dependency chains across restarts. Agents report their own status, and the session holding the Telegram connection polls each pull request on GitHub every ten minutes. An outcome such as a push, a merge or a fix found not needed wakes every session waiting on it, or, when that session has ended, is held and raises a Telegram card offering to resume it. `/deps` sends the graph as a Mermaid diagram rendered by [`mmdc`](https://github.com/mermaid-js/mermaid-cli) with the status of every node, and `/resume` lists the ended sessions with updates waiting.

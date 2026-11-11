@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomInt, randomUUID } from "node:crypto";
 import {
 	appendFileSync,
 	chmodSync,
@@ -53,6 +53,7 @@ import {
 	type WatchQueryAnswer,
 	type WatchQueryEntry,
 } from "./graph.ts";
+import { bordaPoints, byPriority } from "./priority.ts";
 import {
 	type AskOption,
 	type AskQuestion,
@@ -127,6 +128,10 @@ const CRASH_DIR = join(STATE_DIR, "crashed");
 const CRASH_BATCH_DIR = join(CRASH_DIR, "batches");
 const CRASH_KEEP_MS = 7 * 24 * 3_600_000;
 const CRASH_MESSAGE_TYPE = "omp-telegram.crash";
+/** One file per session holding its two rankings of the other live sessions, best first. */
+const BALLOT_DIR = join(STATE_DIR, "ballots");
+/** The focus tally and the user's own window marks, written by the poller and read by every view listing sessions. */
+const PRIORITY_FILE = join(STATE_DIR, "priority.json");
 /** Differs from a record's `boot` exactly when the machine restarted since that record was written. */
 const BOOT_ID = (() => {
 	try {
@@ -852,6 +857,11 @@ const RENDER_DIR = join(GRAPH_DIR, "render");
 const GRAPH_POLL_MS = 10 * 60_000;
 const WATCH_POLL_MS = 60_000;
 const GRAPH_PRUNE_MS = 24 * 3_600_000;
+/** How often the poller re-tallies the priority votes and reapplies their effects. */
+const PRIORITY_TICK_MS = 30_000;
+/** How an agent ranks the other live sessions, shared by `notify_status`, `priority_vote` and their refusals. */
+const BALLOT_GUIDE =
+	"Rank the other live omp sessions best first, each by its badge emoji or tag: `focus` orders which of them deserves the user's attention next, `resources` which deserves the machine's CPU now. Never rank this session. A partial ranking counts, and a session it leaves out scores nothing from this ballot.";
 /** A launch its child has not claimed within this long is shown as never started. */
 const LAUNCH_STALE_MS = 3_600_000;
 const LAUNCH_ENV = "OMP_TELEGRAM_LAUNCH";
@@ -1121,6 +1131,44 @@ function readNode(id: string): LedgerNode | null {
 function listJson(dir: string): string[] {
 	if (!existsSync(dir)) return [];
 	return readdirSync(dir).filter((entry) => entry.endsWith(".json"));
+}
+
+/** A session's two rankings of the other live sessions, best first, as session ids. */
+interface Ballot {
+	focus: string[];
+	resources: string[];
+	at: number;
+}
+
+function ballotOf(raw: unknown): Ballot | null {
+	if (typeof raw !== "object" || raw === null) return null;
+	const { focus, resources, at } = raw as Record<string, unknown>;
+	const ids = (value: unknown): string[] | null =>
+		Array.isArray(value) && value.every((id) => typeof id === "string" && isStateToken(id)) ? value : null;
+	const f = ids(focus);
+	const r = ids(resources);
+	return f === null || r === null || typeof at !== "number" ? null : { focus: f, resources: r, at };
+}
+
+/** Every stored ballot by voter, live or not, since only the tally knows who is live. */
+function readBallots(): Map<string, Ballot> {
+	const ballots = new Map<string, Ballot>();
+	for (const entry of listJson(BALLOT_DIR)) {
+		const ballot = ballotOf(readJsonFile(join(BALLOT_DIR, entry)));
+		if (ballot !== null) ballots.set(entry.slice(0, -5), ballot);
+	}
+	return ballots;
+}
+
+/** What the poller last tallied for the focus vote, and which live sessions sit in a window the user marked. */
+function readFocusTally(): { points: Map<string, number>; marked: Set<string> } {
+	const raw = readJsonFile(PRIORITY_FILE) as { points?: unknown; marked?: unknown } | null;
+	const points = new Map<string, number>();
+	if (typeof raw?.points === "object" && raw.points !== null) {
+		for (const [id, value] of Object.entries(raw.points)) if (typeof value === "number") points.set(id, value);
+	}
+	const marked = new Set(Array.isArray(raw?.marked) ? raw.marked.filter((id) => typeof id === "string") : []);
+	return { points, marked };
 }
 
 function allNodes(): LedgerNode[] {
@@ -1765,7 +1813,7 @@ async function sleepMs(ms: number): Promise<void> {
  */
 function codeStampOfFiles(): string {
 	const hash = createHash("sha256");
-	for (const name of ["index.ts", "render.ts", "graph.ts"]) {
+	for (const name of ["index.ts", "render.ts", "graph.ts", "priority.ts"]) {
 		hash.update(readFileSync(new URL(`./${name}`, import.meta.url).pathname));
 	}
 	return hash.digest("hex");
@@ -3068,6 +3116,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				}
 				if (!restorable && record !== null) retireRecordedPin(record);
 				unlinkSync(join(SESSIONS_DIR, entry));
+				// A crash card's restore resumes voting with the ballot the session last cast.
+				if (!restorable) removeStatePath(BALLOT_DIR, `${id}.json`);
 				rmSync(join(INBOX_DIR, id), { recursive: true, force: true });
 				// The crash card counts held updates itself, and a restore delivers them.
 				if (!restorable && listPending(id).items.length > 0) detach(() => raiseResumeCard(id), "resume card");
@@ -3121,6 +3171,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					unlinkSync(path);
 				} catch {}
 			}
+		}
+		// A ballot outlives its voter only while a crash card can still restore it.
+		for (const entry of listJson(BALLOT_DIR)) {
+			const id = entry.slice(0, -5);
+			if (readSessionRecord(id) === null && readCrash(id) === null) removeStatePath(BALLOT_DIR, entry);
 		}
 		// A writer killed between the temp write and the rename leaves its temp behind, which no reader wants.
 		for (const dir of [SESSIONS_DIR, STATE_DIR]) {
@@ -3362,20 +3417,27 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					"list-panes",
 					"-a",
 					"-F",
-					"#{session_name}\t#{window_index}\t#{window_bell_flag}\t#{@omp_priority}\t#{pane_title}",
+					"#{session_name}\t#{window_index}\t#{window_bell_flag}\t#{@omp_priority}\t#{pane_id}\t#{pane_title}",
 				],
 				{ timeout: 2000 },
 			).toString();
 		} catch {
 			return null;
 		}
-		const parsed: { session: string; index: string; sep: string; bell: boolean; label: string; priority: boolean }[] =
-			[];
+		const parsed: {
+			session: string;
+			index: string;
+			sep: string;
+			bell: boolean;
+			label: string;
+			priority: boolean;
+			pane: string;
+		}[] = [];
 		const ompPanesPerWindow = new Map<string, number>();
 		for (const raw of out.split("\n")) {
 			const parts = raw.split("\t");
-			if (parts.length < 5) continue;
-			const title = parts.slice(4).join("\t");
+			if (parts.length < 6) continue;
+			const title = parts.slice(5).join("\t");
 			if (!title.startsWith("\u03C0 ")) continue;
 			const key = `${parts[0]}\t${parts[1]}`;
 			ompPanesPerWindow.set(key, (ompPanesPerWindow.get(key) ?? 0) + 1);
@@ -3386,6 +3448,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				bell: parts[2] === "1",
 				label: title.slice(4),
 				priority: parts[3] === "high",
+				pane: parts[4] ?? "",
 			});
 		}
 		const rows: {
@@ -3394,6 +3457,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			state: keyof typeof counts;
 			label: string;
 			priority: boolean;
+			pane: string;
 		}[] = [];
 		const counts = { working: 0, waiting: 0, finished: 0, idle: 0 };
 		for (const pane of parsed) {
@@ -3403,7 +3467,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const state =
 				pane.sep === "!" ? "waiting" : SPINNER_FRAMES.has(pane.sep) ? "working" : finished ? "finished" : "idle";
 			counts[state] += 1;
-			rows.push({ session: pane.session, index: pane.index, state, label: pane.label, priority: pane.priority });
+			rows.push({
+				session: pane.session,
+				index: pane.index,
+				state,
+				label: pane.label,
+				priority: pane.priority,
+				pane: pane.pane,
+			});
 		}
 		if (rows.length === 0) return "\u{1F535} No omp windows in tmux right now.";
 		const manySessions = new Set(rows.map((row) => row.session)).size > 1;
@@ -3419,10 +3490,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			.map(([count, word]) => `${count} ${word}`)
 			.join(", ");
 		const glyphs = { working: "\u{1F7E2}", waiting: "\u{1F534}", finished: "\u2705", idle: "\u26AA" };
-		// Whatever wants a human first, then what it can hand over, then what is still busy.
+		// The focus vote first, with the user's own window marks above it, then whatever wants a human, then what
+		// it can hand over, then what is still busy.
 		const rank = { waiting: 0, finished: 1, working: 2, idle: 3 };
+		const focus = readFocusTally();
+		const paneSession = new Map(
+			allRecords()
+				.filter(({ record }) => record.tmuxPane.length > 0)
+				.map(({ id, record }) => [record.tmuxPane, id]),
+		);
+		const byPane = new Map(rows.map((row) => [row.pane, row]));
+		const panePoints = new Map(rows.map((row) => [row.pane, focus.points.get(paneSession.get(row.pane) ?? "") ?? 0]));
+		const marked = new Set(rows.filter((row) => row.priority).map((row) => row.pane));
+		const stateOf = (pane: string): number => rank[byPane.get(pane)?.state ?? "idle"];
+		const order = byPriority(panePoints, marked, (a, b) => stateOf(a) - stateOf(b));
 		const lines = rows
-			.sort((a, b) => rank[a.state] - rank[b.state])
+			.sort((a, b) => order(a.pane, b.pane))
 			.map((row) => {
 				const mark = row.priority ? "\u2757 " : "";
 				const where = manySessions ? `${row.session}:` : "";
@@ -3589,11 +3672,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return lines.join("\n");
 	}
 
-	/** Every live session in one message, busiest attention first. */
+	/**
+	 * Live sessions in the order the focus vote gives them, the user's own window marks first, and the most
+	 * recently heard from first among sessions the vote leaves tied.
+	 */
+	function liveByFocus(): Array<{ id: string; record: SessionRecord }> {
+		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
+		const heard = new Map(live.map(({ id, record }) => [id, record.lastNotified]));
+		const { points, marked } = readFocusTally();
+		const order = byPriority(points, marked, (a, b) => (heard.get(b) ?? 0) - (heard.get(a) ?? 0));
+		return live.sort((a, b) => order(a.id, b.id));
+	}
+
+	/** Every live session in one message, in focus order. */
 	function statusReport(): string {
-		const live = allRecords()
-			.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
-			.sort((a, b) => b.record.lastNotified - a.record.lastNotified);
+		const live = liveByFocus();
 		if (live.length === 0) return "No live omp sessions.";
 		return live.map(({ record }) => statusLine(record)).join("\n\n");
 	}
@@ -3604,9 +3697,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * in the text, which would differ every minute and edit forever.
 	 */
 	function dashboardReport(): string {
-		const live = allRecords()
-			.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
-			.sort((a, b) => b.record.lastNotified - a.record.lastNotified);
+		const live = liveByFocus();
 		if (live.length === 0) return "\u{1F39B} No live omp sessions.";
 		const lines = live.map(({ record }) => {
 			const state = record.state.length > 0 ? record.state : "unknown";
@@ -6484,12 +6575,91 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		},
 	});
 
+	/**
+	 * The sessions a ballot may rank, every one the tally counts as live but this session, shuffled because order
+	 * sways a model's vote.
+	 */
+	function ballotCandidates(): Array<{ id: string; record: SessionRecord }> {
+		const others = allRecords().filter(
+			({ id, record }) => id !== sessionId && Date.now() - record.heartbeat <= LOCK_STALE_MS,
+		);
+		for (let i = others.length - 1; i > 0; i--) {
+			const j = randomInt(i + 1);
+			[others[i], others[j]] = [others[j] as (typeof others)[number], others[i] as (typeof others)[number]];
+		}
+		return others;
+	}
+
+	function candidatesText(candidates: ReadonlyArray<{ record: SessionRecord }>): string {
+		if (candidates.length === 0) return "No other omp session is live, so there is nothing to rank.";
+		const lines = candidates.map(({ record }) => {
+			const said = record.summary.length > 0 ? ` \u2014 last: ${record.summary}` : "";
+			return `${badgeOf(record)} \u2014 tag ${record.tag} \u2014 ${record.state.length > 0 ? record.state : "idle"}${said}`;
+		});
+		return `Live sessions to rank, in random order:\n${lines.join("\n")}`;
+	}
+
+	/**
+	 * Resolves the rankings an agent passed into a ballot of live session ids. `required` refuses a missing ranking
+	 * while another session is live, and a ranking left out otherwise keeps what this session last cast. A ballot of
+	 * `null` means no other session is live, so nothing is stored.
+	 */
+	function castBallot(
+		focus: unknown,
+		resources: unknown,
+		required: boolean,
+	): { ballot: Ballot | null } | { refusal: string } {
+		const candidates = ballotCandidates();
+		if (candidates.length === 0) return { ballot: null };
+		const faults: string[] = [];
+		const resolveRanking = (name: "focus" | "resources", value: unknown): string[] | null => {
+			if (value === undefined) {
+				if (required) faults.push(`\`${name}\` is missing`);
+				return null;
+			}
+			if (!Array.isArray(value) || value.length === 0 || value.some((entry) => typeof entry !== "string")) {
+				faults.push(`\`${name}\` is not a list naming at least one session`);
+				return null;
+			}
+			const ids: string[] = [];
+			for (const entry of value as string[]) {
+				const needle = entry.trim();
+				const prefix = /^[0-9a-f-]{8,36}$/u.test(needle.toLowerCase())
+					? candidates.filter(({ id }) => id.toLowerCase().startsWith(needle.toLowerCase()))
+					: [];
+				const hit =
+					candidates.find(({ record }) => record.emoji.length > 0 && record.emoji === needle) ??
+					candidates.find(({ record }) => record.tag === needle) ??
+					(prefix.length === 1 ? prefix[0] : undefined);
+				if (hit === undefined) {
+					const own = needle === sessionTag || (badgeEmoji.length > 0 && needle === badgeEmoji);
+					faults.push(`\`${name}\` names ${needle}, ${own ? "this session itself" : "no other live session"}`);
+				} else if (ids.includes(hit.id)) {
+					faults.push(`\`${name}\` names ${needle} twice`);
+				} else {
+					ids.push(hit.id);
+				}
+			}
+			return ids;
+		};
+		const f = resolveRanking("focus", focus);
+		const r = resolveRanking("resources", resources);
+		if (faults.length > 0) {
+			return { refusal: `${faults.join(", ")}. ${BALLOT_GUIDE}\n${candidatesText(candidates)}` };
+		}
+		const previous = ballotOf(readJsonFile(join(BALLOT_DIR, `${sessionId}.json`)));
+		return {
+			ballot: { focus: f ?? previous?.focus ?? [], resources: r ?? previous?.resources ?? [], at: Date.now() },
+		};
+	}
+
 	registerTool({
 		name: "notify_status",
 		label: "Notify Status",
 		description:
 			"Record the turn-end Telegram notification, which is all the user sees when away from the terminal. Call it once, immediately before finishing a turn. `summary`: one or two plain sentences when no choice is attached, Markdown subset allowed. Be proactive about what comes next: name the concrete next steps when some exist, and state plainly that nothing remains when the work is complete. Never invent a next step just to have one to offer. When you believe the work is complete, weigh the follow-ups that fit what the turn was. After a bug fix, offer to hunt for surviving bugs of the same family, to complete the test coverage around the fix, and to run mutation testing to grade that coverage. After a feature, offer the related feature that naturally follows once this one is committed, a switch to a cleaner abstraction you found (a trait, generics, a blanket impl) before committing, a pass hunting for cleaner code, criterion benchmarks, or a strict review of the change as the repository's maintainer would run it. `urgency`: green when done and idle, orange when a reply is wanted, red when blocked on the user. " +
 			`A green status also takes \`effect\`, the animation Telegram plays over the summary, chosen for how the turn went: ${EFFECT_GUIDE}. A green status without an effect, or any other status with one, is refused. ` +
+			`${BALLOT_GUIDE} Pass both as \`focus\` and \`resources\`: while another session is live a status without them is refused, and \`priority_vote\` with no arguments lists the sessions to rank. ` +
 			'Whenever any user action is wanted, also set `question` and 2 to 6 `options` drawn from those real next steps. Every option is an object with a short `label` naming the action and a one-line `description` of what choosing it does or costs, and at most one of `recommended`, `lukewarm` or `discouraged` to colour the button. The description is not optional: the button is the whole of what a phone shows, so an option with no description is refused and no status is recorded. Labels and descriptions name who acts, as in "Agent will rebase the branch" or "User will review the diff" with the user\'s name in place of User when it is known, and never I, me, you, your, we or us, because a tapped button starts the next turn as the user\'s own words and a pronoun there could mean either side, so such an option is refused too. Never use only a phase number or letter, such as `Start Phase 7`. Each description becomes its own section under the summary, and the buttons start the next turn with the most likely choice first. Omit `question` and `options` when there is genuinely nothing to ask, never pad with filler choices. The notification must be answerable from a phone without terminal context, so the `summary` names the decision and says why it is needed now. The next steps are held to the same standard as the work: the option that finishes the work properly belongs in the list and carries `recommended`, effort is never a reason to demote it, and any option that leaves a known defect standing says so in its own description and is marked `lukewarm` or `discouraged`. Text the user is meant to copy, an issue body, a PR post, a patch, goes out through `notify_snippet` instead of riding in the summary.',
 		approval: "read",
 		strict: true,
@@ -6512,6 +6682,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					]),
 				)
 				.optional(),
+			focus: z.array(z.string()).optional(),
+			resources: z.array(z.string()).optional(),
 		}),
 		async execute(_toolCallId, params) {
 			const p = params as {
@@ -6520,6 +6692,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				effect?: unknown;
 				question?: unknown;
 				options?: unknown;
+				focus?: unknown;
+				resources?: unknown;
 			};
 			const summary = typeof p.summary === "string" ? p.summary.trim() : "";
 			const raw = typeof p.urgency === "string" ? p.urgency.trim().toLowerCase() : "";
@@ -6579,6 +6753,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
+			const cast = castBallot(p.focus, p.resources, true);
+			if ("refusal" in cast) {
+				return {
+					content: [{ type: "text", text: `Error: nothing was recorded because ${cast.refusal}` }],
+					isError: true,
+				};
+			}
+			if (cast.ballot !== null && registered) writePrivateJson(BALLOT_DIR, `${sessionId}.json`, cast.ballot);
 			const offered = usable.length >= STATUS_OPTIONS_MIN ? usable.slice(0, STATUS_OPTIONS_MAX) : [];
 			const notes: string[] = [];
 			if (offered.length > 0 && usable.length > offered.length) {
@@ -6608,6 +6790,60 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					truncated: clipped,
 					droppedOptions: requested.length - offered.length,
 				},
+			};
+		},
+	});
+
+	registerTool({
+		name: "priority_vote",
+		label: "Priority Vote",
+		description: `${BALLOT_GUIDE} With no arguments it lists the live sessions to rank, each with its state and last summary, in an order shuffled per call. Every turn end already casts both rankings through \`notify_status\`. Call this in the middle of a long turn when the picture changes, say a session starts waiting on the user or a long build starts, passing either ranking or both. The poller tallies every live session's ballot with a modified Borda count, and the focus order sorts \`/status\`, \`/fleet\` and the pinned board. Windows the user marked as priority outrank every vote.`,
+		approval: "read",
+		parameters: z.object({
+			focus: z.array(z.string()).optional(),
+			resources: z.array(z.string()).optional(),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const p = params as { focus?: unknown; resources?: unknown };
+			if (p.focus === undefined && p.resources === undefined) {
+				return { content: [{ type: "text" as const, text: `${BALLOT_GUIDE}\n${candidatesText(ballotCandidates())}` }] };
+			}
+			await followSession(ctx);
+			if (!registered) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: "Another omp process holds this session's id until this session saves a turn, so its ballot would count for that process. Try again after this turn.",
+						},
+					],
+					isError: true,
+				};
+			}
+			const cast = castBallot(p.focus, p.resources, false);
+			if ("refusal" in cast) {
+				return {
+					content: [{ type: "text" as const, text: `Nothing was cast because ${cast.refusal}` }],
+					isError: true,
+				};
+			}
+			if (cast.ballot === null) {
+				return {
+					content: [{ type: "text" as const, text: "No other omp session is live, so there is nothing to rank." }],
+				};
+			}
+			writePrivateJson(BALLOT_DIR, `${sessionId}.json`, cast.ballot);
+			const [focusTags, resourceTags] = [cast.ballot.focus, cast.ballot.resources].map(
+				(ids) => ids.map((id) => readSessionRecord(id)?.tag ?? id).join(", ") || "nobody",
+			);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `Ballot cast. Focus: ${focusTags}. Resources: ${resourceTags}. The poller applies it within ${PRIORITY_TICK_MS / 1000} seconds.`,
+					},
+				],
+				details: { focus: cast.ballot.focus, resources: cast.ballot.resources },
 			};
 		},
 	});
@@ -6781,6 +7017,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastWatchPoll = 0;
 	let lastWatchPrune = 0;
 	let watchPollInFlight = false;
+	let lastPriorityTick = 0;
+	let priorityInFlight = false;
 
 	function isLiveSession(id: string): boolean {
 		if (id === sessionId) return sessionAlive;
@@ -7841,6 +8079,50 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			lastGraphPoll = now;
 			detach(() => pollGraph(), "dependency poll");
 		}
+	}
+
+	/**
+	 * Run by the Telegram lock holder only. Tallies the focus vote over the live sessions and records it, with the
+	 * sessions whose window the user marked, for every view that lists sessions. Everything is recomputed from the
+	 * files, so a new lock holder carries on where the last one stopped.
+	 */
+	function priorityTick(): void {
+		const now = Date.now();
+		if (priorityInFlight || now - lastPriorityTick < PRIORITY_TICK_MS) return;
+		lastPriorityTick = now;
+		priorityInFlight = true;
+		detach(async () => {
+			try {
+				await applyPriority();
+			} finally {
+				priorityInFlight = false;
+			}
+		}, "priority");
+	}
+
+	async function applyPriority(): Promise<void> {
+		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
+		const ballots = [...readBallots()];
+		const markedPanes = await readMarkedPanes();
+		const marked = live.filter(({ record }) => markedPanes.has(record.tmuxPane)).map(({ id }) => id);
+		const focus = bordaPoints(
+			new Map(ballots.map(([id, ballot]) => [id, ballot.focus])),
+			live.map(({ id }) => id),
+		);
+		writeFileAtomic(PRIORITY_FILE, JSON.stringify({ points: Object.fromEntries(focus), marked }), 0o600);
+	}
+
+	/** The tmux panes whose window the user marked `@omp_priority high`. */
+	async function readMarkedPanes(): Promise<Set<string>> {
+		const marked = new Set<string>();
+		if (process.env.TMUX === undefined) return marked;
+		const listed = await run("tmux", ["list-panes", "-a", "-F", "#{pane_id}\t#{@omp_priority}"], 2_000);
+		if (!listed.ok) return marked;
+		for (const line of listed.stdout.split("\n")) {
+			const [pane, priority] = line.split("\t");
+			if (pane !== undefined && pane.length > 0 && priority === "high") marked.add(pane);
+		}
+		return marked;
 	}
 
 	function claimLaunch(ctx: ExtensionContext): void {
@@ -9277,6 +9559,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					graphTick();
 					watchTick();
 					launchRequestTick();
+					priorityTick();
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
 					detachBackground(() => redrawCrashCards(), "crash cards");
@@ -9457,8 +9740,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			removeStatePath(PENDING_DIR, id);
 			removeStatePath(REACTION_ROUTE_LOCK_DIR, `${id}.lock`);
+			const ballot = ballotOf(readJsonFile(join(BALLOT_DIR, `${id}.json`)));
+			if (ballot !== null && !existsSync(join(BALLOT_DIR, `${sessionId}.json`))) {
+				writePrivateJson(BALLOT_DIR, `${sessionId}.json`, ballot);
+			}
+			removeStatePath(BALLOT_DIR, `${id}.json`);
 		}
 		if (left.size > 0) {
+			// Every other session's ballot naming a left id now means this one.
+			const rename = (ids: string[]): string[] => ids.map((id) => (left.has(id) ? sessionId : id));
+			for (const [voter, ballot] of readBallots()) {
+				if (![...ballot.focus, ...ballot.resources].some((id) => left.has(id))) continue;
+				writePrivateJson(BALLOT_DIR, `${voter}.json`, {
+					...ballot,
+					focus: rename(ballot.focus),
+					resources: rename(ballot.resources),
+				});
+			}
 			for (const name of listJson(SENT_DIR)) {
 				const sent = readSentRecord(Number(name.slice(0, -5)));
 				if (sent !== null && left.has(sent.session.id)) {
@@ -9970,6 +10268,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await Promise.allSettled(redPinOperations);
 		closeReplyQuestion();
 		sessionAlive = false;
+		if (!keepForRestore) removeStatePath(BALLOT_DIR, `${sessionId}.json`);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		releaseLock();
 		// Handing the board on rather than leaving the next owner to wait out a stale claim.
