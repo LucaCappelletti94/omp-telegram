@@ -18914,6 +18914,210 @@ heading("memory backstop for lower-ranked sessions");
 	setPressure();
 }
 
+heading("tasks and their conductors");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	const taskDir = join(tasksDir, "connetto-quotas");
+	const taskFile = join(tasksDir, "connetto-quotas.json");
+	const task = () => JSON.parse(readFileSync(taskFile, "utf8"));
+	const taskBin = join(root, "task-bin");
+	mkdirSync(taskBin, { recursive: true });
+	const taskLog = join(root, "task-tmux.log");
+	writeFileSync(taskLog, "");
+	writeFileSync(
+		join(taskBin, "tmux"),
+		`#!/bin/sh
+echo "$*" >> "${taskLog}"
+case "$1" in
+  has-session) exit 0 ;;
+  new-window) [ -e "${taskBin}/fail" ] && { echo "no server" 1>&2; exit 1; }; echo "work:7" ;;
+  display-message) printf 'work\\t3\\n' ;;
+esac
+`,
+		{ mode: 0o755 },
+	);
+	const savedPath = process.env.PATH;
+	process.env.PATH = `${taskBin}:${savedPath}`;
+	const opened = () =>
+		readFileSync(taskLog, "utf8")
+			.split("\n")
+			.filter((line) => line.startsWith("new-window"));
+	const conduct = async (text, update) => {
+		api.queued = [{ update_id: update, message: { message_id: update, date: 1, chat: { id: CHAT }, text } }];
+		await poller.pump(400);
+		return lastCall("sendMessage").body;
+	};
+	const tap = async (data, update) => {
+		api.queued = [
+			{
+				update_id: update,
+				callback_query: {
+					id: `task${update}`,
+					data,
+					from: { id: CHAT },
+					message: { message_id: update, chat: { id: CHAT } },
+				},
+			},
+		];
+		await poller.pump(400);
+		return lastCall("answerCallbackQuery").body.text;
+	};
+	const poller = spawn("0d0e0100-0000-7000-8000-000000000001", "/home/dev/work/conducting");
+	await poller.fire("session_start");
+
+	const none = await conduct("/conduct", 9959);
+	check(
+		"a bare /conduct with no task says how to start one",
+		none.text.includes("No task") && none.reply_markup === undefined,
+	);
+	const noBrief = await conduct("/conduct Connetto quotas", 9960);
+	check(
+		"a new task without a brief is refused and nothing opens",
+		noBrief.text.includes("brief") && !existsSync(taskFile) && opened().length === 0,
+	);
+
+	const started = await conduct("/conduct Connetto quotas\nKeep the server and client PRs in step.", 9961);
+	check(
+		"a new task is written live with its name and brief, and no conductor yet",
+		task().name === "Connetto quotas" &&
+			task().brief === "Keep the server and client PRs in step." &&
+			task().state === "live" &&
+			task().conductor === "",
+	);
+	check(
+		"its conductor opens in a new tmux window in the task's folder, told which task it conducts",
+		opened().length === 1 &&
+			opened()[0].includes(`-c ${taskDir} `) &&
+			opened()[0].includes("-e OMP_TELEGRAM_CONDUCT=connetto-quotas") &&
+			opened()[0].includes(" omp ") &&
+			!opened()[0].includes("--resume") &&
+			existsSync(taskDir),
+	);
+	check("the reply names the tab it opened in", started.text.includes("work:7"));
+
+	const again = await conduct("/conduct Connetto quotas", 9962);
+	check(
+		"a second /conduct while the conductor starts opens nothing",
+		opened().length === 1 && again.text.includes("starting"),
+	);
+
+	process.env.OMP_TELEGRAM_CONDUCT = "connetto-quotas";
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	const conductorId = "0d0e0100-0000-7000-8000-000000000002";
+	const conductor = spawn(conductorId, taskDir);
+	await conductor.fire("session_start");
+	delete process.env.TMUX;
+	check(
+		"the conductor claims its task and clears the variable",
+		task().conductor === conductorId && process.env.OMP_TELEGRAM_CONDUCT === undefined,
+	);
+	const prompts = await conductor.fire("before_agent_start", { prompt: "go", systemPrompt: ["base prompt"] });
+	const prompt = prompts.find((r) => Array.isArray(r?.systemPrompt))?.systemPrompt ?? [];
+	check(
+		"the conductor's system prompt keeps omp's and adds its role with the brief",
+		prompt[0] === "base prompt" &&
+			prompt.length === 2 &&
+			prompt[1].includes("Connetto quotas") &&
+			prompt[1].includes("Keep the server and client PRs in step."),
+	);
+	const plain = await poller.fire("before_agent_start", { prompt: "go", systemPrompt: ["base prompt"] });
+	check(
+		"a session that conducts nothing keeps its system prompt",
+		plain.every((r) => r?.systemPrompt === undefined),
+	);
+
+	const live = await conduct("/conduct connetto QUOTAS", 9963);
+	check(
+		"/conduct for a live conductor names its tab and opens nothing",
+		opened().length === 1 && live.text.includes("work:3"),
+	);
+	const keptBrief = await conduct("/conduct Connetto quotas\nA different brief", 9964);
+	check(
+		"a brief sent for an existing task leaves the first one and says so",
+		task().brief === "Keep the server and client PRs in step." && keptBrief.text.includes("brief"),
+	);
+
+	const list = await conduct("/conduct", 9965);
+	check(
+		"a bare /conduct lists the tasks with a button each",
+		list.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data === "t:connetto-quotas") === true,
+	);
+	check("a tap on a live conductor's task names its tab", (await tap("t:connetto-quotas", 9966)).includes("work:3"));
+
+	await conductor.fire("session_shutdown");
+	check("closing the conductor by hand turns the task dormant", task().state === "dormant");
+
+	const resumed = await tap("t:connetto-quotas", 9967);
+	check(
+		"a tap on a dormant task resumes its conductor from its transcript in the task's folder",
+		opened().length === 2 &&
+			opened()[1].includes(`--resume ${conductorId}`) &&
+			opened()[1].includes(`-c ${taskDir} `) &&
+			!opened()[1].includes("OMP_TELEGRAM_CONDUCT") &&
+			task().state === "dormant" &&
+			resumed.length > 0,
+	);
+	const second = await tap("t:connetto-quotas", 9968);
+	check("a second tap while it starts opens nothing", second.includes("starting") && opened().length === 2);
+
+	// The resumed conductor comes up.
+	const back = spawn(conductorId, taskDir);
+	await back.fire("session_start");
+	check("the resumed conductor turns its task live again", task().state === "live" && task().launchedAt === 0);
+	mkdirSync(join(stateDir, "restart-pending"), { recursive: true });
+	writeFileSync(join(stateDir, "restart-pending", `${conductorId}.json`), JSON.stringify({ at: Date.now() }));
+	await back.fire("session_shutdown");
+	check("a conductor a restart wave stops keeps its task live", task().state === "live");
+
+	const moving = spawn(conductorId, taskDir);
+	await moving.fire("session_start");
+	const continuation = "0d0e0100-0000-7000-8000-000000000003";
+	moving.move(continuation);
+	await moving.pump(200);
+	check("a conductor moved to a continuation id keeps its task", task().conductor === continuation);
+	await moving.fire("session_shutdown");
+	check("the moved conductor closing turns the task dormant", task().state === "dormant");
+	rmSync(join(sessionsDir, `${continuation}.json`), { force: true });
+	await conduct("/conduct Connetto quotas", 9974);
+	check(
+		"a conductor whose session record expired still resumes from its transcript",
+		opened().at(-1).includes(`--resume ${continuation}`) && opened().at(-1).includes(`-c ${taskDir} `),
+	);
+
+	writeFileSync(join(taskBin, "fail"), "");
+	const failed = await conduct("/conduct Docs pass\nWrite the docs.", 9969);
+	rmSync(join(taskBin, "fail"));
+	check(
+		"a conductor that cannot open is reported, and the next /conduct tries again",
+		failed.text.includes("no server") &&
+			JSON.parse(readFileSync(join(tasksDir, "docs-pass.json"), "utf8")).launchedAt === 0,
+	);
+	await conduct("/conduct Docs pass", 9970);
+	check("the retry opens the conductor", opened().at(-1).includes("OMP_TELEGRAM_CONDUCT=docs-pass"));
+	const both = await conduct("/conduct", 9975);
+	check(
+		"the list counts the tasks and marks a dormant one",
+		both.text.includes("2 tasks") &&
+			both.reply_markup.inline_keyboard.flat().some((b) => b.text === "Connetto quotas (dormant)"),
+	);
+
+	const unnamed = await conduct("/conduct !!!\nA brief", 9971);
+	check("a name with no letter or digit is refused", unnamed.text.includes("letter or digit"));
+	const unknown = await conduct("/conduct Nothing here", 9972);
+	check("an unknown name without a brief says how to start it", unknown.text.includes("No task is named"));
+	writeFileSync(join(tasksDir, "docs-pass.json"), "{");
+	check(
+		"a button for a task whose file no longer reads says it is gone",
+		(await tap("t:docs-pass", 9973)).includes("gone"),
+	);
+
+	process.env.PATH = savedPath;
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
