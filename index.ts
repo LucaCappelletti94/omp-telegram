@@ -10299,9 +10299,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (left.size > 0) {
 			for (const task of listTasks(TASKS_DIR)) {
 				if (!left.has(task.conductor)) continue;
-				// Only this process moves a conductor off an id it left, so the task read above still names it.
+				// The listing came before the lock, so another process may have taken the task meanwhile.
 				await updateTask(TASKS_DIR, task.slug, (current) => ({
-					task: { ...current, conductor: sessionId },
+					task: left.has(current.conductor) ? { ...current, conductor: sessionId } : null,
 					result: null,
 				}));
 			}
@@ -10878,7 +10878,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId);
 			if (conducted !== undefined) {
 				await updateTask(TASKS_DIR, conducted.slug, (current) => ({
-					task: { ...current, state: "dormant" },
+					task: current.conductor === sessionId ? { ...current, state: "dormant" } : null,
 					result: null,
 				}));
 			}
