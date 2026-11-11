@@ -261,9 +261,76 @@ export function wrapLeased(command: string, id: string, module: string, stateDir
 }
 
 /**
+ * Offsets in `text` where a shell command can start: its beginning, and after each unquoted `;`, `&`, `|`,
+ * newline, `(` or opening `{`, past blanks. Quoted text and heredoc bodies are data and hold no command start.
+ */
+function commandStarts(text: string): number[] {
+	const starts: number[] = [];
+	const heredocs: Array<{ word: string; tabs: boolean }> = [];
+	let at = 0;
+	let expectCommand = true;
+	while (at < text.length) {
+		const ch = text[at] as string;
+		if (expectCommand && (ch === " " || ch === "\t")) {
+			at++;
+			continue;
+		}
+		if (expectCommand) {
+			starts.push(at);
+			expectCommand = false;
+			if (ch === "{" && /\s/u.test(text.charAt(at + 1))) {
+				at++;
+				expectCommand = true;
+				continue;
+			}
+		}
+		if (ch === "\\") {
+			at += 2;
+		} else if (ch === "'") {
+			const end = text.indexOf("'", at + 1);
+			at = end === -1 ? text.length : end + 1;
+		} else if (ch === '"') {
+			at++;
+			while (at < text.length && text[at] !== '"') at += text[at] === "\\" ? 2 : 1;
+			at++;
+		} else if (text.startsWith("$((", at)) {
+			// Arithmetic, where `<<` is a shift and opens no heredoc.
+			let depth = 2;
+			at += 3;
+			while (at < text.length && depth > 0) {
+				if (text[at] === "(") depth++;
+				else if (text[at] === ")") depth--;
+				at++;
+			}
+		} else if (ch === "<" && text.startsWith("<<", at) && text[at + 2] !== "<") {
+			const opening = /^<<(-?)[ \t]*(['"]?)([A-Za-z0-9_]+)\2/u.exec(text.slice(at));
+			if (opening !== null) heredocs.push({ word: opening[3] as string, tabs: opening[1] === "-" });
+			at += opening === null ? 2 : opening[0].length;
+		} else if (ch === "\n") {
+			at++;
+			// The bodies of the heredocs this line opened follow it, each up to its closing word.
+			for (const { word, tabs } of heredocs.splice(0)) {
+				while (at < text.length) {
+					const end = text.indexOf("\n", at);
+					const line = text.slice(at, end === -1 ? text.length : end);
+					at = end === -1 ? text.length : end + 1;
+					if ((tabs ? line.replace(/^\t+/u, "") : line) === word) break;
+				}
+			}
+			expectCommand = true;
+		} else {
+			at++;
+			expectCommand = ch === ";" || ch === "&" || ch === "|" || ch === "(";
+		}
+	}
+	return starts;
+}
+
+/**
  * `command` with every wrapper `wrapLeased` made with this module and state directory replaced by the command it
- * wraps, wherever in the command it stands and however deeply it nests. An agent reads the rewritten command in its
- * transcript and may write that text again, and its old or invented lease id would then refuse to run the command.
+ * wraps, wherever a command starts in it and however deeply wrappers nest. An agent reads the rewritten command in
+ * its transcript and may write that text again, and its old or invented lease id would then refuse to run the
+ * command. Wrapper text inside quotes or a heredoc is data the command handles and stays as written.
  */
 export function unwrapLeased(command: string, module: string, stateDir: string): string {
 	const literal = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
@@ -271,13 +338,19 @@ export function unwrapLeased(command: string, module: string, stateDir: string):
 	const dir = literal(shellWord(stateDir));
 	const wrapper = new RegExp(
 		`${runner} take ${dir} (l-[0-9a-f]{12}) && \\{ ([\\s\\S]*?)\\n\\} 9> >\\(exec ${runner} hold ${dir} \\1\\)`,
-		"u",
+		"uy",
 	);
 	let inner = command;
-	for (let found = wrapper.exec(inner); found !== null; found = wrapper.exec(inner)) {
+	for (;;) {
+		let found: RegExpExecArray | null = null;
+		for (const start of commandStarts(inner)) {
+			wrapper.lastIndex = start;
+			found = wrapper.exec(inner);
+			if (found !== null) break;
+		}
+		if (found === null) return inner;
 		inner = `${inner.slice(0, found.index)}${found[2]}${inner.slice(found.index + found[0].length)}`;
 	}
-	return inner;
 }
 
 /** How long a taken grant waits for its holder, which starts a few milliseconds after the take. */
