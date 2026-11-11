@@ -35,9 +35,14 @@ export function taskSlug(name: string): string {
 
 /** `/conduct <name>` with the brief on the lines after it, either of them possibly empty. */
 export function parseConduct(text: string): { name: string; brief: string } {
-	const rest = text.replace(/^\s*\/conduct(@\w+)?/u, "").replace(/^[^\S\n]+/u, "");
-	const lines = rest.replace(/^\n+/u, "").split("\n");
-	return { name: (lines[0] ?? "").trim(), brief: lines.slice(1).join("\n").trim() };
+	const rest = text
+		.replace(/^\s*\/conduct(@\w+)?/u, "")
+		.replace(/^[^\S\n]+/u, "")
+		.replace(/^\n+/u, "");
+	const cut = rest.indexOf("\n");
+	return cut < 0
+		? { name: rest.trim(), brief: "" }
+		: { name: rest.slice(0, cut).trim(), brief: rest.slice(cut).trim() };
 }
 
 function parseTask(raw: unknown, slug: string): Task | null {
@@ -86,6 +91,16 @@ export async function changeTask<T>(
 		if (task !== null) writeFileAtomic(join(dir, `${slug}.json`), JSON.stringify(task), 0o600);
 		return result;
 	});
+}
+
+/** `changeTask` for a task that exists: an unknown slug or an absent task changes nothing and gives null. */
+export async function updateTask<T>(
+	dir: string,
+	slug: string,
+	change: (task: Task) => { task: Task | null; result: T },
+): Promise<T | null> {
+	if (!SLUG.test(slug)) return null;
+	return changeTask(dir, slug, (task) => (task === null ? { task: null, result: null } : change(task)));
 }
 
 /** The conductor's standing role, added to its system prompt every turn so compaction and resume keep it. */

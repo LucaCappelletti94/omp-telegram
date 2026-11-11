@@ -3,7 +3,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { changeTask, conductorRole, listTasks, parseConduct, readTask, taskSlug } from "../tasks.ts";
+import { changeTask, conductorRole, listTasks, parseConduct, readTask, taskSlug, updateTask } from "../tasks.ts";
 
 let fails = 0;
 const heading = (title) => {
@@ -58,9 +58,11 @@ heading("task files");
 	writeFileSync(join(dir, "torn.json"), "{");
 	writeFileSync(join(dir, "wrong.json"), JSON.stringify({ ...fresh, slug: "elsewhere" }));
 	writeFileSync(join(dir, "bad-state.json"), JSON.stringify({ ...fresh, slug: "bad-state", state: "paused" }));
+	writeFileSync(join(dir, "scalar.json"), "5");
+	writeFileSync(join(dir, "no-conductor.json"), JSON.stringify({ ...fresh, slug: "no-conductor", conductor: 7 }));
 	await changeTask(dir, "alpha", () => ({ task: { ...fresh, name: "Alpha", slug: "alpha" }, result: null }));
 	check(
-		"listing skips torn files, files named for another slug and unknown states, sorted by name",
+		"listing skips torn and scalar files, files named for another slug, bad fields and unknown states, sorted by name",
 		listTasks(dir)
 			.map((task) => task.slug)
 			.join() === "alpha,docs-pass",
@@ -73,6 +75,21 @@ heading("task files");
 		refused = true;
 	}
 	check("a change refuses a slug outside the pattern", refused);
+	const bumped = await updateTask(dir, "docs-pass", (task) => ({
+		task: { ...task, launchedAt: task.launchedAt + 1 },
+		result: "seen",
+	}));
+	check("an update changes a task that exists", bumped === "seen" && readTask(dir, "docs-pass").launchedAt === 6);
+	let called = false;
+	const absent = await updateTask(dir, "nobody", () => {
+		called = true;
+		return { task: fresh, result: "seen" };
+	});
+	check("an update of an absent task changes nothing", absent === null && !called && readTask(dir, "nobody") === null);
+	check(
+		"an update of a slug outside the pattern gives null",
+		(await updateTask(dir, "../escape", () => ({ task: fresh, result: "seen" }))) === null,
+	);
 	rmSync(dir, { recursive: true, force: true });
 }
 

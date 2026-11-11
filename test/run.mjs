@@ -19073,6 +19073,17 @@ esac
 	await back.fire("session_shutdown");
 	check("a conductor a restart wave stops keeps its task live", task().state === "live");
 
+	// The poller conducts a second task itself, from a pane tmux never named.
+	writeFileSync(
+		join(tasksDir, "side.json"),
+		JSON.stringify({ name: "Side", slug: "side", brief: "b", conductor: poller.id, state: "live", launchedAt: 0 }),
+	);
+	rmSync(join(sessionsDir, `${poller.id}.json`), { force: true });
+	check(
+		"a tap on a task whose live conductor has no known tab says it runs",
+		(await tap("t:side", 9976)) === "Its conductor is running.",
+	);
+
 	const moving = spawn(conductorId, taskDir);
 	await moving.fire("session_start");
 	const continuation = "0d0e0100-0000-7000-8000-000000000003";
@@ -19101,7 +19112,7 @@ esac
 	const both = await conduct("/conduct", 9975);
 	check(
 		"the list counts the tasks and marks a dormant one",
-		both.text.includes("2 tasks") &&
+		both.text.includes("3 tasks") &&
 			both.reply_markup.inline_keyboard.flat().some((b) => b.text === "Connetto quotas (dormant)"),
 	);
 

@@ -90,7 +90,7 @@ import {
 	TELEGRAM_TEXT_MAX,
 	toTelegramHtml,
 } from "./render.ts";
-import { changeTask, conductorRole, listTasks, parseConduct, readTask, type Task, taskSlug } from "./tasks.ts";
+import { changeTask, conductorRole, listTasks, parseConduct, type Task, taskSlug, updateTask } from "./tasks.ts";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "notify-telegram.json");
@@ -5409,10 +5409,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			replyText: message.reply_to_message?.text ?? message.reply_to_message?.caption,
 		};
 
-		const command =
-			typeof text === "string"
-				? /^\/(hidequestions|status|fleet|stop|deps|resume|conduct)\b/u.exec(text.trim())?.[1]
-				: undefined;
+		const typed = typeof text === "string" ? text : "";
+		const command = /^\/(hidequestions|status|fleet|stop|deps|resume|conduct)\b/u.exec(typed.trim())?.[1];
 		if (command === "deps") {
 			// Rendering starts a browser, which must not hold up the updates queued behind this one.
 			detach(
@@ -5433,7 +5431,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 		if (command === "conduct") {
-			detach(() => conduct(cfg, text ?? ""), "conduct");
+			detach(() => conduct(cfg, typed), "conduct");
 			return;
 		}
 		if (command === "fleet") {
@@ -7640,10 +7638,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (opened.ok) {
 			return `\u{1F3BC} ${task.conductor === "" ? "Conducting" : "Resuming the conductor of"} ${title}${inTab(opened.tab)}.`;
 		}
-		await changeTask(TASKS_DIR, task.slug, (current) => ({
-			task: current === null ? null : { ...current, launchedAt: 0 },
-			result: null,
-		}));
+		await updateTask(TASKS_DIR, task.slug, (current) => ({ task: { ...current, launchedAt: 0 }, result: null }));
 		return `Opening the conductor of ${title} failed: ${clip(opened.error, 300)}`;
 	}
 
@@ -7711,12 +7706,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	async function answerTaskCallback(cfg: Config, callbackId: string, slug: string): Promise<void> {
-		const step =
-			readTask(TASKS_DIR, slug) === null
-				? null
-				: await changeTask(TASKS_DIR, slug, (task) =>
-						task === null ? { task: null, result: null } : conductStep(task),
-					);
+		const step = await updateTask(TASKS_DIR, slug, conductStep);
 		let toast: string;
 		if (step === null) toast = "That task is gone.";
 		else if (step.kind === "live") {
@@ -8669,9 +8659,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const named = process.env[CONDUCT_ENV];
 		delete process.env[CONDUCT_ENV];
 		const slug = named ?? listTasks(TASKS_DIR).find((task) => task.conductor === sessionId)?.slug;
-		if (slug === undefined || readTask(TASKS_DIR, slug) === null) return;
-		await changeTask(TASKS_DIR, slug, (task) => ({
-			task: task === null ? null : { ...task, conductor: sessionId, state: "live", launchedAt: 0 },
+		if (slug === undefined) return;
+		await updateTask(TASKS_DIR, slug, (task) => ({
+			task: { ...task, conductor: sessionId, state: "live", launchedAt: 0 },
 			result: null,
 		}));
 	}
@@ -10309,8 +10299,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (left.size > 0) {
 			for (const task of listTasks(TASKS_DIR)) {
 				if (!left.has(task.conductor)) continue;
-				await changeTask(TASKS_DIR, task.slug, (current) => ({
-					task: current !== null && left.has(current.conductor) ? { ...current, conductor: sessionId } : null,
+				// Only this process moves a conductor off an id it left, so the task read above still names it.
+				await updateTask(TASKS_DIR, task.slug, (current) => ({
+					task: { ...current, conductor: sessionId },
 					result: null,
 				}));
 			}
@@ -10886,8 +10877,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			// Closed by hand, a conductor leaves its task dormant until `/conduct` resumes it.
 			const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId);
 			if (conducted !== undefined) {
-				await changeTask(TASKS_DIR, conducted.slug, (current) => ({
-					task: current?.conductor === sessionId ? { ...current, state: "dormant" } : null,
+				await updateTask(TASKS_DIR, conducted.slug, (current) => ({
+					task: { ...current, state: "dormant" },
 					result: null,
 				}));
 			}
