@@ -68,6 +68,16 @@ const writeConfig = (extra = {}) =>
 		{ mode: 0o600 },
 	);
 writeConfig();
+/** Stands in for `/proc/pressure`, calm unless a test writes a load, so no lease waits on the machine running the suite. */
+const pressureDir = join(root, "pressure");
+const setPressure = ({ cpu = 0, memory = 0, io = 0 } = {}) => {
+	for (const [kind, value] of Object.entries({ cpu, memory, io })) {
+		writeFileSync(join(pressureDir, kind), `some avg10=${value.toFixed(2)} avg60=0.00 avg300=0.00 total=1\n`);
+	}
+};
+mkdirSync(pressureDir);
+setPressure();
+process.env.OMP_TELEGRAM_PRESSURE_DIR = pressureDir;
 
 const api = {
 	calls: [],
@@ -14686,6 +14696,10 @@ heading("sessions that died without shutting down");
 			edge: "waits-on",
 		}),
 	);
+	writeFileSync(
+		join(heldDir, "lease-l-0c2a00000013.json"),
+		JSON.stringify({ kind: "lease", at: Date.now(), lease: "l-0c2a00000013", command: "cargo test" }),
+	);
 	// The heartbeat reaps only deaths, so the closed record goes when the next session starts.
 	const cardsBeforeClosed = crashCalls().length;
 	const starter = spawn("0c2a0015-0000-7000-8000-000000000015", folder("starter"));
@@ -14701,6 +14715,13 @@ heading("sessions that died without shutting down");
 			called("sendMessage").some((c) =>
 				c.body.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data === `r:${closedId}`),
 			),
+	);
+	const closedCard = called("sendMessage").find((c) =>
+		c.body.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data === `r:${closedId}`),
+	);
+	check(
+		"a held lease grant neither counts on the resume card nor rides it",
+		closedCard?.body.text.includes("1 update waiting") === true && !closedCard.body.text.includes("cargo test"),
 	);
 	await starter.fire("session_shutdown");
 
@@ -15113,7 +15134,7 @@ heading("sessions that died without shutting down");
 
 // ---------------------------------------------------------------- version skew
 
-const stampFiles = ["index.ts", "render.ts", "graph.ts", "priority.ts"].map(
+const stampFiles = ["index.ts", "render.ts", "graph.ts", "priority.ts", "lease.ts", "lock.ts"].map(
 	(name) => new URL(`../${name}`, import.meta.url).pathname,
 );
 const stampOf = () => {
@@ -18358,6 +18379,168 @@ esac
 	delete process.env.TMUX;
 	delete process.env.TMUX_PANE;
 	clockSkew = 0;
+}
+
+heading("resource leases for heavy commands");
+{
+	clockSkew = 0;
+	writeConfig({ leases: { limit: 1 } });
+	const stateDir = join(root, "notify-telegram");
+	for (const name of ["poller.lock", "leases.json", "priority.json", "ballots"]) {
+		rmSync(join(stateDir, name), { recursive: true, force: true });
+	}
+	rmSync(sessionsDir, { recursive: true, force: true });
+	mkdirSync(sessionsDir, { recursive: true });
+	const ids = {
+		low: "0c1ea5e1-0000-7000-8000-000000000001",
+		mid: "0c1ea5e2-0000-7000-8000-000000000002",
+		high: "0c1ea5e3-0000-7000-8000-000000000003",
+	};
+	const fx = {};
+	for (const [name, id] of Object.entries(ids)) {
+		fx[name] = spawn(id, `/home/dev/lease/${name}`);
+		await fx[name].fire("session_start");
+	}
+	const { low, mid, high } = fx;
+	low.heartbeat();
+	await settle(150);
+	// The resource vote ranks high above mid above low. Only a heartbeat re-tallies, and the section pumps instead.
+	writeFileSync(
+		join(stateDir, "priority.json"),
+		JSON.stringify({ points: {}, resources: { [ids.high]: 4, [ids.mid]: 2, [ids.low]: 0 }, marked: [] }),
+	);
+	const leases = () => JSON.parse(readFileSync(join(stateDir, "leases.json"), "utf8"));
+	const call = async (name, command, extra = {}) =>
+		(await fx[name].fire("tool_call", { toolName: "bash", input: { command, ...extra } })).find((r) => r !== undefined);
+	const leaseOf = (rewritten) => / hold '[^']*' (l-[0-9a-f]{12})\)$/u.exec(rewritten ?? "")?.[1];
+
+	check(
+		"a light command and another tool pass untouched",
+		(await call("low", "git status && cargo metadata")) === undefined &&
+			(await low.fire("tool_call", { toolName: "read", input: { path: "cargo test" } })).every((r) => r === undefined),
+	);
+
+	// No I/O pressure file and a filesystem reporting no blocks, as procfs does, both read as room to run.
+	rmSync(join(pressureDir, "io"));
+	const granted = await call("low", "cargo test -p x", { cwd: "/proc" });
+	setPressure();
+	const lowLease = leaseOf(granted?.input.command);
+	check(
+		"a heavy command with a free slot runs as a group with the lease holder on fd 9",
+		granted?.input.command.startsWith("{ cargo test -p x\n} 9> >(exec node ") === true &&
+			lowLease !== undefined &&
+			leases().granted[0]?.session === ids.low,
+	);
+
+	const midBlocked = await call("mid", "cargo build", { cwd: "sub" });
+	check(
+		"past the limit a heavy command is refused, naming its lease and what it waits on",
+		midBlocked?.block === true &&
+			midBlocked.reason.includes("Queued as resource lease l-") &&
+			midBlocked.reason.includes("all 1 slots are taken"),
+	);
+	check("the queued request keeps the call's own folder", leases().queue[0]?.cwd === "/home/dev/lease/mid/sub");
+	const highBlocked = await call("high", "cargo clippy", { cwd: root });
+	const highLease = /lease (l-[0-9a-f]{12})/u.exec(highBlocked?.reason ?? "")?.[1];
+	const midAgain = await call("mid", "cargo build");
+	check(
+		"a session asked again learns who ranks ahead of it in the resource vote",
+		midAgain?.reason.includes("0c1ea5e3 rank ahead in the resource vote") === true,
+	);
+
+	// The leased group runs in a real shell, with a short sleep standing in for the build.
+	const shell = startProcess("bash", ["-c", granted.input.command.replace("cargo test -p x", "sleep 0.4")]);
+	const shellDone = new Promise((done) => shell.on("exit", done));
+	const until = async (ok) => {
+		for (let i = 0; i < 200 && !ok(); i++) await settle(10);
+		return ok();
+	};
+	check(
+		"the holder records its pid while the command runs",
+		await until(() => typeof leases().granted.find((g) => g.id === lowLease)?.holder === "number"),
+	);
+	await shellDone;
+	check(
+		"the lease is released when the command ends",
+		await until(() => !leases().granted.some((g) => g.id === lowLease)),
+	);
+
+	await low.pump(200);
+	check(
+		"the freed slot goes to the highest-ranked queued session as a reservation",
+		leases().granted.some((g) => g.id === highLease && g.session === ids.high && !g.bound) &&
+			leases()
+				.queue.map((q) => q.session)
+				.join() === ids.mid,
+	);
+	const highCustoms = high.customs.length;
+	await high.pump(150);
+	check(
+		"the grant wakes its session with an update naming the lease",
+		high.customs
+			.slice(highCustoms)
+			.some(
+				(c) =>
+					c.message.content.includes(`lease ${highLease} for \`cargo clippy\` is granted`) && c.options.triggerTurn,
+			),
+	);
+	check(
+		"the session's next heavy command takes its reservation",
+		leaseOf((await call("high", "cargo build")).input.command) === highLease,
+	);
+
+	setPressure({ cpu: 50 });
+	const hot = await call("low", "make -j8");
+	check("machine pressure is named when it holds a command back", hot?.reason.includes("CPU pressure is 50%") === true);
+	setPressure();
+
+	writeFileSync(
+		join(stateDir, "leases.json"),
+		JSON.stringify({
+			...leases(),
+			granted: leases().granted.map((g) => (g.id === highLease ? { ...g, holder: deadPid } : g)),
+		}),
+	);
+	await low.pump(200);
+	check(
+		"a lease whose holder died is reclaimed and its slot granted on",
+		!leases().granted.some((g) => g.id === highLease) && leases().granted.some((g) => g.session === ids.mid),
+	);
+
+	await low.fire("session_shutdown");
+	// The poller closed, so the next heartbeat hands its lock to mid.
+	mid.heartbeat();
+	await settle(150);
+	await mid.pump(200);
+	check("a closed session's queued request is dropped", !leases().queue.some((q) => q.session === ids.low));
+
+	const stale = "l-0c1ea5e00000";
+	const malformed = join(stateDir, "graph", "pending", ids.mid, "lease-malformed.json");
+	writeFileSync(malformed, JSON.stringify({ kind: "lease", at: Date.now(), lease: "../x", command: 1 }));
+	writeFileSync(
+		join(stateDir, "graph", "pending", ids.mid, `lease-${stale}.json`),
+		JSON.stringify({ kind: "lease", at: Date.now() - 200_000, lease: stale, command: "cargo test" }),
+	);
+	const midCustoms = mid.customs.length;
+	await mid.pump(150);
+	check(
+		"a grant older than its reservation is dropped unread",
+		!mid.customs.slice(midCustoms).some((c) => c.message.content.includes(stale)),
+	);
+	check("a malformed lease item is discarded", !existsSync(malformed));
+
+	// A session started without a readable config file admits under the default limit of four, past the single slot.
+	rmSync(join(root, "notify-telegram.json"));
+	const bare = spawn("0c1ea5e4-0000-7000-8000-000000000004", "/home/dev/lease/bare");
+	await bare.fire("session_start");
+	const unconfigured = (await bare.fire("tool_call", { toolName: "bash", input: { command: "cargo doc" } })).find(
+		(r) => r !== undefined,
+	);
+	check("without a config file the default limits apply", leaseOf(unconfigured?.input?.command) !== undefined);
+	await bare.fire("session_shutdown");
+	writeConfig();
+	await mid.fire("session_shutdown");
+	await high.fire("session_shutdown");
 }
 
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
