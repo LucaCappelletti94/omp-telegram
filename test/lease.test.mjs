@@ -183,6 +183,11 @@ heading("holders and reclaim");
 	check("a lease that is gone cannot be taken", !take(state, "nope", 5_000).taken);
 	const reservedOnly = { granted: [{ ...state.granted[0], bound: false }], queue: [] };
 	check("a reservation no call was bound to cannot be taken", !take(reservedOnly, "l1", 5_000).taken);
+	const beside = { granted: [{ ...state.granted[0], id: "other", holder: 9 }, state.granted[0]], queue: [] };
+	check(
+		"taking one lease leaves the others as they were",
+		take(beside, "l1", 170_000).state.granted[0] === beside.granted[0],
+	);
 	state = hold(state, "l1", 4242);
 	check("the holder records its pid on its grant", state.granted[0].holder === 4242);
 	check("holding an unknown lease changes nothing", hold(state, "nope", 1).granted.length === 1);
