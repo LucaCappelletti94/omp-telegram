@@ -14,6 +14,8 @@ import {
 	release,
 	settle,
 	take,
+	unwrapLeased,
+	wrapLeased,
 } from "../lease.ts";
 
 let fails = 0;
@@ -55,6 +57,46 @@ check("cargo metadata is light", !isHeavy("cargo metadata --format-version 1"));
 check("a word that only contains make is light", !isHeavy("cmake --version && echo remake"));
 check("git status is light", !isHeavy("git status --short"));
 check("grep for cargo test in a log is light", !isHeavy("grep 'cargo test' log.txt"));
+check("a cargo test inside a brace group is heavy", isHeavy("{ cargo test; } 2>&1 | tail"));
+
+heading("leased command wrapper");
+{
+	const module = "/opt/it's/lease.ts";
+	const dir = "/state dir";
+	const wrapped = wrapLeased("cargo test -p x", "l-0123456789ab", module, dir);
+	check(
+		"the wrapper takes the lease, then runs the command as a group with the holder on fd 9",
+		wrapped ===
+			"node --disable-warning=ExperimentalWarning '/opt/it'\\''s/lease.ts' take '/state dir' l-0123456789ab && { cargo test -p x\n} 9> >(exec node --disable-warning=ExperimentalWarning '/opt/it'\\''s/lease.ts' hold '/state dir' l-0123456789ab)",
+	);
+	check("unwrapping gives the command back", unwrapLeased(wrapped, module, dir) === "cargo test -p x");
+	const twice = wrapLeased(wrapped, "l-ba9876543210", module, dir);
+	check(
+		"a wrapper echoed and wrapped again unwraps to the plain command",
+		unwrapLeased(twice, module, dir) === "cargo test -p x",
+	);
+	check(
+		"an echoed wrapper whose command was edited unwraps to the edited command",
+		unwrapLeased(wrapped.replace("-p x", "-p y"), module, dir) === "cargo test -p y",
+	);
+	check("a plain command is left as it is", unwrapLeased("cargo build", module, dir) === "cargo build");
+	const truncated = wrapped.slice(0, wrapped.indexOf("\n}"));
+	check("a wrapper missing its holder is left as it is", unwrapLeased(truncated, module, dir) === truncated);
+	const noId = wrapped.replace("l-0123456789ab &&", "later &&");
+	check("a take without a lease id is left as it is", unwrapLeased(noId, module, dir) === noId);
+	check(
+		"a wrapper further into a command unwraps in place",
+		unwrapLeased(`cd crates/x && ${wrapped}; echo done`, module, dir) === "cd crates/x && cargo test -p x; echo done",
+	);
+	check(
+		"an invented lease id in a written-out wrapper unwraps all the same",
+		unwrapLeased(wrapped.replaceAll("l-0123456789ab", "l-bd13d16f8bfc"), module, dir) === "cargo test -p x",
+	);
+	check(
+		"a wrapper naming another module is left as it is",
+		unwrapLeased(wrapLeased("make", "l-0123456789ab", "/other/lease.ts", dir), module, dir).startsWith("node "),
+	);
+}
 
 heading("admission with a free slot");
 {

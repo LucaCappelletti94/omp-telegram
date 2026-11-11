@@ -121,7 +121,8 @@ export function isHeavy(command: string): boolean {
 		let at = 0;
 		while (at < words.length) {
 			const word = words[at] as string;
-			if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) at++;
+			// A brace group's opening word runs nothing itself, so the program follows it.
+			if (word === "{" || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) at++;
 			else if (RUNNERS[word] === true) {
 				at++;
 				while (at < words.length && /^(-|[\d.:,-]+[smhd]?$|[A-Za-z_][A-Za-z0-9_]*=)/u.test(words[at] as string)) at++;
@@ -242,6 +243,41 @@ export function settle(
 		next = { granted: [...next.granted, grant], queue: next.queue.filter((e) => e !== entry) };
 	}
 	return { state: next, granted, reclaimed };
+}
+
+/** `text` as one single-quoted shell word. */
+function shellWord(text: string): string {
+	return `'${text.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * `command` as it runs under lease `id`. It first takes the lease, which fails and runs nothing when the grant was
+ * already reclaimed, then runs as a group in the session's own shell with the holder on fd 9, so the holder lives
+ * exactly as long as the command and the shell keeps its state.
+ */
+export function wrapLeased(command: string, id: string, module: string, stateDir: string): string {
+	const runner = `node --disable-warning=ExperimentalWarning ${shellWord(module)}`;
+	return `${runner} take ${shellWord(stateDir)} ${id} && { ${command}\n} 9> >(exec ${runner} hold ${shellWord(stateDir)} ${id})`;
+}
+
+/**
+ * `command` with every wrapper `wrapLeased` made with this module and state directory replaced by the command it
+ * wraps, wherever in the command it stands and however deeply it nests. An agent reads the rewritten command in its
+ * transcript and may write that text again, and its old or invented lease id would then refuse to run the command.
+ */
+export function unwrapLeased(command: string, module: string, stateDir: string): string {
+	const literal = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+	const runner = literal(`node --disable-warning=ExperimentalWarning ${shellWord(module)}`);
+	const dir = literal(shellWord(stateDir));
+	const wrapper = new RegExp(
+		`${runner} take ${dir} (l-[0-9a-f]{12}) && \\{ ([\\s\\S]*?)\\n\\} 9> >\\(exec ${runner} hold ${dir} \\1\\)`,
+		"u",
+	);
+	let inner = command;
+	for (let found = wrapper.exec(inner); found !== null; found = wrapper.exec(inner)) {
+		inner = `${inner.slice(0, found.index)}${found[2]}${inner.slice(found.index + found[0].length)}`;
+	}
+	return inner;
 }
 
 /** How long a taken grant waits for its holder, which starts a few milliseconds after the take. */

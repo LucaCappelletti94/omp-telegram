@@ -15134,12 +15134,17 @@ heading("sessions that died without shutting down");
 
 // ---------------------------------------------------------------- version skew
 
-const stampFiles = ["index.ts", "render.ts", "graph.ts", "priority.ts", "lease.ts", "lock.ts"].map(
-	(name) => new URL(`../${name}`, import.meta.url).pathname,
-);
+/** The modules beside the extension, the first six in their historical order so older processes agree on the hash. */
+const stampFiles = () => {
+	const known = ["index.ts", "render.ts", "graph.ts", "priority.ts", "lease.ts", "lock.ts"];
+	const extra = readdirSync(new URL("..", import.meta.url).pathname)
+		.filter((name) => name.endsWith(".ts") && !known.includes(name))
+		.sort();
+	return [...known, ...extra].map((name) => new URL(`../${name}`, import.meta.url).pathname);
+};
 const stampOf = () => {
 	const h = createHash("sha256");
-	for (const f of stampFiles) h.update(readFileSync(f));
+	for (const f of stampFiles()) h.update(readFileSync(f));
 	return h.digest("hex");
 };
 
@@ -15210,8 +15215,8 @@ const dummy = (command, ...args) => {
 };
 
 const stampOriginal = stampOf();
-const renderBytes = readFileSync(stampFiles[1]);
-const restoreStamp = () => writeFileSync(stampFiles[1], renderBytes);
+const renderBytes = readFileSync(stampFiles()[1]);
+const restoreStamp = () => writeFileSync(stampFiles()[1], renderBytes);
 const vsPoller = spawn("01a1f101-0000-7000-8000-000000000001", "/home/dev/work/version-skew", "The poller");
 await vsPoller.fire("session_start");
 check("the record carries the stamp of the code it loaded", record(vsPoller.id).codeStamp === stampOriginal);
@@ -15226,7 +15231,7 @@ check(
 	existsSync(vsBoard) && JSON.parse(readFileSync(vsBoard, "utf8")).code === stampOriginal,
 );
 
-writeFileSync(stampFiles[1], Buffer.concat([renderBytes, Buffer.from("\n// version-skew stamp test\n")]));
+writeFileSync(stampFiles()[1], Buffer.concat([renderBytes, Buffer.from("\n// version-skew stamp test\n")]));
 const stampNew = stampOf();
 check("the holder's stamp no longer matches the disk", record(vsPoller.id).codeStamp !== stampNew);
 vsPoller.heartbeat();
@@ -15258,6 +15263,19 @@ check(
 restoreStamp();
 vsFresh.heartbeat();
 await settle(50);
+// A merge that adds a module leaves the existing ones untouched, and older processes must still see it as new code.
+const stampProbe = new URL("../zz-stamp-probe.ts", import.meta.url).pathname;
+writeFileSync(stampProbe, "export {};\n");
+check("a module added beside the extension changes the code stamp", stampOf() !== stampOriginal);
+const vsAdded = spawn("01a1f1ad-0000-7000-8000-0000000000ad", "/home/dev/work/version-skew", "The added module");
+await vsAdded.fire("session_start");
+const addedStamp = stampOf();
+rmSync(stampProbe);
+check(
+	"a session started after a module was added records the stamp that includes it",
+	record(vsAdded.id).codeStamp === addedStamp,
+);
+await vsAdded.fire("session_shutdown");
 vsPoller.heartbeat();
 await settle(50);
 check(
@@ -16092,7 +16110,7 @@ await vsPoller.fire("session_shutdown");
 for (const f of readdirSync(sessionsDir)) rmSync(join(sessionsDir, f), { force: true });
 check(
 	"the extension files are left as they were",
-	readFileSync(stampFiles[1], "utf8") === renderBytes.toString("utf8"),
+	readFileSync(stampFiles()[1], "utf8") === renderBytes.toString("utf8"),
 );
 
 heading("PR watch");
@@ -18569,6 +18587,16 @@ heading("resource leases for heavy commands");
 		(r) => r !== undefined,
 	);
 	check("without a config file the default limits apply", leaseOf(unconfigured?.input?.command) !== undefined);
+	const echoed = (
+		await bare.fire("tool_call", { toolName: "bash", input: { command: unconfigured.input.command } })
+	).find((r) => r !== undefined);
+	check(
+		"a rewritten command run again is unwrapped and leased afresh",
+		leaseOf(echoed?.input?.command) !== undefined &&
+			leaseOf(echoed.input.command) !== leaseOf(unconfigured.input.command) &&
+			echoed.input.command.split(" take ").length === 2 &&
+			echoed.input.command.includes("&& { cargo doc\n}"),
+	);
 	await bare.fire("session_shutdown");
 	writeConfig();
 	await mid.fire("session_shutdown");
