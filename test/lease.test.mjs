@@ -57,6 +57,7 @@ check("cargo metadata is light", !isHeavy("cargo metadata --format-version 1"));
 check("a word that only contains make is light", !isHeavy("cmake --version && echo remake"));
 check("git status is light", !isHeavy("git status --short"));
 check("grep for cargo test in a log is light", !isHeavy("grep 'cargo test' log.txt"));
+check("a cargo test inside a brace group is heavy", isHeavy("{ cargo test; } 2>&1 | tail"));
 
 heading("leased command wrapper");
 {
@@ -83,6 +84,14 @@ heading("leased command wrapper");
 	check("a wrapper missing its holder is left as it is", unwrapLeased(truncated, module, dir) === truncated);
 	const noId = wrapped.replace("l-0123456789ab &&", "later &&");
 	check("a take without a lease id is left as it is", unwrapLeased(noId, module, dir) === noId);
+	check(
+		"a wrapper further into a command unwraps in place",
+		unwrapLeased(`cd crates/x && ${wrapped}; echo done`, module, dir) === "cd crates/x && cargo test -p x; echo done",
+	);
+	check(
+		"an invented lease id in a written-out wrapper unwraps all the same",
+		unwrapLeased(wrapped.replaceAll("l-0123456789ab", "l-bd13d16f8bfc"), module, dir) === "cargo test -p x",
+	);
 	check(
 		"a wrapper naming another module is left as it is",
 		unwrapLeased(wrapLeased("make", "l-0123456789ab", "/other/lease.ts", dir), module, dir).startsWith("node "),

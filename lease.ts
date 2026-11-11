@@ -121,7 +121,8 @@ export function isHeavy(command: string): boolean {
 		let at = 0;
 		while (at < words.length) {
 			const word = words[at] as string;
-			if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) at++;
+			// A brace group's opening word runs nothing itself, so the program follows it.
+			if (word === "{" || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) at++;
 			else if (RUNNERS[word] === true) {
 				at++;
 				while (at < words.length && /^(-|[\d.:,-]+[smhd]?$|[A-Za-z_][A-Za-z0-9_]*=)/u.test(words[at] as string)) at++;
@@ -260,23 +261,23 @@ export function wrapLeased(command: string, id: string, module: string, stateDir
 }
 
 /**
- * The plain command inside any number of wrappers `wrapLeased` made with this module and state directory. An agent
- * reads the rewritten command in its transcript and may run that text again, and its old lease id would then refuse
- * to run the command once that lease is gone.
+ * `command` with every wrapper `wrapLeased` made with this module and state directory replaced by the command it
+ * wraps, wherever in the command it stands and however deeply it nests. An agent reads the rewritten command in its
+ * transcript and may write that text again, and its old or invented lease id would then refuse to run the command.
  */
 export function unwrapLeased(command: string, module: string, stateDir: string): string {
-	const runner = `node --disable-warning=ExperimentalWarning ${shellWord(module)}`;
-	const head = `${runner} take ${shellWord(stateDir)} `;
+	const literal = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+	const runner = literal(`node --disable-warning=ExperimentalWarning ${shellWord(module)}`);
+	const dir = literal(shellWord(stateDir));
+	const wrapper = new RegExp(
+		`${runner} take ${dir} (l-[0-9a-f]{12}) && \\{ ([\\s\\S]*?)\\n\\} 9> >\\(exec ${runner} hold ${dir} \\1\\)`,
+		"u",
+	);
 	let inner = command;
-	for (;;) {
-		if (!inner.startsWith(head)) return inner;
-		const rest = inner.slice(head.length);
-		const opening = /^(l-[0-9a-f]{12}) && \{ /u.exec(rest);
-		if (opening === null) return inner;
-		const tail = `\n} 9> >(exec ${runner} hold ${shellWord(stateDir)} ${opening[1]})`;
-		if (!rest.endsWith(tail)) return inner;
-		inner = rest.slice(opening[0].length, rest.length - tail.length);
+	for (let found = wrapper.exec(inner); found !== null; found = wrapper.exec(inner)) {
+		inner = `${inner.slice(0, found.index)}${found[2]}${inner.slice(found.index + found[0].length)}`;
 	}
+	return inner;
 }
 
 /** How long a taken grant waits for its holder, which starts a few milliseconds after the take. */
