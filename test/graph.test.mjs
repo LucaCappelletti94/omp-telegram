@@ -379,6 +379,7 @@ const watch = (extra = {}) => ({
 	by: "01a00000-0000-0000-0000-000000000000",
 	at: NOW,
 	seeded: true,
+	ended: false,
 	head: "h1",
 	redSent: false,
 	greenSent: false,
@@ -503,7 +504,13 @@ check(
 		prData("OPEN", { headRefOid: "h2", commitOid: "h2", contexts: [checkRun("ci", "SUCCESS")] }),
 	).events[0].event === "ci-green",
 );
-check("a merged pull request ends the watch", diffWatch(watch(), prData("MERGED")).next === null);
+check("a merged pull request ends the watch", diffWatch(watch(), prData("MERGED")).next.ended === true);
+check(
+	"an ended watch reports nothing again, whatever the pull request now says",
+	diffWatch(watch({ ended: true }), prData("MERGED")).events.length === 0 &&
+		diffWatch(watch({ ended: true }), null).events.length === 0 &&
+		diffWatch(watch({ ended: true }), prData("OPEN", { reviews: [review("r7")] })).events.length === 0,
+);
 check("a closed pull request ends the watch", diffWatch(watch(), prData("CLOSED")).events[0].event === "closed");
 
 heading("watch query");

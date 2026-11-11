@@ -16283,8 +16283,8 @@ echo done >> ${wghLog}
 	check("the merge is held for the ended watcher", pendingFiles(w2Id).length === 2);
 	check(
 		"the merged pull request ends every watch of it",
-		!existsSync(join(watchesDir, w1Id, "someorg+widget+9.json")) &&
-			!existsSync(join(watchesDir, w2Id, "someorg+widget+9.json")),
+		!prText(await prOf(w1, { action: "list" })).includes(URL9) &&
+			!prText(await prOf(w2, { action: "list" })).includes(URL9),
 	);
 	check(
 		"the second held event edits the open card instead of sending another",
@@ -16292,6 +16292,20 @@ echo done >> ${wghLog}
 			called("editMessageText").length === editsBefore + 1 &&
 			called("editMessageText").at(-1).body.text.includes("was merged"),
 	);
+	// An agent told of the merge records its outcome with the pull request again, which asks for the watch again.
+	await w1.tools
+		.get("session_graph")
+		.execute("g", { action: "status", status: "pushed", pr: URL9 }, undefined, undefined, w1.ctx);
+	const mergesSeen = w1.customs.filter((c) => c.message.content.includes("was merged")).length;
+	await tick(w1, [w1], [w1]);
+	await tick(w1, [w1], [w1]);
+	check(
+		"a merge already reported is never reported again when the pull request is named again",
+		w1.customs.filter((c) => c.message.content.includes("was merged")).length === mergesSeen,
+	);
+	// The status update gave w1 a graph node, which the later retention checks do not expect.
+	rmSync(join(nodesDir, `${w1Id}.json`), { force: true });
+	rmSync(join(root, "notify-telegram/graph/pr", `${w1Id}.json`), { force: true });
 
 	// A new pull request's CI: red then green on one head, red again on the next, nothing for a push that is pending.
 	const w3 = spawn(w3Id, "/home/dev/work/w3");
@@ -16532,11 +16546,10 @@ echo done >> ${wghLog}
 		"a pull request GitHub no longer finds is reported once",
 		w1.customs.length === d2 + 1 && w1.customs.at(-1).message.content.includes("is gone from GitHub"),
 	);
+	const w1Listed = prText(await prOf(w1, { action: "list" }));
 	check(
 		"the gone pull request ends its watch while the others keep theirs",
-		!existsSync(join(watchesDir, w1Id, "someorg+widget+13.json")) &&
-			existsSync(join(watchesDir, w1Id, "someorg+widget+11.json")) &&
-			existsSync(join(watchesDir, w3Id, "someorg+widget+12.json")),
+		!w1Listed.includes(URL13) && w1Listed.includes(URL11) && prText(await prOf(w3, { action: "list" })).includes(URL12),
 	);
 
 	// A failed query keeps every stored state, and the next tick retries.
@@ -16833,7 +16846,7 @@ echo done >> ${wghLog}
 		"a repository GitHub no longer resolves is reported as gone and ends the watch",
 		w6.customs.length === ghostBefore + 1 &&
 			w6.customs.at(-1).message.content.includes("is gone from GitHub") &&
-			!existsSync(join(watchesDir, w6Id, "someorg+ghost+1.json")),
+			!prText(await prOf(w6, { action: "list" })).includes("someorg/ghost/pull/1"),
 	);
 
 	// add with no readable GitHub output is refused.

@@ -154,6 +154,11 @@ export interface PrWatch {
 	by: string;
 	at: number;
 	seeded: boolean;
+	/**
+	 * The pull request was merged, closed or gone and that was reported. The file stays so that naming the pull
+	 * request again, from the dependency graph or a status update, finds the watch and starts no second one.
+	 */
+	ended: boolean;
 	head: string | null;
 	redSent: boolean;
 	greenSent: boolean;
@@ -315,13 +320,14 @@ function watchPrOf(pr: GqlPullRequest): WatchPrData {
 
 /**
  * The new events of one poll of a watch and the stored state after them. A `data` of null is a pull
- * request GitHub no longer finds, and a merged or closed pull request ends the watch, so the state
- * comes back null.
+ * request GitHub no longer finds. A merged, closed or gone pull request ends the watch, and an ended
+ * watch reports nothing again.
  */
-export function diffWatch(watch: PrWatch, data: WatchPrData | null): { events: WatchEvent[]; next: PrWatch | null } {
-	if (data === null) return { events: [{ event: "gone" }], next: null };
-	if (data.state === "MERGED") return { events: [{ event: "merged" }], next: null };
-	if (data.state === "CLOSED") return { events: [{ event: "closed" }], next: null };
+export function diffWatch(watch: PrWatch, data: WatchPrData | null): { events: WatchEvent[]; next: PrWatch } {
+	if (watch.ended) return { events: [], next: watch };
+	if (data === null) return { events: [{ event: "gone" }], next: { ...watch, ended: true } };
+	if (data.state === "MERGED") return { events: [{ event: "merged" }], next: { ...watch, ended: true } };
+	if (data.state === "CLOSED") return { events: [{ event: "closed" }], next: { ...watch, ended: true } };
 	const events: WatchEvent[] = [];
 	const next: PrWatch = { ...watch, reviews: [...watch.reviews] };
 	// The first poll of an unseeded watch only records what is already true.
