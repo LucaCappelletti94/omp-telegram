@@ -10,6 +10,7 @@ import {
 	readFileSync,
 	renameSync,
 	rmSync,
+	statfsSync,
 	statSync,
 	unlinkSync,
 	utimesSync,
@@ -53,6 +54,16 @@ import {
 	type WatchQueryAnswer,
 	type WatchQueryEntry,
 } from "./graph.ts";
+import {
+	admit as admitLease,
+	changeLeases,
+	DEFAULT_LEASE_POLICY,
+	isHeavy,
+	type LeasePolicy,
+	type Machine,
+	settle,
+} from "./lease.ts";
+import { withFileLock, writeFileAtomic } from "./lock.ts";
 import { bordaPoints, byPriority, cpuWeight } from "./priority.ts";
 import {
 	type AskOption,
@@ -130,8 +141,12 @@ const CRASH_KEEP_MS = 7 * 24 * 3_600_000;
 const CRASH_MESSAGE_TYPE = "omp-telegram.crash";
 /** One file per session holding its two rankings of the other live sessions, best first. */
 const BALLOT_DIR = join(STATE_DIR, "ballots");
-/** The focus tally and the user's own window marks, written by the poller and read by every view listing sessions. */
+/** Both tallies and the user's own window marks, written by the poller and read by every view listing sessions. */
 const PRIORITY_FILE = join(STATE_DIR, "priority.json");
+/** The module a leased command's redirection runs as its holder. */
+const LEASE_MODULE = new URL("./lease.ts", import.meta.url).pathname;
+/** Where the kernel reports pressure stall information, replaceable so tests can set the machine's load. */
+const PRESSURE_DIR = process.env.OMP_TELEGRAM_PRESSURE_DIR ?? "/proc/pressure";
 /**
  * One file per pane scope the poller weighted, named by its systemd unit, so a scope whose session ended gets the
  * kernel default back. Each scope is tracked and forgotten on its own, so no writer rewrites another's entry.
@@ -412,6 +427,8 @@ interface Config {
 	dashboardSeconds: number;
 	/** What an option calls the user instead of "you". Learned from Telegram unless set by hand. */
 	userName: string | null;
+	/** Limits heavy commands are admitted under, the defaults with whatever numbers `leases` overrides. */
+	leases: LeasePolicy;
 	/** This extension instance's lifetime, ended at shutdown so no throttle wait outlives the session. Never written to disk. */
 	lifetime?: AbortSignal;
 }
@@ -795,13 +812,6 @@ function isChatEvent(message: TelegramMessage): boolean {
 	return message.pinned_message !== undefined;
 }
 
-/** Temp plus rename: a reader in another omp process must never see a torn file. */
-function writeFileAtomic(path: string, content: string, mode?: number): void {
-	const temp = `${path}.${process.pid}.${Date.now().toString(36)}.tmp`;
-	writeFileSync(temp, content, mode === undefined ? {} : { mode });
-	renameSync(temp, path);
-}
-
 const AGENT_MESSAGE_ID = /^[0-9a-f]{12}$/u;
 
 interface AgentMessage {
@@ -1051,6 +1061,8 @@ type PendingItem =
 	| { kind: "inbox"; at: number; updateId: number; summary: string; entry: InboxEntry }
 	/** A launch request's outcome, delivered to its requester as an aside, written by no one. */
 	| { kind: "launch"; at: number; requestId: string; state: LaunchRequestState; text: string; summary: string }
+	/** A queued heavy command's lease, granted and reserved for the session, delivered as an aside written by no one. */
+	| { kind: "lease"; at: number; lease: string; command: string }
 	/** A watched pull request's news, delivered to its watcher as an aside, written by no one. */
 	| {
 			kind: "pr";
@@ -1165,15 +1177,43 @@ function readBallots(): Map<string, Ballot> {
 	return ballots;
 }
 
-/** What the poller last tallied for the focus vote, and which live sessions sit in a window the user marked. */
-function readFocusTally(): { points: Map<string, number>; marked: Set<string> } {
-	const raw = readJsonFile(PRIORITY_FILE) as { points?: unknown; marked?: unknown } | null;
+/**
+ * What the poller last tallied, the focus vote under `points` and the resource vote under `resources`, and which
+ * live sessions sit in a window the user marked.
+ */
+function readTally(view: "points" | "resources"): { points: Map<string, number>; marked: Set<string> } {
+	const raw = readJsonFile(PRIORITY_FILE) as Record<string, unknown> | null;
+	const tally = raw?.[view];
 	const points = new Map<string, number>();
-	if (typeof raw?.points === "object" && raw.points !== null) {
-		for (const [id, value] of Object.entries(raw.points)) if (typeof value === "number") points.set(id, value);
+	if (typeof tally === "object" && tally !== null) {
+		for (const [id, value] of Object.entries(tally)) if (typeof value === "number") points.set(id, value);
 	}
 	const marked = new Set(Array.isArray(raw?.marked) ? raw.marked.filter((id) => typeof id === "string") : []);
 	return { points, marked };
+}
+
+/** The machine as lease admission sees it, each `some avg10` pressure and a filesystem's free share. */
+function readMachine(): Machine {
+	const pressure = (kind: string): number => {
+		let text = "";
+		try {
+			text = readFileSync(join(PRESSURE_DIR, kind), "utf8");
+		} catch {}
+		return Number.parseFloat(/^some avg10=([\d.]+)/mu.exec(text)?.[1] ?? "0");
+	};
+	return {
+		cpu: pressure("cpu"),
+		memory: pressure("memory"),
+		io: pressure("io"),
+		freeShare: (cwd) => {
+			try {
+				const stats = statfsSync(cwd);
+				return stats.blocks > 0 ? stats.bavail / stats.blocks : 1;
+			} catch {
+				return 1;
+			}
+		},
+	};
 }
 
 function allNodes(): LedgerNode[] {
@@ -1268,6 +1308,9 @@ function pendingItemOf(raw: unknown): PendingItem | null {
 			typeof entry?.value === "string" &&
 			(entry.kind === "text" || entry.kind === "file");
 		return valid ? (item as unknown as PendingItem) : null;
+	}
+	if (item.kind === "lease") {
+		return isStateToken(item.lease) && typeof item.command === "string" ? (item as unknown as PendingItem) : null;
 	}
 	if (item.kind === "launch") {
 		const valid =
@@ -1507,7 +1550,18 @@ function loadConfig(): Config | null {
 		pinnedDashboard: raw.pinnedDashboard === true,
 		dashboardSeconds: typeof raw.dashboardSeconds === "number" ? raw.dashboardSeconds : 30,
 		userName: typeof raw.userName === "string" && raw.userName.trim().length > 0 ? raw.userName.trim() : null,
+		leases: leasePolicyOf(raw.leases),
 	};
+}
+
+function leasePolicyOf(raw: unknown): LeasePolicy {
+	const policy = { ...DEFAULT_LEASE_POLICY };
+	if (typeof raw !== "object" || raw === null) return policy;
+	for (const key of Object.keys(policy) as Array<keyof LeasePolicy>) {
+		const value = (raw as Record<string, unknown>)[key];
+		if (typeof value === "number" && Number.isFinite(value) && value >= 0) policy[key] = value;
+	}
+	return policy;
 }
 
 /**
@@ -1596,25 +1650,11 @@ async function changeThrottle<T>(
 	const lock = resolve(THROTTLE_LOCK_FILE);
 	if (!lock.startsWith(`${resolve(STATE_DIR)}${sep}`))
 		throw new Error("The throttle lock lies outside the state directory");
-	for (;;) {
-		try {
-			writeFileSync(lock, "", { flag: "wx", mode: 0o600 });
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			// A lock that vanished since the failed create reads as fresh, and the next pass takes it.
-			const heldSince = statSync(lock, { throwIfNoEntry: false })?.mtimeMs ?? Date.now();
-			if (Date.now() - heldSince > THROTTLE_LOCK_STALE_MS) rmSync(lock, { force: true });
-			await sleepMs(5);
-			continue;
-		}
-		try {
-			const { state, result } = change(readThrottle());
-			if (state !== null) writeFileAtomic(THROTTLE_FILE, JSON.stringify(state), 0o600);
-			return result;
-		} finally {
-			rmSync(lock, { force: true });
-		}
-	}
+	return withFileLock(lock, THROTTLE_LOCK_STALE_MS, () => {
+		const { state, result } = change(readThrottle());
+		if (state !== null) writeFileAtomic(THROTTLE_FILE, JSON.stringify(state), 0o600);
+		return result;
+	});
 }
 
 /** Seconds the shared throttle and the slots booked after it still hold a send back, for a refusal. Empty when none. */
@@ -1818,7 +1858,7 @@ async function sleepMs(ms: number): Promise<void> {
  */
 function codeStampOfFiles(): string {
 	const hash = createHash("sha256");
-	for (const name of ["index.ts", "render.ts", "graph.ts", "priority.ts"]) {
+	for (const name of ["index.ts", "render.ts", "graph.ts", "priority.ts", "lease.ts", "lock.ts"]) {
 		hash.update(readFileSync(new URL(`./${name}`, import.meta.url).pathname));
 	}
 	return hash.digest("hex");
@@ -3498,7 +3538,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// The focus vote first, with the user's own window marks above it, then whatever wants a human, then what
 		// it can hand over, then what is still busy.
 		const rank = { waiting: 0, finished: 1, working: 2, idle: 3 };
-		const focus = readFocusTally();
+		const focus = readTally("points");
 		const paneSession = new Map(
 			allRecords()
 				.filter(({ record }) => record.tmuxPane.length > 0)
@@ -3683,7 +3723,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function liveByFocus(): Array<{ id: string; record: SessionRecord }> {
 		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
 		const heard = new Map(live.map(({ id, record }) => [id, record.lastNotified]));
-		const { points, marked } = readFocusTally();
+		const { points, marked } = readTally("points");
 		const order = byPriority(points, marked, (a, b) => (heard.get(b) as number) - (heard.get(a) as number));
 		return live.sort((a, b) => order(a.id, b.id));
 	}
@@ -7243,6 +7283,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				);
 				continue;
 			}
+			// A grant is worth reading only while its reservation holds, which a resumed session has long outlived.
+			if (item.kind === "lease") {
+				const reserveMs = leasePolicy().reserveMs;
+				if (Date.now() - item.at > reserveMs) continue;
+				pi.sendMessage(
+					{
+						customType: DEPENDENCY_MESSAGE_TYPE,
+						content: `Automatic resource-lease update, written by no one: lease ${item.lease} for \`${clip(item.command, 200)}\` is granted. Its slot is reserved for this session for ${duration(reserveMs)}, and the next heavy command this session runs takes it, so run the command again now if it is still needed. This is a status update, not a message, so there is no one to reply to.`,
+						display: true,
+						details: item,
+					},
+					{ deliverAs: "aside", triggerTurn: true },
+				);
+				continue;
+			}
 			// A PR-watch event is a status update, so it is written by no one and answers to no one.
 			if (item.kind === "pr") {
 				pi.sendMessage(
@@ -7257,8 +7312,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			);
 		}
 		removeStatePath(join(PENDING_DIR, id), "resuming.json");
-		if (items.length > 0) {
-			const text = `\u2705 Delivered ${updates(items.length)} to **${titleOf(id)}**${inTab(tabOf(launchSpec))}.`;
+		const delivered = items.filter(({ item }) => item.kind !== "lease").length;
+		if (delivered > 0) {
+			const text = `\u2705 Delivered ${updates(delivered)} to **${titleOf(id)}**${inTab(tabOf(launchSpec))}.`;
 			detach(() => settleResumeCard(id, text, "closed"), "resume card settle");
 		}
 	}
@@ -7292,7 +7348,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** One card per ended session: the first held item sends it, later ones edit it. */
 	async function raiseResumeCard(id: string): Promise<void> {
 		if (config === null || !isStateToken(id)) return;
-		const { items } = listPending(id);
+		// A lease grant expires within minutes, so it never wakes a resume card or rides one.
+		const items = listPending(id).items.filter(
+			(entry): entry is { file: string; item: Exclude<PendingItem, { kind: "lease" }> } => entry.item.kind !== "lease",
+		);
 		if (items.length === 0) return;
 		const lines = items
 			.slice(-5)
@@ -8135,7 +8194,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const resources = bordaPoints(new Map(ballots.map(([id, ballot]) => [id, ballot.resources])), ids);
 		writeFileAtomic(
 			PRIORITY_FILE,
-			JSON.stringify({ points: Object.fromEntries(focus.points), marked: [...marked] }),
+			JSON.stringify({
+				points: Object.fromEntries(focus.points),
+				resources: Object.fromEntries(resources.points),
+				marked: [...marked],
+			}),
 			0o600,
 		);
 		await markFocusWinner(live, focus.points, panes);
@@ -8273,6 +8336,52 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				removeStatePath(WEIGHTED_SCOPES_DIR, unit);
 			}
 		}
+	}
+
+	/** The poller's lease pass while it runs, so a tick never starts a second one. */
+	let leaseWork: Promise<void> | null = null;
+
+	/** The configured lease limits, or the defaults while no config file is readable. */
+	function leasePolicy(): LeasePolicy {
+		return config?.leases ?? DEFAULT_LEASE_POLICY;
+	}
+
+	/**
+	 * Reclaims leases whose holder died or never started, and grants free slots to the queue in resource-vote order.
+	 * Each grant reaches its session as an aside, since the session was told a grant would wake it.
+	 */
+	function leaseTick(): void {
+		if (leaseWork !== null || !existsSync(join(STATE_DIR, "leases.json"))) return;
+		const live = new Set(
+			allRecords()
+				.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
+				.map(({ id }) => id),
+		);
+		const { points, marked } = readTally("resources");
+		const ctx = {
+			rank: byPriority(points, marked, () => 0),
+			machine: readMachine(),
+			policy: leasePolicy(),
+			now: Date.now(),
+			live,
+			alive: processRuns,
+		};
+		const work = changeLeases(STATE_DIR, (state) => {
+			const settled = settle(state, ctx);
+			const changed = JSON.stringify(settled.state) !== JSON.stringify(state);
+			return { state: changed ? settled.state : null, result: settled.granted };
+		})
+			.then((granted) => {
+				for (const grant of granted) {
+					const item: PendingItem = { kind: "lease", at: Date.now(), lease: grant.id, command: grant.command };
+					writePrivateJson(join(PENDING_DIR, grant.session), `lease-${grant.id}.json`, item);
+				}
+			})
+			.finally(() => {
+				leaseWork = null;
+			});
+		leaseWork = work;
+		detach(() => work, "leases");
 	}
 
 	function claimLaunch(ctx: ExtensionContext): void {
@@ -9741,8 +9850,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				maybeDraft();
 				maybeDashboard();
 				// Re-read rather than trusting a boolean: two pollers caused 918 Telegram conflicts.
-				if (ownsLock()) detach(() => pollOnce(), "telegram poll");
-				else {
+				if (ownsLock()) {
+					detach(() => pollOnce(), "telegram poll");
+					leaseTick();
+				} else {
 					// A holder whose process is gone frees the lock now, before its heartbeat goes stale.
 					const held = readLock();
 					if (held !== null && held.pid > 0 && !processRuns(held.pid)) acquireLock();
@@ -10117,6 +10228,49 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		recorded.input += input;
 		recorded.output += output;
 		recorded.cost += cost;
+	});
+
+	/**
+	 * Admits a heavy bash command under a resource lease. A granted command first takes its lease, which fails and
+	 * runs nothing when approval or scheduling delayed it past the grant's expiry. It then runs as a group in the
+	 * session's own shell with the lease holder on fd 9, so the holder lives exactly as long as the command and the
+	 * shell keeps its state. A refused one runs nothing, and the poller's grant wakes the session later.
+	 */
+	pi.on("tool_call", async (event, ctx) => {
+		const input = event.input as Record<string, unknown>;
+		const command = input.command;
+		if (event.toolName !== "bash" || typeof command !== "string" || !isHeavy(command)) return undefined;
+		const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
+		const { points, marked } = readTally("resources");
+		const leaseCtx = {
+			rank: byPriority(points, marked, () => 0),
+			machine: readMachine(),
+			policy: leasePolicy(),
+			now: Date.now(),
+		};
+		const ask = { session: sessionId, id: `l-${randomUUID().replaceAll("-", "").slice(0, 12)}`, command, cwd };
+		mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+		const outcome = await changeLeases(STATE_DIR, (state) => {
+			const admitted = admitLease(state, ask, leaseCtx);
+			return { state: admitted.state, result: admitted.outcome };
+		});
+		const quoted = (text: string): string => `'${text.replaceAll("'", "'\\''")}'`;
+		if (outcome.kind === "grant") {
+			const lease = `node --disable-warning=ExperimentalWarning ${quoted(LEASE_MODULE)}`;
+			const take = `${lease} take ${quoted(STATE_DIR)} ${outcome.id}`;
+			const holder = `exec ${lease} hold ${quoted(STATE_DIR)} ${outcome.id}`;
+			return { input: { ...input, command: `${take} && { ${command}\n} 9> >(${holder})` } };
+		}
+		const waits = [
+			...outcome.blockers,
+			...(outcome.ahead.length > 0
+				? [`${outcome.ahead.map((id) => titleOf(id)).join(", ")} rank ahead in the resource vote and wait too`]
+				: []),
+		];
+		return {
+			block: true,
+			reason: `Queued as resource lease ${outcome.id}, so nothing ran. Heavy commands share the machine and start in the order of the sessions' resource vote. Waiting because ${waits.join(", and ")}. A grant wakes this session with an update naming the lease and reserves the slot for its next heavy command, so do other work meanwhile or end the turn instead of retrying.`,
+		};
 	});
 
 	pi.on("tool_execution_start", async (event, ctx) => {
