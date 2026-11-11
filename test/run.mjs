@@ -1413,6 +1413,17 @@ heading("a session resumed while another omp holds it");
 	waiter.heartbeat();
 	await settle(100);
 	const waiterWaited = record(heldId).instance === holderInstance;
+	const ballotBytes = readFileSync(heldBallot, "utf8");
+	const waiterVote = await waiter.tools
+		.get("priority_vote")
+		.execute("pv-wait", { focus: ["anyone"] }, undefined, undefined, waiter.ctx);
+	check(
+		"a waiting instance refuses to vote, since its ballot would count for the holder",
+		waiterWaited &&
+			waiterVote.isError === true &&
+			waiterVote.content[0].text.includes("holds this session's id") &&
+			readFileSync(heldBallot, "utf8") === ballotBytes,
+	);
 	await waiter.fire("session_shutdown");
 	check(
 		"a waiting instance's shutdown leaves the holder's ballot",
