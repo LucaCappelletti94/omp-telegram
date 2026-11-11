@@ -1,6 +1,15 @@
 // The pure Borda tally behind session priority, called directly. No fake server, no session, no sleeping.
 
-import { bordaPoints, byPriority, cpuWeight, PRIORITY_WEIGHT_MAX, PRIORITY_WEIGHT_MIN } from "../priority.ts";
+import {
+	BACKSTOP_CALM_MS,
+	backstopStep,
+	bordaPoints,
+	byPriority,
+	cappedSessions,
+	cpuWeight,
+	PRIORITY_WEIGHT_MAX,
+	PRIORITY_WEIGHT_MIN,
+} from "../priority.ts";
 
 let fails = 0;
 const heading = (title) => {
@@ -63,6 +72,42 @@ check("half the attainable points lands on the kernel default", cpuWeight(2, 4, 
 check("the map is geometric, a quarter of the way doubles the bottom", cpuWeight(1, 4, false) === 50);
 check("a mark the user set gets the top weight whatever the votes", cpuWeight(0, 4, true) === PRIORITY_WEIGHT_MAX);
 check("a mark gets the top weight with no ballots at all", cpuWeight(0, 0, true) === PRIORITY_WEIGHT_MAX);
+
+heading("memory backstop episode");
+{
+	const off = { active: false, calmSince: 0 };
+	const on = { active: true, calmSince: 0 };
+	const step = (prev, pressure, now = 1_000) => backstopStep(prev, pressure, 10, now);
+	check("pressure at the threshold starts an episode", JSON.stringify(step(off, 10)) === JSON.stringify(on));
+	check("pressure under the threshold starts none", JSON.stringify(step(off, 9)) === JSON.stringify(off));
+	check(
+		"pressure between half and the threshold keeps an episode on",
+		JSON.stringify(step(on, 6)) === JSON.stringify(on),
+	);
+	check(
+		"pressure back in that band forgets the calm so far",
+		JSON.stringify(step({ active: true, calmSince: 500 }, 6)) === JSON.stringify(on),
+	);
+	const calm = step(on, 2, 1_000);
+	check("pressure under half the threshold starts the calm clock", calm.active && calm.calmSince === 1_000);
+	check(
+		"the calm clock keeps its start while it lasts",
+		JSON.stringify(step(calm, 2, 1_000 + BACKSTOP_CALM_MS - 1)) === JSON.stringify(calm),
+	);
+	check(
+		"five calm minutes end the episode",
+		JSON.stringify(step(calm, 2, 1_000 + BACKSTOP_CALM_MS)) === JSON.stringify(off),
+	);
+}
+
+heading("sessions the memory backstop caps");
+{
+	const capped = (order, marked = []) => [...cappedSessions(order, new Set(marked))].join();
+	check("the lower half of the resource order is capped", capped(["a", "b", "c", "d"]) === "c,d");
+	check("an odd middle session stays uncapped", capped(["a", "b", "c"]) === "c");
+	check("a lone session is never capped", capped(["a"]) === "");
+	check("a marked window is never capped", capped(["a", "b", "c", "d"], ["d"]) === "c");
+}
 
 if (fails > 0) {
 	console.log(`\n${fails} FAILURE(S)`);

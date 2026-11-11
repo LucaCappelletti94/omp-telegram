@@ -55,3 +55,32 @@ export function cpuWeight(points: number, attainable: number, marked: boolean): 
 	const share = Math.min(1, Math.max(0, points / attainable));
 	return Math.round(PRIORITY_WEIGHT_MIN * (PRIORITY_WEIGHT_MAX / PRIORITY_WEIGHT_MIN) ** share);
 }
+
+/** How long memory pressure must stay under half its threshold before a backstop episode ends. */
+export const BACKSTOP_CALM_MS = 5 * 60_000;
+
+/** Whether lower-ranked scopes are capped right now, and since when pressure has stayed under half the threshold. */
+export interface Backstop {
+	active: boolean;
+	calmSince: number;
+}
+
+/**
+ * The next state of the memory backstop. Pressure at `threshold` starts an episode, pressure between half the
+ * threshold and the threshold keeps it on and forgets any calm so far, and an episode ends once pressure has stayed
+ * under half the threshold for `BACKSTOP_CALM_MS`, so a cap set at a peak is not lifted by the first quiet tick.
+ */
+export function backstopStep(prev: Backstop, pressure: number, threshold: number, now: number): Backstop {
+	if (pressure >= threshold) return { active: true, calmSince: 0 };
+	if (!prev.active || pressure >= threshold / 2) return { active: prev.active, calmSince: 0 };
+	const calmSince = prev.calmSince > 0 ? prev.calmSince : now;
+	return now - calmSince >= BACKSTOP_CALM_MS ? { active: false, calmSince: 0 } : { active: true, calmSince };
+}
+
+/**
+ * The live sessions the memory backstop caps, the lower half of `order` by resource vote, rounding the middle
+ * session up into the uncapped half, and never a window the user marked.
+ */
+export function cappedSessions(order: readonly string[], marked: ReadonlySet<string>): Set<string> {
+	return new Set(order.slice(Math.ceil(order.length / 2)).filter((id) => !marked.has(id)));
+}

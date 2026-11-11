@@ -66,7 +66,7 @@ import {
 	wrapLeased,
 } from "./lease.ts";
 import { withFileLock, writeFileAtomic } from "./lock.ts";
-import { bordaPoints, byPriority, cpuWeight } from "./priority.ts";
+import { type Backstop, backstopStep, bordaPoints, byPriority, cappedSessions, cpuWeight } from "./priority.ts";
 import {
 	type AskOption,
 	type AskQuestion,
@@ -147,8 +147,15 @@ const BALLOT_DIR = join(STATE_DIR, "ballots");
 const PRIORITY_FILE = join(STATE_DIR, "priority.json");
 /** The module a leased command's redirection runs as its holder. */
 const LEASE_MODULE = new URL("./lease.ts", import.meta.url).pathname;
-/** Where the kernel reports pressure stall information, replaceable so tests can set the machine's load. */
-const PRESSURE_DIR = process.env.OMP_TELEGRAM_PRESSURE_DIR ?? "/proc/pressure";
+/**
+ * Prefix of the kernel's `/proc` and `/sys/fs/cgroup` paths the poller reads for pressure, cgroups and memory use,
+ * empty on a real machine and replaceable so tests can set a scope's load.
+ */
+const SYSTEM_ROOT = process.env.OMP_TELEGRAM_SYSTEM_ROOT ?? "";
+/** One file per pane scope the poller capped with `MemoryHigh`, named by its systemd unit and holding the cap. */
+const MEMORY_HIGH_DIR = join(STATE_DIR, "memory-high-scopes");
+/** Whether a memory backstop episode is on and since when pressure has stayed calm, so a new poller carries on. */
+const BACKSTOP_FILE = join(STATE_DIR, "memory-backstop.json");
 /**
  * One file per pane scope the poller weighted, named by its systemd unit, so a scope whose session ended gets the
  * kernel default back. Each scope is tracked and forgotten on its own, so no writer rewrites another's entry.
@@ -1199,7 +1206,7 @@ function readMachine(): Machine {
 	const pressure = (kind: string): number => {
 		let text = "";
 		try {
-			text = readFileSync(join(PRESSURE_DIR, kind), "utf8");
+			text = readFileSync(join(SYSTEM_ROOT, "/proc/pressure", kind), "utf8");
 		} catch {}
 		return Number.parseFloat(/^some avg10=([\d.]+)/mu.exec(text)?.[1] ?? "0");
 	};
@@ -8211,6 +8218,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 		await markFocusWinner(live, focus.points, panes);
 		await weightScopes(live, resources, marked);
+		await capScopes(live, resources, marked);
 	}
 
 	/** Each tmux pane's window, whether the user marked that window, and whether it carries the vote's mark. */
@@ -8257,14 +8265,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** The systemd unit whose cgroup holds `pid`, the last segment of its cgroup v2 path, or null when none can be read. */
-	function unitOf(pid: number): string | null {
+	/** The cgroup v2 path holding `pid`, or null when none can be read. Its last segment is the systemd unit. */
+	function cgroupOf(pid: number): { path: string; unit: string } | null {
 		let cgroups = "";
 		try {
-			cgroups = readFileSync(`/proc/${pid}/cgroup`, "utf8");
+			cgroups = readFileSync(join(SYSTEM_ROOT, `/proc/${pid}/cgroup`), "utf8");
 		} catch {}
 		// The characters a state token allows, since the unit also names a file under `weighted-scopes/`.
-		return /^0::.*\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/mu.exec(cgroups)?.[1] ?? null;
+		const found = /^0::(.*\/([A-Za-z0-9][A-Za-z0-9._-]{0,127}))$/mu.exec(cgroups);
+		return found === null ? null : { path: found[1] as string, unit: found[2] as string };
 	}
 
 	/**
@@ -8280,8 +8289,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const want = new Map<string, number>();
 		for (const { id, record } of live) {
 			if (record.tmuxPane.length === 0) continue;
-			const unit = unitOf(record.pid);
-			if (unit === null) continue;
+			const unit = cgroupOf(record.pid)?.unit;
+			if (unit === undefined) continue;
 			const weight = cpuWeight(resources.points.get(id) as number, resources.attainable, marked.has(id));
 			want.set(unit, Math.max(weight, want.get(unit) ?? 0));
 		}
@@ -8343,6 +8352,87 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			} else if (gone.has(unit)) {
 				removeStatePath(WEIGHTED_SCOPES_DIR, unit);
 			}
+		}
+	}
+
+	/**
+	 * The memory backstop. While an episode is on, each scope whose live sessions all sit in the lower half of the
+	 * resource vote gets `MemoryHigh` at 110 % of its use when first capped, fixed for the episode so it cannot
+	 * ratchet upward. A scope that leaves that half, loses its sessions or outlives the episode gets its cap lifted.
+	 * A unit the user manager no longer loads is forgotten without a write.
+	 */
+	async function capScopes(
+		live: ReadonlyArray<{ id: string; record: SessionRecord }>,
+		resources: { points: ReadonlyMap<string, number> },
+		marked: ReadonlySet<string>,
+	): Promise<void> {
+		const saved = readJsonFile(BACKSTOP_FILE) as Partial<Backstop> | null;
+		const prev = {
+			active: saved?.active === true,
+			calmSince: typeof saved?.calmSince === "number" ? saved.calmSince : 0,
+		};
+		const episode = backstopStep(prev, readMachine().memory, leasePolicy().memoryPressure, Date.now());
+		if (episode.active !== prev.active || episode.calmSince !== prev.calmSince) {
+			writeFileAtomic(BACKSTOP_FILE, JSON.stringify(episode), 0o600);
+		}
+		const order = live.map(({ id }) => id).sort(byPriority(resources.points, marked, (a, b) => a.localeCompare(b)));
+		const capped = cappedSessions(order, marked);
+		// A scope is capped only when every live session in it is, so a lower-ranked session never caps a higher one.
+		const scopes = new Map<string, { path: string; capped: boolean }>();
+		for (const { id, record } of live) {
+			// Only a tmux pane gets a scope of its own, so any other cgroup may hold more than one omp's work.
+			const cgroup = record.tmuxPane.length > 0 ? cgroupOf(record.pid) : null;
+			if (cgroup === null) continue;
+			const allCapped = (scopes.get(cgroup.unit)?.capped ?? true) && capped.has(id);
+			scopes.set(cgroup.unit, { path: cgroup.path, capped: allCapped });
+		}
+		const tracked = new Set(existsSync(MEMORY_HIGH_DIR) ? readdirSync(MEMORY_HIGH_DIR).filter(isStateToken) : []);
+		const cap = episode.active
+			? [...scopes]
+					.filter(([unit, scope]) => scope.capped && !tracked.has(unit))
+					.map(([unit, scope]) => ({ unit, path: scope.path }))
+			: [];
+		const lift = [...tracked].filter((unit) => !episode.active || scopes.get(unit)?.capped !== true);
+		if (cap.length === 0 && lift.length === 0) return;
+		const units = [...cap.map(({ unit }) => unit), ...lift];
+		const shown = await run("systemctl", ["--user", "show", "-p", "Id", "-p", "LoadState", ...units], 5_000);
+		// A failed read proves nothing about any scope, so every listed one waits for the next tick.
+		if (!shown.ok) return;
+		const loaded = new Set<string>();
+		for (const block of shown.stdout.split("\n\n")) {
+			const id = /^Id=(.*)$/mu.exec(block)?.[1];
+			if (id !== undefined && /^LoadState=loaded$/mu.test(block)) loaded.add(id);
+		}
+		for (const { unit, path } of cap) {
+			if (!loaded.has(unit)) continue;
+			let current = Number.NaN;
+			try {
+				current = Number.parseInt(
+					readFileSync(join(SYSTEM_ROOT, "/sys/fs/cgroup", path, "memory.current"), "utf8"),
+					10,
+				);
+			} catch {}
+			if (!Number.isFinite(current)) continue;
+			// A closing process writes no further cap, so the lift its shutdown sends is the last word.
+			if (!sessionAlive) return;
+			const bytes = Math.ceil((current * 11) / 10);
+			const written = await run(
+				"systemctl",
+				["--user", "set-property", "--runtime", unit, `MemoryHigh=${bytes}`],
+				5_000,
+			);
+			if (written.ok) writePrivateJson(MEMORY_HIGH_DIR, unit, { bytes });
+			else pi.logger.warn("memory cap write failed", { unit, bytes, stderr: written.stderr });
+		}
+		for (const unit of lift) {
+			if (!loaded.has(unit)) {
+				removeStatePath(MEMORY_HIGH_DIR, unit);
+				continue;
+			}
+			const lifted = await run("systemctl", ["--user", "set-property", "--runtime", unit, "MemoryHigh="], 5_000);
+			// A scope whose lift failed stays tracked, so the next tick tries again.
+			if (lifted.ok) removeStatePath(MEMORY_HIGH_DIR, unit);
+			else pi.logger.warn("memory cap lift failed", { unit, stderr: lifted.stderr });
 		}
 	}
 
@@ -10583,13 +10673,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// A process that only waited on an id another process holds owns no ballot under it.
 		if (registered && !keepForRestore) removeStatePath(BALLOT_DIR, `${sessionId}.json`);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-		// No poller tick follows the last omp's exit, so the scope its shell keeps gets the default back here, after
-		// any weight this process is still writing. The scope stays tracked, so a weight another poller wrote in the
-		// meantime is given back at its next tick.
-		const ownUnit = unitOf(process.pid);
-		if (registered && ownUnit !== null && existsSync(join(WEIGHTED_SCOPES_DIR, ownUnit))) {
+		// No poller tick follows the last omp's exit, so the scope its shell keeps gets its default weight and no
+		// memory cap back here, after any write this process is still making. The scope stays tracked, so a weight or
+		// cap another poller wrote in the meantime is given back at its next tick.
+		const ownUnit = cgroupOf(process.pid)?.unit;
+		const resets = [
+			...(ownUnit !== undefined && existsSync(join(WEIGHTED_SCOPES_DIR, ownUnit)) ? ["CPUWeight="] : []),
+			...(ownUnit !== undefined && existsSync(join(MEMORY_HIGH_DIR, ownUnit)) ? ["MemoryHigh="] : []),
+		];
+		if (registered && ownUnit !== undefined && resets.length > 0) {
 			if (priorityWork !== null) await Promise.race([priorityWork.catch(() => undefined), sleepMs(500)]);
-			await run("systemctl", ["--user", "set-property", "--runtime", ownUnit, "CPUWeight="], 1_000);
+			await run("systemctl", ["--user", "set-property", "--runtime", ownUnit, ...resets], 1_000);
 		}
 		releaseLock();
 		// Handing the board on rather than leaving the next owner to wait out a stale claim.
