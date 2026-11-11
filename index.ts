@@ -7698,8 +7698,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const byKey = new Map<string, WatchFetch>();
 			for (const entry of entries)
 				byKey.set(`${entry.owner}\u0000${entry.name}\u0000${entry.number}`, fetched.get(entry.alias) as WatchFetch);
+			// The query can outlast a lock handover or a change to a watch, so only the holder writes, and only over
+			// the state it read before the query.
+			if (!ownsLock()) return;
 			let order = 0;
 			for (const { session, entry, watch } of watches) {
+				const current = prWatchOf(readJsonFile(join(WATCH_DIR, session, entry)));
+				if (current === null || JSON.stringify(current) !== JSON.stringify(watch)) continue;
 				const got = byKey.get(`${watch.owner}\u0000${watch.name}\u0000${watch.number}`) as WatchFetch;
 				// A per-PR error that is not a disappearance keeps this watch's state.
 				if (got.data === null && !got.gone) continue;

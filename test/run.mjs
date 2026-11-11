@@ -16618,6 +16618,63 @@ echo done >> ${wghLog}
 			queriesBefore + 1,
 	);
 
+	// A watch changed while the poll waits on GitHub keeps the change, and the poll's stale view sends nothing.
+	const reviewedEleven = pr(11, "OPEN", {
+		reviews: [
+			review("r9a", "carol", "COMMENTED", "First pass."),
+			review("r9b", "dave", "COMMENTED", "Second pass."),
+			review("r9c", "erin", "COMMENTED", "A late look."),
+		],
+		contexts: [checkRun("ci/lint", "FAILURE")],
+	});
+	const tableSaved = readFileSync(ghTable, "utf8");
+	setGhTable({ "someorg/widget/11": reviewedEleven, "someorg/widget/12": pr(12, "OPEN", { head: "m1" }) });
+	await ghQuiet();
+	const beforeRemoval = w1.customs.length;
+	const elevenFile = join(watchesDir, w1Id, "someorg+widget+11.json");
+	const elevenSaved = readFileSync(elevenFile, "utf8");
+	process.env.WGH_SLOW = "1";
+	jump(61_000);
+	w3.heartbeat();
+	await settle(300);
+	await prOf(w1, { action: "remove", url: URL11 });
+	await settle(2_500);
+	delete process.env.WGH_SLOW;
+	await ghQuiet();
+	await w1.pump(200);
+	check(
+		"a watch removed while the poll waits on GitHub stays removed and reports nothing",
+		w1.customs.length === beforeRemoval && !prText(await prOf(w1, { action: "list" })).includes(URL11),
+	);
+	// The checks below expect w1 to watch #11 as before.
+	writeFileSync(elevenFile, elevenSaved);
+
+	// A poller that lost the lock while it waited on GitHub leaves the news to the new holder.
+	const twelveBefore = JSON.stringify(watchOf(w3Id, "someorg", "widget", 12));
+	setGhTable({
+		"someorg/widget/12": pr(12, "OPEN", { head: "m1", reviews: [review("r12", "frank", "COMMENTED", "Late.")] }),
+	});
+	const heldLock = readFileSync(lockPath, "utf8");
+	process.env.WGH_SLOW = "1";
+	jump(61_000);
+	w3.heartbeat();
+	await settle(300);
+	writeFileSync(
+		lockPath,
+		JSON.stringify({ ...JSON.parse(heldLock), instance: "another-poller", heartbeat: Date.now() }),
+	);
+	await settle(2_500);
+	delete process.env.WGH_SLOW;
+	await ghQuiet();
+	check(
+		"a poller that lost the lock mid-query writes no watch state and sends nothing",
+		JSON.stringify(watchOf(w3Id, "someorg", "widget", 12)) === twelveBefore &&
+			pendingFiles(w3Id).length === 0 &&
+			!w3.customs.some((c) => c.message.content.includes("review from frank")),
+	);
+	writeFileSync(lockPath, JSON.stringify({ ...JSON.parse(heldLock), heartbeat: Date.now() }));
+	writeFileSync(ghTable, tableSaved);
+
 	// Terminal pull requests are reported by add without a watch, and so is a repository the token cannot read.
 	setGhTable({ "someorg/widget/14": pr(14, "MERGED") });
 	check(
