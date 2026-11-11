@@ -14,6 +14,23 @@ export interface Task {
 	state: "live" | "dormant";
 	/** When a window was last opened for the conductor, so a second `/conduct` meanwhile opens none. */
 	launchedAt: number;
+	/** Sessions Luca joined to the task. */
+	members: Member[];
+	/** Sessions the conductor invited, kept while Luca's answer is open or after he skipped them. */
+	candidates: Candidate[];
+}
+
+export interface Member {
+	session: string;
+	joinedAt: number;
+}
+
+export interface Candidate {
+	session: string;
+	/** The invitation card's own id, which its buttons carry. */
+	card: string;
+	/** `skipped` once Luca tapped Skip, so the session is never proposed again. */
+	state: "proposed" | "skipped";
 }
 
 /** A slug is a file name, so it stays a plain token no path can escape. */
@@ -51,7 +68,23 @@ function parseTask(raw: unknown, slug: string): Task | null {
 	if (t.slug !== slug || typeof t.name !== "string" || typeof t.brief !== "string") return null;
 	if (typeof t.conductor !== "string" || typeof t.launchedAt !== "number") return null;
 	if (t.state !== "live" && t.state !== "dormant") return null;
-	return { name: t.name, slug, brief: t.brief, conductor: t.conductor, state: t.state, launchedAt: t.launchedAt };
+	const members = (Array.isArray(t.members) ? t.members : []).filter(
+		(m): m is Member => typeof m?.session === "string" && typeof m.joinedAt === "number",
+	);
+	const candidates = (Array.isArray(t.candidates) ? t.candidates : []).filter(
+		(c): c is Candidate =>
+			typeof c?.session === "string" && typeof c.card === "string" && (c.state === "proposed" || c.state === "skipped"),
+	);
+	return {
+		name: t.name,
+		slug,
+		brief: t.brief,
+		conductor: t.conductor,
+		state: t.state,
+		launchedAt: t.launchedAt,
+		members,
+		candidates,
+	};
 }
 
 export function readTask(dir: string, slug: string): Task | null {
@@ -109,6 +142,17 @@ export function conductorRole(task: Task): string {
 		`You are the conductor of the task "${task.name}". The brief:`,
 		task.brief,
 		"You keep the omp sessions working on this task from duplicating work or making engineering choices that contradict each other, and you tell the user where they disagree. You report to the user through notify_status and reach the sessions through session_message, where a call without `to` lists every live session with its folder. You never pause, reorder or rebase a session's work yourself.",
+		"To bring a session into the task, call the `conductor` tool with `action` `invite`, the session's badge emoji or tag in `session`, and in `reason` why it belongs. The user answers Join or Skip on Telegram, and the answer reaches you as an aside written by no one.",
 		`Closing this session leaves the task dormant, and \`/conduct ${task.name}\` in Telegram resumes it.`,
 	].join("\n\n");
+}
+
+/** What a member reads every turn: each task it belongs to and the address of that task's conductor. */
+export function memberRole(tasks: { name: string; conductor: string }[]): string {
+	const lines = tasks.map((task) => `- "${task.name}", conducted by the session ${task.conductor}`);
+	return [
+		`This session is a member of ${tasks.length === 1 ? "a task" : `${tasks.length} tasks`}:`,
+		...lines,
+		"A conductor keeps the sessions of its task from duplicating work or contradicting each other. Tell it through session_message when you start work another member could also take up, or make an engineering choice the others should follow, and expect it to message you when another member's work touches yours.",
+	].join("\n");
 }

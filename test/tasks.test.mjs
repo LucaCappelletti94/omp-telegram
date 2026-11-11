@@ -3,7 +3,16 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { changeTask, conductorRole, listTasks, parseConduct, readTask, taskSlug, updateTask } from "../tasks.ts";
+import {
+	changeTask,
+	conductorRole,
+	listTasks,
+	memberRole,
+	parseConduct,
+	readTask,
+	taskSlug,
+	updateTask,
+} from "../tasks.ts";
 
 let fails = 0;
 const heading = (title) => {
@@ -48,7 +57,16 @@ heading("the /conduct text");
 heading("task files");
 {
 	const dir = mkdtempSync(join(tmpdir(), "tasks-test-"));
-	const fresh = { name: "Docs pass", slug: "docs-pass", brief: "b", conductor: "", state: "live", launchedAt: 5 };
+	const fresh = {
+		name: "Docs pass",
+		slug: "docs-pass",
+		brief: "b",
+		conductor: "",
+		state: "live",
+		launchedAt: 5,
+		members: [{ session: "m", joinedAt: 1 }],
+		candidates: [{ session: "c", card: "0a1b2c3d", state: "skipped" }],
+	};
 	const made = await changeTask(dir, "docs-pass", (task) => ({ task: task === null ? fresh : task, result: task }));
 	check("an absent task reads as null inside the change", made === null);
 	check("a change writes the task it returns", JSON.stringify(readTask(dir, "docs-pass")) === JSON.stringify(fresh));
@@ -90,6 +108,32 @@ heading("task files");
 		"an update of a slug outside the pattern gives null",
 		(await updateTask(dir, "../escape", () => ({ task: fresh, result: "seen" }))) === null,
 	);
+	const { members, candidates, ...older } = fresh;
+	writeFileSync(join(dir, "older.json"), JSON.stringify({ ...older, slug: "older" }));
+	const plain = readTask(dir, "older");
+	check(
+		"a task written before membership reads with no members or candidates",
+		plain.members.length === 0 && plain.candidates.length === 0,
+	);
+	writeFileSync(
+		join(dir, "mixed.json"),
+		JSON.stringify({
+			...fresh,
+			slug: "mixed",
+			members: [null, { session: 1, joinedAt: 2 }, ...members],
+			candidates: [
+				{ session: "c", card: "x", state: "joined" },
+				{ session: "c", card: 3, state: "proposed" },
+				...candidates,
+			],
+		}),
+	);
+	const mixed = readTask(dir, "mixed");
+	check(
+		"malformed members and candidates are dropped, well-formed ones kept",
+		JSON.stringify(mixed.members) === JSON.stringify(members) &&
+			JSON.stringify(mixed.candidates) === JSON.stringify(candidates),
+	);
 	rmSync(dir, { recursive: true, force: true });
 }
 
@@ -112,6 +156,24 @@ heading("the conductor's role");
 		role.includes("notify_status") && role.includes("session_message"),
 	);
 	check("the role names the command that reopens it", role.includes("/conduct Connetto quotas"));
+}
+
+heading("the member's instruction");
+{
+	const one = memberRole([{ name: "Docs", conductor: "🎼 docs (tag ab12c)" }]);
+	check(
+		"one task is named with its conductor's address",
+		one.includes("a task:") && one.includes('"Docs", conducted by the session 🎼 docs (tag ab12c)'),
+	);
+	const two = memberRole([
+		{ name: "Docs", conductor: "a" },
+		{ name: "Quotas", conductor: "b" },
+	]);
+	check(
+		"several tasks are counted and each listed",
+		two.includes("2 tasks:") && two.includes('"Quotas", conducted by the session b'),
+	);
+	check("the instruction says when to tell the conductor", one.includes("session_message"));
 }
 
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);

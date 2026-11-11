@@ -90,7 +90,16 @@ import {
 	TELEGRAM_TEXT_MAX,
 	toTelegramHtml,
 } from "./render.ts";
-import { changeTask, conductorRole, listTasks, parseConduct, type Task, taskSlug, updateTask } from "./tasks.ts";
+import {
+	changeTask,
+	conductorRole,
+	listTasks,
+	memberRole,
+	parseConduct,
+	type Task,
+	taskSlug,
+	updateTask,
+} from "./tasks.ts";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "notify-telegram.json");
@@ -1077,6 +1086,8 @@ type PendingItem =
 	| { kind: "launch"; at: number; requestId: string; state: LaunchRequestState; text: string; summary: string }
 	/** A queued heavy command's lease, granted and reserved for the session, delivered as an aside written by no one. */
 	| { kind: "lease"; at: number; lease: string; command: string }
+	/** News a conductor needs about its task, delivered as an aside written by no one and held while it is down. */
+	| { kind: "lead"; at: number; task: string; text: string }
 	/** A watched pull request's news, delivered to its watcher as an aside, written by no one. */
 	| {
 			kind: "pr";
@@ -1325,6 +1336,9 @@ function pendingItemOf(raw: unknown): PendingItem | null {
 	}
 	if (item.kind === "lease") {
 		return isStateToken(item.lease) && typeof item.command === "string" ? (item as unknown as PendingItem) : null;
+	}
+	if (item.kind === "lead") {
+		return typeof item.task === "string" && typeof item.text === "string" ? (item as unknown as PendingItem) : null;
 	}
 	if (item.kind === "launch") {
 		const valid =
@@ -5335,6 +5349,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await answerTaskCallback(cfg, callback.id, callback.data.slice(2));
 				return;
 			}
+			if (callback.data.startsWith("j:")) {
+				await answerJoinCallback(cfg, callback.id, callback.data, callback.message.message_id);
+				return;
+			}
 			if (/^[rln]:/u.test(callback.data)) {
 				await answerResumeCallback(cfg, callback);
 				return;
@@ -7058,11 +7076,32 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		};
 	});
 
-	/** A conductor's role rides its system prompt, which omp rebuilds every turn, so compaction and resume keep it. */
+	/**
+	 * A conductor's role and a member's tasks ride the system prompt, which omp rebuilds every turn, so compaction and
+	 * resume keep them.
+	 */
 	pi.on("before_agent_start", async (event) => {
-		const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId);
-		if (conducted === undefined) return undefined;
-		return { systemPrompt: [...event.systemPrompt, conductorRole(conducted)] };
+		const tasks = listTasks(TASKS_DIR);
+		const conducted = tasks.find((task) => task.conductor === sessionId);
+		const joined = tasks.filter((task) => task.members.some((member) => member.session === sessionId));
+		const sections = [
+			...(conducted === undefined ? [] : [conductorRole(conducted)]),
+			...(joined.length === 0
+				? []
+				: [
+						memberRole(
+							joined.map((task) => {
+								const record = readSessionRecord(task.conductor);
+								return {
+									name: task.name,
+									conductor: record === null ? task.conductor : `${badgeOf(record)} (tag ${record.tag})`,
+								};
+							}),
+						),
+					]),
+		];
+		if (sections.length === 0) return undefined;
+		return { systemPrompt: [...event.systemPrompt, ...sections] };
 	});
 
 	// ------------------------------------------------------------------ dependency graph
@@ -7331,6 +7370,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				);
 				continue;
 			}
+			if (item.kind === "lead") {
+				pi.sendMessage(
+					{
+						customType: DEPENDENCY_MESSAGE_TYPE,
+						content: `Automatic conductor update for the task "${item.task}", written by no one: ${item.text} This is a status update, not a message, so there is no one to reply to.`,
+						display: true,
+						details: item,
+					},
+					{ deliverAs: "aside", triggerTurn: true },
+				);
+				continue;
+			}
 			// A PR-watch event is a status update, so it is written by no one and answers to no one.
 			if (item.kind === "pr") {
 				pi.sendMessage(
@@ -7397,7 +7448,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							? `- ${item.summary}`
 							: item.kind === "pr"
 								? `- ${prSummary(item)}`
-								: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
+								: item.kind === "lead"
+									? `- ${item.task}: ${clip(item.text, 80)}`
+									: `- a message from ${item.message.from.emoji.length > 0 ? item.message.from.emoji : item.message.from.tag}: ${clip(item.message.text, 80)}`,
 			);
 		const text = `\u23F8\uFE0F **${titleOf(id)}**${inTab(tabOf(readNode(id)?.launch))} has ended with ${updates(items.length)} waiting:\n${lines.join("\n")}\n\nResume it to deliver them?`;
 		const body = {
@@ -7619,7 +7672,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						cwd,
 						[
 							"omp",
-							`Begin conducting the task "${task.name}". List the live sessions and tell the user which of them work on it.`,
+							`Begin conducting the task "${task.name}". List the live sessions and invite those that work on it.`,
 						],
 						["-e", `${CONDUCT_ENV}=${task.slug}`],
 						"",
@@ -7684,7 +7737,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const step = await changeTask(TASKS_DIR, slug, (task): { task: Task | null; result: ConductStep | null } => {
 			if (task !== null) return conductStep(task);
 			if (brief === "") return { task: null, result: null };
-			const fresh: Task = { name, slug, brief, conductor: "", state: "live", launchedAt: Date.now() };
+			const fresh: Task = {
+				name,
+				slug,
+				brief,
+				conductor: "",
+				state: "live",
+				launchedAt: Date.now(),
+				members: [],
+				candidates: [],
+			};
 			return { task: fresh, result: { kind: "open", task: fresh } };
 		});
 		if (step === null) {
@@ -7720,6 +7782,188 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callbackId, text: toast }, 10_000);
 	}
+
+	/** Hands a conductor news about its task, held behind a resume card while the conductor is down. */
+	function sendLead(task: Task, text: string): void {
+		const item: PendingItem = { kind: "lead", at: Date.now(), task: task.name, text };
+		writePrivateJson(join(PENDING_DIR, task.conductor), `lead-${Date.now()}-${randomUUID().slice(0, 8)}.json`, item);
+		if (!isLiveSession(task.conductor)) detach(() => raiseResumeCard(task.conductor), "resume card");
+	}
+
+	/** What Luca's tap on an invitation card did to the task and the invited session. */
+	type JoinOutcome = { task: Task; session: string; outcome: "joined" | "skipped" | "gone" };
+
+	/** Luca's answer on an invitation card: `j:<card>:y` joins the session, `j:<card>:n` skips it for good. */
+	async function answerJoinCallback(cfg: Config, callbackId: string, data: string, messageId: number): Promise<void> {
+		const [, card, answer] = data.split(":");
+		const open = (task: Task) => task.candidates.find((c) => c.card === card && c.state === "proposed");
+		const owner = listTasks(TASKS_DIR).find((task) => open(task) !== undefined);
+		const settled =
+			owner === undefined
+				? null
+				: await updateTask(TASKS_DIR, owner.slug, (task): { task: Task | null; result: JoinOutcome | null } => {
+						const candidate = open(task);
+						if (candidate === undefined) return { task: null, result: null };
+						const others = task.candidates.filter((c) => c !== candidate);
+						const { session } = candidate;
+						if (answer !== "y") {
+							const skipped = { ...candidate, state: "skipped" as const };
+							return {
+								task: { ...task, candidates: [...others, skipped] },
+								result: { task, session, outcome: "skipped" as const },
+							};
+						}
+						if (!isLiveSession(session)) {
+							return { task: { ...task, candidates: others }, result: { task, session, outcome: "gone" as const } };
+						}
+						const members = [...task.members, { session, joinedAt: Date.now() }];
+						return {
+							task: { ...task, candidates: others, members },
+							result: { task, session, outcome: "joined" as const },
+						};
+					});
+		if (settled === null) {
+			await callTelegram(
+				cfg,
+				"answerCallbackQuery",
+				{ callback_query_id: callbackId, text: "That invitation is no longer open." },
+				10_000,
+			);
+			return;
+		}
+		const { task, session, outcome } = settled;
+		const title = titleOf(session);
+		const wording = {
+			joined: {
+				card: `\u{1F3BC} **${title}** joined the task **${task.name}**.`,
+				lead: `The user joined ${title} to the task. It reads the member instruction from its next turn on.`,
+				toast: "Joined.",
+			},
+			skipped: {
+				card: `\u{1F3BC} **${title}** was skipped for the task **${task.name}** and will not be proposed again.`,
+				lead: `The user skipped ${title}, so it will not be proposed again.`,
+				toast: "Skipped.",
+			},
+			gone: {
+				card: `\u{1F3BC} **${title}** closed before joining the task **${task.name}**, so nobody joined.`,
+				lead: `${title} closed before the user's Join, so nobody joined. Invite it again once it is resumed.`,
+				toast: "That session has closed, so nobody joined.",
+			},
+		}[outcome];
+		sendLead(task, wording.lead);
+		await callTelegram(
+			cfg,
+			"editMessageText",
+			{ chat_id: cfg.chatId, message_id: messageId, text: toTelegramHtml(wording.card), parse_mode: "HTML" },
+			15_000,
+		);
+		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callbackId, text: wording.toast }, 10_000);
+	}
+
+	registerTool({
+		name: "conductor",
+		label: "Conductor",
+		description:
+			"Act as the conductor of a task opened with `/conduct`. `action` `invite` proposes the live session named in `session`, by its badge emoji or tag, for the task this session conducts, and `reason` tells the user why it belongs. The user answers Join or Skip on a Telegram card, and the answer arrives as an aside written by no one. A session conducting a task, a member and a session the user skipped cannot be invited.",
+		approval: "read",
+		parameters: z.object({
+			action: z.string(),
+			session: z.string().optional(),
+			reason: z.string().optional(),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const refuse = (text: string) => ({
+				content: [{ type: "text" as const, text }],
+				details: { invited: false },
+				isError: true,
+			});
+			if (config === null) {
+				return refuse(
+					"The conductor tool rides the omp-telegram session registry, which starts only once the bot is paired with `node setup.mjs`.",
+				);
+			}
+			const cfg = config;
+			await followSession(ctx);
+			const p = params as { action?: unknown; session?: unknown; reason?: unknown };
+			const session = typeof p.session === "string" ? p.session.trim() : "";
+			const reason = typeof p.reason === "string" ? p.reason.trim() : "";
+			if (p.action !== "invite") return refuse("`action` must be `invite`.");
+			const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId && task.state === "live");
+			if (conducted === undefined) {
+				return refuse(
+					"This session conducts no live task, so it cannot invite. `/conduct` in Telegram opens a conductor.",
+				);
+			}
+			if (reason.length === 0)
+				return refuse("Say in `reason` why the session belongs to the task, since the user reads it on the card.");
+			if ((badgeEmoji.length > 0 && session === badgeEmoji) || session === sessionTag) {
+				return refuse(`${session} is this conductor itself.`);
+			}
+			const resolved = resolveSession(session);
+			const target = allRecords().find(({ id, record }) => id === resolved && id !== sessionId && routable(record));
+			if (target === undefined) {
+				return refuse(`No live session shows ${session}. session_message without \`to\` lists the live sessions.`);
+			}
+			const name = badgeOf(target.record);
+			const conducting = listTasks(TASKS_DIR).find((task) => task.conductor === target.id);
+			if (conducting !== undefined) {
+				return refuse(`${name} conducts the task "${conducting.name}", and a conductor never joins a task.`);
+			}
+			const card = randomUUID().replaceAll("-", "").slice(0, 8);
+			const claimed = await updateTask(TASKS_DIR, conducted.slug, (task) => {
+				if (task.members.some((member) => member.session === target.id))
+					return { task: null, result: "member" as const };
+				const known = task.candidates.find((candidate) => candidate.session === target.id);
+				if (known !== undefined) return { task: null, result: known.state === "skipped" ? "skipped" : "open" } as const;
+				const candidates = [...task.candidates, { session: target.id, card, state: "proposed" as const }];
+				return { task: { ...task, candidates }, result: "proposed" as const };
+			});
+			const refusals = {
+				member: `${name} is already a member of the task.`,
+				skipped: `The user skipped ${name} for this task, so it is never proposed again.`,
+				open: `${name} already has an invitation card open. Wait for the user's answer.`,
+			};
+			if (claimed === null) return refuse(`The task "${conducted.name}" no longer reads.`);
+			if (claimed !== "proposed") return refuse(refusals[claimed]);
+			const tab = inTab(tabOf({ tmuxSession: target.record.tmux, tmuxWindow: target.record.tmuxWindow }));
+			const text = `${messageHead(ctx)}\n\n\u{1F3BC} **Join ${name} to the task ${conducted.name}?**${tab}\n${reason}`;
+			const sent = await callTelegram<TelegramMessage>(
+				cfg,
+				"sendMessage",
+				{
+					chat_id: cfg.chatId,
+					text: toTelegramHtml(fitToTelegram(text, "")),
+					parse_mode: "HTML",
+					link_preview_options: { is_disabled: true },
+					reply_markup: {
+						inline_keyboard: [
+							[
+								{ text: "Join", callback_data: `j:${card}:y`, style: "success" },
+								{ text: "Skip", callback_data: `j:${card}:n` },
+							],
+						],
+					},
+				},
+				15_000,
+			);
+			if (sent === null) {
+				await updateTask(TASKS_DIR, conducted.slug, (task) => ({
+					task: { ...task, candidates: task.candidates.filter((candidate) => candidate.card !== card) },
+					result: null,
+				}));
+				return refuse("The invitation card could not be sent, so nothing changed. Try again.");
+			}
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `Invited ${name}. The user's Join or Skip arrives as an aside written by no one.`,
+					},
+				],
+				details: { invited: true, card },
+			};
+		},
+	});
 
 	function crashTitle(record: SessionRecord): string {
 		const name = record.label || record.name || record.cwd.split("/").filter(Boolean).pop() || record.tag;

@@ -19158,6 +19158,259 @@ esac
 	process.env.PATH = savedPath;
 }
 
+heading("conductor invites and members");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	const taskFile = join(tasksDir, "docs.json");
+	const task = () => JSON.parse(readFileSync(taskFile, "utf8"));
+	const writeTask = (slug, conductor) =>
+		writeFileSync(
+			join(tasksDir, `${slug}.json`),
+			JSON.stringify({
+				name: slug === "docs" ? "Docs" : "Other",
+				slug,
+				brief: "Write the docs.",
+				conductor,
+				state: "live",
+				launchedAt: 0,
+				members: [],
+				candidates: [],
+			}),
+		);
+	const poller = spawn("0d0e0200-0000-7000-8000-000000000001", "/home/dev/work/members");
+	await poller.fire("session_start");
+	const conductorId = "0d0e0200-0000-7000-8000-000000000002";
+	const otherId = "0d0e0200-0000-7000-8000-000000000003";
+	mkdirSync(tasksDir, { recursive: true });
+	writeTask("docs", conductorId);
+	writeTask("other", otherId);
+	const conductor = spawn(conductorId, join(tasksDir, "docs"));
+	await conductor.fire("session_start");
+	const other = spawn(otherId, join(tasksDir, "other"));
+	await other.fire("session_start");
+	const worker = spawn("0d0e0200-0000-7000-8000-000000000004", "/home/dev/work/docs-site");
+	await worker.fire("session_start");
+	const invite = (from, session, reason = "It edits the docs site.") =>
+		from.tools.get("conductor").execute("inv", { action: "invite", session, reason }, undefined, undefined, from.ctx);
+	const tap = async (data, update) => {
+		api.queued = [
+			{
+				update_id: update,
+				callback_query: {
+					id: `join${update}`,
+					data,
+					from: { id: CHAT },
+					message: { message_id: update, chat: { id: CHAT } },
+				},
+			},
+		];
+		await poller.pump(400);
+		return lastCall("answerCallbackQuery").body.text;
+	};
+	const tagOf = (s) => record(s.id).tag;
+	const refusal = async (from, session, reason) => {
+		const result = await invite(from, session, reason);
+		return result.isError === true ? result.content[0].text : "";
+	};
+
+	check(
+		"a session that conducts no live task cannot invite",
+		(await refusal(worker, tagOf(conductor))).includes("conducts no live task"),
+	);
+	check("an invite naming no live session is refused", (await refusal(conductor, "zz9zz")).includes("No live session"));
+	check("a conductor cannot invite itself", (await refusal(conductor, tagOf(conductor))).includes("itself"));
+	check("a conductor cannot invite another conductor", (await refusal(conductor, tagOf(other))).includes("conducts"));
+
+	const sends = called("sendMessage").length;
+	const invited = await invite(conductor, tagOf(worker));
+	const card = called("sendMessage").at(-1).body;
+	const buttons = card.reply_markup?.inline_keyboard?.flat() ?? [];
+	const joinButton = buttons.find((b) => b.text === "Join")?.callback_data ?? "";
+	const skipButton = buttons.find((b) => b.text === "Skip")?.callback_data ?? "";
+	check(
+		"an invite sends Luca one card with the reason and Join and Skip",
+		invited.isError !== true &&
+			called("sendMessage").length === sends + 1 &&
+			card.text.includes("It edits the docs site.") &&
+			card.text.includes("Docs") &&
+			/^j:[0-9a-f]{8}:y$/u.test(joinButton) &&
+			skipButton === joinButton.replace(/y$/u, "n"),
+	);
+	check(
+		"the invited session is a proposed candidate holding its card",
+		task().candidates.length === 1 &&
+			task().candidates[0].session === worker.id &&
+			task().candidates[0].state === "proposed" &&
+			task().candidates[0].card === joinButton.slice(2, 10),
+	);
+	check(
+		"a second invite while its card is open is refused",
+		(await refusal(conductor, tagOf(worker))).includes("card"),
+	);
+
+	const joined = await tap(joinButton, 9980);
+	check(
+		"Join adds the session to the members and settles the card",
+		task().members.some((m) => m.session === worker.id) &&
+			task().candidates.length === 0 &&
+			joined.length > 0 &&
+			lastCall("editMessageText").body.text.includes("joined"),
+	);
+	await conductor.pump(200);
+	check(
+		"the conductor learns of the join as an aside written by no one",
+		conductor.customs.some(
+			(c) => String(c.message.content).includes("written by no one") && String(c.message.content).includes("joined"),
+		),
+	);
+	const memberPrompt = await worker.fire("before_agent_start", { prompt: "go", systemPrompt: ["base"] });
+	const instruction = memberPrompt.find((r) => Array.isArray(r?.systemPrompt))?.systemPrompt ?? [];
+	check(
+		"a member's system prompt names its task and how to reach the conductor",
+		instruction[0] === "base" &&
+			instruction.length === 2 &&
+			instruction[1].includes("Docs") &&
+			instruction[1].includes(tagOf(conductor)),
+	);
+	check("a second tap on the settled card changes nothing", (await tap(joinButton, 9981)).includes("no longer open"));
+	check("a member cannot be invited again", (await refusal(conductor, tagOf(worker))).includes("member"));
+	check("an invite without a reason is refused", (await refusal(conductor, tagOf(worker), "")).includes("reason"));
+	check(
+		"an action other than invite is refused",
+		(
+			await conductor.tools
+				.get("conductor")
+				.execute("inv", { action: "kick", session: tagOf(worker) }, undefined, undefined, conductor.ctx)
+		).content[0].text.includes("`invite`"),
+	);
+
+	const unreachable = spawn("0d0e0200-0000-7000-8000-000000000008", "/home/dev/work/unreachable");
+	await unreachable.fire("session_start");
+	api.failMethods = ["sendMessage"];
+	const unsent = await refusal(conductor, tagOf(unreachable));
+	api.failMethods = [];
+	check(
+		"an invitation card that cannot be sent leaves no candidate behind",
+		unsent.includes("could not be sent") && !task().candidates.some((c) => c.session === unreachable.id),
+	);
+
+	const skipped = spawn("0d0e0200-0000-7000-8000-000000000005", "/home/dev/work/unrelated");
+	await skipped.fire("session_start");
+	await invite(conductor, tagOf(skipped));
+	const skipData = called("sendMessage").at(-1).body.reply_markup.inline_keyboard.flat()[1].callback_data;
+	await tap(skipData, 9982);
+	check(
+		"Skip keeps the candidate as skipped and settles the card",
+		task().candidates.some((c) => c.session === skipped.id && c.state === "skipped") &&
+			!task().members.some((m) => m.session === skipped.id) &&
+			lastCall("editMessageText").body.text.includes("skipped"),
+	);
+	check("a skipped session is never proposed again", (await refusal(conductor, tagOf(skipped))).includes("skipped"));
+
+	const leaver = spawn("0d0e0200-0000-7000-8000-000000000006", "/home/dev/work/leaver");
+	await leaver.fire("session_start");
+	await invite(conductor, tagOf(leaver));
+	const leaverJoin = called("sendMessage").at(-1).body.reply_markup.inline_keyboard.flat()[0].callback_data;
+	await leaver.fire("session_shutdown");
+	await tap(leaverJoin, 9983);
+	check(
+		"Join for a session that closed meanwhile joins nobody and says so",
+		!task().members.some((m) => m.session === leaver.id) &&
+			!task().candidates.some((c) => c.session === leaver.id) &&
+			lastCall("editMessageText").body.text.includes("closed before joining"),
+	);
+
+	const late = spawn("0d0e0200-0000-7000-8000-000000000007", "/home/dev/work/late");
+	await late.fire("session_start");
+	await invite(conductor, tagOf(late));
+	const lateJoin = called("sendMessage").at(-1).body.reply_markup.inline_keyboard.flat()[0].callback_data;
+	await conductor.fire("session_shutdown");
+	await tap(lateJoin, 9984);
+	check(
+		"Join while the conductor is down still adds the member and holds the lead for it",
+		task().members.some((m) => m.session === late.id) &&
+			readdirSync(join(stateDir, "graph/pending", conductorId)).some((f) => f.startsWith("lead-")),
+	);
+	check("a button for a card nobody knows says so", (await tap("j:0000ffff:y", 9985)).includes("no longer"));
+
+	// The conductor's record is gone while it is down, so a member is told its id.
+	rmSync(join(sessionsDir, `${conductorId}.json`), { force: true });
+	const unnamed = await late.fire("before_agent_start", { prompt: "go", systemPrompt: ["base"] });
+	check(
+		"a member whose conductor left no record is told the conductor's id",
+		(unnamed.find((r) => Array.isArray(r?.systemPrompt))?.systemPrompt[1] ?? "").includes(conductorId),
+	);
+	writeFileSync(
+		join(stateDir, "graph/pending", conductorId, "lead-bad.json"),
+		JSON.stringify({ kind: "lead", at: 1, task: 5, text: "x" }),
+	);
+	const back = spawn(conductorId, join(tasksDir, "docs"));
+	await back.fire("session_start");
+	await back.pump(200);
+	check(
+		"a malformed lead is discarded and the held one delivered",
+		!existsSync(join(stateDir, "graph/pending", conductorId, "lead-bad.json")) &&
+			back.customs.some((c) => String(c.message.content).includes("joined")),
+	);
+	const noSession = await back.tools
+		.get("conductor")
+		.execute("inv", { action: "invite", reason: "r" }, undefined, undefined, back.ctx);
+	check("an invite naming no session is refused", noSession.content[0].text.includes("No live session"));
+
+	// The task changes while a tap or an invite waits for the task lock.
+	const taskLock = join(tasksDir, "tasks.lock");
+	const racer = spawn("0d0e0200-0000-7000-8000-00000000000a", "/home/dev/work/racer");
+	await racer.fire("session_start");
+	await invite(back, tagOf(racer));
+	const racerJoin = called("sendMessage").at(-1).body.reply_markup.inline_keyboard.flat()[0].callback_data;
+	writeFileSync(taskLock, "");
+	api.queued = [
+		{
+			update_id: 9986,
+			callback_query: {
+				id: "join9986",
+				data: racerJoin,
+				from: { id: CHAT },
+				message: { message_id: 9986, chat: { id: CHAT } },
+			},
+		},
+	];
+	await poller.pump(60);
+	writeFileSync(taskFile, JSON.stringify({ ...task(), candidates: [] }));
+	rmSync(taskLock);
+	await settle(400);
+	check(
+		"a tap whose invitation was withdrawn while it waited joins nobody",
+		lastCall("answerCallbackQuery").body.text.includes("no longer open") &&
+			!task().members.some((m) => m.session === racer.id),
+	);
+	const intact = readFileSync(taskFile, "utf8");
+	writeFileSync(taskLock, "");
+	const waiting = refusal(back, tagOf(racer));
+	await settle(60);
+	writeFileSync(taskFile, "{");
+	rmSync(taskLock);
+	check("an invite whose task stopped reading while it waited is refused", (await waiting).includes("no longer reads"));
+	writeFileSync(taskFile, intact);
+
+	rmSync(join(root, "notify-telegram.json"));
+	const bare = spawn("0d0e0200-0000-7000-8000-000000000009", "/home/dev/work/bare");
+	await bare.fire("session_start");
+	const unpaired = await bare.tools
+		.get("conductor")
+		.execute("inv", { action: "invite", session: "x", reason: "y" }, undefined, undefined, bare.ctx);
+	check(
+		"without a config the conductor tool says the bot is not paired",
+		unpaired.content[0].text.includes("setup.mjs"),
+	);
+	await bare.fire("session_shutdown");
+	writeConfig();
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
