@@ -244,6 +244,41 @@ export function settle(
 	return { state: next, granted, reclaimed };
 }
 
+/** `text` as one single-quoted shell word. */
+function shellWord(text: string): string {
+	return `'${text.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * `command` as it runs under lease `id`. It first takes the lease, which fails and runs nothing when the grant was
+ * already reclaimed, then runs as a group in the session's own shell with the holder on fd 9, so the holder lives
+ * exactly as long as the command and the shell keeps its state.
+ */
+export function wrapLeased(command: string, id: string, module: string, stateDir: string): string {
+	const runner = `node --disable-warning=ExperimentalWarning ${shellWord(module)}`;
+	return `${runner} take ${shellWord(stateDir)} ${id} && { ${command}\n} 9> >(exec ${runner} hold ${shellWord(stateDir)} ${id})`;
+}
+
+/**
+ * The plain command inside any number of wrappers `wrapLeased` made with this module and state directory. An agent
+ * reads the rewritten command in its transcript and may run that text again, and its old lease id would then refuse
+ * to run the command once that lease is gone.
+ */
+export function unwrapLeased(command: string, module: string, stateDir: string): string {
+	const runner = `node --disable-warning=ExperimentalWarning ${shellWord(module)}`;
+	const head = `${runner} take ${shellWord(stateDir)} `;
+	let inner = command;
+	for (;;) {
+		if (!inner.startsWith(head)) return inner;
+		const rest = inner.slice(head.length);
+		const opening = /^(l-[0-9a-f]{12}) && \{ /u.exec(rest);
+		if (opening === null) return inner;
+		const tail = `\n} 9> >(exec ${runner} hold ${shellWord(stateDir)} ${opening[1]})`;
+		if (!rest.endsWith(tail)) return inner;
+		inner = rest.slice(opening[0].length, rest.length - tail.length);
+	}
+}
+
 /** How long a taken grant waits for its holder, which starts a few milliseconds after the take. */
 const HOLDER_START_MS = 60_000;
 

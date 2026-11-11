@@ -62,6 +62,8 @@ import {
 	type LeasePolicy,
 	type Machine,
 	settle,
+	unwrapLeased,
+	wrapLeased,
 } from "./lease.ts";
 import { withFileLock, writeFileAtomic } from "./lock.ts";
 import { bordaPoints, byPriority, cpuWeight } from "./priority.ts";
@@ -1854,11 +1856,17 @@ async function sleepMs(ms: number): Promise<void> {
 
 /**
  * The hash of the extension files a process loaded. omp keeps the code of a merge from before in every
- * process it started, so a process re-reads these files each tick and compares the hash with its own.
+ * process it started, so a process re-reads these files each tick and compares the hash with its own. Every module
+ * beside `index.ts` counts, so a merge that only adds one still reads as new code to every older process, and the
+ * first six keep their historical order so processes started before modules were listed agree on the hash.
  */
 function codeStampOfFiles(): string {
+	const known = ["index.ts", "render.ts", "graph.ts", "priority.ts", "lease.ts", "lock.ts"];
+	const extra = readdirSync(dirname(new URL(import.meta.url).pathname))
+		.filter((name) => name.endsWith(".ts") && !known.includes(name))
+		.sort();
 	const hash = createHash("sha256");
-	for (const name of ["index.ts", "render.ts", "graph.ts", "priority.ts", "lease.ts", "lock.ts"]) {
+	for (const name of [...known, ...extra]) {
 		hash.update(readFileSync(new URL(`./${name}`, import.meta.url).pathname));
 	}
 	return hash.digest("hex");
@@ -10238,8 +10246,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 */
 	pi.on("tool_call", async (event, ctx) => {
 		const input = event.input as Record<string, unknown>;
-		const command = input.command;
-		if (event.toolName !== "bash" || typeof command !== "string" || !isHeavy(command)) return undefined;
+		// An agent that runs a rewritten command again from its transcript gets its plain command leased afresh.
+		const command = typeof input.command === "string" ? unwrapLeased(input.command, LEASE_MODULE, STATE_DIR) : null;
+		if (event.toolName !== "bash" || command === null || !isHeavy(command)) return undefined;
 		const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
 		const { points, marked } = readTally("resources");
 		const leaseCtx = {
@@ -10254,12 +10263,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const admitted = admitLease(state, ask, leaseCtx);
 			return { state: admitted.state, result: admitted.outcome };
 		});
-		const quoted = (text: string): string => `'${text.replaceAll("'", "'\\''")}'`;
 		if (outcome.kind === "grant") {
-			const lease = `node --disable-warning=ExperimentalWarning ${quoted(LEASE_MODULE)}`;
-			const take = `${lease} take ${quoted(STATE_DIR)} ${outcome.id}`;
-			const holder = `exec ${lease} hold ${quoted(STATE_DIR)} ${outcome.id}`;
-			return { input: { ...input, command: `${take} && { ${command}\n} 9> >(${holder})` } };
+			return { input: { ...input, command: wrapLeased(command, outcome.id, LEASE_MODULE, STATE_DIR) } };
 		}
 		const waits = [
 			...outcome.blockers,
