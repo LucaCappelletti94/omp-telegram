@@ -92,6 +92,37 @@ heading("leased command wrapper");
 		"an invented lease id in a written-out wrapper unwraps all the same",
 		unwrapLeased(wrapped.replaceAll("l-0123456789ab", "l-bd13d16f8bfc"), module, dir) === "cargo test -p x",
 	);
+	const quoted = `printf '%s\\n' "${wrapped}"; cargo check`;
+	check("wrapper text inside double quotes is data and stays as it is", unwrapLeased(quoted, module, dir) === quoted);
+	const heredoc = `cat <<'EOF' > notes.txt\n${wrapped}\nEOF\ncargo check`;
+	check("wrapper text inside a heredoc is data and stays as it is", unwrapLeased(heredoc, module, dir) === heredoc);
+	check(
+		"a wrapper run after a heredoc unwraps",
+		unwrapLeased(`cat <<-END\n\tx\n\tEND\n${wrapped}`, module, dir) === "cat <<-END\n\tx\n\tEND\ncargo test -p x",
+	);
+	const escaped = `echo \\"${wrapped}`;
+	check(
+		"an escaped quote opens no string, and a wrapper there is an argument",
+		unwrapLeased(escaped, module, dir) === escaped,
+	);
+	check(
+		"a wrapper inside a brace group unwraps",
+		unwrapLeased(`{ ${wrapped}\n}`, module, dir) === "{ cargo test -p x\n}",
+	);
+	check(
+		"an unclosed single quote runs to the end as data",
+		unwrapLeased('echo "x" \'tail', module, dir) === 'echo "x" \'tail',
+	);
+	check(
+		"a heredoc word that is not a plain word opens nothing, so a wrapper after it unwraps",
+		unwrapLeased(`cat << $END; ${wrapped}`, module, dir) === "cat << $END; cargo test -p x",
+	);
+	check(
+		"a shift is no heredoc, so a wrapper after it unwraps",
+		unwrapLeased(`echo $(( (1<<2) )); ${wrapped}`, module, dir) === "echo $(( (1<<2) )); cargo test -p x",
+	);
+	const open = `cat <<EOF\n${wrapped}`;
+	check("a heredoc that never closes keeps the rest as data", unwrapLeased(open, module, dir) === open);
 	check(
 		"a wrapper naming another module is left as it is",
 		unwrapLeased(wrapLeased("make", "l-0123456789ab", "/other/lease.ts", dir), module, dir).startsWith("node "),

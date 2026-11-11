@@ -48,7 +48,7 @@ case "$1 $2" in
 		if [ -e "${systemdUnits}/$1.gone" ]; then
 			printf 'Id=%s\\nLoadState=not-found\\nCPUWeight=[not set]\\n\\n' "$1"
 		else
-			printf 'Id=%s\\nLoadState=loaded\\nCPUWeight=%s\\n\\n' "$1" "$(cat "${systemdUnits}/$1" 2>/dev/null || echo '[not set]')"
+			printf 'Id=%s\\nLoadState=loaded\\nCPUWeight=%s\\nMemoryHigh=%s\\n\\n' "$1" "$(cat "${systemdUnits}/$1" 2>/dev/null || echo '[not set]')" "$(cat "${systemdUnits}/$1.MemoryHigh" 2>/dev/null || echo infinity)"
 		fi
 		shift
 	done ;;
@@ -18593,23 +18593,34 @@ heading("resource leases for heavy commands");
 				.join() === leaseOf(rival?.input?.command),
 	);
 
-	// A session started without a readable config file admits under the default limit of four, past the single slot.
-	rmSync(join(root, "notify-telegram.json"));
-	const bare = spawn("0c1ea5e4-0000-7000-8000-000000000004", "/home/dev/lease/bare");
-	await bare.fire("session_start");
-	const unconfigured = (await bare.fire("tool_call", { toolName: "bash", input: { command: "cargo doc" } })).find(
-		(r) => r !== undefined,
-	);
-	check("without a config file the default limits apply", leaseOf(unconfigured?.input?.command) !== undefined);
-	const echoed = (
-		await bare.fire("tool_call", { toolName: "bash", input: { command: unconfigured.input.command } })
-	).find((r) => r !== undefined);
+	// Four slots now, so mid can hold more than its rival grant.
+	writeConfig({ leases: { limit: 4 } });
+	mid.heartbeat();
+	await settle(100);
+	const first = await call("mid", "cargo doc");
+	const echoed = await call("mid", first.input.command);
 	check(
 		"a rewritten command run again is unwrapped and leased afresh",
 		leaseOf(echoed?.input?.command) !== undefined &&
-			leaseOf(echoed.input.command) !== leaseOf(unconfigured.input.command) &&
+			leaseOf(echoed.input.command) !== leaseOf(first.input.command) &&
 			echoed.input.command.split(" take ").length === 2 &&
 			echoed.input.command.includes("&& { cargo doc\n}"),
+	);
+	const data = `printf '%s\\n' "${first.input.command}" > notes.txt; cargo check`;
+	const printed = await call("mid", data);
+	check(
+		"wrapper text a command only prints stays as written while the command is leased",
+		printed?.input?.command.includes(`&& { ${data}\n}`) === true,
+	);
+
+	// A session started without a readable config file has the extension disabled and no poller to schedule it.
+	rmSync(join(root, "notify-telegram.json"));
+	const bare = spawn("0c1ea5e4-0000-7000-8000-000000000004", "/home/dev/lease/bare");
+	await bare.fire("session_start");
+	const unconfigured = await bare.fire("tool_call", { toolName: "bash", input: { command: "cargo doc" } });
+	check(
+		"without a config file heavy commands run unleased",
+		unconfigured.every((r) => r === undefined) && !leases().queue.some((q) => q.session === ""),
 	);
 	await bare.fire("session_shutdown");
 	writeConfig();
@@ -18771,7 +18782,7 @@ heading("memory backstop for lower-ranked sessions");
 	rmSync(join(systemdUnits, "fail-show"));
 	check(
 		"a failed systemctl show caps nothing that tick",
-		!readFileSync(systemdLog, "utf8").includes("MemoryHigh") && tracked() === "",
+		!readFileSync(systemdLog, "utf8").includes("MemoryHigh=") && tracked() === "",
 	);
 	rmSync(join(systemRoot, "sys/fs/cgroup", g2.path, "memory.current"));
 	await tick();
@@ -18781,8 +18792,8 @@ heading("memory backstop for lower-ranked sessions");
 	await tick();
 	rmSync(join(systemdUnits, "fail-set-property"));
 	check(
-		"a failed cap write is logged and leaves the scope untracked",
-		tracked() === "" && alpha.warns.some((w) => w.m === "memory cap write failed"),
+		"a failed cap write is logged and the cap stays recorded for the next tick",
+		tracked() === g2.unit && capOf(g2.unit) === "" && alpha.warns.some((w) => w.m === "memory cap write failed"),
 	);
 	await tick();
 	check("the next tick tries again", capOf(g2.unit) === "2200" && tracked() === g2.unit);
@@ -18820,8 +18831,20 @@ heading("memory backstop for lower-ranked sessions");
 		"a failed lift is logged and the scope stays tracked for the next tick",
 		alpha.warns.some((w) => w.m === "memory cap lift failed") && tracked().includes(suiteUnit),
 	);
-	vote(alphaLast);
+	// beta joins alpha's pane scope, and both rank last, so the scope stays capped for the two of them.
+	const betaId = "0d0e0002-0000-7000-8000-000000000002";
+	process.env.TMUX_PANE = "%82";
+	const beta = spawn(betaId, "/home/dev/memory/beta");
+	await beta.fire("session_start");
+	delete process.env.TMUX_PANE;
+	vote({
+		[alphaId]: [g1.id, g3.id, betaId],
+		[betaId]: [g1.id, g3.id, alphaId],
+		[g1.id]: [g3.id, alphaId, betaId],
+		[g3.id]: [g1.id, alphaId, betaId],
+	});
 	await tick();
+	const sharedCap = capOf(suiteUnit);
 	writeFileSync(systemdLog, "");
 	await alpha.fire("session_shutdown");
 	check(
@@ -18831,26 +18854,56 @@ heading("memory backstop for lower-ranked sessions");
 			readFileSync(systemdLog, "utf8").includes("MemoryHigh=\n") &&
 			capOf(suiteUnit) === "",
 	);
-
-	// beta takes over the poller, ranks last, and closes while its own cap is still being decided.
-	rmSync(join(stateDir, "memory-high-scopes"), { recursive: true, force: true });
-	const betaId = "0d0e0002-0000-7000-8000-000000000002";
-	process.env.TMUX_PANE = "%82";
-	const beta = spawn(betaId, "/home/dev/memory/beta");
-	await beta.fire("session_start");
-	delete process.env.TMUX_PANE;
-	// beta ranks first while it takes the lock, then last for the pass it closes during.
-	vote({ [betaId]: [g1.id, g3.id], [g1.id]: [betaId, g3.id], [g3.id]: [betaId, g1.id] });
+	beta.heartbeat();
+	await settle(150);
+	jump(31_000);
+	for (const ghost of live) writeGhost(ghost);
 	beta.heartbeat();
 	await settle(400);
-	vote({ [betaId]: [g1.id, g3.id], [g1.id]: [g3.id, betaId], [g3.id]: [g1.id, betaId] });
+	check(
+		"the cap a closing session lifted from a scope it shared comes back for the session still in it",
+		sharedCap !== "" && capOf(suiteUnit) === sharedCap,
+	);
+
+	// beta's cap is decided afresh, and beta closes while its write is still running.
+	rmSync(join(stateDir, "memory-high-scopes"), { recursive: true, force: true });
+	rmSync(join(systemdUnits, `${suiteUnit}.MemoryHigh`), { force: true });
 	writeFileSync(systemdLog, "");
-	writeFileSync(join(systemdUnits, "slow-show"), "");
+	writeFileSync(join(systemdUnits, "slow-set-property"), "");
 	jump(31_000);
 	for (const ghost of live) writeGhost(ghost);
 	beta.heartbeat();
 	await settle(100);
 	await beta.fire("session_shutdown");
+	await settle(800);
+	rmSync(join(systemdUnits, "slow-set-property"));
+	const betaLog = readFileSync(systemdLog, "utf8");
+	check(
+		"a closing session lifts a cap whose write was still running when it closed",
+		capOf(suiteUnit) === "" &&
+			betaLog.indexOf(`${suiteUnit} MemoryHigh=5`) !== -1 &&
+			betaLog.lastIndexOf("MemoryHigh=\n") > betaLog.indexOf(`${suiteUnit} MemoryHigh=5`),
+	);
+
+	// gamma takes over the poller, ranks last, and closes while its own cap is still being decided.
+	rmSync(join(stateDir, "memory-high-scopes"), { recursive: true, force: true });
+	const gammaId = "0d0e0003-0000-7000-8000-000000000003";
+	process.env.TMUX_PANE = "%83";
+	const gamma = spawn(gammaId, "/home/dev/memory/gamma");
+	await gamma.fire("session_start");
+	delete process.env.TMUX_PANE;
+	// gamma ranks first while it takes the lock, then last for the pass it closes during.
+	vote({ [gammaId]: [g1.id, g3.id], [g1.id]: [gammaId, g3.id], [g3.id]: [gammaId, g1.id] });
+	gamma.heartbeat();
+	await settle(400);
+	vote({ [gammaId]: [g1.id, g3.id], [g1.id]: [g3.id, gammaId], [g3.id]: [g1.id, gammaId] });
+	writeFileSync(systemdLog, "");
+	writeFileSync(join(systemdUnits, "slow-show"), "");
+	jump(31_000);
+	for (const ghost of live) writeGhost(ghost);
+	gamma.heartbeat();
+	await settle(100);
+	await gamma.fire("session_shutdown");
 	await settle(800);
 	rmSync(join(systemdUnits, "slow-show"));
 	check(

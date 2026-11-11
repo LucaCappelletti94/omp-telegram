@@ -7262,7 +7262,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** Delivers what was held for this session, in the order it happened. */
 	function drainPending(): void {
-		if (sessionCtx === null || !sessionAlive || !registered) return;
+		if (sessionCtx === null || config === null || !sessionAlive || !registered) return;
 		if (crashNote !== null) {
 			const content = crashNote;
 			crashNote = null;
@@ -7300,7 +7300,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			// A grant is worth reading only while its reservation holds, which a resumed session has long outlived.
 			if (item.kind === "lease") {
-				const reserveMs = leasePolicy().reserveMs;
+				const reserveMs = config.leases.reserveMs;
 				if (Date.now() - item.at > reserveMs) continue;
 				pi.sendMessage(
 					{
@@ -8188,16 +8188,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 */
 	function priorityTick(): void {
 		const now = Date.now();
-		if (priorityWork !== null || now - lastPriorityTick < PRIORITY_TICK_MS) return;
+		const cfg = config;
+		if (cfg === null || priorityWork !== null || now - lastPriorityTick < PRIORITY_TICK_MS) return;
 		lastPriorityTick = now;
-		const work = applyPriority().finally(() => {
+		const work = applyPriority(cfg.leases).finally(() => {
 			priorityWork = null;
 		});
 		priorityWork = work;
 		detach(() => work, "priority");
 	}
 
-	async function applyPriority(): Promise<void> {
+	async function applyPriority(policy: LeasePolicy): Promise<void> {
 		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
 		const ids = live.map(({ id }) => id);
 		const ballots = [...readBallots()];
@@ -8218,7 +8219,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 		await markFocusWinner(live, focus.points, panes);
 		await weightScopes(live, resources, marked);
-		await capScopes(live, resources, marked);
+		await capScopes(live, resources, marked, policy);
 	}
 
 	/** Each tmux pane's window, whether the user marked that window, and whether it carries the vote's mark. */
@@ -8357,21 +8358,24 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/**
 	 * The memory backstop. While an episode is on, each scope whose live sessions all sit in the lower half of the
-	 * resource vote gets `MemoryHigh` at 110 % of its use when first capped, fixed for the episode so it cannot
-	 * ratchet upward. A scope that leaves that half, loses its sessions or outlives the episode gets its cap lifted.
-	 * A unit the user manager no longer loads is forgotten without a write.
+	 * resource vote gets `MemoryHigh` at 110 % of its use when first capped, recorded in `memory-high-scopes/` and
+	 * fixed for the episode so it cannot ratchet upward. Every tick sets the recorded cap again wherever the kernel
+	 * holds another value, so a cap a closing session lifted from a scope it shared comes back. A scope that leaves
+	 * that half, loses its sessions or outlives the episode gets its cap lifted. A unit the user manager no longer
+	 * loads is forgotten without a write.
 	 */
 	async function capScopes(
 		live: ReadonlyArray<{ id: string; record: SessionRecord }>,
 		resources: { points: ReadonlyMap<string, number> },
 		marked: ReadonlySet<string>,
+		policy: LeasePolicy,
 	): Promise<void> {
 		const saved = readJsonFile(BACKSTOP_FILE) as Partial<Backstop> | null;
 		const prev = {
 			active: saved?.active === true,
 			calmSince: typeof saved?.calmSince === "number" ? saved.calmSince : 0,
 		};
-		const episode = backstopStep(prev, readMachine().memory, leasePolicy().memoryPressure, Date.now());
+		const episode = backstopStep(prev, readMachine().memory, policy.memoryPressure, Date.now());
 		if (episode.active !== prev.active || episode.calmSince !== prev.calmSince) {
 			writeFileAtomic(BACKSTOP_FILE, JSON.stringify(episode), 0o600);
 		}
@@ -8387,45 +8391,57 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			scopes.set(cgroup.unit, { path: cgroup.path, capped: allCapped });
 		}
 		const tracked = new Set(existsSync(MEMORY_HIGH_DIR) ? readdirSync(MEMORY_HIGH_DIR).filter(isStateToken) : []);
-		const cap = episode.active
-			? [...scopes]
-					.filter(([unit, scope]) => scope.capped && !tracked.has(unit))
-					.map(([unit, scope]) => ({ unit, path: scope.path }))
-			: [];
+		const want = episode.active ? [...scopes].filter(([, scope]) => scope.capped) : [];
 		const lift = [...tracked].filter((unit) => !episode.active || scopes.get(unit)?.capped !== true);
-		if (cap.length === 0 && lift.length === 0) return;
-		const units = [...cap.map(({ unit }) => unit), ...lift];
-		const shown = await run("systemctl", ["--user", "show", "-p", "Id", "-p", "LoadState", ...units], 5_000);
+		const units = [...want.map(([unit]) => unit), ...lift];
+		if (units.length === 0) return;
+		const shown = await run(
+			"systemctl",
+			["--user", "show", "-p", "Id", "-p", "LoadState", "-p", "MemoryHigh", ...units],
+			5_000,
+		);
 		// A failed read proves nothing about any scope, so every listed one waits for the next tick.
 		if (!shown.ok) return;
-		const loaded = new Set<string>();
+		const kernelCap = new Map<string, string | undefined>();
 		for (const block of shown.stdout.split("\n\n")) {
 			const id = /^Id=(.*)$/mu.exec(block)?.[1];
-			if (id !== undefined && /^LoadState=loaded$/mu.test(block)) loaded.add(id);
+			if (id !== undefined && /^LoadState=loaded$/mu.test(block)) {
+				kernelCap.set(id, /^MemoryHigh=(.*)$/mu.exec(block)?.[1]);
+			}
 		}
-		for (const { unit, path } of cap) {
-			if (!loaded.has(unit)) continue;
-			let current = Number.NaN;
-			try {
-				current = Number.parseInt(
-					readFileSync(join(SYSTEM_ROOT, "/sys/fs/cgroup", path, "memory.current"), "utf8"),
-					10,
-				);
-			} catch {}
-			if (!Number.isFinite(current)) continue;
+		for (const [unit, scope] of want) {
 			// A closing process writes no further cap, so the lift its shutdown sends is the last word.
 			if (!sessionAlive) return;
-			const bytes = Math.ceil((current * 11) / 10);
+			if (!kernelCap.has(unit)) continue;
+			const set = kernelCap.get(unit);
+			const recorded = tracked.has(unit)
+				? (readJsonFile(join(MEMORY_HIGH_DIR, unit)) as { bytes?: unknown } | null)?.bytes
+				: undefined;
+			let bytes = typeof recorded === "number" ? recorded : Number.NaN;
+			if (!Number.isFinite(bytes)) {
+				let current = Number.NaN;
+				try {
+					current = Number.parseInt(
+						readFileSync(join(SYSTEM_ROOT, "/sys/fs/cgroup", scope.path, "memory.current"), "utf8"),
+						10,
+					);
+				} catch {}
+				if (!Number.isFinite(current)) continue;
+				bytes = Math.ceil((current * 11) / 10);
+				// Recorded before it is written, so a session closing meanwhile finds the cap and lifts it.
+				writePrivateJson(MEMORY_HIGH_DIR, unit, { bytes });
+			}
+			if (set === String(bytes)) continue;
 			const written = await run(
 				"systemctl",
 				["--user", "set-property", "--runtime", unit, `MemoryHigh=${bytes}`],
 				5_000,
 			);
-			if (written.ok) writePrivateJson(MEMORY_HIGH_DIR, unit, { bytes });
-			else pi.logger.warn("memory cap write failed", { unit, bytes, stderr: written.stderr });
+			// The recorded cap stays, so the next tick writes it again.
+			if (!written.ok) pi.logger.warn("memory cap write failed", { unit, bytes, stderr: written.stderr });
 		}
 		for (const unit of lift) {
-			if (!loaded.has(unit)) {
+			if (!kernelCap.has(unit)) {
 				removeStatePath(MEMORY_HIGH_DIR, unit);
 				continue;
 			}
@@ -8439,17 +8455,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** The poller's lease pass while it runs, so a tick never starts a second one. */
 	let leaseWork: Promise<void> | null = null;
 
-	/** The configured lease limits, or the defaults while no config file is readable. */
-	function leasePolicy(): LeasePolicy {
-		return config?.leases ?? DEFAULT_LEASE_POLICY;
-	}
-
 	/**
 	 * Reclaims leases whose holder died or never started, and grants free slots to the queue in resource-vote order.
 	 * Each grant reaches its session as an aside, since the session was told a grant would wake it.
 	 */
 	function leaseTick(): void {
-		if (leaseWork !== null || !existsSync(join(STATE_DIR, "leases.json"))) return;
+		const cfg = config;
+		if (cfg === null || leaseWork !== null || !existsSync(join(STATE_DIR, "leases.json"))) return;
 		const live = new Set(
 			allRecords()
 				.filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS)
@@ -8459,7 +8471,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const ctx = {
 			rank: byPriority(points, marked, () => 0),
 			machine: readMachine(),
-			policy: leasePolicy(),
+			policy: cfg.leases,
 			now: Date.now(),
 			live,
 			alive: processRuns,
@@ -10333,8 +10345,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 * runs nothing when approval or scheduling delayed it past the grant's expiry. It then runs as a group in the
 	 * session's own shell with the lease holder on fd 9, so the holder lives exactly as long as the command and the
 	 * shell keeps its state. A refused one runs nothing, and the poller's grant wakes the session later.
+	 *
+	 * With the extension disabled for want of a config, no poller runs, so nothing could ever grant a queued command
+	 * or reclaim a dead holder, and heavy commands run unleased.
 	 */
 	pi.on("tool_call", async (event, ctx) => {
+		const cfg = config;
+		if (cfg === null) return undefined;
 		const input = event.input as Record<string, unknown>;
 		// An agent that runs a rewritten command again from its transcript gets its plain command leased afresh.
 		const command = typeof input.command === "string" ? unwrapLeased(input.command, LEASE_MODULE, STATE_DIR) : null;
@@ -10344,7 +10361,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const leaseCtx = {
 			rank: byPriority(points, marked, () => 0),
 			machine: readMachine(),
-			policy: leasePolicy(),
+			policy: cfg.leases,
 			now: Date.now(),
 		};
 		const ask = { session: sessionId, id: `l-${randomUUID().replaceAll("-", "").slice(0, 12)}`, command, cwd };
@@ -10673,17 +10690,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// A process that only waited on an id another process holds owns no ballot under it.
 		if (registered && !keepForRestore) removeStatePath(BALLOT_DIR, `${sessionId}.json`);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-		// No poller tick follows the last omp's exit, so the scope its shell keeps gets its default weight and no
-		// memory cap back here, after any write this process is still making. The scope stays tracked, so a weight or
-		// cap another poller wrote in the meantime is given back at its next tick.
+		// No poller tick follows the last omp's exit, so the scope its shell keeps is given back its defaults here.
 		const ownUnit = cgroupOf(process.pid)?.unit;
-		const resets = [
-			...(ownUnit !== undefined && existsSync(join(WEIGHTED_SCOPES_DIR, ownUnit)) ? ["CPUWeight="] : []),
-			...(ownUnit !== undefined && existsSync(join(MEMORY_HIGH_DIR, ownUnit)) ? ["MemoryHigh="] : []),
-		];
-		if (registered && ownUnit !== undefined && resets.length > 0) {
+		if (registered && ownUnit !== undefined) {
+			// Markers are read after the pass in flight, which records a cap before writing it.
 			if (priorityWork !== null) await Promise.race([priorityWork.catch(() => undefined), sleepMs(500)]);
-			await run("systemctl", ["--user", "set-property", "--runtime", ownUnit, ...resets], 1_000);
+			const resets = [
+				...(existsSync(join(WEIGHTED_SCOPES_DIR, ownUnit)) ? ["CPUWeight="] : []),
+				...(existsSync(join(MEMORY_HIGH_DIR, ownUnit)) ? ["MemoryHigh="] : []),
+			];
+			if (resets.length > 0) await run("systemctl", ["--user", "set-property", "--runtime", ownUnit, ...resets], 1_000);
 		}
 		releaseLock();
 		// Handing the board on rather than leaving the next owner to wait out a stale claim.
