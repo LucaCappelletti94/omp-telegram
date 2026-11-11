@@ -7746,6 +7746,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				launchedAt: Date.now(),
 				members: [],
 				candidates: [],
+				led: [],
 			};
 			return { task: fresh, result: { kind: "open", task: fresh } };
 		});
@@ -7788,6 +7789,29 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const item: PendingItem = { kind: "lead", at: Date.now(), task: task.name, text };
 		writePrivateJson(join(PENDING_DIR, task.conductor), `lead-${Date.now()}-${randomUUID().slice(0, 8)}.json`, item);
 		if (!isLiveSession(task.conductor)) detach(() => raiseResumeCard(task.conductor), "resume card");
+	}
+
+	/**
+	 * Tells each live task's conductor about this session at its turn end, once while the session stays live, so the
+	 * conductor can invite it. Its own conductor, a task's members and candidates, and conductors themselves are skipped.
+	 */
+	async function leadConductors(ctx: ExtensionContext, headline: string): Promise<void> {
+		const tasks = listTasks(TASKS_DIR);
+		if (!registered || tasks.some((task) => task.conductor === sessionId)) return;
+		const text = `${badge(ctx)} (tag ${sessionTag}) in ${ctx.cwd} ended a turn: ${headline} Invite it with the conductor tool if it works on this task.`;
+		for (const { slug } of tasks) {
+			const led = await updateTask(TASKS_DIR, slug, (task) => {
+				const judged =
+					task.state !== "live" ||
+					task.led.includes(sessionId) ||
+					task.members.some((member) => member.session === sessionId) ||
+					task.candidates.some((candidate) => candidate.session === sessionId);
+				if (judged) return { task: null, result: null };
+				const still = task.led.filter((id) => isLiveSession(id));
+				return { task: { ...task, led: [...still, sessionId] }, result: task };
+			});
+			if (led !== null) sendLead(led, text);
+		}
 	}
 
 	/** What Luca's tap on an invitation card did to the task and the invited session. */
@@ -10903,6 +10927,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				turnSummary = null;
 				return;
 			}
+		}
+		// Conductors hear of a session at its turn end whether or not turn ends reach Telegram.
+		if (turnSummary !== null) {
+			const headline = turnSummary.text.replace(/\n[\s\S]*$/u, "").trim();
+			detach(() => leadConductors(ctx, headline), "conductor leads");
 		}
 		if (config === null || !config.notifyOnTurnEnd) return;
 		const quiet = Date.now() - lastLocalInput < config.quietSeconds * 1000;

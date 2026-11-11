@@ -19411,6 +19411,97 @@ heading("conductor invites and members");
 	writeConfig();
 }
 
+heading("conductors hear of sessions they have not judged");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const taskOf = (slug) => JSON.parse(readFileSync(join(tasksDir, `${slug}.json`), "utf8"));
+	const writeTask = (slug, conductor, state, members = []) =>
+		writeFileSync(
+			join(tasksDir, `${slug}.json`),
+			JSON.stringify({
+				name: slug,
+				slug,
+				brief: "b",
+				conductor,
+				state,
+				launchedAt: 0,
+				members: members.map((session) => ({ session, joinedAt: 1 })),
+				candidates: [],
+				led: [],
+			}),
+		);
+	const ids = Object.fromEntries(
+		["docs", "other", "sleepy", "worker", "member", "late"].map((name, i) => [
+			name,
+			`0d0e0300-0000-7000-8000-00000000000${i + 1}`,
+		]),
+	);
+	writeTask("docs", ids.docs, "live", [ids.member]);
+	writeTask("other", ids.other, "live");
+	writeTask("sleepy", ids.sleepy, "dormant");
+	const docs = spawn(ids.docs, join(tasksDir, "docs"));
+	await docs.fire("session_start");
+	const other = spawn(ids.other, join(tasksDir, "other"));
+	await other.fire("session_start");
+	const endTurn = async (s, summary) => {
+		await s.tools.get("notify_status").execute("lead", { summary, urgency: "orange" }, undefined, undefined, s.ctx);
+		await s.fire("session_stop");
+		await settle(200);
+	};
+	const leadsTo = async (s) => {
+		await s.pump(150);
+		return s.customs.filter((c) => String(c.message.content).startsWith("Automatic conductor update"));
+	};
+
+	const worker = spawn(ids.worker, "/home/dev/work/docs-build");
+	await worker.fire("session_start");
+	await endTurn(worker, "Fixed the docs build.");
+	const docsLeads = await leadsTo(docs);
+	check(
+		"a session's turn end leads every live conductor with its summary and tag",
+		docsLeads.length === 1 &&
+			String(docsLeads[0].message.content).includes("Fixed the docs build.") &&
+			String(docsLeads[0].message.content).includes(record(ids.worker).tag) &&
+			(await leadsTo(other)).length === 1,
+	);
+	check(
+		"a dormant task's conductor hears nothing",
+		!existsSync(join(stateDir, "graph/pending", ids.sleepy)) && !taskOf("sleepy").led.includes(ids.worker),
+	);
+	await endTurn(worker, "Docs deployed.");
+	check("a session already led about is not led about again", (await leadsTo(docs)).length === 1);
+
+	await endTurn(other, "Watching the other task.");
+	await endTurn(docs, "Watching the docs task.");
+	check(
+		"a conductor is never led about itself or another conductor",
+		(await leadsTo(docs)).length === 1 && (await leadsTo(other)).length === 1,
+	);
+
+	const member = spawn(ids.member, "/home/dev/work/docs-site");
+	await member.fire("session_start");
+	await endTurn(member, "Restyled the docs site.");
+	check(
+		"a member is not led about to its own conductor, only to others",
+		(await leadsTo(docs)).length === 1 && (await leadsTo(other)).length === 2,
+	);
+
+	await worker.fire("session_shutdown");
+	const late = spawn(ids.late, "/home/dev/work/late");
+	await late.fire("session_start");
+	await endTurn(late, "Started late.");
+	check(
+		"sessions no longer live are dropped from those already led about",
+		!taskOf("docs").led.includes(ids.worker) && taskOf("docs").led.includes(ids.late),
+	);
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
