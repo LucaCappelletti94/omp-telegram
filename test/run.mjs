@@ -17155,6 +17155,20 @@ echo done >> ${wghLog}
 			greenSent: false,
 			reviews: [1],
 		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			url: "u",
+			by: w1Id,
+			at: 1,
+			seeded: false,
+			ended: "yes",
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: [],
+		}),
 	];
 	bad.forEach((content, i) => {
 		writeFileSync(join(w1w, `bad-${i}.json`), content);
