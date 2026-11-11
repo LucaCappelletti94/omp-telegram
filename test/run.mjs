@@ -53,8 +53,16 @@ case "$1 $2" in
 		shift
 	done ;;
 "--user set-property")
-	value=\${5#CPUWeight=}
-	if [ -z "$value" ]; then rm -f "${systemdUnits}/$4"; else echo "$value" > "${systemdUnits}/$4"; fi ;;
+	unit="$4"
+	shift 4
+	for assignment in "$@"; do
+		case "$assignment" in
+		CPUWeight=*) value=\${assignment#CPUWeight=}; file="${systemdUnits}/$unit" ;;
+		MemoryHigh=*) value=\${assignment#MemoryHigh=}; file="${systemdUnits}/$unit.MemoryHigh" ;;
+		*) continue ;;
+		esac
+		if [ -z "$value" ]; then rm -f "$file"; else echo "$value" > "$file"; fi
+	done ;;
 *) echo running ;;
 esac
 `,
@@ -68,16 +76,22 @@ const writeConfig = (extra = {}) =>
 		{ mode: 0o600 },
 	);
 writeConfig();
-/** Stands in for `/proc/pressure`, calm unless a test writes a load, so no lease waits on the machine running the suite. */
-const pressureDir = join(root, "pressure");
+/**
+ * Stands in for the kernel's `/proc` and `/sys/fs/cgroup`. Pressure stays calm unless a test writes a load, so no
+ * lease waits on the machine running the suite, and the suite's own process keeps the cgroup it really has.
+ */
+const systemRoot = join(root, "system");
+const pressureDir = join(systemRoot, "proc/pressure");
 const setPressure = ({ cpu = 0, memory = 0, io = 0 } = {}) => {
 	for (const [kind, value] of Object.entries({ cpu, memory, io })) {
 		writeFileSync(join(pressureDir, kind), `some avg10=${value.toFixed(2)} avg60=0.00 avg300=0.00 total=1\n`);
 	}
 };
-mkdirSync(pressureDir);
+mkdirSync(pressureDir, { recursive: true });
 setPressure();
-process.env.OMP_TELEGRAM_PRESSURE_DIR = pressureDir;
+mkdirSync(join(systemRoot, `proc/${process.pid}`));
+writeFileSync(join(systemRoot, `proc/${process.pid}/cgroup`), readFileSync("/proc/self/cgroup"));
+process.env.OMP_TELEGRAM_SYSTEM_ROOT = systemRoot;
 
 const api = {
 	calls: [],
@@ -18601,6 +18615,250 @@ heading("resource leases for heavy commands");
 	writeConfig();
 	await mid.fire("session_shutdown");
 	await high.fire("session_shutdown");
+}
+
+heading("memory backstop for lower-ranked sessions");
+{
+	writeConfig();
+	setPressure();
+	const stateDir = join(root, "notify-telegram");
+	for (const name of [
+		"poller.lock",
+		"ballots",
+		"priority.json",
+		"weighted-scopes",
+		"memory-high-scopes",
+		"memory-backstop.json",
+	]) {
+		rmSync(join(stateDir, name), { recursive: true, force: true });
+	}
+	rmSync(sessionsDir, { recursive: true, force: true });
+	mkdirSync(sessionsDir, { recursive: true });
+	writeFileSync(systemdLog, "");
+	const suitePath = readFileSync("/proc/self/cgroup", "utf8").match(/^0::(.*)$/mu)?.[1] ?? "";
+	mkdirSync(join(systemRoot, "sys/fs/cgroup", suitePath), { recursive: true });
+	writeFileSync(join(systemRoot, "sys/fs/cgroup", suitePath, "memory.current"), "500\n");
+	const suiteUnit =
+		readFileSync("/proc/self/cgroup", "utf8")
+			.split("\n")
+			.find((line) => line.startsWith("0::"))
+			?.split("/")
+			.pop() ?? "";
+	const alphaId = "0d0e0001-0000-7000-8000-000000000001";
+	process.env.TMUX_PANE = "%81";
+	const alpha = spawn(alphaId, "/home/dev/memory/alpha");
+	await alpha.fire("session_start");
+	delete process.env.TMUX_PANE;
+	// Each other session is a live process placed in a pane scope of its own through the stand-in /proc.
+	const ghosts = {};
+	for (const name of ["g1", "g2", "g3"]) {
+		const child = startProcess("sleep", ["600"]);
+		const unit = `mem-${name}.scope`;
+		const path = `/user.slice/mem/${unit}`;
+		mkdirSync(join(systemRoot, `proc/${child.pid}`), { recursive: true });
+		writeFileSync(join(systemRoot, `proc/${child.pid}/cgroup`), `0::${path}\n`);
+		mkdirSync(join(systemRoot, "sys/fs/cgroup", path), { recursive: true });
+		ghosts[name] = { id: `0d0e010${name.slice(1)}-0000-7000-8000-00000000010${name.slice(1)}`, child, unit, path };
+	}
+	const { g1, g2, g3 } = ghosts;
+	const useMemory = (ghost, bytes) =>
+		writeFileSync(join(systemRoot, "sys/fs/cgroup", ghost.path, "memory.current"), `${bytes}\n`);
+	useMemory(g1, 1000);
+	useMemory(g2, 2000);
+	useMemory(g3, 3000);
+	const template = record(alphaId);
+	const writeGhost = (ghost) =>
+		writeFileSync(
+			join(sessionsDir, `${ghost.id}.json`),
+			JSON.stringify({
+				...template,
+				instance: ghost.id,
+				tag: ghost.unit,
+				pid: ghost.child.pid,
+				tmuxPane: `%9${ghost.id[7]}`,
+				heartbeat: Date.now(),
+			}),
+		);
+	const vote = (ballots) => {
+		mkdirSync(join(stateDir, "ballots"), { recursive: true });
+		for (const [voter, resources] of Object.entries(ballots)) {
+			writeFileSync(
+				join(stateDir, "ballots", `${voter}.json`),
+				JSON.stringify({ focus: [], resources, at: Date.now() }),
+			);
+		}
+	};
+	const live = new Set([g1, g2, g3]);
+	const tick = async (ms = 31_000) => {
+		jump(ms);
+		for (const ghost of live) writeGhost(ghost);
+		alpha.heartbeat();
+		await settle(400);
+	};
+	const capOf = (unit) =>
+		existsSync(join(systemdUnits, `${unit}.MemoryHigh`))
+			? readFileSync(join(systemdUnits, `${unit}.MemoryHigh`), "utf8").trim()
+			: "";
+	const tracked = () =>
+		existsSync(join(stateDir, "memory-high-scopes"))
+			? readdirSync(join(stateDir, "memory-high-scopes")).sort().join()
+			: "";
+	const episode = () => JSON.parse(readFileSync(join(stateDir, "memory-backstop.json"), "utf8"));
+	// Resource order alpha, g1, g2, g3, so g2 and g3 make up the lower half.
+	vote({
+		[alphaId]: [g1.id, g2.id, g3.id],
+		[g1.id]: [alphaId, g2.id, g3.id],
+		[g2.id]: [alphaId, g1.id, g3.id],
+		[g3.id]: [alphaId, g1.id, g2.id],
+	});
+
+	await tick();
+	check("a calm machine caps nobody", [g1, g2, g3].every((g) => capOf(g.unit) === "") && tracked() === "");
+
+	setPressure({ memory: 50 });
+	await tick();
+	check(
+		"under memory pressure the lower half is capped at 110 % of its use",
+		capOf(g2.unit) === "2200" && capOf(g3.unit) === "3300" && capOf(g1.unit) === "" && capOf(suiteUnit) === "",
+	);
+	check("each capped scope is tracked", tracked() === [g2.unit, g3.unit].sort().join());
+
+	useMemory(g3, 9000);
+	await tick();
+	check("a cap stays as set for the episode, so it cannot ratchet upward", capOf(g3.unit) === "3300");
+
+	// Everyone now ranks g3 first, so the order is g3, alpha, g1, g2.
+	vote({
+		[alphaId]: [g3.id, g1.id, g2.id],
+		[g1.id]: [g3.id, alphaId, g2.id],
+		[g2.id]: [g3.id, alphaId, g1.id],
+		[g3.id]: [alphaId, g1.id, g2.id],
+	});
+	await tick();
+	check(
+		"a session voted into the upper half has its cap lifted, and the one that fell is capped",
+		capOf(g3.unit) === "" && capOf(g1.unit) === "1100" && capOf(g2.unit) === "2200",
+	);
+
+	// g1's process now runs in alpha's scope, so g1's own scope has no live session and alpha's holds a higher one.
+	writeFileSync(join(systemRoot, `proc/${g1.child.pid}/cgroup`), readFileSync("/proc/self/cgroup"));
+	await tick();
+	check("a capped scope whose session is gone is lifted", capOf(g1.unit) === "" && !tracked().includes(g1.unit));
+	check("a scope that also holds a higher-ranked session is never capped", capOf(suiteUnit) === "");
+
+	setPressure({ memory: 7 });
+	await tick();
+	check(
+		"pressure under the threshold but over half of it keeps the caps",
+		capOf(g2.unit) === "2200" && episode().active,
+	);
+	setPressure({ memory: 2 });
+	await tick();
+	check(
+		"calm under half the threshold starts the clock without lifting yet",
+		capOf(g2.unit) === "2200" && episode().calmSince > 0,
+	);
+	await tick(5 * 60_000);
+	check(
+		"five calm minutes end the episode and lift every cap",
+		capOf(g2.unit) === "" && tracked() === "" && !episode().active,
+	);
+
+	setPressure({ memory: 50 });
+	writeFileSync(join(systemdUnits, "fail-show"), "");
+	writeFileSync(systemdLog, "");
+	await tick();
+	rmSync(join(systemdUnits, "fail-show"));
+	check(
+		"a failed systemctl show caps nothing that tick",
+		!readFileSync(systemdLog, "utf8").includes("MemoryHigh") && tracked() === "",
+	);
+	rmSync(join(systemRoot, "sys/fs/cgroup", g2.path, "memory.current"));
+	await tick();
+	check("a scope whose use cannot be read is left uncapped", capOf(g2.unit) === "" && tracked() === "");
+	useMemory(g2, 2000);
+	writeFileSync(join(systemdUnits, "fail-set-property"), "");
+	await tick();
+	rmSync(join(systemdUnits, "fail-set-property"));
+	check(
+		"a failed cap write is logged and leaves the scope untracked",
+		tracked() === "" && alpha.warns.some((w) => w.m === "memory cap write failed"),
+	);
+	await tick();
+	check("the next tick tries again", capOf(g2.unit) === "2200" && tracked() === g2.unit);
+
+	// g2 ends, and its unit is gone from the user manager by the next tick.
+	live.delete(g2);
+	rmSync(join(sessionsDir, `${g2.id}.json`));
+	writeFileSync(join(systemdUnits, `${g2.unit}.gone`), "");
+	writeFileSync(systemdLog, "");
+	await tick();
+	check(
+		"a tracked unit the user manager no longer loads is forgotten without a write",
+		tracked() === "" && !readFileSync(systemdLog, "utf8").includes(`${g2.unit} MemoryHigh`),
+	);
+
+	// g3 ranks last while its unit is gone from the user manager.
+	vote({ [alphaId]: [g1.id, g3.id], [g1.id]: [alphaId, g3.id], [g3.id]: [alphaId, g1.id] });
+	writeFileSync(join(systemdUnits, `${g3.unit}.gone`), "");
+	await tick();
+	rmSync(join(systemdUnits, `${g3.unit}.gone`));
+	check("a scope whose unit the user manager does not load is not capped", capOf(g3.unit) === "" && tracked() === "");
+
+	// alpha now ranks last, alone in its scope, so the poller caps its own scope.
+	const alphaLast = { [alphaId]: [g1.id, g3.id], [g1.id]: [g3.id, alphaId], [g3.id]: [g1.id, alphaId] };
+	vote(alphaLast);
+	writeFileSync(join(systemRoot, `proc/${g1.child.pid}/cgroup`), `0::${g1.path}\n`);
+	await tick();
+	const capped = capOf(suiteUnit) !== "";
+	// Voted first again while systemctl refuses every write, alpha's cap cannot be lifted yet.
+	vote({ [alphaId]: [g1.id, g3.id], [g1.id]: [alphaId, g3.id], [g3.id]: [alphaId, g1.id] });
+	writeFileSync(join(systemdUnits, "fail-set-property"), "");
+	await tick();
+	rmSync(join(systemdUnits, "fail-set-property"));
+	check(
+		"a failed lift is logged and the scope stays tracked for the next tick",
+		alpha.warns.some((w) => w.m === "memory cap lift failed") && tracked().includes(suiteUnit),
+	);
+	vote(alphaLast);
+	await tick();
+	writeFileSync(systemdLog, "");
+	await alpha.fire("session_shutdown");
+	check(
+		"a closing session lifts the cap on its own scope",
+		capped &&
+			readFileSync(systemdLog, "utf8").includes(`${suiteUnit} `) &&
+			readFileSync(systemdLog, "utf8").includes("MemoryHigh=\n") &&
+			capOf(suiteUnit) === "",
+	);
+
+	// beta takes over the poller, ranks last, and closes while its own cap is still being decided.
+	rmSync(join(stateDir, "memory-high-scopes"), { recursive: true, force: true });
+	const betaId = "0d0e0002-0000-7000-8000-000000000002";
+	process.env.TMUX_PANE = "%82";
+	const beta = spawn(betaId, "/home/dev/memory/beta");
+	await beta.fire("session_start");
+	delete process.env.TMUX_PANE;
+	// beta ranks first while it takes the lock, then last for the pass it closes during.
+	vote({ [betaId]: [g1.id, g3.id], [g1.id]: [betaId, g3.id], [g3.id]: [betaId, g1.id] });
+	beta.heartbeat();
+	await settle(400);
+	vote({ [betaId]: [g1.id, g3.id], [g1.id]: [g3.id, betaId], [g3.id]: [g1.id, betaId] });
+	writeFileSync(systemdLog, "");
+	writeFileSync(join(systemdUnits, "slow-show"), "");
+	jump(31_000);
+	for (const ghost of live) writeGhost(ghost);
+	beta.heartbeat();
+	await settle(100);
+	await beta.fire("session_shutdown");
+	await settle(800);
+	rmSync(join(systemdUnits, "slow-show"));
+	check(
+		"a poller that closes mid-pass never caps its own scope afterwards",
+		capOf(suiteUnit) === "" && !readFileSync(systemdLog, "utf8").includes(`${suiteUnit} MemoryHigh=5`),
+	);
+	for (const ghost of [g1, g2, g3]) ghost.child.kill();
+	setPressure();
 }
 
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
