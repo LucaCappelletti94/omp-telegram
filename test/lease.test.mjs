@@ -10,6 +10,7 @@ import {
 	DEFAULT_LEASE_POLICY,
 	hold,
 	isHeavy,
+	moveSessions,
 	parseLeases,
 	release,
 	settle,
@@ -325,6 +326,29 @@ heading("parsing");
 	});
 	check("well-formed entries survive", parsed.granted.length === 1 && parsed.queue.length === 1);
 	check("garbage reads as no leases", parseLeases("nope").granted.length === 0 && parseLeases(null).queue.length === 0);
+}
+
+heading("a session moved to a continuation id");
+{
+	const state = {
+		granted: [
+			{ id: "l1", session: "old", command: "c", grantedAt: 1, holder: null, bound: false, expires: 9 },
+			{ id: "l2", session: "other", command: "c", grantedAt: 1, holder: 4, bound: true, expires: 9 },
+		],
+		queue: [
+			{ id: "q1", session: "old", command: "c", cwd: "/w", requestedAt: 1 },
+			{ id: "q2", session: "other", command: "c", cwd: "/w", requestedAt: 2 },
+		],
+	};
+	const moved = moveSessions(state, new Set(["old"]), "new");
+	check(
+		"its granted and queued leases move to the new id and the others stay",
+		moved !== null &&
+			moved.granted.map((g) => g.session).join() === "new,other" &&
+			moved.queue.map((q) => q.session).join() === "new,other" &&
+			moved.granted[0].id === "l1",
+	);
+	check("a session holding no lease changes nothing", moveSessions(state, new Set(["absent"]), "new") === null);
 }
 
 const leaseModule = new URL("../lease.ts", import.meta.url).pathname;

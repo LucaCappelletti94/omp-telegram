@@ -386,6 +386,15 @@ export function release(state: Leases, id: string): Leases {
 	return { ...state, granted: state.granted.filter((grant) => grant.id !== id) };
 }
 
+/** Hands every lease of the sessions in `left` to `to`, the id omp moved them to, or null when none held one. */
+export function moveSessions(state: Leases, left: ReadonlySet<string>, to: string): Leases | null {
+	if (![...state.granted, ...state.queue].some((lease) => left.has(lease.session))) return null;
+	return {
+		granted: state.granted.map((grant) => (left.has(grant.session) ? { ...grant, session: to } : grant)),
+		queue: state.queue.map((queued) => (left.has(queued.session) ? { ...queued, session: to } : queued)),
+	};
+}
+
 /** The leases file's contents, dropping any entry that is not well formed. */
 export function parseLeases(raw: unknown): Leases {
 	const record = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
