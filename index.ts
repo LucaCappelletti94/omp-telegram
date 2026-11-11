@@ -6610,6 +6610,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	): { ballot: Ballot | null } | { refusal: string } {
 		const candidates = ballotCandidates();
 		if (candidates.length === 0) return { ballot: null };
+		const others = allRecords().filter(({ id }) => id !== sessionId);
 		const faults: string[] = [];
 		const resolveRanking = (name: "focus" | "resources", value: unknown): string[] | null => {
 			if (value === undefined) {
@@ -6623,13 +6624,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const ids: string[] = [];
 			for (const entry of value as string[]) {
 				const needle = entry.trim();
-				const prefix = /^[0-9a-f-]{8,36}$/u.test(needle.toLowerCase())
-					? candidates.filter(({ id }) => id.toLowerCase().startsWith(needle.toLowerCase()))
-					: [];
+				const byId = /^[0-9a-f-]{8,36}$/u.test(needle.toLowerCase());
+				const names = ({ id, record }: { id: string; record: SessionRecord }): boolean =>
+					(record.emoji.length > 0 && record.emoji === needle) ||
+					record.tag === needle ||
+					(byId && id.toLowerCase().startsWith(needle.toLowerCase()));
+				const prefix = byId ? candidates.filter(({ id }) => id.toLowerCase().startsWith(needle.toLowerCase())) : [];
 				const hit =
 					candidates.find(({ record }) => record.emoji.length > 0 && record.emoji === needle) ??
 					candidates.find(({ record }) => record.tag === needle) ??
 					(prefix.length === 1 ? prefix[0] : undefined);
+				// A session that ended after the agent read the list counts for nobody, as in the tally, so it is dropped.
+				if (hit === undefined && others.some(names)) continue;
 				if (hit === undefined) {
 					const own = needle === sessionTag || (badgeEmoji.length > 0 && needle === badgeEmoji);
 					faults.push(`\`${name}\` names ${needle}, ${own ? "this session itself" : "no other live session"}`);

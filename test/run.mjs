@@ -17980,6 +17980,23 @@ esac
 		"a ranking may name sessions by an id prefix",
 		JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.gamma, ids.beta]),
 	);
+	// Gamma's heartbeat lapses between the listing and the vote, as when its omp exits mid-turn.
+	const gammaRecord = readFileSync(join(sessionsDir, `${ids.gamma}.json`), "utf8");
+	writeFileSync(
+		join(sessionsDir, `${ids.gamma}.json`),
+		JSON.stringify({ ...JSON.parse(gammaRecord), heartbeat: Date.now() - 60_000 }),
+	);
+	const lapsed = await vote("alpha", { focus: [tagOf("gamma"), tagOf("beta")] });
+	check(
+		"a ranking naming a session that has just ended drops it instead of refusing the ballot",
+		lapsed.isError !== true && JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.beta]),
+	);
+	const lapsedById = await vote("alpha", { focus: [ids.gamma.slice(0, 8), tagOf("beta")] });
+	check(
+		"an ended session named by an id prefix is dropped the same way",
+		lapsedById.isError !== true && JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.beta]),
+	);
+	writeFileSync(join(sessionsDir, `${ids.gamma}.json`), gammaRecord);
 	await vote("alpha", { focus: [tagOf("beta"), tagOf("gamma")] });
 
 	// Alpha takes the poller lock before any tick, so it answers the commands and runs every tally.
