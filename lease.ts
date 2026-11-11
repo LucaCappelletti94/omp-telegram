@@ -244,6 +244,30 @@ export function settle(
 	return { state: next, granted, reclaimed };
 }
 
+/** How long a taken grant waits for its holder, which starts a few milliseconds after the take. */
+const HOLDER_START_MS = 60_000;
+
+/**
+ * Claims grant `id` the moment its command is about to run, since the call that was granted it may have waited for
+ * approval or scheduling past the grant's expiry. A bound grant with no holder yet gets a fresh window for its
+ * holder to start. A grant already reclaimed, perhaps handed on to another session, or already held by a running
+ * copy of the same command, cannot be taken, and the command must not run.
+ */
+export function take(state: Leases, id: string, now: number): { state: Leases; taken: boolean } {
+	if (!state.granted.some((grant) => grant.id === id && grant.bound && grant.holder === null)) {
+		return { state, taken: false };
+	}
+	return {
+		state: {
+			...state,
+			granted: state.granted.map((grant) =>
+				grant.id === id ? { ...grant, expires: Math.max(grant.expires, now + HOLDER_START_MS) } : grant,
+			),
+		},
+		taken: true,
+	};
+}
+
 /** Records the pid that lives as long as lease `id`'s command. An unknown lease changes nothing. */
 export function hold(state: Leases, id: string, pid: number): Leases {
 	return { ...state, granted: state.granted.map((grant) => (grant.id === id ? { ...grant, holder: pid } : grant)) };
@@ -304,19 +328,34 @@ export async function changeLeases<T>(
 }
 
 /**
- * `node lease.ts hold <stateDir> <id>` runs on the redirection of a heavy command's group, so it lives exactly as
- * long as the command. It records its pid on the lease, waits for the pipe to close and releases the lease. When
- * the command is killed it dies with it, and the poller reclaims the lease from the dead pid.
+ * `node lease.ts take <stateDir> <id>` runs just before a leased command and fails, so the command never starts,
+ * when the grant has already been reclaimed. `node lease.ts hold <stateDir> <id>` then runs on the redirection of
+ * the command's group, so it lives exactly as long as the command. It records its pid on the lease, waits for the
+ * pipe to close and releases the lease. When the command is killed it dies with it, and the poller reclaims the
+ * lease from the dead pid.
  */
 if (import.meta.main) {
 	const [verb, stateDir, id] = process.argv.slice(2);
-	if (verb !== "hold" || stateDir === undefined || id === undefined) {
-		process.stderr.write("usage: lease.ts hold <stateDir> <id>\n");
+	if ((verb !== "take" && verb !== "hold") || stateDir === undefined || id === undefined) {
+		process.stderr.write("usage: lease.ts take|hold <stateDir> <id>\n");
 		process.exit(2);
 	}
-	await changeLeases(stateDir, (state) => ({ state: hold(state, id, process.pid), result: null }));
-	process.stdin.on("end", () => {
-		void changeLeases(stateDir, (state) => ({ state: release(state, id), result: null }));
-	});
-	process.stdin.resume();
+	if (verb === "take") {
+		const taken = await changeLeases(stateDir, (state) => {
+			const claimed = take(state, id, Date.now());
+			return { state: claimed.taken ? claimed.state : null, result: claimed.taken };
+		});
+		if (!taken) {
+			process.stderr.write(
+				`Resource lease ${id} expired before this command started and its slot may already belong to another session, so nothing ran. Run the command again to queue for a new lease.\n`,
+			);
+			process.exit(1);
+		}
+	} else {
+		await changeLeases(stateDir, (state) => ({ state: hold(state, id, process.pid), result: null }));
+		process.stdin.on("end", () => {
+			void changeLeases(stateDir, (state) => ({ state: release(state, id), result: null }));
+		});
+		process.stdin.resume();
+	}
 }

@@ -10231,9 +10231,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	});
 
 	/**
-	 * Admits a heavy bash command under a resource lease. A granted command runs as a group in the session's own
-	 * shell with the lease holder on fd 9, so the holder lives exactly as long as the command and the shell keeps
-	 * its state. A refused one runs nothing, and the poller's grant wakes the session later.
+	 * Admits a heavy bash command under a resource lease. A granted command first takes its lease, which fails and
+	 * runs nothing when approval or scheduling delayed it past the grant's expiry. It then runs as a group in the
+	 * session's own shell with the lease holder on fd 9, so the holder lives exactly as long as the command and the
+	 * shell keeps its state. A refused one runs nothing, and the poller's grant wakes the session later.
 	 */
 	pi.on("tool_call", async (event, ctx) => {
 		const input = event.input as Record<string, unknown>;
@@ -10255,8 +10256,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		});
 		const quoted = (text: string): string => `'${text.replaceAll("'", "'\\''")}'`;
 		if (outcome.kind === "grant") {
-			const holder = `exec node --disable-warning=ExperimentalWarning ${quoted(LEASE_MODULE)} hold ${quoted(STATE_DIR)} ${outcome.id}`;
-			return { input: { ...input, command: `{ ${command}\n} 9> >(${holder})` } };
+			const lease = `node --disable-warning=ExperimentalWarning ${quoted(LEASE_MODULE)}`;
+			const take = `${lease} take ${quoted(STATE_DIR)} ${outcome.id}`;
+			const holder = `exec ${lease} hold ${quoted(STATE_DIR)} ${outcome.id}`;
+			return { input: { ...input, command: `${take} && { ${command}\n} 9> >(${holder})` } };
 		}
 		const waits = [
 			...outcome.blockers,

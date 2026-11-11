@@ -4,7 +4,17 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { admit, changeLeases, DEFAULT_LEASE_POLICY, hold, isHeavy, parseLeases, release, settle } from "../lease.ts";
+import {
+	admit,
+	changeLeases,
+	DEFAULT_LEASE_POLICY,
+	hold,
+	isHeavy,
+	parseLeases,
+	release,
+	settle,
+	take,
+} from "../lease.ts";
 
 let fails = 0;
 const heading = (title) => {
@@ -167,9 +177,16 @@ heading("reservations");
 heading("holders and reclaim");
 {
 	let state = admit(empty(), ask("a", "l1"), base()).state;
+	const taken = take(state, "l1", 170_000);
+	check("a granted call takes its lease when its command starts", taken.taken);
+	check("taking gives the holder a fresh window to start", taken.state.granted[0].expires > state.granted[0].expires);
+	check("a lease that is gone cannot be taken", !take(state, "nope", 5_000).taken);
+	const reservedOnly = { granted: [{ ...state.granted[0], bound: false }], queue: [] };
+	check("a reservation no call was bound to cannot be taken", !take(reservedOnly, "l1", 5_000).taken);
 	state = hold(state, "l1", 4242);
 	check("the holder records its pid on its grant", state.granted[0].holder === 4242);
 	check("holding an unknown lease changes nothing", hold(state, "nope", 1).granted.length === 1);
+	check("a lease its holder already runs under cannot be taken again", !take(state, "l1", 5_000).taken);
 	const ctx = (now, alive, live = new Set(["a"])) => ({ ...base(now), live, alive });
 	const kept = settle(
 		state,

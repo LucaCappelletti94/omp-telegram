@@ -18426,8 +18426,11 @@ heading("resource leases for heavy commands");
 	setPressure();
 	const lowLease = leaseOf(granted?.input.command);
 	check(
-		"a heavy command with a free slot runs as a group with the lease holder on fd 9",
-		granted?.input.command.startsWith("{ cargo test -p x\n} 9> >(exec node ") === true &&
+		"a heavy command with a free slot takes its lease, then runs as a group with the lease holder on fd 9",
+		granted?.input.command.startsWith("node ") === true &&
+			granted.input.command.includes(
+				` take '${stateDir}' ${leaseOf(granted.input.command)} && { cargo test -p x\n} 9> >(exec node `,
+			) &&
 			lowLease !== undefined &&
 			leases().granted[0]?.session === ids.low,
 	);
@@ -18528,6 +18531,35 @@ heading("resource leases for heavy commands");
 		!mid.customs.slice(midCustoms).some((c) => c.message.content.includes(stale)),
 	);
 	check("a malformed lease item is discarded", !existsSync(malformed));
+
+	// With one slot, a command granted to high but delayed past its expiry must not run once the slot is mid's.
+	rmSync(join(stateDir, "leases.json"));
+	const delayed = await call("high", "cargo test");
+	// Past the default three-minute window a grant whose holder never started is reclaimed.
+	jump(3 * 60_000 + 1_000);
+	mid.heartbeat();
+	high.heartbeat();
+	await settle(150);
+	await mid.pump(200);
+	const rival = await call("mid", "cargo build");
+	const marker = join(root, "delayed-ran");
+	const late = startProcess("bash", ["-c", delayed.input.command.replace("cargo test", `touch '${marker}'`)], {
+		stdio: ["ignore", "ignore", "pipe"],
+	});
+	let lateErr = "";
+	late.stderr.on("data", (chunk) => {
+		lateErr += chunk;
+	});
+	const lateCode = await new Promise((done) => late.on("exit", done));
+	check(
+		"a command delayed past its grant's expiry runs nothing once the slot went to another session",
+		lateCode !== 0 &&
+			!existsSync(marker) &&
+			lateErr.includes("expired before this command started") &&
+			leases()
+				.granted.map((g) => g.id)
+				.join() === leaseOf(rival?.input?.command),
+	);
 
 	// A session started without a readable config file admits under the default limit of four, past the single slot.
 	rmSync(join(root, "notify-telegram.json"));
