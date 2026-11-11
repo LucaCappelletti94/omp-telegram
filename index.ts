@@ -10268,7 +10268,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await Promise.allSettled(redPinOperations);
 		closeReplyQuestion();
 		sessionAlive = false;
-		if (!keepForRestore) removeStatePath(BALLOT_DIR, `${sessionId}.json`);
+		// A process that only waited on an id another process holds owns no ballot under it.
+		if (registered && !keepForRestore) removeStatePath(BALLOT_DIR, `${sessionId}.json`);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		releaseLock();
 		// Handing the board on rather than leaving the next owner to wait out a stale claim.

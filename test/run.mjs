@@ -1404,6 +1404,20 @@ heading("a session resumed while another omp holds it");
 	);
 	check("neither press is answered as a closed question", closedNotices() === closedBefore);
 	await resumed.fire("session_shutdown");
+	// A further process resumed on the holder's id waits behind the leased holder, and its exit leaves the holder's ballot.
+	const heldBallot = join(root, "notify-telegram/ballots", `${heldId}.json`);
+	mkdirSync(join(root, "notify-telegram/ballots"), { recursive: true });
+	writeFileSync(heldBallot, JSON.stringify({ focus: [], resources: [], at: Date.now() }));
+	const waiter = spawn(heldId, "/home/dev/work/connetto");
+	await waiter.fire("session_start");
+	waiter.heartbeat();
+	await settle(100);
+	const waiterWaited = record(heldId).instance === holderInstance;
+	await waiter.fire("session_shutdown");
+	check(
+		"a waiting instance's shutdown leaves the holder's ballot",
+		waiterWaited && record(heldId).instance === holderInstance && existsSync(heldBallot),
+	);
 	await holder.fire("session_shutdown");
 
 	// A waiting instance whose holder ends takes the session over as an ordinary resume.
