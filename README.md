@@ -69,7 +69,7 @@ Agents in different live sessions write to each other with `session_message`, ad
 
 ## Priority vote
 
-Every turn end ranks the other live sessions twice through `notify_status`, once for your attention and once for CPU, and `priority_vote` updates either ranking mid-turn. The session holding the Telegram connection tallies the live ballots every thirty seconds with a modified Borda count in which no session ranks itself, and the attention order sorts `/status`, `/fleet` and the pinned board. A window marked `@omp_priority high` in omp-tmux lists above every vote.
+Every turn end ranks the other live sessions twice through `notify_status`, once for your attention and once for CPU, and `priority_vote` updates either ranking mid-turn. The session holding the Telegram connection tallies the live ballots every thirty seconds with a modified Borda count in which no session ranks itself. The attention order sorts `/status`, `/fleet` and the pinned board, and sets the tmux window option `@omp_vote` to `top` on the winner's window. The CPU order sets `CPUWeight` on each tmux pane's scope through the systemd user manager, from 25 to 400 geometrically with the default 100 at half the attainable points, and gives the default back once the session ends. A window marked `@omp_priority high` in omp-tmux outranks every vote in both orders.
 
 ## Dependencies between sessions
 

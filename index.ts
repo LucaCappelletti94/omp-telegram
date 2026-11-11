@@ -53,7 +53,7 @@ import {
 	type WatchQueryAnswer,
 	type WatchQueryEntry,
 } from "./graph.ts";
-import { bordaPoints, byPriority } from "./priority.ts";
+import { bordaPoints, byPriority, cpuWeight } from "./priority.ts";
 import {
 	type AskOption,
 	type AskQuestion,
@@ -132,6 +132,11 @@ const CRASH_MESSAGE_TYPE = "omp-telegram.crash";
 const BALLOT_DIR = join(STATE_DIR, "ballots");
 /** The focus tally and the user's own window marks, written by the poller and read by every view listing sessions. */
 const PRIORITY_FILE = join(STATE_DIR, "priority.json");
+/**
+ * One file per pane scope the poller weighted, named by its systemd unit, so a scope whose session ended gets the
+ * kernel default back. Each scope is tracked and forgotten on its own, so no writer rewrites another's entry.
+ */
+const WEIGHTED_SCOPES_DIR = join(STATE_DIR, "weighted-scopes");
 /** Differs from a record's `boot` exactly when the machine restarted since that record was written. */
 const BOOT_ID = (() => {
 	try {
@@ -6807,7 +6812,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	registerTool({
 		name: "priority_vote",
 		label: "Priority Vote",
-		description: `${BALLOT_GUIDE} With no arguments it lists the live sessions to rank, each with its state and last summary, in an order shuffled per call. Every turn end already casts both rankings through \`notify_status\`. Call this in the middle of a long turn when the picture changes, say a session starts waiting on the user or a long build starts, passing either ranking or both. The poller tallies every live session's ballot with a modified Borda count, and the focus order sorts \`/status\`, \`/fleet\` and the pinned board. Windows the user marked as priority outrank every vote.`,
+		description: `${BALLOT_GUIDE} With no arguments it lists the live sessions to rank, each with its state and last summary, in an order shuffled per call. Every turn end already casts both rankings through \`notify_status\`. Call this in the middle of a long turn when the picture changes, say a session starts waiting on the user or a long build starts, passing either ranking or both. The poller tallies every live session's ballot with a modified Borda count. The focus order sorts \`/status\`, \`/fleet\` and the pinned board and marks the winner's tmux window, and the resource order sets each session's CPU weight. Windows the user marked as priority outrank every vote.`,
 		approval: "read",
 		parameters: z.object({
 			focus: z.array(z.string()).optional(),
@@ -7025,7 +7030,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastWatchPrune = 0;
 	let watchPollInFlight = false;
 	let lastPriorityTick = 0;
-	let priorityInFlight = false;
+	/** The tally and its effects while they run, so a tick never starts a second one and shutdown can wait for it. */
+	let priorityWork: Promise<void> | null = null;
 
 	function isLiveSession(id: string): boolean {
 		if (id === sessionId) return sessionAlive;
@@ -8102,47 +8108,171 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Run by the Telegram lock holder only. Tallies the focus vote over the live sessions and records it, with the
-	 * sessions whose window the user marked, for every view that lists sessions. Everything is recomputed from the
-	 * files, so a new lock holder carries on where the last one stopped.
+	 * Run by the Telegram lock holder only. Tallies both votes over the live sessions, records the focus order for
+	 * every view, marks the focus winner's window and weights each live session's pane scope by the resource vote.
+	 * Everything is recomputed from the files, so a new lock holder carries on where the last one stopped.
 	 */
 	function priorityTick(): void {
 		const now = Date.now();
-		if (priorityInFlight || now - lastPriorityTick < PRIORITY_TICK_MS) return;
+		if (priorityWork !== null || now - lastPriorityTick < PRIORITY_TICK_MS) return;
 		lastPriorityTick = now;
-		priorityInFlight = true;
-		detach(async () => {
-			try {
-				await applyPriority();
-			} finally {
-				priorityInFlight = false;
-			}
-		}, "priority");
+		const work = applyPriority().finally(() => {
+			priorityWork = null;
+		});
+		priorityWork = work;
+		detach(() => work, "priority");
 	}
 
 	async function applyPriority(): Promise<void> {
 		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
+		const ids = live.map(({ id }) => id);
 		const ballots = [...readBallots()];
-		const markedPanes = await readMarkedPanes();
-		const marked = live.filter(({ record }) => markedPanes.has(record.tmuxPane)).map(({ id }) => id);
-		const focus = bordaPoints(
-			new Map(ballots.map(([id, ballot]) => [id, ballot.focus])),
-			live.map(({ id }) => id),
+		const panes = await readPaneMarks();
+		const marked = new Set(
+			live.filter(({ record }) => panes.get(record.tmuxPane)?.priority === true).map(({ id }) => id),
 		);
-		writeFileAtomic(PRIORITY_FILE, JSON.stringify({ points: Object.fromEntries(focus), marked }), 0o600);
+		const focus = bordaPoints(new Map(ballots.map(([id, ballot]) => [id, ballot.focus])), ids);
+		const resources = bordaPoints(new Map(ballots.map(([id, ballot]) => [id, ballot.resources])), ids);
+		writeFileAtomic(
+			PRIORITY_FILE,
+			JSON.stringify({ points: Object.fromEntries(focus.points), marked: [...marked] }),
+			0o600,
+		);
+		await markFocusWinner(live, focus.points, panes);
+		await weightScopes(live, resources, marked);
 	}
 
-	/** The tmux panes whose window the user marked `@omp_priority high`. */
-	async function readMarkedPanes(): Promise<Set<string>> {
-		const marked = new Set<string>();
-		if (process.env.TMUX === undefined) return marked;
-		const listed = await run("tmux", ["list-panes", "-a", "-F", "#{pane_id}\t#{@omp_priority}"], 2_000);
-		if (!listed.ok) return marked;
+	/** Each tmux pane's window, whether the user marked that window, and whether it carries the vote's mark. */
+	async function readPaneMarks(): Promise<Map<string, { window: string; priority: boolean; vote: boolean }>> {
+		const panes = new Map<string, { window: string; priority: boolean; vote: boolean }>();
+		if (process.env.TMUX === undefined) return panes;
+		const listed = await run(
+			"tmux",
+			["list-panes", "-a", "-F", "#{pane_id}\t#{window_id}\t#{@omp_priority}\t#{@omp_vote}"],
+			2_000,
+		);
+		if (!listed.ok) return panes;
 		for (const line of listed.stdout.split("\n")) {
-			const [pane, priority] = line.split("\t");
-			if (pane !== undefined && pane.length > 0 && priority === "high") marked.add(pane);
+			const [pane, window, priority, vote] = line.split("\t");
+			if (pane === undefined || window === undefined || pane.length === 0) continue;
+			panes.set(pane, { window, priority: priority === "high", vote: vote === "top" });
 		}
-		return marked;
+		return panes;
+	}
+
+	/**
+	 * Sets `@omp_vote top` on the window of the session with the most focus points and unsets it on every other
+	 * window. The user's own `@omp_priority` is never written, so a mark the user set stays the user's.
+	 */
+	async function markFocusWinner(
+		live: ReadonlyArray<{ id: string; record: SessionRecord }>,
+		points: ReadonlyMap<string, number>,
+		panes: ReadonlyMap<string, { window: string; priority: boolean; vote: boolean }>,
+	): Promise<void> {
+		if (process.env.TMUX === undefined) return;
+		const placed = live.flatMap(({ id, record }) => {
+			const pane = panes.get(record.tmuxPane);
+			return pane === undefined ? [] : [{ id, window: pane.window }];
+		});
+		const order = byPriority(points, new Set(), (a, b) => a.localeCompare(b));
+		const winner = placed.sort((a, b) => order(a.id, b.id))[0];
+		const target = winner !== undefined && (points.get(winner.id) as number) > 0 ? winner.window : undefined;
+		const voted = new Set([...panes.values()].filter((pane) => pane.vote).map((pane) => pane.window));
+		for (const window of voted) {
+			if (window !== target) await run("tmux", ["set-option", "-w", "-u", "-t", window, "@omp_vote"], 2_000);
+		}
+		if (target !== undefined && !voted.has(target)) {
+			await run("tmux", ["set-option", "-w", "-t", target, "@omp_vote", "top"], 2_000);
+		}
+	}
+
+	/** The systemd unit whose cgroup holds `pid`, the last segment of its cgroup v2 path, or null when none can be read. */
+	function unitOf(pid: number): string | null {
+		let cgroups = "";
+		try {
+			cgroups = readFileSync(`/proc/${pid}/cgroup`, "utf8");
+		} catch {}
+		// The characters a state token allows, since the unit also names a file under `weighted-scopes/`.
+		return /^0::.*\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/mu.exec(cgroups)?.[1] ?? null;
+	}
+
+	/**
+	 * Sets `CPUWeight` on the user-manager unit of each live tmux session's process, its pane's scope, from the
+	 * resource vote, and gives the default back to a scope the poller weighted once its session is gone. A unit
+	 * the user manager does not know is left alone, and a weight already in place spawns no write.
+	 */
+	async function weightScopes(
+		live: ReadonlyArray<{ id: string; record: SessionRecord }>,
+		resources: { points: ReadonlyMap<string, number>; attainable: number },
+		marked: ReadonlySet<string>,
+	): Promise<void> {
+		const want = new Map<string, number>();
+		for (const { id, record } of live) {
+			if (record.tmuxPane.length === 0) continue;
+			const unit = unitOf(record.pid);
+			if (unit === null) continue;
+			const weight = cpuWeight(resources.points.get(id) as number, resources.attainable, marked.has(id));
+			want.set(unit, Math.max(weight, want.get(unit) ?? 0));
+		}
+		const weighted = new Set(
+			existsSync(WEIGHTED_SCOPES_DIR) ? readdirSync(WEIGHTED_SCOPES_DIR).filter(isStateToken) : [],
+		);
+		const units = [...new Set([...want.keys(), ...weighted])];
+		if (units.length === 0) return;
+		const shown = await run(
+			"systemctl",
+			["--user", "show", "-p", "Id", "-p", "LoadState", "-p", "CPUWeight", ...units],
+			5_000,
+		);
+		// A failed read proves nothing about any scope, so every listed one waits for the next tick.
+		if (!shown.ok) return;
+		const current = new Map<string, number | null>();
+		const gone = new Set<string>();
+		for (const block of shown.stdout.split("\n\n")) {
+			const fields = new Map(
+				block.split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)] as const),
+			);
+			const id = fields.get("Id");
+			if (id === undefined) continue;
+			if (fields.get("LoadState") !== "loaded") {
+				gone.add(id);
+				continue;
+			}
+			const set = Number.parseInt(fields.get("CPUWeight") as string, 10);
+			current.set(id, Number.isFinite(set) ? set : null);
+		}
+		for (const [unit, weight] of want) {
+			if (!current.has(unit)) continue;
+			const set = current.get(unit) ?? null;
+			// A weight set on a live session's scope is the poller's to give back once the session ends.
+			if ((set !== null || weight !== 100) && !weighted.has(unit)) {
+				weighted.add(unit);
+				writePrivateJson(WEIGHTED_SCOPES_DIR, unit, {});
+			}
+			if ((set ?? 100) === weight) continue;
+			// A closing process writes no further weight, so the reset its shutdown sends is the last word.
+			if (!sessionAlive) return;
+			const written = await run(
+				"systemctl",
+				["--user", "set-property", "--runtime", unit, `CPUWeight=${weight}`],
+				5_000,
+			);
+			if (!written.ok) pi.logger.warn("cpu weight write failed", { unit, weight, stderr: written.stderr });
+		}
+		for (const unit of weighted) {
+			if (want.has(unit) && current.has(unit)) continue;
+			if (current.has(unit)) {
+				const reset = await run("systemctl", ["--user", "set-property", "--runtime", unit, "CPUWeight="], 5_000);
+				// A scope whose reset failed stays tracked, so the next tick tries again.
+				if (!reset.ok) {
+					pi.logger.warn("cpu weight reset failed", { unit, stderr: reset.stderr });
+					continue;
+				}
+				removeStatePath(WEIGHTED_SCOPES_DIR, unit);
+			} else if (gone.has(unit)) {
+				removeStatePath(WEIGHTED_SCOPES_DIR, unit);
+			}
+		}
 	}
 
 	function claimLaunch(ctx: ExtensionContext): void {
@@ -10294,6 +10424,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// A process that only waited on an id another process holds owns no ballot under it.
 		if (registered && !keepForRestore) removeStatePath(BALLOT_DIR, `${sessionId}.json`);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+		// No poller tick follows the last omp's exit, so the scope its shell keeps gets the default back here, after
+		// any weight this process is still writing. The scope stays tracked, so a weight another poller wrote in the
+		// meantime is given back at its next tick.
+		const ownUnit = unitOf(process.pid);
+		if (registered && ownUnit !== null && existsSync(join(WEIGHTED_SCOPES_DIR, ownUnit))) {
+			if (priorityWork !== null) await Promise.race([priorityWork.catch(() => undefined), sleepMs(500)]);
+			await run("systemctl", ["--user", "set-property", "--runtime", ownUnit, "CPUWeight="], 1_000);
+		}
 		releaseLock();
 		// Handing the board on rather than leaving the next owner to wait out a stale claim.
 		releaseLock(DASHBOARD_LOCK_FILE);
