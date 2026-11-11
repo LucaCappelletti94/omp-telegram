@@ -39,7 +39,7 @@ writeFileSync(
 	`#!/bin/sh
 echo "$*" >> ${systemdLog}
 [ -e "${systemdUnits}/fail-$2" ] && exit 1
-[ -e "${systemdUnits}/slow-$2" ] && sleep 0.5
+[ -e "${systemdUnits}/slow-$2" ] && sleep 0.3
 case "$1 $2" in
 "--user show")
 	shift 2
@@ -18313,10 +18313,10 @@ esac
 	await settle(100);
 	check("a session closed by hand drops its ballot", ballotOf(ids.gamma) === null);
 	check(
-		"a closing session gives its weighted scope the default back without waiting for a poller",
+		"a closing session gives its weighted scope the default back without waiting for a poller, and keeps it tracked",
 		weightedBeforeExit &&
 			readFileSync(systemdLog, "utf8").includes(`set-property --runtime ${suiteUnit} CPUWeight=\n`) &&
-			!weightedList().includes(suiteUnit),
+			weightedList().includes(suiteUnit),
 	);
 	check(
 		"a scope tracked while a closing session resets its own stays tracked",
@@ -18337,7 +18337,23 @@ esac
 		"with no vote counted no window carries the vote mark",
 		["@91", "@92", "@93"].every((w) => voted(w) === ""),
 	);
+	// Alpha's own weight write still waits on systemd when alpha closes, and alpha's reset must stay the last word.
+	writeFileSync(join(voteDir, "prio-91"), "high");
+	writeFileSync(join(systemdUnits, "slow-show"), "");
+	writeFileSync(systemdLog, "");
+	jump(31_000);
+	alpha.heartbeat();
+	await settle(100);
 	await alpha.fire("session_shutdown");
+	await settle(500);
+	rmSync(join(systemdUnits, "slow-show"));
+	rmSync(join(voteDir, "prio-91"));
+	const closingLog = readFileSync(systemdLog, "utf8").split("\n");
+	check(
+		"a closing poller's pending weight write never lands after its own reset",
+		closingLog.findLastIndex((line) => line.endsWith(`${suiteUnit} CPUWeight=400`)) <
+			closingLog.findLastIndex((line) => line.endsWith(`${suiteUnit} CPUWeight=`)) && unitWeight() === "",
+	);
 	process.env.PATH = voteSavedPath;
 	delete process.env.TMUX;
 	delete process.env.TMUX_PANE;

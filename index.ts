@@ -7030,7 +7030,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastWatchPrune = 0;
 	let watchPollInFlight = false;
 	let lastPriorityTick = 0;
-	let priorityInFlight = false;
+	/** The tally and its effects while they run, so a tick never starts a second one and shutdown can wait for it. */
+	let priorityWork: Promise<void> | null = null;
 
 	function isLiveSession(id: string): boolean {
 		if (id === sessionId) return sessionAlive;
@@ -8113,16 +8114,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 */
 	function priorityTick(): void {
 		const now = Date.now();
-		if (priorityInFlight || now - lastPriorityTick < PRIORITY_TICK_MS) return;
+		if (priorityWork !== null || now - lastPriorityTick < PRIORITY_TICK_MS) return;
 		lastPriorityTick = now;
-		priorityInFlight = true;
-		detach(async () => {
-			try {
-				await applyPriority();
-			} finally {
-				priorityInFlight = false;
-			}
-		}, "priority");
+		const work = applyPriority().finally(() => {
+			priorityWork = null;
+		});
+		priorityWork = work;
+		detach(() => work, "priority");
 	}
 
 	async function applyPriority(): Promise<void> {
@@ -8252,6 +8250,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				writePrivateJson(WEIGHTED_SCOPES_DIR, unit, {});
 			}
 			if ((set ?? 100) === weight) continue;
+			// A closing process writes no further weight, so the reset its shutdown sends is the last word.
+			if (!sessionAlive) return;
 			const written = await run(
 				"systemctl",
 				["--user", "set-property", "--runtime", unit, `CPUWeight=${weight}`],
@@ -10424,11 +10424,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// A process that only waited on an id another process holds owns no ballot under it.
 		if (registered && !keepForRestore) removeStatePath(BALLOT_DIR, `${sessionId}.json`);
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
-		// No poller tick follows the last omp's exit, so the scope its shell keeps gets the default back here.
+		// No poller tick follows the last omp's exit, so the scope its shell keeps gets the default back here, after
+		// any weight this process is still writing. The scope stays tracked, so a weight another poller wrote in the
+		// meantime is given back at its next tick.
 		const ownUnit = unitOf(process.pid);
 		if (registered && ownUnit !== null && existsSync(join(WEIGHTED_SCOPES_DIR, ownUnit))) {
-			const reset = await run("systemctl", ["--user", "set-property", "--runtime", ownUnit, "CPUWeight="], 1_000);
-			if (reset.ok) removeStatePath(WEIGHTED_SCOPES_DIR, ownUnit);
+			if (priorityWork !== null) await Promise.race([priorityWork.catch(() => undefined), sleepMs(500)]);
+			await run("systemctl", ["--user", "set-property", "--runtime", ownUnit, "CPUWeight="], 1_000);
 		}
 		releaseLock();
 		// Handing the board on rather than leaving the next owner to wait out a stale claim.
