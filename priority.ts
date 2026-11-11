@@ -13,7 +13,7 @@ export function bordaPoints(
 		if (!live.has(voter)) continue;
 		const counted = [...new Set(ranking)].filter((id) => id !== voter && live.has(id));
 		counted.forEach((id, place) => {
-			points.set(id, (points.get(id) ?? 0) + counted.length - place);
+			points.set(id, (points.get(id) as number) + counted.length - place);
 		});
 	}
 	return points;

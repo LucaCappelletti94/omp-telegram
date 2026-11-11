@@ -17837,6 +17837,7 @@ list-panes)
 			printf 'work\\t%s\\t0\\t%s\\t%%%s\\t\\317\\200 > window %s\\n' "$p" "$(cat ${voteDir}/prio-$p 2>/dev/null)" "$p" "$p"
 		done ;;
 	*)
+		[ -e ${voteDir}/fail-list ] && exit 1
 		for p in 91 92 93; do
 			printf '%%%s\\t%s\\n' "$p" "$(cat ${voteDir}/prio-$p 2>/dev/null)"
 		done ;;
@@ -17941,11 +17942,29 @@ esac
 			JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.beta, ids.gamma]) &&
 			JSON.stringify(ballotOf(ids.alpha)?.resources) === JSON.stringify([ids.gamma, ids.beta]),
 	);
+	// A ballot file mangled on disk is no earlier ballot, so a vote passing one ranking leaves the other empty.
+	mkdirSync(join(stateDir, "ballots"), { recursive: true });
+	writeFileSync(join(stateDir, "ballots", `${ids.beta}.json`), JSON.stringify({ focus: "x", resources: [ids.alpha] }));
+	await vote("beta", { resources: [tagOf("alpha")] });
+	writeFileSync(
+		join(stateDir, "ballots", `${ids.beta}.json`),
+		JSON.stringify({ focus: [ids.alpha], resources: [ids.alpha] }),
+	);
 	await vote("beta", { focus: [tagOf("gamma")] });
+	check(
+		"a ballot file without its cast time counts as no earlier ballot",
+		JSON.stringify(ballotOf(ids.beta)?.resources) === "[]",
+	);
+	await vote("beta", { resources: [tagOf("alpha")] });
 	check(
 		"a mid-turn vote may pass one ranking and leaves the other as it was",
 		JSON.stringify(ballotOf(ids.beta)?.focus) === JSON.stringify([ids.gamma]) &&
-			JSON.stringify(ballotOf(ids.beta)?.resources) === "[]",
+			JSON.stringify(ballotOf(ids.beta)?.resources) === JSON.stringify([ids.alpha]),
+	);
+	// The tallies below expect beta to rank nobody for resources, which no vote can cast.
+	writeFileSync(
+		join(stateDir, "ballots", `${ids.beta}.json`),
+		JSON.stringify({ ...ballotOf(ids.beta), resources: [] }),
 	);
 	await vote("gamma", { focus: [tagOf("beta"), tagOf("alpha")], resources: [tagOf("beta"), tagOf("alpha")] });
 
@@ -17982,7 +18001,21 @@ esac
 		fleet.indexOf("93 window 93") < fleet.indexOf("92 window 92") &&
 			fleet.indexOf("92 window 92") < fleet.indexOf("91 window 91"),
 	);
+	// A tmux that cannot list its panes marks no window, so the vote order stands alone.
+	writeFileSync(join(voteDir, "fail-list"), "");
+	await tick();
+	check("when tmux cannot list its panes no window counts as marked", (await statusOrder())[0] === "beta");
+	rmSync(join(voteDir, "fail-list"));
 	rmSync(join(voteDir, "prio-93"), { force: true });
+	// A tally file mangled on disk sorts nothing, and every live session is still listed.
+	writeFileSync(join(stateDir, "priority.json"), JSON.stringify({ points: { [ids.beta]: "x" }, marked: "gamma" }));
+	writeFileSync(join(inboxOf(ids.alpha), "993.json"), JSON.stringify({ kind: "command", value: "status" }));
+	await alpha.pump(300);
+	const mangled = lastCall("sendMessage").body.text;
+	check(
+		"a mangled tally file still lists every live session",
+		["alpha", "beta", "gamma"].every((name) => mangled.includes(` ${name} \u00B7`)),
+	);
 
 	await vote("alpha", { focus: [tagOf("gamma"), tagOf("beta")] });
 	await vote("gamma", { focus: [tagOf("alpha"), tagOf("beta")] });

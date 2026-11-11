@@ -3448,7 +3448,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				bell: parts[2] === "1",
 				label: title.slice(4),
 				priority: parts[3] === "high",
-				pane: parts[4] ?? "",
+				pane: parts[4] as string,
 			});
 		}
 		const rows: {
@@ -3499,11 +3499,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				.filter(({ record }) => record.tmuxPane.length > 0)
 				.map(({ id, record }) => [record.tmuxPane, id]),
 		);
-		const byPane = new Map(rows.map((row) => [row.pane, row]));
 		const panePoints = new Map(rows.map((row) => [row.pane, focus.points.get(paneSession.get(row.pane) ?? "") ?? 0]));
 		const marked = new Set(rows.filter((row) => row.priority).map((row) => row.pane));
-		const stateOf = (pane: string): number => rank[byPane.get(pane)?.state ?? "idle"];
-		const order = byPriority(panePoints, marked, (a, b) => stateOf(a) - stateOf(b));
+		const stateRank = new Map(rows.map((row) => [row.pane, rank[row.state]]));
+		const order = byPriority(panePoints, marked, (a, b) => (stateRank.get(a) as number) - (stateRank.get(b) as number));
 		const lines = rows
 			.sort((a, b) => order(a.pane, b.pane))
 			.map((row) => {
@@ -3680,7 +3679,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const live = allRecords().filter(({ record }) => Date.now() - record.heartbeat <= LOCK_STALE_MS);
 		const heard = new Map(live.map(({ id, record }) => [id, record.lastNotified]));
 		const { points, marked } = readFocusTally();
-		const order = byPriority(points, marked, (a, b) => (heard.get(b) ?? 0) - (heard.get(a) ?? 0));
+		const order = byPriority(points, marked, (a, b) => (heard.get(b) as number) - (heard.get(a) as number));
 		return live.sort((a, b) => order(a.id, b.id));
 	}
 
@@ -6594,7 +6593,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (candidates.length === 0) return "No other omp session is live, so there is nothing to rank.";
 		const lines = candidates.map(({ record }) => {
 			const said = record.summary.length > 0 ? ` \u2014 last: ${record.summary}` : "";
-			return `${badgeOf(record)} \u2014 tag ${record.tag} \u2014 ${record.state.length > 0 ? record.state : "idle"}${said}`;
+			return `${badgeOf(record)} \u2014 tag ${record.tag} \u2014 ${record.state}${said}`;
 		});
 		return `Live sessions to rank, in random order:\n${lines.join("\n")}`;
 	}
@@ -6833,14 +6832,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				};
 			}
 			writePrivateJson(BALLOT_DIR, `${sessionId}.json`, cast.ballot);
-			const [focusTags, resourceTags] = [cast.ballot.focus, cast.ballot.resources].map(
-				(ids) => ids.map((id) => readSessionRecord(id)?.tag ?? id).join(", ") || "nobody",
-			);
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: `Ballot cast. Focus: ${focusTags}. Resources: ${resourceTags}. The poller applies it within ${PRIORITY_TICK_MS / 1000} seconds.`,
+						text: `Ballot cast, ranking ${cast.ballot.focus.length} sessions for focus and ${cast.ballot.resources.length} for resources. The poller applies it within ${PRIORITY_TICK_MS / 1000} seconds.`,
 					},
 				],
 				details: { focus: cast.ballot.focus, resources: cast.ballot.resources },
