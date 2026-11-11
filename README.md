@@ -53,6 +53,7 @@ Setting `completion.notify` and `ask.notify` to `"off"` in `config.yml` stops om
 - The tmux pane option `@omp_state` carries the state omp-tmux colours its bar with, `urgent` for a turn end recorded red, `reply` for a turn end that wants a reply or offers a choice, `sleeping` for a turn end that waits on a background job or on another session that is not finished, `done` for a turn end with nothing to wait on, and `crashed` on the pane of a dead session while its Restore card is open. A session clears the option when it starts, takes input, or shuts down, and a crash clears it when the card is dismissed, the session comes back, or its record expires, only while the pane still reads `crashed`. Outside tmux nothing is written, and a failed write is ignored until the next event.
 - A green summary plays the Telegram send effect its agent chose for how the turn went, one of 🎉 🔥 👍 ❤️ 👎 💩, or none at all.
 - `/status` reports session state, `/fleet` lists omp tmux windows, and all commands sit in the bot menu.
+- `/conduct <name>`, with the task's brief on the lines after it, opens an omp session in a new tmux window that conducts that task. Closing it leaves the task dormant, the same command resumes it, and a bare `/conduct` lists the tasks.
 - Context compaction announces itself; retries and model fallbacks show as a provider note on the board and in `/status` rather than a message per session.
 
 ## Grading with reactions

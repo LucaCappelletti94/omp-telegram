@@ -90,6 +90,7 @@ import {
 	TELEGRAM_TEXT_MAX,
 	toTelegramHtml,
 } from "./render.ts";
+import { changeTask, conductorRole, listTasks, parseConduct, type Task, taskSlug, updateTask } from "./tasks.ts";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "notify-telegram.json");
@@ -161,6 +162,8 @@ const BACKSTOP_FILE = join(STATE_DIR, "memory-backstop.json");
  * kernel default back. Each scope is tracked and forgotten on its own, so no writer rewrites another's entry.
  */
 const WEIGHTED_SCOPES_DIR = join(STATE_DIR, "weighted-scopes");
+/** One file per task a conductor watches, and one folder per task that its conductor runs in. */
+const TASKS_DIR = join(STATE_DIR, "tasks");
 /** Differs from a record's `boot` exactly when the machine restarted since that record was written. */
 const BOOT_ID = (() => {
 	try {
@@ -889,6 +892,8 @@ const BALLOT_GUIDE =
 /** A launch its child has not claimed within this long is shown as never started. */
 const LAUNCH_STALE_MS = 3_600_000;
 const LAUNCH_ENV = "OMP_TELEGRAM_LAUNCH";
+/** The task a newly opened conductor claims, named in its window's environment. */
+const CONDUCT_ENV = "OMP_TELEGRAM_CONDUCT";
 /** How long a resumed session gets to come live before another Resume tap opens a window again. */
 const RESUME_START_MS = 60_000;
 /** What a tap gets when its window is already opening. */
@@ -5326,6 +5331,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await answerCrashCallback(cfg, callback);
 				return;
 			}
+			if (callback.data.startsWith("t:")) {
+				await answerTaskCallback(cfg, callback.id, callback.data.slice(2));
+				return;
+			}
 			if (/^[rln]:/u.test(callback.data)) {
 				await answerResumeCallback(cfg, callback);
 				return;
@@ -5400,10 +5409,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			replyText: message.reply_to_message?.text ?? message.reply_to_message?.caption,
 		};
 
-		const command =
-			typeof text === "string"
-				? /^\/(hidequestions|status|fleet|stop|deps|resume)\b/u.exec(text.trim())?.[1]
-				: undefined;
+		const typed = typeof text === "string" ? text : "";
+		const command = /^\/(hidequestions|status|fleet|stop|deps|resume|conduct)\b/u.exec(typed.trim())?.[1];
 		if (command === "deps") {
 			// Rendering starts a browser, which must not hold up the updates queued behind this one.
 			detach(
@@ -5421,6 +5428,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		if (command === "resume") {
 			detach(() => sendResumeList(cfg), "resume list");
+			return;
+		}
+		if (command === "conduct") {
+			detach(() => conduct(cfg, typed), "conduct");
 			return;
 		}
 		if (command === "fleet") {
@@ -7047,6 +7058,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		};
 	});
 
+	/** A conductor's role rides its system prompt, which omp rebuilds every turn, so compaction and resume keep it. */
+	pi.on("before_agent_start", async (event) => {
+		const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId);
+		if (conducted === undefined) return undefined;
+		return { systemPrompt: [...event.systemPrompt, conductorRole(conducted)] };
+	});
+
 	// ------------------------------------------------------------------ dependency graph
 
 	const launchSpec: LaunchSpec = { argv: resumeArgs(process.argv.slice(2)), tmuxSession: "", tmuxWindow: null };
@@ -7445,20 +7463,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (node === null) return { ok: false, error: "That session is not in the dependency graph." };
 		if (node.launch === undefined) return { ok: false, error: "That node has no omp session behind it to resume." };
 		const { argv, tmuxSession, tmuxWindow } = node.launch;
-		return openOmp(id, node.cwd, argv, tmuxSession, tmuxWindow, nodePlace(node));
+		return openOmp(node.cwd, ["omp", ...argv, "--resume", id], [], tmuxSession, tmuxWindow, nodePlace(node));
 	}
 
 	/**
-	 * Opens `omp <argv> --resume <id>` in a detached window of the named tmux session, or in a new
-	 * detached tmux session of that name when a reboot took it, so the poller needs no tmux of its
-	 * own. Detached, because a tap on the phone must not pull the terminal away from whoever sits at it.
-	 * A known `windowIndex` reopens the old tab number, or appends when another window holds it.
-	 * `tab` is where the window opened, as `session:window`.
+	 * Opens `command` in a detached window of the named tmux session, or in a new detached tmux session of that
+	 * name when a reboot took it, so the poller needs no tmux of its own. Detached, because a tap on the phone must
+	 * not pull the terminal away from whoever sits at it. `env` holds the window's `-e NAME=value` pairs. A known
+	 * `windowIndex` reopens the old tab number, or appends when another window holds it. `tab` is where the window
+	 * opened, as `session:window`.
 	 */
 	async function openOmp(
-		id: string,
 		cwd: string,
-		argv: string[],
+		command: string[],
+		env: string[],
 		tmuxSession: string,
 		windowIndex: number | null,
 		name: string,
@@ -7467,8 +7485,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return { ok: false, error: `Its folder ${cwd} no longer exists, so omp would resume it somewhere else.` };
 		}
 		const target = tmuxSession || launchSpec.tmuxSession || "omp";
-		const named = ["-n", clip(name, 30), "-c", cwd];
-		const command = ["omp", ...argv, "--resume", id];
+		const named = ["-n", clip(name, 30), "-c", cwd, ...env];
 		const window = [...named, ...command];
 		if (!(await run("tmux", ["has-session", "-t", `=${target}`])).ok) {
 			const created = await run("tmux", ["new-session", "-d", "-s", target, "-P", "-F", "#{window_index}", ...window]);
@@ -7569,6 +7586,139 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			},
 			15_000,
 		);
+	}
+
+	/** What `/conduct` or a task button does for a task that exists, decided under the task lock. */
+	type ConductStep = { kind: "live" | "starting" | "open"; task: Task };
+
+	/** A conductor neither live nor already opening is stamped as opening, so two taps meanwhile open one window. */
+	function conductStep(task: Task): { task: Task | null; result: ConductStep } {
+		if (task.conductor !== "" && isLiveSession(task.conductor)) return { task: null, result: { kind: "live", task } };
+		if (Date.now() - task.launchedAt < RESUME_START_MS) return { task: null, result: { kind: "starting", task } };
+		const opening = { ...task, launchedAt: Date.now() };
+		return { task: opening, result: { kind: "open", task: opening } };
+	}
+
+	/** The tab a live conductor runs in, as `session:window`, or nothing when its record names none. */
+	function conductorTab(task: Task): string {
+		const record = readSessionRecord(task.conductor);
+		return tabOf(record === null ? undefined : { tmuxSession: record.tmux, tmuxWindow: record.tmuxWindow });
+	}
+
+	/**
+	 * Opens the conductor's window in the task's folder: a new omp told its task, or the conductor's own transcript
+	 * resumed. A failed open clears the stamp, so the next `/conduct` tries again at once.
+	 */
+	async function openConductor(task: Task): Promise<string> {
+		const cwd = resolve(TASKS_DIR, task.slug);
+		if (cwd.startsWith(`${resolve(TASKS_DIR)}${sep}`)) mkdirSync(cwd, { recursive: true, mode: 0o700 });
+		const record = task.conductor === "" ? null : readSessionRecord(task.conductor);
+		const opened =
+			task.conductor === ""
+				? await openOmp(
+						cwd,
+						[
+							"omp",
+							`Begin conducting the task "${task.name}". List the live sessions and tell the user which of them work on it.`,
+						],
+						["-e", `${CONDUCT_ENV}=${task.slug}`],
+						"",
+						null,
+						task.name,
+					)
+				: await openOmp(
+						cwd,
+						["omp", ...(record?.argv ?? []), "--resume", task.conductor],
+						[],
+						record?.tmux ?? "",
+						record?.tmuxWindow ?? null,
+						task.name,
+					);
+		const title = `**${task.name}**`;
+		if (opened.ok) {
+			return `\u{1F3BC} ${task.conductor === "" ? "Conducting" : "Resuming the conductor of"} ${title}${inTab(opened.tab)}.`;
+		}
+		await updateTask(TASKS_DIR, task.slug, (current) => ({ task: { ...current, launchedAt: 0 }, result: null }));
+		return `Opening the conductor of ${title} failed: ${clip(opened.error, 300)}`;
+	}
+
+	async function sendTaskMessage(cfg: Config, text: string, keyboard: InlineButton[][] = []): Promise<void> {
+		await callTelegram(
+			cfg,
+			"sendMessage",
+			{
+				chat_id: cfg.chatId,
+				text: toTelegramHtml(fitToTelegram(text, "")),
+				parse_mode: "HTML",
+				link_preview_options: { is_disabled: true },
+				...(keyboard.length === 0 ? {} : { reply_markup: { inline_keyboard: keyboard } }),
+			},
+			15_000,
+		);
+	}
+
+	/** `/conduct`: a bare one lists the tasks, a named one opens or resumes that task's conductor. */
+	async function conduct(cfg: Config, text: string): Promise<void> {
+		const { name, brief } = parseConduct(text);
+		if (name === "") {
+			const tasks = listTasks(TASKS_DIR);
+			await sendTaskMessage(
+				cfg,
+				tasks.length === 0
+					? "\u{1F3BC} No task has a conductor yet. Send /conduct with the task's name, and its brief on the lines after it."
+					: `\u{1F3BC} ${tasks.length === 1 ? "One task" : `${tasks.length} tasks`}. Tap one to open or resume its conductor.`,
+				tasks.map((task) => [
+					{
+						text: buttonText(task.state === "dormant" ? `${task.name} (dormant)` : task.name),
+						callback_data: `t:${task.slug}`,
+					},
+				]),
+			);
+			return;
+		}
+		const slug = taskSlug(name);
+		if (slug === "") {
+			await sendTaskMessage(cfg, "A task name needs a letter or digit.");
+			return;
+		}
+		const step = await changeTask(TASKS_DIR, slug, (task): { task: Task | null; result: ConductStep | null } => {
+			if (task !== null) return conductStep(task);
+			if (brief === "") return { task: null, result: null };
+			const fresh: Task = { name, slug, brief, conductor: "", state: "live", launchedAt: Date.now() };
+			return { task: fresh, result: { kind: "open", task: fresh } };
+		});
+		if (step === null) {
+			await sendTaskMessage(
+				cfg,
+				`No task is named **${name}** yet. Send /conduct ${name} with its brief on the lines after it to start one.`,
+			);
+			return;
+		}
+		const title = `**${step.task.name}**`;
+		const outcome =
+			step.kind === "live"
+				? `\u{1F3BC} ${title} is conducted${inTab(conductorTab(step.task))}.`
+				: step.kind === "starting"
+					? `\u{1F3BC} The conductor of ${title} is already starting.`
+					: await openConductor(step.task);
+		const kept = brief !== "" && brief !== step.task.brief ? " Its brief stays as first given." : "";
+		await sendTaskMessage(cfg, `${outcome}${kept}`);
+	}
+
+	async function answerTaskCallback(cfg: Config, callbackId: string, slug: string): Promise<void> {
+		const step = await updateTask(TASKS_DIR, slug, conductStep);
+		let toast: string;
+		if (step === null) toast = "That task is gone.";
+		else if (step.kind === "live") {
+			const tab = conductorTab(step.task);
+			toast = tab === "" ? "Its conductor is running." : `Its conductor runs in tmux ${tab}.`;
+		} else if (step.kind === "starting") toast = "Its conductor is already starting.";
+		else {
+			const task = step.task;
+			detach(async () => sendTaskMessage(cfg, await openConductor(task)), "conductor open");
+			toast = "Opening its conductor in a new tmux window.";
+		}
+		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callbackId, text: toast }, 10_000);
 	}
 
 	function crashTitle(record: SessionRecord): string {
@@ -7740,7 +7890,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		crashInFlight.add(id);
 		writePrivateJson(CRASH_DIR, `${id}.json`, { ...kept, restoringAt: Date.now(), error: "" });
 		detach(async () => {
-			const opened = await openOmp(id, record.cwd, record.argv, record.tmux, record.tmuxWindow, title);
+			const opened = await openOmp(
+				record.cwd,
+				["omp", ...record.argv, "--resume", id],
+				[],
+				record.tmux,
+				record.tmuxWindow,
+				title,
+			);
 			crashInFlight.delete(id);
 			const current = readCrash(id);
 			if (current === null) return;
@@ -8492,6 +8649,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			});
 		leaseWork = work;
 		detach(() => work, "leases");
+	}
+
+	/**
+	 * A conductor takes its task back to live: one opened for a new task finds it in its environment, cleared so a
+	 * nested omp cannot claim it again, and one resumed is already named in it.
+	 */
+	async function claimTask(): Promise<void> {
+		const named = process.env[CONDUCT_ENV];
+		delete process.env[CONDUCT_ENV];
+		const slug = named ?? listTasks(TASKS_DIR).find((task) => task.conductor === sessionId)?.slug;
+		if (slug === undefined) return;
+		await updateTask(TASKS_DIR, slug, (task) => ({
+			task: { ...task, conductor: sessionId, state: "live", launchedAt: 0 },
+			result: null,
+		}));
 	}
 
 	function claimLaunch(ctx: ExtensionContext): void {
@@ -9887,6 +10059,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							{ command: "stop", description: "Abort the running turn, reply to pick the session" },
 							{ command: "deps", description: "Draw the dependencies between sessions" },
 							{ command: "resume", description: "Resume an ended session that has updates waiting" },
+							{ command: "conduct", description: "Open or resume the conductor of a task" },
 						],
 					},
 					15_000,
@@ -9976,7 +10149,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}, DRAIN_MS);
 
 		await readTmuxPlace();
-		if (registered) claimLaunch(ctx);
+		if (registered) {
+			claimLaunch(ctx);
+			await claimTask();
+		}
 		syncOwnNode(ctx);
 
 		writeSessionRecord(ctx);
@@ -10121,6 +10297,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			removeStatePath(BALLOT_DIR, `${id}.json`);
 		}
 		if (left.size > 0) {
+			for (const task of listTasks(TASKS_DIR)) {
+				if (!left.has(task.conductor)) continue;
+				// Only this process moves a conductor off an id it left, so the task read above still names it.
+				await updateTask(TASKS_DIR, task.slug, (current) => ({
+					task: { ...current, conductor: sessionId },
+					result: null,
+				}));
+			}
 			// Every other session's ballot naming a left id now means this one.
 			const rename = (ids: string[]): string[] => ids.map((id) => (left.has(id) ? sessionId : id));
 			for (const [voter, ballot] of readBallots()) {
@@ -10688,7 +10872,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		closeReplyQuestion();
 		sessionAlive = false;
 		// A process that only waited on an id another process holds owns no ballot under it.
-		if (registered && !keepForRestore) removeStatePath(BALLOT_DIR, `${sessionId}.json`);
+		if (registered && !keepForRestore) {
+			removeStatePath(BALLOT_DIR, `${sessionId}.json`);
+			// Closed by hand, a conductor leaves its task dormant until `/conduct` resumes it.
+			const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId);
+			if (conducted !== undefined) {
+				await updateTask(TASKS_DIR, conducted.slug, (current) => ({
+					task: { ...current, state: "dormant" },
+					result: null,
+				}));
+			}
+		}
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		// No poller tick follows the last omp's exit, so the scope its shell keeps is given back its defaults here.
 		const ownUnit = cgroupOf(process.pid)?.unit;
