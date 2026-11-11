@@ -7584,6 +7584,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!Number.isSafeInteger(w.number) || (w.number as number) <= 0) return null;
 		if (typeof w.url !== "string" || !isStateToken(w.by) || typeof w.at !== "number") return null;
 		if (typeof w.seeded !== "boolean") return null;
+		// A file without `ended` holds a live watch.
+		if (w.ended !== undefined && typeof w.ended !== "boolean") return null;
 		if (w.head !== null && typeof w.head !== "string") return null;
 		if (typeof w.redSent !== "boolean" || typeof w.greenSent !== "boolean") return null;
 		if (!Array.isArray(w.reviews) || !w.reviews.every((id) => typeof id === "string")) return null;
@@ -7595,6 +7597,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			by: w.by as string,
 			at: w.at as number,
 			seeded: w.seeded as boolean,
+			ended: w.ended === true,
 			head: w.head as string | null,
 			redSent: w.redSent as boolean,
 			greenSent: w.greenSent as boolean,
@@ -7617,6 +7620,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			by: session,
 			at: Date.now(),
 			seeded: false,
+			ended: false,
 			head: null,
 			redSent: false,
 			greenSent: false,
@@ -7659,6 +7663,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						});
 						continue;
 					}
+					// An ended watch only keeps a later mention of its pull request from starting a second one.
+					if (watch.ended) continue;
 					const key = `${watch.owner}\u0000${watch.name}\u0000${watch.number}`;
 					if (!unique.has(key)) unique.set(key, { owner: watch.owner, name: watch.name, number: watch.number });
 					watches.push({ session, entry, watch });
@@ -7695,8 +7701,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const byKey = new Map<string, WatchFetch>();
 			for (const entry of entries)
 				byKey.set(`${entry.owner}\u0000${entry.name}\u0000${entry.number}`, fetched.get(entry.alias) as WatchFetch);
+			// The query can outlast a lock handover or a change to a watch, so only the holder writes, and only over
+			// the state it read before the query.
+			if (!ownsLock()) return;
 			let order = 0;
 			for (const { session, entry, watch } of watches) {
+				const current = prWatchOf(readJsonFile(join(WATCH_DIR, session, entry)));
+				if (current === null || JSON.stringify(current) !== JSON.stringify(watch)) continue;
 				const got = byKey.get(`${watch.owner}\u0000${watch.name}\u0000${watch.number}`) as WatchFetch;
 				// A per-PR error that is not a disappearance keeps this watch's state.
 				if (got.data === null && !got.gone) continue;
@@ -7745,8 +7756,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					);
 					if (!live) detach(() => raiseResumeCard(session), "resume card");
 				});
-				if (next !== null) writePrivateJson(join(WATCH_DIR, session), entry, next);
-				else removeStatePath(join(WATCH_DIR, session), entry);
+				writePrivateJson(join(WATCH_DIR, session), entry, next);
 			}
 			sweepWatches();
 		} finally {
@@ -8368,7 +8378,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const rows: string[] = [];
 				for (const entry of listJson(dir)) {
 					const watch = prWatchOf(readJsonFile(join(dir, entry)));
-					if (watch === null) continue;
+					if (watch === null || watch.ended) continue;
 					rows.push(`- ${watch.url} \u2014 watched for ${requestAge(watch.at)}`);
 				}
 				return reply(
@@ -8385,7 +8395,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			if (action === "remove") {
 				const name = prWatchName(key.owner, key.name, key.number);
-				if (!existsSync(join(dir, `${name}.json`))) {
+				const watched = prWatchOf(readJsonFile(join(dir, `${name}.json`)));
+				if (watched === null || watched.ended) {
 					return refuse(`This session does not watch ${key.owner}/${key.name}#${key.number}.`);
 				}
 				removeStatePath(dir, `${name}.json`);
@@ -8393,7 +8404,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			if (action !== "add") return refuse("`action` must be add, remove or list.");
 			const name = prWatchName(key.owner, key.name, key.number);
-			if (existsSync(join(dir, `${name}.json`))) {
+			const existing = prWatchOf(readJsonFile(join(dir, `${name}.json`)));
+			if (existing !== null && !existing.ended) {
 				return reply(`Already watching ${key.owner}/${key.name}#${key.number}.`, { url });
 			}
 			const alias = "w0";
@@ -8441,6 +8453,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				by: self,
 				at: Date.now(),
 				seeded: true,
+				ended: false,
 				head: data.headRefOid,
 				redSent: verdict === "red",
 				greenSent: verdict === "green",

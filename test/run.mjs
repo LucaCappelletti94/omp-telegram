@@ -16287,8 +16287,8 @@ echo done >> ${wghLog}
 	check("the merge is held for the ended watcher", pendingFiles(w2Id).length === 2);
 	check(
 		"the merged pull request ends every watch of it",
-		!existsSync(join(watchesDir, w1Id, "someorg+widget+9.json")) &&
-			!existsSync(join(watchesDir, w2Id, "someorg+widget+9.json")),
+		!prText(await prOf(w1, { action: "list" })).includes(URL9) &&
+			!prText(await prOf(w2, { action: "list" })).includes(URL9),
 	);
 	check(
 		"the second held event edits the open card instead of sending another",
@@ -16296,6 +16296,20 @@ echo done >> ${wghLog}
 			called("editMessageText").length === editsBefore + 1 &&
 			called("editMessageText").at(-1).body.text.includes("was merged"),
 	);
+	// An agent told of the merge records its outcome with the pull request again, which asks for the watch again.
+	await w1.tools
+		.get("session_graph")
+		.execute("g", { action: "status", status: "pushed", pr: URL9 }, undefined, undefined, w1.ctx);
+	const mergesSeen = w1.customs.filter((c) => c.message.content.includes("was merged")).length;
+	await tick(w1, [w1], [w1]);
+	await tick(w1, [w1], [w1]);
+	check(
+		"a merge already reported is never reported again when the pull request is named again",
+		w1.customs.filter((c) => c.message.content.includes("was merged")).length === mergesSeen,
+	);
+	// The status update gave w1 a graph node, which the later retention checks do not expect.
+	rmSync(join(nodesDir, `${w1Id}.json`), { force: true });
+	rmSync(join(root, "notify-telegram/graph/pr", `${w1Id}.json`), { force: true });
 
 	// A new pull request's CI: red then green on one head, red again on the next, nothing for a push that is pending.
 	const w3 = spawn(w3Id, "/home/dev/work/w3");
@@ -16536,11 +16550,10 @@ echo done >> ${wghLog}
 		"a pull request GitHub no longer finds is reported once",
 		w1.customs.length === d2 + 1 && w1.customs.at(-1).message.content.includes("is gone from GitHub"),
 	);
+	const w1Listed = prText(await prOf(w1, { action: "list" }));
 	check(
 		"the gone pull request ends its watch while the others keep theirs",
-		!existsSync(join(watchesDir, w1Id, "someorg+widget+13.json")) &&
-			existsSync(join(watchesDir, w1Id, "someorg+widget+11.json")) &&
-			existsSync(join(watchesDir, w3Id, "someorg+widget+12.json")),
+		!w1Listed.includes(URL13) && w1Listed.includes(URL11) && prText(await prOf(w3, { action: "list" })).includes(URL12),
 	);
 
 	// A failed query keeps every stored state, and the next tick retries.
@@ -16608,6 +16621,63 @@ echo done >> ${wghLog}
 			.filter((line) => line.startsWith("api graphql")).length ===
 			queriesBefore + 1,
 	);
+
+	// A watch changed while the poll waits on GitHub keeps the change, and the poll's stale view sends nothing.
+	const reviewedEleven = pr(11, "OPEN", {
+		reviews: [
+			review("r9a", "carol", "COMMENTED", "First pass."),
+			review("r9b", "dave", "COMMENTED", "Second pass."),
+			review("r9c", "erin", "COMMENTED", "A late look."),
+		],
+		contexts: [checkRun("ci/lint", "FAILURE")],
+	});
+	const tableSaved = readFileSync(ghTable, "utf8");
+	setGhTable({ "someorg/widget/11": reviewedEleven, "someorg/widget/12": pr(12, "OPEN", { head: "m1" }) });
+	await ghQuiet();
+	const beforeRemoval = w1.customs.length;
+	const elevenFile = join(watchesDir, w1Id, "someorg+widget+11.json");
+	const elevenSaved = readFileSync(elevenFile, "utf8");
+	process.env.WGH_SLOW = "1";
+	jump(61_000);
+	w3.heartbeat();
+	await settle(300);
+	await prOf(w1, { action: "remove", url: URL11 });
+	await settle(2_500);
+	delete process.env.WGH_SLOW;
+	await ghQuiet();
+	await w1.pump(200);
+	check(
+		"a watch removed while the poll waits on GitHub stays removed and reports nothing",
+		w1.customs.length === beforeRemoval && !prText(await prOf(w1, { action: "list" })).includes(URL11),
+	);
+	// The checks below expect w1 to watch #11 as before.
+	writeFileSync(elevenFile, elevenSaved);
+
+	// A poller that lost the lock while it waited on GitHub leaves the news to the new holder.
+	const twelveBefore = JSON.stringify(watchOf(w3Id, "someorg", "widget", 12));
+	setGhTable({
+		"someorg/widget/12": pr(12, "OPEN", { head: "m1", reviews: [review("r12", "frank", "COMMENTED", "Late.")] }),
+	});
+	const heldLock = readFileSync(lockPath, "utf8");
+	process.env.WGH_SLOW = "1";
+	jump(61_000);
+	w3.heartbeat();
+	await settle(300);
+	writeFileSync(
+		lockPath,
+		JSON.stringify({ ...JSON.parse(heldLock), instance: "another-poller", heartbeat: Date.now() }),
+	);
+	await settle(2_500);
+	delete process.env.WGH_SLOW;
+	await ghQuiet();
+	check(
+		"a poller that lost the lock mid-query writes no watch state and sends nothing",
+		JSON.stringify(watchOf(w3Id, "someorg", "widget", 12)) === twelveBefore &&
+			pendingFiles(w3Id).length === 0 &&
+			!w3.customs.some((c) => c.message.content.includes("review from frank")),
+	);
+	writeFileSync(lockPath, JSON.stringify({ ...JSON.parse(heldLock), heartbeat: Date.now() }));
+	writeFileSync(ghTable, tableSaved);
 
 	// Terminal pull requests are reported by add without a watch, and so is a repository the token cannot read.
 	setGhTable({ "someorg/widget/14": pr(14, "MERGED") });
@@ -16837,7 +16907,7 @@ echo done >> ${wghLog}
 		"a repository GitHub no longer resolves is reported as gone and ends the watch",
 		w6.customs.length === ghostBefore + 1 &&
 			w6.customs.at(-1).message.content.includes("is gone from GitHub") &&
-			!existsSync(join(watchesDir, w6Id, "someorg+ghost+1.json")),
+			!prText(await prOf(w6, { action: "list" })).includes("someorg/ghost/pull/1"),
 	);
 
 	// add with no readable GitHub output is refused.
@@ -17145,6 +17215,20 @@ echo done >> ${wghLog}
 			redSent: false,
 			greenSent: false,
 			reviews: [1],
+		}),
+		JSON.stringify({
+			owner: "o",
+			name: "r",
+			number: 9,
+			url: "u",
+			by: w1Id,
+			at: 1,
+			seeded: false,
+			ended: "yes",
+			head: null,
+			redSent: false,
+			greenSent: false,
+			reviews: [],
 		}),
 	];
 	bad.forEach((content, i) => {
