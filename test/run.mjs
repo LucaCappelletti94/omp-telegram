@@ -19092,6 +19092,35 @@ esac
 	check("a conductor moved to a continuation id keeps its task", task().conductor === continuation);
 	await moving.fire("session_shutdown");
 	check("the moved conductor closing turns the task dormant", task().state === "dormant");
+
+	// Another process takes the task while a closing or moving conductor waits on the task lock.
+	const taskLock = join(tasksDir, "tasks.lock");
+	const rival = "0d0e0100-0000-7000-8000-000000000009";
+	const handTo = (conductor, state) => writeFileSync(taskFile, JSON.stringify({ ...task(), conductor, state }));
+	const racer = spawn(continuation, taskDir);
+	await racer.fire("session_start");
+	writeFileSync(taskLock, "");
+	const closing = racer.fire("session_shutdown");
+	await settle(60);
+	handTo(rival, "live");
+	rmSync(taskLock);
+	await closing;
+	check(
+		"a conductor closing while another took its task leaves that task live",
+		task().conductor === rival && task().state === "live",
+	);
+	handTo(continuation, "live");
+	const mover = spawn(continuation, taskDir);
+	await mover.fire("session_start");
+	writeFileSync(taskLock, "");
+	mover.move("0d0e0100-0000-7000-8000-00000000000a");
+	await mover.pump(60);
+	handTo(rival, "live");
+	rmSync(taskLock);
+	await settle(200);
+	check("a conductor moving while another took its task leaves that conductor", task().conductor === rival);
+	await mover.fire("session_shutdown");
+	handTo(continuation, "dormant");
 	rmSync(join(sessionsDir, `${continuation}.json`), { force: true });
 	await conduct("/conduct Connetto quotas", 9974);
 	check(
