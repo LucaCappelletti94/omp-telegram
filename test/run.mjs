@@ -17924,6 +17924,20 @@ esac
 	);
 	await vote("gamma", { focus: [tagOf("beta"), tagOf("alpha")], resources: [tagOf("beta"), tagOf("alpha")] });
 
+	const twice = await vote("alpha", { focus: [tagOf("beta"), tagOf("beta")] });
+	check(
+		"a ranking naming one session twice is refused and leaves the ballot as it was",
+		twice.isError === true &&
+			twice.content[0].text.includes(`names ${tagOf("beta")} twice`) &&
+			JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.beta, ids.gamma]),
+	);
+	await vote("alpha", { focus: [ids.gamma.slice(0, 8), ids.beta.slice(0, 8)] });
+	check(
+		"a ranking may name sessions by an id prefix",
+		JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.gamma, ids.beta]),
+	);
+	await vote("alpha", { focus: [tagOf("beta"), tagOf("gamma")] });
+
 	// Alpha takes the poller lock before any tick, so it answers the commands and runs every tally.
 	rmSync(join(stateDir, "poller.lock"), { force: true });
 	alpha.heartbeat();
@@ -17968,8 +17982,13 @@ esac
 	await settle(100);
 	check("a session closed by hand drops its ballot", ballotOf(ids.gamma) === null);
 
-	await alpha.fire("session_shutdown");
 	await beta.fire("session_shutdown");
+	const alone = await vote("alpha", { focus: ["zzzzz"] });
+	check(
+		"with no other live session a vote is accepted with nothing to rank",
+		alone.isError !== true && alone.content[0].text.includes("nothing to rank"),
+	);
+	await alpha.fire("session_shutdown");
 	process.env.PATH = voteSavedPath;
 	delete process.env.TMUX;
 	delete process.env.TMUX_PANE;
