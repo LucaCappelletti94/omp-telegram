@@ -18,6 +18,8 @@ export interface Task {
 	members: Member[];
 	/** Sessions the conductor invited, kept while Luca's answer is open or after he skipped them. */
 	candidates: Candidate[];
+	/** Live sessions the conductor was already told about, so each reaches it once while it stays live. */
+	led: string[];
 }
 
 export interface Member {
@@ -75,6 +77,7 @@ function parseTask(raw: unknown, slug: string): Task | null {
 		(c): c is Candidate =>
 			typeof c?.session === "string" && typeof c.card === "string" && (c.state === "proposed" || c.state === "skipped"),
 	);
+	const led = (Array.isArray(t.led) ? t.led : []).filter((id): id is string => typeof id === "string");
 	return {
 		name: t.name,
 		slug,
@@ -84,6 +87,7 @@ function parseTask(raw: unknown, slug: string): Task | null {
 		launchedAt: t.launchedAt,
 		members,
 		candidates,
+		led,
 	};
 }
 
@@ -142,7 +146,7 @@ export function conductorRole(task: Task): string {
 		`You are the conductor of the task "${task.name}". The brief:`,
 		task.brief,
 		"You keep the omp sessions working on this task from duplicating work or making engineering choices that contradict each other, and you tell the user where they disagree. You report to the user through notify_status and reach the sessions through session_message, where a call without `to` lists every live session with its folder. You never pause, reorder or rebase a session's work yourself.",
-		"To bring a session into the task, call the `conductor` tool with `action` `invite`, the session's badge emoji or tag in `session`, and in `reason` why it belongs. The user answers Join or Skip on Telegram, and the answer reaches you as an aside written by no one.",
+		"To bring a session into the task, call the `conductor` tool with `action` `invite`, the session's badge emoji or tag in `session`, and in `reason` why it belongs. The user answers Join or Skip on Telegram, and the answer reaches you as an aside written by no one. Each live session that ends a turn reaches you once the same way, so you can judge whether it belongs.",
 		`Closing this session leaves the task dormant, and \`/conduct ${task.name}\` in Telegram resumes it.`,
 	].join("\n\n");
 }

@@ -66,6 +66,7 @@ heading("task files");
 		launchedAt: 5,
 		members: [{ session: "m", joinedAt: 1 }],
 		candidates: [{ session: "c", card: "0a1b2c3d", state: "skipped" }],
+		led: ["s"],
 	};
 	const made = await changeTask(dir, "docs-pass", (task) => ({ task: task === null ? fresh : task, result: task }));
 	check("an absent task reads as null inside the change", made === null);
@@ -108,12 +109,12 @@ heading("task files");
 		"an update of a slug outside the pattern gives null",
 		(await updateTask(dir, "../escape", () => ({ task: fresh, result: "seen" }))) === null,
 	);
-	const { members, candidates, ...older } = fresh;
+	const { members, candidates, led, ...older } = fresh;
 	writeFileSync(join(dir, "older.json"), JSON.stringify({ ...older, slug: "older" }));
 	const plain = readTask(dir, "older");
 	check(
-		"a task written before membership reads with no members or candidates",
-		plain.members.length === 0 && plain.candidates.length === 0,
+		"a task written before membership reads with no members, candidates or leads",
+		plain.members.length === 0 && plain.candidates.length === 0 && plain.led.length === 0,
 	);
 	writeFileSync(
 		join(dir, "mixed.json"),
@@ -126,13 +127,15 @@ heading("task files");
 				{ session: "c", card: 3, state: "proposed" },
 				...candidates,
 			],
+			led: [4, ...led],
 		}),
 	);
 	const mixed = readTask(dir, "mixed");
 	check(
-		"malformed members and candidates are dropped, well-formed ones kept",
+		"malformed members, candidates and leads are dropped, well-formed ones kept",
 		JSON.stringify(mixed.members) === JSON.stringify(members) &&
-			JSON.stringify(mixed.candidates) === JSON.stringify(candidates),
+			JSON.stringify(mixed.candidates) === JSON.stringify(candidates) &&
+			JSON.stringify(mixed.led) === JSON.stringify(led),
 	);
 	rmSync(dir, { recursive: true, force: true });
 }
