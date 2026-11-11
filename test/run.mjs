@@ -228,6 +228,24 @@ const opts = (...labels) => labels.map((label) => ({ label, description: `what "
 /** ask refuses an option with no description either; most tests do not care what it says. */
 const askOpt = (label) => ({ label, description: `what "${label}" does` });
 const askOpts = (...labels) => labels.map(askOpt);
+/**
+ * notify_status refuses a status without both rankings while another session is live, and most tests do not care
+ * how it ranks: a call without them ranks every peer `priority_vote` lists, in tag order so tallies stay fixed.
+ * `raw` is the tool as registered, for the tests that do care.
+ */
+const withBallot = (def, tools) => ({
+	...def,
+	raw: def,
+	execute: async (callId, params, ...rest) => {
+		if (params?.focus !== undefined || params?.resources !== undefined) return def.execute(callId, params, ...rest);
+		const listed = await tools.get("priority_vote").execute("list", {}, ...rest);
+		// Some sections refresh every leftover record, so an ended session can list beside a successor that reused its tag.
+		const tags = [
+			...new Set([...listed.content[0].text.matchAll(/ \u2014 tag (\S+) \u2014 /gu)].map((m) => m[1])),
+		].sort();
+		return def.execute(callId, tags.length > 0 ? { ...params, focus: tags, resources: tags } : params, ...rest);
+	},
+});
 const inboxCount = (id) =>
 	existsSync(inboxOf(id)) ? readdirSync(inboxOf(id)).filter((f) => f.endsWith(".json")).length : 0;
 const sentRecordFile = (id) => JSON.parse(readFileSync(join(root, `notify-telegram/sent/${id}.json`), "utf8"));
@@ -260,7 +278,7 @@ const spawn = (id, cwd, title = "") => {
 		zod: chain,
 		logger: { debug() {}, info() {}, warn: (m, meta) => warns.push({ m, meta }), error() {} },
 		on: (event, fn) => handlers.set(event, [...(handlers.get(event) ?? []), fn]),
-		registerTool: (def) => tools.set(def.name, def),
+		registerTool: (def) => tools.set(def.name, def.name === "notify_status" ? withBallot(def, tools) : def),
 		sendUserMessage: (text, options) => steers.push({ text, options }),
 		sendMessage: (message, options) => customs.push({ message, options }),
 		setSessionName: async (value) => {
@@ -1386,6 +1404,31 @@ heading("a session resumed while another omp holds it");
 	);
 	check("neither press is answered as a closed question", closedNotices() === closedBefore);
 	await resumed.fire("session_shutdown");
+	// A further process resumed on the holder's id waits behind the leased holder, and its exit leaves the holder's ballot.
+	const heldBallot = join(root, "notify-telegram/ballots", `${heldId}.json`);
+	mkdirSync(join(root, "notify-telegram/ballots"), { recursive: true });
+	writeFileSync(heldBallot, JSON.stringify({ focus: [], resources: [], at: Date.now() }));
+	const waiter = spawn(heldId, "/home/dev/work/connetto");
+	await waiter.fire("session_start");
+	waiter.heartbeat();
+	await settle(100);
+	const waiterWaited = record(heldId).instance === holderInstance;
+	const ballotBytes = readFileSync(heldBallot, "utf8");
+	const waiterVote = await waiter.tools
+		.get("priority_vote")
+		.execute("pv-wait", { focus: ["anyone"] }, undefined, undefined, waiter.ctx);
+	check(
+		"a waiting instance refuses to vote, since its ballot would count for the holder",
+		waiterWaited &&
+			waiterVote.isError === true &&
+			waiterVote.content[0].text.includes("holds this session's id") &&
+			readFileSync(heldBallot, "utf8") === ballotBytes,
+	);
+	await waiter.fire("session_shutdown");
+	check(
+		"a waiting instance's shutdown leaves the holder's ballot",
+		waiterWaited && record(heldId).instance === holderInstance && existsSync(heldBallot),
+	);
 	await holder.fire("session_shutdown");
 
 	// A waiting instance whose holder ends takes the session over as an ordinary resume.
@@ -3903,7 +3946,7 @@ mkdirSync(fakeBin, { recursive: true });
 const fakeTmux = join(fakeBin, "tmux");
 writeFileSync(
 	fakeTmux,
-	"#!/bin/sh\nprintf '0\\t0\\t0\\t\\t\u03C0 \u280B Fixing the parser\\n'\nprintf '0\\t1\\t0\\t\\t\u03C0 ! Choose a name\\n'\nprintf '0\\t2\\t1\\t\\t\u03C0 > Docs pass\\n'\nprintf '0\\t3\\t0\\t\\t\u03C0 > Sleepy\\n'\nprintf '0\\t4\\t0\\t\\tbash\\n'\n",
+	"#!/bin/sh\nprintf '0\\t0\\t0\\t\\t%%10\\t\u03C0 \u280B Fixing the parser\\n'\nprintf '0\\t1\\t0\\t\\t%%11\\t\u03C0 ! Choose a name\\n'\nprintf '0\\t2\\t1\\t\\t%%12\\t\u03C0 > Docs pass\\n'\nprintf '0\\t3\\t0\\t\\t%%13\\t\u03C0 > Sleepy\\n'\nprintf '0\\t4\\t0\\t\\t%%14\\tbash\\n'\n",
 	{ mode: 0o755 },
 );
 const realPath = process.env.PATH;
@@ -3927,7 +3970,7 @@ check("fleet skips windows that are not omp", !fleetMsg.text.includes("bash"));
 check("fleet does not touch any session inbox", inboxCount(ux.id) === 0);
 
 // The report is re-read per command: an emptied fleet answers accordingly.
-writeFileSync(fakeTmux, "#!/bin/sh\nprintf '0\\t4\\t0\\t\\tbash\\n'\n", { mode: 0o755 });
+writeFileSync(fakeTmux, "#!/bin/sh\nprintf '0\\t4\\t0\\t\\t%%14\\tbash\\n'\n", { mode: 0o755 });
 api.queued = [{ update_id: 613, message: { message_id: 84, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
 await ux.pump(250);
 check("an omp-free fleet says so", lastCall("sendMessage").body.text.includes("No omp windows in tmux right now"));
@@ -3942,7 +3985,7 @@ check("fleet without tmux explains itself", lastCall("sendMessage").body.text.in
 {
 	writeFileSync(
 		fakeTmux,
-		`#!/bin/sh\nif [ "$1" = list-panes ]; then\n\tprintf 'work\\t3\\t0\\t\\t\u03C0 \u280B Session A\\n'\n\tprintf 'work\\t3\\t0\\t\\t\u03C0 ! Session B\\n'\nelif [ "$1" = list-windows ]; then\n\tprintf 'work\\t3\\t0\\t\\t\u03C0 \u280B Session A\\n'\nfi\n`,
+		`#!/bin/sh\nif [ "$1" = list-panes ]; then\n\tprintf 'work\\t3\\t0\\t\\t%%15\\t\u03C0 \u280B Session A\\n'\n\tprintf 'work\\t3\\t0\\t\\t%%16\\t\u03C0 ! Session B\\n'\nelif [ "$1" = list-windows ]; then\n\tprintf 'work\\t3\\t0\\t\\t\u03C0 \u280B Session A\\n'\nfi\n`,
 		{ mode: 0o755 },
 	);
 	process.env.PATH = `${fakeBin}:${realPath}`;
@@ -3965,7 +4008,7 @@ check("fleet without tmux explains itself", lastCall("sendMessage").body.text.in
 {
 	writeFileSync(
 		fakeTmux,
-		`#!/bin/sh\nif [ "$1" = list-panes ]; then\n\tprintf 'work\\t3\\t1\\t\\t\u03C0 > Session C\\n'\n\tprintf 'work\\t3\\t1\\t\\t\u03C0 > Session D\\n'\n\tprintf 'work\\t4\\t1\\t\\t\u03C0 > Session E\\n'\nfi\n`,
+		`#!/bin/sh\nif [ "$1" = list-panes ]; then\n\tprintf 'work\\t3\\t1\\t\\t%%17\\t\u03C0 > Session C\\n'\n\tprintf 'work\\t3\\t1\\t\\t%%18\\t\u03C0 > Session D\\n'\n\tprintf 'work\\t4\\t1\\t\\t%%19\\t\u03C0 > Session E\\n'\nfi\n`,
 		{ mode: 0o755 },
 	);
 	process.env.PATH = `${fakeBin}:${realPath}`;
@@ -7685,7 +7728,7 @@ heading("attention-first /fleet");
 			'case "$1" in',
 			"  display-message) printf 'main\\t2\\n' ;;",
 			"  list-panes)",
-			...rows.map((r) => `    printf 'main\\t${r[0]}\\t${r[1]}\\t${r[2]}\\t${r[3]}\\n'`),
+			...rows.map((r) => `    printf 'main\\t${r[0]}\\t${r[1]}\\t${r[2]}\\t%%5${r[0]}\\t${r[3]}\\n'`),
 			"    ;;",
 			"esac",
 			"",
@@ -7707,6 +7750,7 @@ heading("attention-first /fleet");
 	await fl.pump(250);
 	const report = lastCall("sendMessage").body.text ?? "";
 	const at = (needle) => report.indexOf(needle);
+	check("a window the user marked lists first", at("Marked urgent") < at("Needs you"));
 	check("waiting comes before finished", at("Needs you") < at("Done here"));
 	check("finished comes before working", at("Done here") < at("Building"));
 	check("working comes before idle", at("Building") < at("Idle one"));
@@ -8806,9 +8850,9 @@ heading("spinner frames match omp exactly");
 	const spinBin = join(root, "spin-bin");
 	mkdirSync(spinBin, { recursive: true });
 	const rows = [
-		...frames.map((f, i) => `    printf '0\\t${i}\\t0\\t\\t\u03C0 ${f} Frame ${i}\\n'`),
-		`    printf '0\\t90\\t0\\t\\t\u03C0 \u28FF Not an omp frame\\n'`,
-		`    printf '0\\t91\\t0\\t\\t\u03C0 \u2801 Also not a frame\\n'`,
+		...frames.map((f, i) => `    printf '0\\t${i}\\t0\\t\\t%%6${i}\\t\u03C0 ${f} Frame ${i}\\n'`),
+		`    printf '0\\t90\\t0\\t\\t%%690\\t\u03C0 \u28FF Not an omp frame\\n'`,
+		`    printf '0\\t91\\t0\\t\\t%%691\\t\u03C0 \u2801 Also not a frame\\n'`,
 	];
 	writeFileSync(
 		join(spinBin, "tmux"),
@@ -15036,7 +15080,9 @@ heading("sessions that died without shutting down");
 
 // ---------------------------------------------------------------- version skew
 
-const stampFiles = ["index.ts", "render.ts", "graph.ts"].map((name) => new URL(`../${name}`, import.meta.url).pathname);
+const stampFiles = ["index.ts", "render.ts", "graph.ts", "priority.ts"].map(
+	(name) => new URL(`../${name}`, import.meta.url).pathname,
+);
 const stampOf = () => {
 	const h = createHash("sha256");
 	for (const f of stampFiles) h.update(readFileSync(f));
@@ -17845,6 +17891,280 @@ esac
 
 	await pc.fire("session_shutdown");
 	process.env.PATH = paneSavedPath;
+	delete process.env.TMUX;
+	delete process.env.TMUX_PANE;
+	clockSkew = 0;
+}
+
+heading("Borda vote on session priority");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(sessionsDir, { recursive: true, force: true });
+	mkdirSync(sessionsDir, { recursive: true });
+	for (const name of ["poller.lock", "dashboard.lock", "ballots", "priority.json"]) {
+		rmSync(join(stateDir, name), { recursive: true, force: true });
+	}
+	// Three panes in windows 91 to 93. A window's user mark lives in a file, so a test sets the mark the user would set.
+	const voteBin = join(root, "vote-bin");
+	const voteDir = join(root, "vote-state");
+	const voteLog = join(root, "vote-tmux.log");
+	mkdirSync(voteBin, { recursive: true });
+	mkdirSync(voteDir, { recursive: true });
+	writeFileSync(voteLog, "");
+	writeFileSync(
+		join(voteBin, "tmux"),
+		`#!/bin/sh
+echo "$*" >> ${voteLog}
+case "$1" in
+list-panes)
+	case "$*" in
+	*pane_title*)
+		for p in 91 92 93; do
+			printf 'work\\t%s\\t0\\t%s\\t%%%s\\t\\317\\200 > window %s\\n' "$p" "$(cat ${voteDir}/prio-$p 2>/dev/null)" "$p" "$p"
+		done ;;
+	*)
+		[ -e ${voteDir}/fail-list ] && exit 1
+		for p in 91 92 93; do
+			printf '%%%s\\t%s\\n' "$p" "$(cat ${voteDir}/prio-$p 2>/dev/null)"
+		done ;;
+	esac ;;
+display-message) printf 'work\\t3\\n' ;;
+*) exit 0 ;;
+esac
+`,
+		{ mode: 0o755 },
+	);
+	writeFileSync(join(voteBin, "gh"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+	const voteSavedPath = process.env.PATH;
+	process.env.PATH = `${voteBin}:${voteSavedPath}`;
+	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	const ballotOf = (id) => {
+		const file = join(stateDir, "ballots", `${id}.json`);
+		return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : null;
+	};
+
+	const ids = {
+		alpha: "0b0da001-0000-7000-8000-000000000001",
+		beta: "0b0da002-0000-7000-8000-000000000002",
+		gamma: "0b0da003-0000-7000-8000-000000000003",
+	};
+	const fx = {};
+	for (const [name, pane] of [
+		["alpha", "%91"],
+		["beta", "%92"],
+		["gamma", "%93"],
+	]) {
+		process.env.TMUX_PANE = pane;
+		fx[name] = spawn(ids[name], `/home/dev/borda/${name}`);
+		await fx[name].fire("session_start");
+	}
+	await settle(150);
+	const { alpha, beta, gamma } = fx;
+	const tagOf = (name) => record(ids[name]).tag;
+	const vote = (name, params) =>
+		fx[name].tools.get("priority_vote").execute("v", params, undefined, undefined, fx[name].ctx);
+	const rawStatus = (name, params) =>
+		fx[name].tools.get("notify_status").raw.execute("s", params, undefined, undefined, fx[name].ctx);
+	// One poller tick: every session refreshes its record, then alpha, the poller, re-tallies.
+	const tick = async () => {
+		jump(31_000);
+		beta.heartbeat();
+		gamma.heartbeat();
+		alpha.heartbeat();
+		await settle(400);
+	};
+	const statusOrder = async () => {
+		writeFileSync(join(inboxOf(ids.alpha), "991.json"), JSON.stringify({ kind: "command", value: "status" }));
+		await alpha.pump(300);
+		// The reply opens with the answering session's own head, so the list starts after the first blank line.
+		const listing = lastCall("sendMessage").body.text.split("\n\n").slice(1).join("\n\n");
+		return ["alpha", "beta", "gamma"].sort((a, b) => listing.indexOf(` ${a} \u00B7`) - listing.indexOf(` ${b} \u00B7`));
+	};
+
+	const listed = await vote("alpha", {});
+	const listing = listed.content[0].text;
+	check(
+		"priority_vote with no arguments lists every other live session by tag",
+		listing.includes(`tag ${tagOf("beta")} `) &&
+			listing.includes(`tag ${tagOf("gamma")} `) &&
+			!listing.includes(`tag ${tagOf("alpha")} `),
+	);
+
+	const missing = await rawStatus("alpha", { summary: "done", urgency: "orange" });
+	check(
+		"a status without rankings is refused while another session is live, and the refusal lists whom to rank",
+		missing.isError === true &&
+			missing.content[0].text.includes("`focus` is missing") &&
+			missing.content[0].text.includes(`tag ${tagOf("beta")} `) &&
+			ballotOf(ids.alpha) === null,
+	);
+	const selfRanked = await rawStatus("alpha", {
+		summary: "done",
+		urgency: "orange",
+		focus: [tagOf("alpha")],
+		resources: [tagOf("beta")],
+	});
+	check(
+		"a ranking naming its own session is refused",
+		selfRanked.isError === true && selfRanked.content[0].text.includes("this session itself"),
+	);
+	const unknown = await rawStatus("alpha", { summary: "done", urgency: "orange", focus: ["zzzzz"], resources: [] });
+	check(
+		"an unknown session and an empty ranking are both named in the refusal",
+		unknown.isError === true &&
+			unknown.content[0].text.includes("names zzzzz, no other live session") &&
+			unknown.content[0].text.includes("`resources` is not a list naming at least one session"),
+	);
+
+	const cast = await rawStatus("alpha", {
+		summary: "done",
+		urgency: "orange",
+		focus: [tagOf("beta"), tagOf("gamma")],
+		resources: [tagOf("gamma"), tagOf("beta")],
+	});
+	check(
+		"a status with both rankings is recorded and stores them as session ids",
+		cast.isError !== true &&
+			JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.beta, ids.gamma]) &&
+			JSON.stringify(ballotOf(ids.alpha)?.resources) === JSON.stringify([ids.gamma, ids.beta]),
+	);
+	// A ballot file mangled on disk is no earlier ballot, so a vote passing one ranking leaves the other empty.
+	mkdirSync(join(stateDir, "ballots"), { recursive: true });
+	writeFileSync(join(stateDir, "ballots", `${ids.beta}.json`), JSON.stringify({ focus: "x", resources: [ids.alpha] }));
+	await vote("beta", { resources: [tagOf("alpha")] });
+	writeFileSync(
+		join(stateDir, "ballots", `${ids.beta}.json`),
+		JSON.stringify({ focus: [ids.alpha], resources: [ids.alpha] }),
+	);
+	await vote("beta", { focus: [tagOf("gamma")] });
+	check(
+		"a ballot file without its cast time counts as no earlier ballot",
+		JSON.stringify(ballotOf(ids.beta)?.resources) === "[]",
+	);
+	await vote("beta", { resources: [tagOf("alpha")] });
+	check(
+		"a mid-turn vote may pass one ranking and leaves the other as it was",
+		JSON.stringify(ballotOf(ids.beta)?.focus) === JSON.stringify([ids.gamma]) &&
+			JSON.stringify(ballotOf(ids.beta)?.resources) === JSON.stringify([ids.alpha]),
+	);
+	// The tallies below expect beta to rank nobody for resources, which no vote can cast.
+	writeFileSync(
+		join(stateDir, "ballots", `${ids.beta}.json`),
+		JSON.stringify({ ...ballotOf(ids.beta), resources: [] }),
+	);
+	await vote("gamma", { focus: [tagOf("beta"), tagOf("alpha")], resources: [tagOf("beta"), tagOf("alpha")] });
+
+	const twice = await vote("alpha", { focus: [tagOf("beta"), tagOf("beta")] });
+	check(
+		"a ranking naming one session twice is refused and leaves the ballot as it was",
+		twice.isError === true &&
+			twice.content[0].text.includes(`names ${tagOf("beta")} twice`) &&
+			JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.beta, ids.gamma]),
+	);
+	await vote("alpha", { focus: [ids.gamma.slice(0, 8), ids.beta.slice(0, 8)] });
+	check(
+		"a ranking may name sessions by an id prefix",
+		JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.gamma, ids.beta]),
+	);
+	// Gamma's heartbeat lapses between the listing and the vote, as when its omp exits mid-turn.
+	const gammaRecord = readFileSync(join(sessionsDir, `${ids.gamma}.json`), "utf8");
+	writeFileSync(
+		join(sessionsDir, `${ids.gamma}.json`),
+		JSON.stringify({ ...JSON.parse(gammaRecord), heartbeat: Date.now() - 60_000 }),
+	);
+	const lapsed = await vote("alpha", { focus: [tagOf("gamma"), tagOf("beta")] });
+	check(
+		"a ranking naming a session that has just ended drops it instead of refusing the ballot",
+		lapsed.isError !== true && JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.beta]),
+	);
+	const lapsedById = await vote("alpha", { focus: [ids.gamma.slice(0, 8), tagOf("beta")] });
+	check(
+		"an ended session named by an id prefix is dropped the same way",
+		lapsedById.isError !== true && JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.beta]),
+	);
+	writeFileSync(join(sessionsDir, `${ids.gamma}.json`), gammaRecord);
+	// A second live session whose id starts like beta's makes the prefix ambiguous.
+	const twinFile = join(sessionsDir, "0b0da002-ffff-7000-8000-0000000000ff.json");
+	writeFileSync(
+		twinFile,
+		JSON.stringify({ ...record(ids.beta), instance: "twin", tag: "twinx", emoji: "", heartbeat: Date.now() }),
+	);
+	const ambiguous = await vote("alpha", { focus: [ids.beta.slice(0, 8)] });
+	check(
+		"an id prefix two live sessions share is refused, not dropped",
+		ambiguous.isError === true && ambiguous.content[0].text.includes("several live sessions"),
+	);
+	rmSync(twinFile);
+	await vote("alpha", { focus: [tagOf("beta"), tagOf("gamma")] });
+
+	// Alpha takes the poller lock before any tick, so it answers the commands and runs every tally.
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	alpha.heartbeat();
+	await settle(150);
+	await tick();
+	// Focus: beta 2 + 2, gamma 1 + 1, alpha 1.
+	check("/status lists sessions in focus order", (await statusOrder()).join(" ") === "beta gamma alpha");
+
+	writeFileSync(join(voteDir, "prio-93"), "high");
+	await tick();
+	check("a window the user marked lists first, above every vote", (await statusOrder())[0] === "gamma");
+	api.queued = [{ update_id: 9920, message: { message_id: 9920, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
+	await alpha.pump(300);
+	const fleet = lastCall("sendMessage").body.text;
+	check(
+		"/fleet lists the marked window first, then the panes in focus order",
+		fleet.indexOf("93 window 93") < fleet.indexOf("92 window 92") &&
+			fleet.indexOf("92 window 92") < fleet.indexOf("91 window 91"),
+	);
+	// A tmux that cannot list its panes marks no window, so the vote order stands alone.
+	writeFileSync(join(voteDir, "fail-list"), "");
+	await tick();
+	check("when tmux cannot list its panes no window counts as marked", (await statusOrder())[0] === "beta");
+	rmSync(join(voteDir, "fail-list"));
+	rmSync(join(voteDir, "prio-93"), { force: true });
+	// A tally file mangled on disk sorts nothing, and every live session is still listed.
+	writeFileSync(join(stateDir, "priority.json"), JSON.stringify({ points: { [ids.beta]: "x" }, marked: "gamma" }));
+	writeFileSync(join(inboxOf(ids.alpha), "993.json"), JSON.stringify({ kind: "command", value: "status" }));
+	await alpha.pump(300);
+	const mangled = lastCall("sendMessage").body.text;
+	check(
+		"a mangled tally file still lists every live session",
+		["alpha", "beta", "gamma"].every((name) => mangled.includes(` ${name} \u00B7`)),
+	);
+
+	await vote("alpha", { focus: [tagOf("gamma"), tagOf("beta")] });
+	await vote("gamma", { focus: [tagOf("alpha"), tagOf("beta")] });
+	await tick();
+	// Focus: gamma 2 + 1, beta 1 + 1, alpha 2.
+	check("a recast ballot reorders /status at the next tally", (await statusOrder()).join(" ") === "gamma alpha beta");
+
+	const movedId = "0b0da00b-0000-7000-8000-00000000000b";
+	beta.move(movedId);
+	beta.heartbeat();
+	await settle(200);
+	check(
+		"a session moved to a continuation id takes its ballot along",
+		ballotOf(movedId) !== null && ballotOf(ids.beta) === null,
+	);
+	check(
+		"other ballots naming the old id now name the continuation",
+		ballotOf(ids.alpha)?.focus.includes(movedId) && !ballotOf(ids.alpha)?.focus.includes(ids.beta),
+	);
+
+	await gamma.fire("session_shutdown");
+	await settle(100);
+	check("a session closed by hand drops its ballot", ballotOf(ids.gamma) === null);
+
+	await beta.fire("session_shutdown");
+	const alone = await vote("alpha", { focus: ["zzzzz"] });
+	check(
+		"with no other live session a vote is accepted with nothing to rank",
+		alone.isError !== true && alone.content[0].text.includes("nothing to rank"),
+	);
+	await alpha.fire("session_shutdown");
+	process.env.PATH = voteSavedPath;
 	delete process.env.TMUX;
 	delete process.env.TMUX_PANE;
 	clockSkew = 0;
