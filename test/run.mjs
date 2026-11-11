@@ -28,6 +28,39 @@ const root = mkdtempSync(join(tmpdir(), "notify-suite-"));
 process.env.PI_CODING_AGENT_DIR = root;
 delete process.env.TMUX;
 delete process.env.TMUX_PANE;
+/** Stands in for systemd's user manager for the whole suite, so no test reweights the scope the suite runs in. */
+const systemdBin = join(root, "systemd-bin");
+const systemdLog = join(root, "systemctl.log");
+const systemdUnits = join(root, "systemd-units");
+mkdirSync(systemdBin);
+mkdirSync(systemdUnits);
+writeFileSync(
+	join(systemdBin, "systemctl"),
+	`#!/bin/sh
+echo "$*" >> ${systemdLog}
+[ -e "${systemdUnits}/fail-$2" ] && exit 1
+[ -e "${systemdUnits}/slow-$2" ] && sleep 0.5
+case "$1 $2" in
+"--user show")
+	shift 2
+	while [ $# -gt 0 ]; do
+		case "$1" in -p) shift 2; continue ;; esac
+		if [ -e "${systemdUnits}/$1.gone" ]; then
+			printf 'Id=%s\\nLoadState=not-found\\nCPUWeight=[not set]\\n\\n' "$1"
+		else
+			printf 'Id=%s\\nLoadState=loaded\\nCPUWeight=%s\\n\\n' "$1" "$(cat "${systemdUnits}/$1" 2>/dev/null || echo '[not set]')"
+		fi
+		shift
+	done ;;
+"--user set-property")
+	value=\${5#CPUWeight=}
+	if [ -z "$value" ]; then rm -f "${systemdUnits}/$4"; else echo "$value" > "${systemdUnits}/$4"; fi ;;
+*) echo running ;;
+esac
+`,
+	{ mode: 0o755 },
+);
+process.env.PATH = `${systemdBin}:${process.env.PATH}`;
 const writeConfig = (extra = {}) =>
 	writeFileSync(
 		join(root, "notify-telegram.json"),
@@ -17903,10 +17936,11 @@ heading("Borda vote on session priority");
 	const stateDir = join(root, "notify-telegram");
 	rmSync(sessionsDir, { recursive: true, force: true });
 	mkdirSync(sessionsDir, { recursive: true });
-	for (const name of ["poller.lock", "dashboard.lock", "ballots", "priority.json"]) {
+	for (const name of ["poller.lock", "dashboard.lock", "ballots", "priority.json", "weighted-scopes"]) {
 		rmSync(join(stateDir, name), { recursive: true, force: true });
 	}
-	// Three panes in windows 91 to 93. A window's user mark lives in a file, so a test sets the mark the user would set.
+	// Three panes in windows @91 to @93. A window's user mark and vote mark live in files, so a test sets the mark
+	// the user would set and reads the mark the poller writes.
 	const voteBin = join(root, "vote-bin");
 	const voteDir = join(root, "vote-state");
 	const voteLog = join(root, "vote-tmux.log");
@@ -17927,9 +17961,23 @@ list-panes)
 	*)
 		[ -e ${voteDir}/fail-list ] && exit 1
 		for p in 91 92 93; do
-			printf '%%%s\\t%s\\n' "$p" "$(cat ${voteDir}/prio-$p 2>/dev/null)"
+			printf '%%%s\\t@%s\\t%s\\t%s\\n' "$p" "$p" "$(cat ${voteDir}/prio-$p 2>/dev/null)" "$(cat ${voteDir}/vote-@$p 2>/dev/null)"
 		done ;;
 	esac ;;
+set-option)
+	T=""; U=0; O=""; V=""; shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-t) shift; T="$1" ;;
+		-u) U=1 ;;
+		-w|-p|-q) ;;
+		@*) O="$1" ;;
+		*) V="$1" ;;
+		esac
+		shift
+	done
+	[ "$O" = "@omp_vote" ] || exit 0
+	if [ "$U" = 1 ]; then rm -f "${voteDir}/vote-$T"; else printf '%s' "$V" > "${voteDir}/vote-$T"; fi ;;
 display-message) printf 'work\\t3\\n' ;;
 *) exit 0 ;;
 esac
@@ -17940,10 +17988,21 @@ esac
 	const voteSavedPath = process.env.PATH;
 	process.env.PATH = `${voteBin}:${voteSavedPath}`;
 	process.env.TMUX = "/tmp/fake-tmux,1,0";
+	const voted = (window) =>
+		existsSync(join(voteDir, `vote-${window}`)) ? readFileSync(join(voteDir, `vote-${window}`), "utf8") : "";
 	const ballotOf = (id) => {
 		const file = join(stateDir, "ballots", `${id}.json`);
 		return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : null;
 	};
+	// Every spawn runs in this process, so all three share the scope the suite runs in.
+	const suiteUnit =
+		readFileSync("/proc/self/cgroup", "utf8")
+			.split("\n")
+			.find((line) => line.startsWith("0::"))
+			?.split("/")
+			.pop() ?? "";
+	const unitWeight = () =>
+		existsSync(join(systemdUnits, suiteUnit)) ? readFileSync(join(systemdUnits, suiteUnit), "utf8").trim() : "";
 
 	const ids = {
 		alpha: "0b0da001-0000-7000-8000-000000000001",
@@ -18103,13 +18162,25 @@ esac
 	rmSync(join(stateDir, "poller.lock"), { force: true });
 	alpha.heartbeat();
 	await settle(150);
+	writeFileSync(voteLog, "");
 	await tick();
-	// Focus: beta 2 + 2, gamma 1 + 1, alpha 1.
+	// Focus: beta 2 + 2, gamma 1 + 1, alpha 1. Resources: beta 1 + 2, gamma 2, alpha 1, of 4 attainable.
 	check("/status lists sessions in focus order", (await statusOrder()).join(" ") === "beta gamma alpha");
+	check("the focus winner's window carries the vote mark", voted("@92") === "top" && voted("@91") === "");
+	check(
+		"the user's own priority option is never written",
+		!readFileSync(voteLog, "utf8").includes("@omp_priority high"),
+	);
+	check(
+		"the shared scope takes the highest weight any session in it earned, beta's 200 of 25 to 400",
+		unitWeight() === "200",
+	);
 
 	writeFileSync(join(voteDir, "prio-93"), "high");
 	await tick();
 	check("a window the user marked lists first, above every vote", (await statusOrder())[0] === "gamma");
+	check("the vote mark stays with the vote's own winner", voted("@92") === "top" && voted("@93") === "");
+	check("a window the user marked gets the top weight", unitWeight() === "400");
 	api.queued = [{ update_id: 9920, message: { message_id: 9920, date: 1, chat: { id: CHAT }, text: "/fleet" } }];
 	await alpha.pump(300);
 	const fleet = lastCall("sendMessage").body.text;
@@ -18139,6 +18210,82 @@ esac
 	await tick();
 	// Focus: gamma 2 + 1, beta 1 + 1, alpha 2.
 	check("a recast ballot reorders /status at the next tally", (await statusOrder()).join(" ") === "gamma alpha beta");
+	check("a new focus winner takes the vote mark from the old one", voted("@93") === "top" && voted("@92") === "");
+
+	// A tmux that cannot list its panes leaves every window mark as it was.
+	writeFileSync(join(voteDir, "fail-list"), "");
+	writeFileSync(voteLog, "");
+	await tick();
+	check(
+		"when tmux cannot list its panes no window mark changes",
+		voted("@93") === "top" && !readFileSync(voteLog, "utf8").includes("set-option -w"),
+	);
+	rmSync(join(voteDir, "fail-list"));
+
+	// The poller tracks each weighted scope as its own file, so a test tracks one the same way.
+	const weightedDir = join(stateDir, "weighted-scopes");
+	const weightedList = () => (existsSync(weightedDir) ? readdirSync(weightedDir) : []).join("\n");
+	const track = (unit) => {
+		mkdirSync(weightedDir, { recursive: true });
+		writeFileSync(join(weightedDir, unit), "{}");
+	};
+	// A scope weighted for a session that has since ended gets the kernel default back.
+	track(suiteUnit);
+	track("tmux-spawn-ended.scope");
+	writeFileSync(join(systemdUnits, "tmux-spawn-ended.scope"), "400");
+	writeFileSync(systemdLog, "");
+	await tick();
+	check(
+		"a weighted scope with no live session left in it is reset and forgotten",
+		readFileSync(systemdLog, "utf8").includes("set-property --runtime tmux-spawn-ended.scope CPUWeight=\n") &&
+			!existsSync(join(systemdUnits, "tmux-spawn-ended.scope")) &&
+			!weightedList().includes("ended"),
+	);
+
+	track("tmux-spawn-ended.scope");
+	writeFileSync(join(systemdUnits, "tmux-spawn-ended.scope"), "400");
+	writeFileSync(join(systemdUnits, "fail-show"), "");
+	await tick();
+	check("a failed systemd read forgets no weighted scope", weightedList().includes("tmux-spawn-ended.scope"));
+	rmSync(join(systemdUnits, "fail-show"));
+	writeFileSync(join(systemdUnits, "fail-set-property"), "");
+	await tick();
+	check(
+		"a failed reset keeps the scope listed",
+		weightedList().includes("tmux-spawn-ended.scope") &&
+			readFileSync(join(systemdUnits, "tmux-spawn-ended.scope"), "utf8").trim() === "400",
+	);
+	rmSync(join(systemdUnits, "fail-set-property"));
+	await tick();
+	check(
+		"the next tick retries the reset and then forgets the scope",
+		!existsSync(join(systemdUnits, "tmux-spawn-ended.scope")) && !weightedList().includes("ended"),
+	);
+	track("tmux-spawn-gone.scope");
+	writeFileSync(join(systemdUnits, "tmux-spawn-gone.scope.gone"), "");
+	writeFileSync(systemdLog, "");
+	await tick();
+	check(
+		"a scope systemd no longer knows is forgotten without a reset",
+		!weightedList().includes("tmux-spawn-gone.scope") &&
+			!readFileSync(systemdLog, "utf8").includes("tmux-spawn-gone.scope CPUWeight="),
+	);
+	const weightBefore = unitWeight();
+	writeFileSync(join(voteDir, "prio-92"), "high");
+	writeFileSync(join(systemdUnits, "fail-set-property"), "");
+	await tick();
+	check("a failed weight write leaves the scope as it was", unitWeight() === weightBefore && weightBefore !== "400");
+	rmSync(join(systemdUnits, "fail-set-property"));
+	// A live record whose process already exited has no scope to read, and the tick still weights the others.
+	const ghostRecord = join(sessionsDir, "0b0da0dd-0000-7000-8000-0000000000dd.json");
+	writeFileSync(
+		ghostRecord,
+		JSON.stringify({ ...record(ids.alpha), instance: "ghost", tag: "ghost", pid: deadPid, tmuxPane: "%94" }),
+	);
+	await tick();
+	check("the next tick writes the weight again, past a session whose process is gone", unitWeight() === "400");
+	rmSync(ghostRecord, { force: true });
+	rmSync(join(voteDir, "prio-92"), { force: true });
 
 	const movedId = "0b0da00b-0000-7000-8000-00000000000b";
 	beta.move(movedId);
@@ -18153,15 +18300,42 @@ esac
 		ballotOf(ids.alpha)?.focus.includes(movedId) && !ballotOf(ids.alpha)?.focus.includes(ids.beta),
 	);
 
-	await gamma.fire("session_shutdown");
+	// Every spawn shares the suite's scope, so gamma's exit stands for the last omp in a pane leaving its shell.
+	const weightedBeforeExit = weightedList().includes(suiteUnit);
+	writeFileSync(systemdLog, "");
+	writeFileSync(join(systemdUnits, "slow-set-property"), "");
+	const gammaClosed = gamma.fire("session_shutdown");
+	await settle(150);
+	// A poller tick tracks another scope while gamma's reset still waits on systemd.
+	track("tmux-spawn-other.scope");
+	await gammaClosed;
+	rmSync(join(systemdUnits, "slow-set-property"));
 	await settle(100);
 	check("a session closed by hand drops its ballot", ballotOf(ids.gamma) === null);
+	check(
+		"a closing session gives its weighted scope the default back without waiting for a poller",
+		weightedBeforeExit &&
+			readFileSync(systemdLog, "utf8").includes(`set-property --runtime ${suiteUnit} CPUWeight=\n`) &&
+			!weightedList().includes(suiteUnit),
+	);
+	check(
+		"a scope tracked while a closing session resets its own stays tracked",
+		weightedList().includes("tmux-spawn-other.scope"),
+	);
 
 	await beta.fire("session_shutdown");
 	const alone = await vote("alpha", { focus: ["zzzzz"] });
 	check(
 		"with no other live session a vote is accepted with nothing to rank",
 		alone.isError !== true && alone.content[0].text.includes("nothing to rank"),
+	);
+	// Alone, alpha's ballot names nobody live, so no vote counts and the old winner loses its mark.
+	jump(31_000);
+	alpha.heartbeat();
+	await settle(400);
+	check(
+		"with no vote counted no window carries the vote mark",
+		["@91", "@92", "@93"].every((w) => voted(w) === ""),
 	);
 	await alpha.fire("session_shutdown");
 	process.env.PATH = voteSavedPath;
