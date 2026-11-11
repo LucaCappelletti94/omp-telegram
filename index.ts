@@ -6610,7 +6610,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	): { ballot: Ballot | null } | { refusal: string } {
 		const candidates = ballotCandidates();
 		if (candidates.length === 0) return { ballot: null };
-		const others = allRecords().filter(({ id }) => id !== sessionId);
+		const liveIds = new Set(candidates.map(({ id }) => id));
+		const ended = allRecords().filter(({ id }) => id !== sessionId && !liveIds.has(id));
 		const faults: string[] = [];
 		const resolveRanking = (name: "focus" | "resources", value: unknown): string[] | null => {
 			if (value === undefined) {
@@ -6634,8 +6635,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					candidates.find(({ record }) => record.emoji.length > 0 && record.emoji === needle) ??
 					candidates.find(({ record }) => record.tag === needle) ??
 					(prefix.length === 1 ? prefix[0] : undefined);
+				if (hit === undefined && prefix.length > 1) {
+					faults.push(`\`${name}\` names ${needle}, which several live sessions' ids start with`);
+					continue;
+				}
 				// A session that ended after the agent read the list counts for nobody, as in the tally, so it is dropped.
-				if (hit === undefined && others.some(names)) continue;
+				if (hit === undefined && ended.some(names)) continue;
 				if (hit === undefined) {
 					const own = needle === sessionTag || (badgeEmoji.length > 0 && needle === badgeEmoji);
 					faults.push(`\`${name}\` names ${needle}, ${own ? "this session itself" : "no other live session"}`);

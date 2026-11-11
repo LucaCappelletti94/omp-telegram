@@ -17997,6 +17997,18 @@ esac
 		lapsedById.isError !== true && JSON.stringify(ballotOf(ids.alpha)?.focus) === JSON.stringify([ids.beta]),
 	);
 	writeFileSync(join(sessionsDir, `${ids.gamma}.json`), gammaRecord);
+	// A second live session whose id starts like beta's makes the prefix ambiguous.
+	const twinFile = join(sessionsDir, "0b0da002-ffff-7000-8000-0000000000ff.json");
+	writeFileSync(
+		twinFile,
+		JSON.stringify({ ...record(ids.beta), instance: "twin", tag: "twinx", emoji: "", heartbeat: Date.now() }),
+	);
+	const ambiguous = await vote("alpha", { focus: [ids.beta.slice(0, 8)] });
+	check(
+		"an id prefix two live sessions share is refused, not dropped",
+		ambiguous.isError === true && ambiguous.content[0].text.includes("several live sessions"),
+	);
+	rmSync(twinFile);
 	await vote("alpha", { focus: [tagOf("beta"), tagOf("gamma")] });
 
 	// Alpha takes the poller lock before any tick, so it answers the commands and runs every tally.
