@@ -7008,7 +7008,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		removeStatePath(join(PENDING_DIR, id), "resuming.json");
 		if (items.length > 0) {
 			const text = `\u2705 Delivered ${updates(items.length)} to **${titleOf(id)}**${inTab(tabOf(launchSpec))}.`;
-			detach(() => settleResumeCard(id, text, false), "resume card settle");
+			detach(() => settleResumeCard(id, text, "closed"), "resume card settle");
 		}
 	}
 
@@ -7092,12 +7092,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		writeFileAtomic(cardFile(id), JSON.stringify({ messageId: sent.message_id }), 0o600);
 	}
 
-	/** `keep` leaves the resume offer open after Later or while a resume is starting. */
-	async function settleResumeCard(id: string, text: string, keep: boolean): Promise<void> {
+	/**
+	 * `held` keeps the card and its Resume and No buttons after Later, `starting` keeps the card without buttons
+	 * so the delivery can still settle it, and `closed` retires it.
+	 */
+	async function settleResumeCard(id: string, text: string, mode: "held" | "starting" | "closed"): Promise<void> {
 		if (config === null) return;
 		const messageId = readCardId(id);
 		if (messageId === null) return;
-		if (!keep) rmSync(cardFile(id), { force: true });
+		if (mode === "closed") rmSync(cardFile(id), { force: true });
 		await callTelegram(
 			config,
 			"editMessageText",
@@ -7106,7 +7109,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				message_id: messageId,
 				text: toTelegramHtml(text),
 				parse_mode: "HTML",
-				reply_markup: { inline_keyboard: keep ? resumeButtons(id, false) : [] },
+				reply_markup: { inline_keyboard: mode === "held" ? resumeButtons(id, false) : [] },
 			},
 			15_000,
 		);
@@ -7179,7 +7182,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				toast = "That resume card is already closed.";
 			} else {
 				const text = `Dismissed the resume offer for **${titleOf(id)}**. Updates remain available through /resume.`;
-				detach(() => settleResumeCard(id, text, false), "resume card close");
+				detach(() => settleResumeCard(id, text, "closed"), "resume card close");
 				toast = "Resume offer dismissed.";
 			}
 		} else if (isLiveSession(id)) {
@@ -7187,7 +7190,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} else if (data.startsWith("l:")) {
 			const count = listPending(id).items.length;
 			const text = `\u23F8\uFE0F ${updates(count)} for **${titleOf(id)}** ${count === 1 ? "is" : "are"} held until you resume it. /resume lists it.`;
-			detach(() => settleResumeCard(id, text, true), "resume card hold");
+			detach(() => settleResumeCard(id, text, "held"), "resume card hold");
 			toast = "Held until you resume it.";
 		} else if (resumeInFlight.has(id) || Date.now() - readResumingAt(id) < RESUME_START_MS) {
 			toast = ALREADY_STARTING;
@@ -7202,7 +7205,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (resumed.ok) {
 					writePrivateJson(join(PENDING_DIR, id), "resuming.json", { at: Date.now() });
 					const text = `\u25B6\uFE0F Resuming **${title}**${inTab(resumed.tab)}.`;
-					await settleResumeCard(id, text, true);
+					await settleResumeCard(id, text, "starting");
 				} else {
 					removeStatePath(join(PENDING_DIR, id), "resuming.json");
 					pollerNotice(`Resuming ${title} failed: ${clip(resumed.error, 190)}`);

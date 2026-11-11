@@ -13426,6 +13426,10 @@ heading("dependency graph across sessions");
 		"the card says the session is resuming in that tab",
 		/Resuming .*<code>work:4<\/code>/u.test(lastCall("editMessageText").body.text),
 	);
+	check(
+		"the resuming card drops its buttons",
+		(lastCall("editMessageText").body.reply_markup?.inline_keyboard ?? []).flat().length === 0,
+	);
 	writeFileSync(tmuxLog, "");
 	api.queued = [
 		{
