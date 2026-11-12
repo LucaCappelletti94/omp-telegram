@@ -1966,11 +1966,11 @@ function childArgvByParent(): Map<number, ChildArgv[]> {
 }
 
 /**
- * Whether a child is one of omp's own: a `__omp_worker_` process, or the Python eval kernel, which omp runs as
- * `python -u <tmp>/omp-python-runner-<uid>/runner-<id>.py`.
+ * Whether a child is one of omp's own: a `__omp_worker_` process, named as the program or as the omp binary's first
+ * argument, or the Python eval kernel, which omp runs as `python -u <tmp>/omp-python-runner-<uid>/runner-<id>.py`.
  */
 function isOmpWorker([program, flag, script]: ChildArgv): boolean {
-	if (program.startsWith("__omp_worker_")) return true;
+	if (program.startsWith("__omp_worker_") || flag.startsWith("__omp_worker_")) return true;
 	return flag === "-u" && basename(dirname(script)).startsWith("omp-python-runner-");
 }
 
