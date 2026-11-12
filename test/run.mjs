@@ -20440,6 +20440,153 @@ heading("the task register");
 	);
 }
 
+heading("conductor verdicts on the register");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "author"].map((name, i) => [name, `0d0e0a00-0000-7000-8000-00000000000${i + 1}`]),
+	);
+	const taskFile = join(tasksDir, "api.json");
+	writeFileSync(
+		taskFile,
+		JSON.stringify({
+			name: "API",
+			slug: "api",
+			brief: "b",
+			conductor: ids.conductor,
+			state: "live",
+			launchedAt: 0,
+			members: [{ session: ids.author, joinedAt: 1 }],
+			candidates: [],
+			led: [],
+			closing: false,
+			findings: [],
+			register: [],
+		}),
+	);
+	const entry = (title) => JSON.parse(readFileSync(taskFile, "utf8")).register.find((e) => e.title === title);
+	const poller = spawn(ids.poller, "/home/dev/work/verdicts");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "api"));
+	await conductor.fire("session_start");
+	const author = spawn(ids.author, "/home/dev/work/author");
+	await author.fire("session_start");
+	const tool = (s, params) => s.tools.get("conductor").execute("v", params, undefined, undefined, s.ctx);
+	const text = async (s, params) => (await tool(s, params)).content[0].text;
+	const leadsTo = async (s) => {
+		await s.pump(150);
+		return s.customs.map((c) => String(c.message.content)).filter((t) => t.startsWith("Automatic conductor update"));
+	};
+	const tap = async (data, update, messageId) => {
+		api.queued = [
+			{
+				update_id: update,
+				callback_query: {
+					id: `verdict${update}`,
+					data,
+					from: { id: CHAT },
+					message: { message_id: messageId, chat: { id: CHAT } },
+				},
+			},
+		];
+		await poller.pump(400);
+		return lastCall("answerCallbackQuery").body.text;
+	};
+	for (const title of ["Take the parser", "Rename the crate", "Drop the old API", "Split the module"]) {
+		await tool(author, { action: "claim", title, body: title === "Rename the crate" ? "Call it borda-core." : "" });
+	}
+
+	check(
+		"a member cannot accept or object",
+		(await text(author, { action: "accept", entry: entry("Take the parser").id })).includes("conducts no live task"),
+	);
+	check(
+		"a verdict without an entry asks for one",
+		(await text(conductor, { action: "accept" })).includes("Name the proposed entry"),
+	);
+	check(
+		"accepting an unknown entry is refused",
+		(await text(conductor, { action: "accept", entry: "00000000" })).includes("No entry"),
+	);
+	await tool(conductor, { action: "accept", entry: entry("Take the parser").id });
+	check(
+		"accept marks the entry accepted and tells its author",
+		entry("Take the parser").status === "accepted" &&
+			(await leadsTo(author)).some((t) => t.includes("Take the parser") && t.includes("accepted")),
+	);
+	check(
+		"an entry no longer proposed takes no verdict",
+		(await text(conductor, { action: "object", entry: entry("Take the parser").id, reason: "Late." })).includes(
+			"accepted",
+		),
+	);
+	check(
+		"an objection needs a reason",
+		(await text(conductor, { action: "object", entry: entry("Rename the crate").id })).includes("reason"),
+	);
+
+	await tool(conductor, {
+		action: "object",
+		entry: entry("Rename the crate").id,
+		reason: "The name is shared with the server.",
+	});
+	const card = lastCall("sendMessage").body;
+	const buttons = card.reply_markup.inline_keyboard.flat();
+	const renamed = entry("Rename the crate");
+	check(
+		"an objection marks the entry objected, keeps the reason, and sends Luca a card with Uphold and Overrule",
+		renamed.status === "objected" &&
+			renamed.reason === "The name is shared with the server." &&
+			card.text.includes("Rename the crate") &&
+			card.text.includes("Call it borda-core.") &&
+			card.text.includes("The name is shared with the server.") &&
+			buttons.map((b) => b.text).join() === "Uphold,Overrule",
+	);
+	check(
+		"its author is told to hold off with the reason",
+		(await leadsTo(author)).some(
+			(t) => t.includes("Rename the crate") && t.includes("The name is shared with the server."),
+		),
+	);
+	const uphold = buttons.find((b) => b.text === "Uphold").callback_data;
+	await tap(uphold, 10010, 777);
+	check(
+		"Uphold keeps the entry objected, settles the card and tells the author",
+		entry("Rename the crate").status === "objected" &&
+			lastCall("editMessageReplyMarkup")
+				.body.reply_markup.inline_keyboard.flat()
+				.some((b) => b.text === "\u2713 Uphold") &&
+			(await leadsTo(author)).some((t) => t.includes("Rename the crate") && t.includes("upheld")),
+	);
+	check("a second tap on a settled objection says so", (await tap(uphold, 10011, 777)).includes("no longer"));
+
+	await tool(conductor, { action: "object", entry: entry("Drop the old API").id, reason: "Clients still call it." });
+	const overrule = lastCall("sendMessage")
+		.body.reply_markup.inline_keyboard.flat()
+		.find((b) => b.text === "Overrule").callback_data;
+	await tap(overrule, 10012, 778);
+	check(
+		"Overrule accepts the entry and tells the author to go ahead",
+		entry("Drop the old API").status === "accepted" &&
+			(await leadsTo(author)).some((t) => t.includes("Drop the old API") && t.includes("go ahead")),
+	);
+
+	api.failMethods = ["sendMessage"];
+	const unsent = await text(conductor, { action: "object", entry: entry("Split the module").id, reason: "Too early." });
+	api.failMethods = [];
+	check(
+		"an objection whose card cannot be sent changes nothing",
+		unsent.includes("could not be sent") && entry("Split the module").status === "proposed",
+	);
+	check("a tap on an objection nobody knows says so", (await tap("v:0000ffff:u", 10013, 1)).includes("no longer"));
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });

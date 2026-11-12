@@ -92,6 +92,7 @@ heading("task files");
 				proposedAt: 1,
 				decidedAt: 0,
 				reason: "",
+				upheld: true,
 			},
 		],
 	};
@@ -183,7 +184,7 @@ heading("task files");
 				{ ...register[0], proposedAt: "1" },
 				{ ...register[0], decidedAt: "0" },
 				{ ...register[0], reason: 1 },
-				{ ...register[0], kind: "decision" },
+				{ ...register[0], kind: "decision", upheld: undefined },
 			],
 		}),
 	);
@@ -194,7 +195,7 @@ heading("task files");
 			JSON.stringify(mixed.candidates) === JSON.stringify(candidates) &&
 			JSON.stringify(mixed.led) === JSON.stringify(led) &&
 			JSON.stringify(mixed.findings) === JSON.stringify([{ ...findings[0], messageId: 42 }]) &&
-			JSON.stringify(mixed.register) === JSON.stringify([{ ...register[0], kind: "decision" }]),
+			JSON.stringify(mixed.register) === JSON.stringify([{ ...register[0], kind: "decision", upheld: false }]),
 	);
 	rmSync(dir, { recursive: true, force: true });
 }

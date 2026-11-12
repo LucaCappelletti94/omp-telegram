@@ -45,6 +45,8 @@ export interface Entry {
 	decidedAt: number;
 	/** Why the conductor objected, or empty. */
 	reason: string;
+	/** Set once the user upheld the conductor's objection, which settles its card. */
+	upheld: boolean;
 }
 
 /** The signals a conductor raises, from the plan's decision 4, and `completed` for a member whose work is done. */
@@ -141,19 +143,21 @@ function parseTask(raw: unknown, slug: string): Task | null {
 			(f.messageId === null || typeof f.messageId === "number") &&
 			["open", "told", "resolved", "rejected"].includes(f.state),
 	);
-	const register = (Array.isArray(t.register) ? t.register : []).filter(
-		(e): e is Entry =>
-			typeof e?.id === "string" &&
-			(e.kind === "claim" || e.kind === "decision") &&
-			typeof e.author === "string" &&
-			typeof e.title === "string" &&
-			typeof e.body === "string" &&
-			(ENTRY_STATUSES as readonly unknown[]).includes(e.status) &&
-			typeof e.supersedes === "string" &&
-			typeof e.proposedAt === "number" &&
-			typeof e.decidedAt === "number" &&
-			typeof e.reason === "string",
-	);
+	const register = (Array.isArray(t.register) ? t.register : [])
+		.filter(
+			(e): e is Entry =>
+				typeof e?.id === "string" &&
+				(e.kind === "claim" || e.kind === "decision") &&
+				typeof e.author === "string" &&
+				typeof e.title === "string" &&
+				typeof e.body === "string" &&
+				(ENTRY_STATUSES as readonly unknown[]).includes(e.status) &&
+				typeof e.supersedes === "string" &&
+				typeof e.proposedAt === "number" &&
+				typeof e.decidedAt === "number" &&
+				typeof e.reason === "string",
+		)
+		.map((e) => ({ ...e, upheld: e.upheld === true }));
 	return {
 		name: t.name,
 		slug,
@@ -228,6 +232,7 @@ export function conductorRole(task: Task): string {
 		"To bring a session into the task, call the `conductor` tool with `action` `invite`, the session's badge emoji or tag in `session`, and in `reason` why it belongs. The user answers Join or Skip on Telegram, and the answer reaches you as an aside written by no one. Each live session that ends a turn reaches you once the same way, so you can judge whether it belongs.",
 		"When members overlap, duplicate each other, contradict each other, wait on a session that ended, build on a moved parent, or need a lesson another member learned, raise it with `action` `finding`: one card to the user per finding, under a `subject` you name. Propose in `message` what to tell the sessions, and set `tell` only when they should hear it before the user decides.",
 		"When a member has finished its part entirely, its pull request merged and nothing left open, raise a finding of kind `completed` naming that one member and why it is done. The card carries the member's own close buttons, and you never close a session yourself.",
+		"Members record claims and proposed decisions in the task register, and each new or closed entry reaches you as an aside. Judge each proposed entry against the others: `action` `accept` with its `entry` id, or `object` with a `reason` when it duplicates or contradicts another member's work. An objection goes to the user, who upholds or overrules it. An entry you leave unanswered for ten minutes stands accepted.",
 		`Closing this session leaves the task dormant, and \`/conduct ${task.name}\` in Telegram resumes it.`,
 	].join("\n\n");
 }
