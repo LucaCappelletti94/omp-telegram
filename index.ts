@@ -7922,12 +7922,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** The followed member's turn end leads each live task following it with the transcript lines the turn wrote. */
 	async function reviewTurn(headline: string): Promise<void> {
+		const following = listTasks(TASKS_DIR).filter((task) => task.state === "live" && task.followed === sessionId);
+		if (following.length === 0) return;
 		const { path, lines } = transcriptLines(sessionId);
-		for (const listed of listTasks(TASKS_DIR)) {
-			if (listed.state !== "live") continue;
-			const reviewed = listed.members.filter(
-				(m) => m.session === sessionId && listed.followed === sessionId && lines > m.reviewLine,
-			);
+		for (const listed of following) {
+			const reviewed = listed.members.filter((m) => m.session === sessionId && lines > m.reviewLine);
 			for (const me of reviewed) {
 				await updateTask(TASKS_DIR, listed.slug, (task) => ({
 					task: {
@@ -11989,7 +11988,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			detach(() => leadConductors(ctx, headline), "conductor leads");
 			detach(() => checkOverlaps(sessionId), "overlap check");
 			// A turn that ends asking the user something waits on the user, and its lines are reviewed with the next turn.
-			if (turnSummary.urgency === "green" && turnSummary.options === undefined) {
+			if (turnSummary.urgency === "green" && turnSummary.options === undefined && turnSummary.question === undefined) {
 				detach(() => reviewTurn(headline), "focus review");
 			}
 		}

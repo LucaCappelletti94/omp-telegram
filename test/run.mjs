@@ -20988,6 +20988,16 @@ heading("the conductor follows its top focus member");
 		"a turn that ends waiting on the user leads nowhere and keeps the review where it was",
 		(await reviews()).length === 1 && memberOf(ids.a).reviewLine === 5,
 	);
+	await endTurn(a, { summary: "Parser ready.", urgency: "green", options: opts("Fast", "Strict") });
+	check(
+		"a green turn with choices leads nowhere and keeps its lines for review",
+		(await reviews()).length === 1 && memberOf(ids.a).reviewLine === 5,
+	);
+	await endTurn(a, { summary: "Parser ready.", urgency: "green", question: "Which parser should be used?" });
+	check(
+		"a green turn with a question leads nowhere and keeps its lines for review",
+		(await reviews()).length === 1 && memberOf(ids.a).reviewLine === 5,
+	);
 
 	// Every turn end casts a ballot of its own, so each live session's ballot is set here to fix the tally.
 	mkdirSync(join(stateDir, "ballots"), { recursive: true });
