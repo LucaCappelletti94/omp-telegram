@@ -7714,7 +7714,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** A conductor neither live nor already opening is stamped as opening, so two taps meanwhile open one window. */
 	function conductStep(task: Task): { task: Task | null; result: ConductStep } {
 		if (task.conductor !== "" && isLiveSession(task.conductor)) return { task: null, result: { kind: "live", task } };
-		if (Date.now() - task.launchedAt < RESUME_START_MS) return { task: null, result: { kind: "starting", task } };
+		const openedAt = Math.max(task.launchedAt, readResumingAt(task.conductor));
+		if (Date.now() - openedAt < RESUME_START_MS) return { task: null, result: { kind: "starting", task } };
 		const opening = { ...task, launchedAt: Date.now() };
 		return { task: opening, result: { kind: "open", task: opening } };
 	}
@@ -7733,6 +7734,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const cwd = resolve(TASKS_DIR, task.slug);
 		if (cwd.startsWith(`${resolve(TASKS_DIR)}${sep}`)) mkdirSync(cwd, { recursive: true, mode: 0o700 });
 		const record = task.conductor === "" ? null : readSessionRecord(task.conductor);
+		if (task.conductor !== "") writePrivateJson(join(PENDING_DIR, task.conductor), "resuming.json", { at: Date.now() });
 		const opened =
 			task.conductor === ""
 				? await openOmp(
@@ -7758,6 +7760,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (opened.ok) {
 			return `\u{1F3BC} ${task.conductor === "" ? "Conducting" : "Resuming the conductor of"} ${title}${inTab(opened.tab)}.`;
 		}
+		if (task.conductor !== "") removeStatePath(join(PENDING_DIR, task.conductor), "resuming.json");
 		await updateTask(TASKS_DIR, task.slug, (current) => ({ task: { ...current, launchedAt: 0 }, result: null }));
 		return `Opening the conductor of ${title} failed: ${clip(opened.error, 300)}`;
 	}

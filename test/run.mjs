@@ -19050,6 +19050,9 @@ esac
 		list.reply_markup?.inline_keyboard?.flat().some((b) => b.callback_data === "t:connetto-quotas") === true,
 	);
 	check("a tap on a live conductor's task names its tab", (await tap("t:connetto-quotas", 9966)).includes("work:3"));
+	await conductor.tools
+		.get("session_graph")
+		.execute("resume-stamp", { action: "status", status: "waiting" }, undefined, undefined, conductor.ctx);
 
 	await conductor.fire("session_shutdown");
 	check("closing the conductor by hand turns the task dormant", task().state === "dormant");
@@ -19075,6 +19078,49 @@ esac
 	writeFileSync(join(stateDir, "restart-pending", `${conductorId}.json`), JSON.stringify({ at: Date.now() }));
 	await back.fire("session_shutdown");
 	check("a conductor a restart wave stops keeps its task live", task().state === "live");
+
+	const resumeStamp = join(stateDir, "graph", "pending", conductorId, "resuming.json");
+	writeFileSync(taskFile, JSON.stringify({ ...task(), conductor: conductorId, launchedAt: 0 }));
+	rmSync(resumeStamp, { force: true });
+	const beforeConductResume = opened().length;
+	await conduct("/conduct Connetto quotas", 9977);
+	const resumeAfterConduct = await tap(`r:${conductorId}`, 9978);
+	check(
+		"a Resume tap within a minute of /conduct opens no second window",
+		opened().length === beforeConductResume + 1 && resumeAfterConduct.includes("already starting"),
+	);
+
+	writeFileSync(taskFile, JSON.stringify({ ...task(), launchedAt: 0 }));
+	rmSync(resumeStamp, { force: true });
+	const beforeResumeConduct = opened().length;
+	await tap(`r:${conductorId}`, 9979);
+	const conductAfterResume = await conduct("/conduct Connetto quotas", 9980);
+	check(
+		"/conduct within a minute of a Resume tap opens no second window",
+		opened().length === beforeResumeConduct + 1 && conductAfterResume.text.includes("starting"),
+	);
+
+	writeFileSync(taskFile, JSON.stringify({ ...task(), launchedAt: 0 }));
+	writeFileSync(resumeStamp, JSON.stringify({ at: Date.now() - 60_001 }));
+	const beforeExpiredResume = opened().length;
+	await conduct("/conduct Connetto quotas", 9981);
+	check("an expired Resume stamp lets /conduct open its conductor", opened().length === beforeExpiredResume + 1);
+
+	writeFileSync(taskFile, JSON.stringify({ ...task(), launchedAt: 0 }));
+	writeFileSync(resumeStamp, JSON.stringify({ at: Date.now() - 60_001 }));
+	writeFileSync(join(taskBin, "fail"), "");
+	const failedResume = await conduct("/conduct Connetto quotas", 9982);
+	rmSync(join(taskBin, "fail"));
+	check(
+		"a failed conductor resume clears both opening stamps",
+		failedResume.text.includes("no server") && task().launchedAt === 0 && !existsSync(resumeStamp),
+	);
+	const beforeRetryResume = opened().length;
+	const retriedResume = await conduct("/conduct Connetto quotas", 9983);
+	check(
+		"a failed conductor resume can be retried at once",
+		opened().length === beforeRetryResume + 1 && retriedResume.text.includes("Resuming the conductor"),
+	);
 
 	// The poller conducts a second task itself, from a pane tmux never named.
 	writeFileSync(
