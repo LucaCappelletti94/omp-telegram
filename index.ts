@@ -1097,8 +1097,11 @@ type PendingItem =
 	| { kind: "launch"; at: number; requestId: string; state: LaunchRequestState; text: string; summary: string }
 	/** A queued heavy command's lease, granted and reserved for the session, delivered as an aside written by no one. */
 	| { kind: "lease"; at: number; lease: string; command: string }
-	/** News a conductor needs about its task, delivered as an aside written by no one and held while it is down. */
-	| { kind: "lead"; at: number; task: string; text: string }
+	/**
+	 * News a conductor needs about its task, delivered as an aside written by no one and held while it is down.
+	 * `about` names the session the news concerns, so leads about one session arrive together.
+	 */
+	| { kind: "lead"; at: number; task: string; text: string; about?: string }
 	/** A watched pull request's news, delivered to its watcher as an aside, written by no one. */
 	| {
 			kind: "pr";
@@ -2446,6 +2449,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Every session a restart wave touched, and what it ended up as. */
 	const restartEntries = new Map<string, RestartEntry>();
 	let turnActive = false;
+	/** Set from a step's start to its end, while leads wait so the step's news arrives together at its boundary. */
+	let stepRunning = false;
 	let sessionAlive = true;
 	/** Set by a session_shutdown that a reboot or poweroff caused, so the record stays restorable. */
 	let systemShutdownAt = 0;
@@ -7367,7 +7372,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			rmSync(file, { force: true });
 			pi.logger.warn("notify-telegram: discarded a malformed pending item", { file });
 		}
-		for (const { file, item } of items) {
+		// Leads wait out a running step and then arrive together, one aside per session they concern.
+		const due = stepRunning ? items.filter(({ item }) => item.kind !== "lead") : items;
+		const leads: Array<Extract<PendingItem, { kind: "lead" }>> = [];
+		for (const { file, item } of due) {
 			rmSync(file, { force: true });
 			if (item.kind === "message") {
 				deliverAgentMessage(item.message);
@@ -7402,15 +7410,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				continue;
 			}
 			if (item.kind === "lead") {
-				pi.sendMessage(
-					{
-						customType: DEPENDENCY_MESSAGE_TYPE,
-						content: `Automatic conductor update for the task "${item.task}", written by no one: ${item.text} This is a status update, not a message, so there is no one to reply to.`,
-						display: true,
-						details: item,
-					},
-					{ deliverAs: "aside", triggerTurn: true },
-				);
+				leads.push(item);
 				continue;
 			}
 			// A PR-watch event is a status update, so it is written by no one and answers to no one.
@@ -7426,8 +7426,33 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				{ deliverAs: "aside", triggerTurn: true },
 			);
 		}
+		const grouped = new Map<string, typeof leads>();
+		for (const lead of leads) {
+			const about = lead.about ?? "";
+			const group = grouped.get(about);
+			if (group === undefined) grouped.set(about, [lead]);
+			else group.push(lead);
+		}
+		// News about the task as a whole comes first, then each session's in focus order.
+		const { points, marked } =
+			leads.length > 0 ? readTally("points") : { points: new Map<string, number>(), marked: new Set<string>() };
+		const focus = byPriority(points, marked, () => 0);
+		const abouts = [...grouped.keys()].sort((x, y) => Number(x !== "") - Number(y !== "") || focus(x, y));
+		for (const about of abouts) {
+			const group = grouped.get(about) as typeof leads;
+			const { task } = group[0] as (typeof leads)[number];
+			pi.sendMessage(
+				{
+					customType: DEPENDENCY_MESSAGE_TYPE,
+					content: `Automatic conductor update for the task "${task}", written by no one: ${group.map((lead) => lead.text).join("\n\n")} This is a status update, not a message, so there is no one to reply to.`,
+					display: true,
+					details: { kind: "lead", about, leads: group },
+				},
+				{ deliverAs: "aside", triggerTurn: true },
+			);
+		}
 		removeStatePath(join(PENDING_DIR, id), "resuming.json");
-		const delivered = items.filter(({ item }) => item.kind !== "lease").length;
+		const delivered = due.filter(({ item }) => item.kind !== "lease").length;
 		if (delivered > 0) {
 			const text = `\u2705 Delivered ${updates(delivered)} to **${titleOf(id)}**${inTab(tabOf(launchSpec))}.`;
 			detach(() => settleResumeCard(id, text, "closed"), "resume card settle");
@@ -7820,9 +7845,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callbackId, text: toast }, 10_000);
 	}
 
-	/** Hands news about a task to `to`, its conductor unless named, held behind a resume card while that session is down. */
-	function sendLead(task: Task, text: string, to = task.conductor): void {
-		const item: PendingItem = { kind: "lead", at: Date.now(), task: task.name, text };
+	/**
+	 * Hands news about a task to `to`, its conductor unless named, held behind a resume card while that session is down.
+	 * `about` names the session the news concerns, so a busy conductor gets that session's leads in one aside.
+	 */
+	function sendLead(task: Task, text: string, route: { to?: string; about?: string } = {}): void {
+		const to = route.to ?? task.conductor;
+		const item: PendingItem = { kind: "lead", at: Date.now(), task: task.name, text, about: route.about };
 		writePrivateJson(join(PENDING_DIR, to), `lead-${Date.now()}-${randomUUID().slice(0, 8)}.json`, item);
 		if (!isLiveSession(to)) detach(() => raiseResumeCard(to), "resume card");
 	}
@@ -7900,6 +7929,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				sendLead(
 					listed,
 					`${titleOf(sessionId)} (session ${sessionId}), the member you follow, ended a turn: ${headline} Review it in \`${path}:${me.reviewLine + 1}-${lines}\`.`,
+					{ about: sessionId },
 				);
 			}
 		}
@@ -7924,7 +7954,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const still = task.led.filter((id) => isLiveSession(id));
 				return { task: { ...task, led: [...still, sessionId] }, result: task };
 			});
-			if (led !== null) sendLead(led, text);
+			if (led !== null) sendLead(led, text, { about: sessionId });
 		}
 	}
 
@@ -8253,7 +8283,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}));
 		if (q.action === "accept") {
 			await settle("accepted", "");
-			sendLead(conducted, `The conductor accepted your ${target.kind} ${id}, ${target.title}.`, target.author);
+			sendLead(conducted, `The conductor accepted your ${target.kind} ${id}, ${target.title}.`, { to: target.author });
 			return { content: [{ type: "text", text: `Accepted ${target.kind} ${id}.` }], details: {} };
 		}
 		const reason = (q.reason ?? "").trim();
@@ -8276,7 +8306,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		sendLead(
 			conducted,
 			`The conductor objects to your ${target.kind} ${id}, ${target.title}: ${reason} Hold off until the user upholds or overrules the objection, and you hear which.`,
-			target.author,
+			{ to: target.author },
 		);
 		return {
 			content: [
@@ -8314,7 +8344,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				answer === "o"
 					? `The user overruled the objection to your ${target.kind} ${id}, ${target.title}, so go ahead.`
 					: `The user upheld the objection to your ${target.kind} ${id}, ${target.title}, so do not go ahead with it.`,
-				target.author,
+				{ to: target.author },
 			);
 			await callTelegram(
 				cfg,
@@ -8395,7 +8425,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				},
 				result: null,
 			}));
-			sendLead(task, `${titleOf(sessionId)} (session ${sessionId}) sends an update: ${text}`);
+			sendLead(task, `${titleOf(sessionId)} (session ${sessionId}) sends an update: ${text}`, { about: sessionId });
 			return reply(`Sent your update to the conductor of "${task.name}".`);
 		}
 		if (q.action === "claim" || q.action === "propose") {
@@ -8422,6 +8452,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			sendLead(
 				task,
 				`${titleOf(sessionId)} proposes the ${entry.kind} ${entry.id}: ${title}.${entry.body === "" ? "" : ` ${entry.body}`} It stands accepted in ten minutes.`,
+				{ about: sessionId },
 			);
 			const open = [...task.register, entry].filter((e) => e.status === "proposed" || e.status === "accepted");
 			return reply(
@@ -8462,6 +8493,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		sendLead(
 			task,
 			`${titleOf(sessionId)} closed its ${target.kind} ${id}, ${target.title}, as ${outcome}${by === "" ? "" : `, superseded by ${by}`}.`,
+			{ about: sessionId },
 		);
 		return reply(`Closed ${target.kind} ${id} as ${outcome}.`);
 	}
@@ -8477,7 +8509,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					sendLead(
 						task,
 						`Your ${e.kind} ${e.id}, ${e.title}, stands accepted, since the conductor did not object within ten minutes.`,
-						e.author,
+						{ to: e.author },
 					);
 				}
 				return {
@@ -8531,7 +8563,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				);
 				return { task: { ...current, members }, result: null };
 			});
-			for (const lead of leads) sendLead(listed, lead.text);
+			for (const lead of leads) sendLead(listed, lead.text, { about: lead.session });
 		}
 	}
 
@@ -11429,8 +11461,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		noteState();
 	});
 
+	pi.on("turn_start", async () => {
+		stepRunning = true;
+	});
+
+	pi.on("turn_end", async () => {
+		stepRunning = false;
+	});
+
 	pi.on("agent_end", async (event, ctx) => {
 		turnActive = false;
+		stepRunning = false;
 		replyOwedAt = 0;
 		turnEndedAt = Date.now();
 		approvalWaiting = false;

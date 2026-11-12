@@ -20893,6 +20893,95 @@ heading("the conductor follows its top focus member");
 	clockSkew = 0;
 }
 
+heading("leads wait out the conductor's step and arrive merged per member");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	for (const name of ["poller.lock", "priority.json", "ballots"]) {
+		rmSync(join(stateDir, name), { recursive: true, force: true });
+	}
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "a", "b"].map((name, i) => [name, `0d0e0d00-0000-7000-8000-00000000000${i + 1}`]),
+	);
+	writeFileSync(
+		join(tasksDir, "api.json"),
+		JSON.stringify({
+			name: "api",
+			slug: "api",
+			brief: "b",
+			conductor: ids.conductor,
+			state: "live",
+			launchedAt: 0,
+			members: [ids.a, ids.b].map((session) => ({ session, joinedAt: Date.now() })),
+			candidates: [],
+			led: [],
+			closing: false,
+			findings: [],
+			register: [],
+		}),
+	);
+	const poller = spawn(ids.poller, "/home/dev/work/coalesce");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "api"));
+	await conductor.fire("session_start");
+	const a = spawn(ids.a, "/home/dev/work/a");
+	await a.fire("session_start");
+	const b = spawn(ids.b, "/home/dev/work/b");
+	await b.fire("session_start");
+	mkdirSync(join(stateDir, "ballots"), { recursive: true });
+	for (const voter of [ids.poller, ids.conductor]) {
+		writeFileSync(
+			join(stateDir, "ballots", `${voter}.json`),
+			JSON.stringify({ focus: [ids.b, ids.a], resources: [], at: Date.now() }),
+		);
+	}
+	jump(31_000);
+	for (const s of [conductor, a, b]) s.heartbeat();
+	poller.heartbeat();
+	await settle(400);
+	const update = (s, text) =>
+		s.tools.get("conductor").execute("c", { action: "update", text }, undefined, undefined, s.ctx);
+	const leads = async () => {
+		await conductor.pump(300);
+		return conductor.customs
+			.map((c) => String(c.message.content))
+			.filter((t) => t.startsWith("Automatic conductor update"));
+	};
+	const before = (await leads()).length;
+
+	await conductor.fire("agent_start");
+	await conductor.fire("turn_start", { turnIndex: 0, timestamp: Date.now() });
+	await update(a, "Lexer started.");
+	await update(b, "Docs started.");
+	await update(a, "Lexer done.");
+	writeFileSync(
+		join(stateDir, "graph/pending", ids.conductor, "lead-0-general.json"),
+		JSON.stringify({ kind: "lead", at: Date.now(), task: "api", text: "The task as a whole changed." }),
+	);
+	check("leads wait while the conductor is mid-step", (await leads()).length === before);
+	await conductor.fire("turn_end", { turnIndex: 0, message: {}, toolResults: [] });
+	const merged = (await leads()).slice(before);
+	check(
+		"at the step's end the task's own leads come first, then one per member in focus order",
+		merged.length === 3 &&
+			merged[0].includes("The task as a whole changed.") &&
+			merged[1].includes("Docs started.") &&
+			merged[2].includes("Lexer started.") &&
+			merged[2].includes("Lexer done.") &&
+			merged[2].indexOf("Lexer started.") < merged[2].indexOf("Lexer done."),
+	);
+	await conductor.fire("agent_end");
+	await update(b, "Docs done.");
+	const idle = (await leads()).slice(before + merged.length);
+	check("an idle conductor gets a lead at once", idle.length === 1 && idle[0].includes("Docs done."));
+	rmSync(join(stateDir, "ballots"), { recursive: true, force: true });
+	clockSkew = 0;
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
