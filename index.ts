@@ -8609,7 +8609,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				.filter((node) => members.has(node.session))
 				.flatMap((node) => node.edges)
 				.filter((edge) => {
-					if (edge.type !== "waits-on") return false;
+					// A pull request the graph still polls wakes the wait when it merges or closes.
+					if (edge.type !== "waits-on" || prs.has(edge.to) || byId.get(edge.to)?.pr !== undefined) return false;
 					const crash = readCrash(edge.to);
 					const target = byId.get(edge.to);
 					return (
