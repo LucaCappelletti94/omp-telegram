@@ -8960,6 +8960,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 		});
 		rmSync(file, { force: true });
+		detach(() => joinRequesterTasks(launch.parent), "launch joins");
+	}
+
+	/** A member's `upstream_launch` child joins every task its requester belongs to, keeping a closing conductor open. */
+	async function joinRequesterTasks(parent: string): Promise<void> {
+		const self = sessionId;
+		const text = `${titleOf(self)} joined as an upstream launch of ${titleOf(parent)}.`;
+		for (const listed of listTasks(TASKS_DIR)) {
+			if (!listed.members.some((member) => member.session === parent)) continue;
+			const joined = await updateTask(TASKS_DIR, listed.slug, (task) => {
+				if (task.members.some((member) => member.session === self)) return { task: null, result: null };
+				const members = [...task.members, { session: self, joinedAt: Date.now() }];
+				return { task: { ...task, members, closing: false }, result: task };
+			});
+			if (joined !== null) sendLead(joined, text);
+		}
 	}
 
 	/** A request's age for a listing, as minutes, hours or days. */
