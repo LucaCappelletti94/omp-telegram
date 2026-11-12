@@ -5368,6 +5368,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await answerFindingCallback(cfg, callback.id, callback.data, callback.message.message_id);
 				return;
 			}
+			if (callback.data.startsWith("v:")) {
+				await answerObjectionCallback(cfg, callback.id, callback.data, callback.message.message_id);
+				return;
+			}
 			if (/^[rln]:/u.test(callback.data)) {
 				await answerResumeCallback(cfg, callback);
 				return;
@@ -8142,6 +8146,109 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callbackId, text: toast }, 10_000);
 	}
 
+	/** The conductor's verdict on a proposed register entry: `accept` it, or `object` with a card for the user. */
+	async function conductorVerdict(
+		ctx: ExtensionContext,
+		conducted: Task,
+		params: Record<string, unknown>,
+		refuse: (text: string) => ToolReply,
+	): Promise<ToolReply> {
+		// omp validated the parameters against the tool's schema, so each is its declared type or absent.
+		const q = params as { action: string; entry?: string; reason?: string };
+		const id = (q.entry ?? "").trim();
+		if (id === "") return refuse("Name the proposed entry you judge in `entry`, by the id the register lists.");
+		const target = conducted.register.find((e) => e.id === id);
+		if (target === undefined) return refuse(`No entry ${id} in the task "${conducted.name}".`);
+		if (target.status !== "proposed") return refuse(`Entry ${id} is already ${target.status}, so it takes no verdict.`);
+		const author = titleOf(target.author);
+		const settle = (status: "accepted" | "objected", reason: string) =>
+			updateTask(TASKS_DIR, conducted.slug, (task) => ({
+				task: {
+					...task,
+					register: task.register.map((e) => (e.id === id ? { ...e, status, reason, decidedAt: Date.now() } : e)),
+				},
+				result: null,
+			}));
+		if (q.action === "accept") {
+			await settle("accepted", "");
+			sendLead(conducted, `The conductor accepted your ${target.kind} ${id}, ${target.title}.`, target.author);
+			return { content: [{ type: "text", text: `Accepted ${target.kind} ${id}.` }], details: {} };
+		}
+		const reason = (q.reason ?? "").trim();
+		if (reason === "") return refuse("Say in `reason` why you object, since the author and the user read it.");
+		const body = `${author} proposes the ${target.kind} **${target.title}** in the task **${conducted.name}**.${target.body === "" ? "" : `\n${target.body}`}\n\nThe conductor objects: ${reason}`;
+		const sent = await notify(ctx, "notice", "\u{1F6D1} Objection", body, {
+			reply_markup: {
+				inline_keyboard: [
+					[
+						{ text: "Uphold", callback_data: `v:${id}:u`, style: "danger" },
+						{ text: "Overrule", callback_data: `v:${id}:o`, style: "success" },
+					],
+				],
+			},
+		});
+		if (!isTelegramMessageId(sent?.message_id)) {
+			return refuse("The objection card could not be sent, so nothing changed. Try again.");
+		}
+		await settle("objected", reason);
+		sendLead(
+			conducted,
+			`The conductor objects to your ${target.kind} ${id}, ${target.title}: ${reason} Hold off until the user upholds or overrules the objection, and you hear which.`,
+			target.author,
+		);
+		return {
+			content: [
+				{ type: "text", text: `Objected to ${target.kind} ${id}. The user upholds or overrules it on Telegram.` },
+			],
+			details: {},
+		};
+	}
+
+	/** Luca's tap on an objection card, `v:<entry>:u` upholding the objection and `v:<entry>:o` overruling it. */
+	async function answerObjectionCallback(
+		cfg: Config,
+		callbackId: string,
+		data: string,
+		messageId: number,
+	): Promise<void> {
+		const [, id, answer] = data.split(":");
+		const owner = listTasks(TASKS_DIR).find((task) => task.register.some((e) => e.id === id));
+		const settled =
+			owner === undefined
+				? null
+				: await updateTask(TASKS_DIR, owner.slug, (task) => {
+						const target = task.register.find((e) => e.id === id && e.status === "objected" && !e.upheld);
+						if (target === undefined) return { task: null, result: null };
+						const ruling = answer === "o" ? { status: "accepted" as const } : { upheld: true };
+						const register = task.register.map((e) => (e.id === id ? { ...e, ...ruling, decidedAt: Date.now() } : e));
+						return { task: { ...task, register }, result: { task, target } };
+					});
+		let toast = "That objection is no longer open.";
+		if (settled !== null) {
+			const { task, target } = settled;
+			const chosen = answer === "o" ? "Overrule" : "Uphold";
+			sendLead(
+				task,
+				answer === "o"
+					? `The user overruled the objection to your ${target.kind} ${id}, ${target.title}, so go ahead.`
+					: `The user upheld the objection to your ${target.kind} ${id}, ${target.title}, so do not go ahead with it.`,
+				target.author,
+			);
+			await callTelegram(
+				cfg,
+				"editMessageReplyMarkup",
+				{
+					chat_id: cfg.chatId,
+					message_id: messageId,
+					reply_markup: { inline_keyboard: settledKeyboard(["Uphold", "Overrule"], new Set([chosen])) },
+				},
+				15_000,
+			);
+			toast = answer === "o" ? "Overruled." : "Upheld.";
+		}
+		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callbackId, text: toast }, 10_000);
+	}
+
 	/** The register's member actions: `register`, `claim`, `propose` and `close` on a task this session belongs to. */
 	async function memberAction(
 		params: Record<string, unknown>,
@@ -8206,6 +8313,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				proposedAt: Date.now(),
 				decidedAt: 0,
 				reason: "",
+				upheld: false,
 			};
 			await updateTask(TASKS_DIR, task.slug, (current) => ({
 				task: { ...current, register: [...current.register, entry] },
@@ -8287,7 +8395,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "conductor",
 		label: "Conductor",
 		description:
-			"Coordinate the sessions of a task opened with `/conduct`. A member records its work in the task register before starting it: `action` `register` lists the entries, filtered by `filter` text; `claim` records a claim on a piece of work and `propose` a decision, each with a `title` and a `body`, and the answer lists the open entries first; `close` settles one of your own `entry` ids with `outcome` done or abandoned for a claim, or superseded with the replacing decision's id in `by`. An entry the conductor does not object to within ten minutes stands accepted. A member of several tasks names one in `task`. The conductor's actions: `invite` proposes the live session named in `session`, by its badge emoji or tag, for the task this session conducts, and `reason` tells the user why it belongs. The user answers Join or Skip on a Telegram card, and the answer arrives as an aside written by no one. A session conducting a task, a member and a session the user skipped cannot be invited. `finding` sends the user one card about members named in `sessions`: `kind` is one of overlap, stacked-parent, dead-wait, duplicate, contradiction, lesson or completed, `text` says what you found, and `subject` is a short key such as `overlap:src/lease.ts`. A subject is raised once, and one the user settled is never raised again, so name a new subject when the situation changes. An optional `message` is what you propose to tell the sessions: the card offers to send it, or `tell` sends it at once, as a message from you. A `completed` finding names the one member that finished, and its card carries that member's close buttons.",
+			"Coordinate the sessions of a task opened with `/conduct`. A member records its work in the task register before starting it: `action` `register` lists the entries, filtered by `filter` text; `claim` records a claim on a piece of work and `propose` a decision, each with a `title` and a `body`, and the answer lists the open entries first; `close` settles one of your own `entry` ids with `outcome` done or abandoned for a claim, or superseded with the replacing decision's id in `by`. An entry the conductor does not object to within ten minutes stands accepted. A member of several tasks names one in `task`. The conductor's actions: `accept` a proposed `entry`, or `object` to it with a `reason`, which tells its author to hold off and sends the user a card to uphold or overrule the objection. `invite` proposes the live session named in `session`, by its badge emoji or tag, for the task this session conducts, and `reason` tells the user why it belongs. The user answers Join or Skip on a Telegram card, and the answer arrives as an aside written by no one. A session conducting a task, a member and a session the user skipped cannot be invited. `finding` sends the user one card about members named in `sessions`: `kind` is one of overlap, stacked-parent, dead-wait, duplicate, contradiction, lesson or completed, `text` says what you found, and `subject` is a short key such as `overlap:src/lease.ts`. A subject is raised once, and one the user settled is never raised again, so name a new subject when the situation changes. An optional `message` is what you propose to tell the sessions: the card offers to send it, or `tell` sends it at once, as a message from you. A `completed` finding names the one member that finished, and its card carries that member's close buttons.",
 		approval: "read",
 		parameters: z.object({
 			action: z.string(),
@@ -8326,16 +8434,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (typeof p.action === "string" && ["register", "claim", "propose", "close"].includes(p.action)) {
 				return memberAction(p, refuse);
 			}
-			if (p.action !== "invite" && p.action !== "finding") {
-				return refuse("`action` is one of `register`, `claim`, `propose`, `close`, `invite` or `finding`.");
+			if (!["invite", "finding", "accept", "object"].includes(String(p.action))) {
+				return refuse(
+					"`action` is one of `register`, `claim`, `propose`, `close`, `invite`, `finding`, `accept` or `object`.",
+				);
 			}
 			const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId && task.state === "live");
 			if (conducted === undefined) {
 				return refuse(
-					"This session conducts no live task, so it cannot invite or raise findings. `/conduct` in Telegram opens a conductor.",
+					"This session conducts no live task, so it cannot invite, raise findings or judge entries. `/conduct` in Telegram opens a conductor.",
 				);
 			}
 			if (p.action === "finding") return raiseFinding(ctx, conducted, p, refuse);
+			if (p.action === "accept" || p.action === "object") return conductorVerdict(ctx, conducted, p, refuse);
 			if (reason.length === 0)
 				return refuse("Say in `reason` why the session belongs to the task, since the user reads it on the card.");
 			if ((badgeEmoji.length > 0 && session === badgeEmoji) || session === sessionTag) {
