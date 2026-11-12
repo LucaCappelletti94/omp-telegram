@@ -21279,6 +21279,139 @@ esac
 	clockSkew = 0;
 }
 
+heading("a member waiting on a session that closed");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const nodesDir = join(stateDir, "graph/nodes");
+	mkdirSync(nodesDir, { recursive: true });
+	const crashDir = join(stateDir, "crashed");
+	mkdirSync(crashDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "member", "closed", "live", "crashed", "finished", "nodeless", "dismissed"].map(
+			(name, i) => [name, `0d0e1000-0000-7000-8000-00000000000${i + 1}`],
+		),
+	);
+	const node = (session, status, edges = []) =>
+		writeFileSync(
+			join(nodesDir, `${session}.json`),
+			JSON.stringify({
+				session,
+				label: `node ${session.slice(-1)}`,
+				emoji: "",
+				tag: `n${session.slice(-1)}`,
+				cwd: "/nowhere",
+				status,
+				note: "",
+				edges,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			}),
+		);
+	const task = (slug, conductor, state) =>
+		writeFileSync(
+			join(tasksDir, `${slug}.json`),
+			JSON.stringify({
+				name: slug,
+				slug,
+				brief: "b",
+				conductor,
+				state,
+				launchedAt: 0,
+				members: [{ session: ids.member, joinedAt: Date.now() }],
+				candidates: [],
+				led: [],
+				closing: false,
+				findings: [],
+				register: [],
+			}),
+		);
+	task("api", ids.conductor, "live");
+	task("old", "0d0e1000-0000-7000-8000-0000000000ff", "dormant");
+	writeFileSync(
+		join(tasksDir, "empty.json"),
+		JSON.stringify({
+			...JSON.parse(readFileSync(join(tasksDir, "api.json"), "utf8")),
+			name: "empty",
+			slug: "empty",
+			conductor: "0d0e1000-0000-7000-8000-0000000000fe",
+			members: [],
+		}),
+	);
+	const poller = spawn(ids.poller, "/home/dev/work/deadwait");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "api"));
+	await conductor.fire("session_start");
+	const member = spawn(ids.member, "/home/dev/work/member");
+	await member.fire("session_start");
+	const live = spawn(ids.live, "/home/dev/work/live");
+	await live.fire("session_start");
+	const crash = (id, dismissed) =>
+		writeFileSync(
+			join(crashDir, `${id}.json`),
+			JSON.stringify({
+				record: { ...record(ids.live), tag: `c${id.slice(-1)}` },
+				batch: "0d0e1000-batch",
+				machine: false,
+				restoringAt: 0,
+				error: "",
+				dismissed,
+			}),
+		);
+	crash(ids.crashed, false);
+	crash(ids.dismissed, true);
+	const waitsOn = (to) => ({ from: ids.member, to, type: "waits-on", at: Date.now() });
+	node(ids.member, "waiting", [
+		...["closed", "live", "crashed", "finished", "nodeless", "dismissed"].map((name) => waitsOn(ids[name])),
+		{ from: ids.member, to: ids.closed, type: "related", at: Date.now() },
+	]);
+	node(ids.closed, "working");
+	node(ids.live, "working");
+	node(ids.crashed, "working");
+	node(ids.finished, "done");
+	node(ids.dismissed, "working");
+	const check10 = async () => {
+		jump(10 * 60_000 + 1_000);
+		for (const s of [conductor, member, live]) s.heartbeat();
+		poller.heartbeat();
+		await settle(500);
+	};
+	// Leads about one member delivered together arrive as one aside, so the leads are counted by their wording.
+	const deadWaits = async () => {
+		await conductor.pump(300);
+		return conductor.customs
+			.map((c) => String(c.message.content))
+			.join("\n")
+			.split("closed before finishing")
+			.slice(0, -1);
+	};
+
+	await check10();
+	const first = (await deadWaits()).join("\n");
+	check(
+		"a wait on a session that closed unfinished or whose crash card was dismissed leads its conductor, and one on a session with no node too",
+		(await deadWaits()).length === 3 &&
+			first.includes(ids.closed) &&
+			first.includes(ids.nodeless) &&
+			first.includes(ids.dismissed) &&
+			!first.includes(ids.live) &&
+			!first.includes(ids.crashed) &&
+			!first.includes(ids.finished),
+	);
+	await check10();
+	check("each dead wait leads once", (await deadWaits()).length === 3);
+	check(
+		"a dormant task's file is never rewritten for it",
+		!("deadWaits" in JSON.parse(readFileSync(join(tasksDir, "old.json"), "utf8"))),
+	);
+	clockSkew = 0;
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });

@@ -7813,6 +7813,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				silenceHours: DEFAULT_SILENCE_HOURS,
 				followed: "",
 				overlaps: [],
+				deadWaits: [],
 			};
 			return { task: fresh, result: { kind: "open", task: fresh } };
 		});
@@ -8541,6 +8542,45 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		]);
 		const files = [...new Set(`${changed.stdout}\n${untracked.stdout}`.split("\n").filter((f) => f !== ""))].sort();
 		return { repo: origin.stdout, branch: branch.stdout, files };
+	}
+
+	/**
+	 * Leads each live task's conductor once per `waits-on` edge a member declared to a session that closed before
+	 * finishing, one with no record and no crash record kept whose work reached no outcome that ends it.
+	 */
+	async function checkDeadWaits(): Promise<void> {
+		const { nodes, prs } = graphSnapshot();
+		const byId = new Map(nodes.map((node) => [node.session, node]));
+		for (const listed of listTasks(TASKS_DIR)) {
+			if (listed.state !== "live") continue;
+			const members = new Set(listed.members.map((m) => m.session));
+			const dead = nodes
+				.filter((node) => members.has(node.session))
+				.flatMap((node) => node.edges)
+				.filter((edge) => {
+					if (edge.type !== "waits-on") return false;
+					const crash = readCrash(edge.to);
+					const target = byId.get(edge.to);
+					return (
+						readSessionRecord(edge.to) === null &&
+						(crash === null || crash.dismissed) &&
+						(target === undefined || !isFinished(displayedStatus(target, prs.get(edge.to))))
+					);
+				});
+			if (dead.length === 0) continue;
+			await updateTask(TASKS_DIR, listed.slug, (task) => {
+				const fresh = dead.filter((edge) => !task.deadWaits.includes(`${edge.from} ${edge.to}`));
+				for (const edge of fresh) {
+					sendLead(
+						task,
+						`${titleOf(edge.from)} (session ${edge.from}) waits on ${titleOf(edge.to)} (session ${edge.to}), which closed before finishing, so the wait cannot end on its own.`,
+						{ about: edge.from },
+					);
+				}
+				const deadWaits = [...task.deadWaits, ...fresh.map((edge) => `${edge.from} ${edge.to}`)];
+				return { task: { ...task, deadWaits }, result: null };
+			});
+		}
 	}
 
 	/**
@@ -11223,6 +11263,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					if (Date.now() - lastOverlapCheck >= OVERLAP_CHECK_MS) {
 						lastOverlapCheck = Date.now();
 						detach(() => checkOverlaps(""), "overlap check");
+						detach(() => checkDeadWaits(), "dead wait check");
 					}
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
