@@ -14,6 +14,7 @@ import {
 	isFinished,
 	outcomeOfPr,
 	outcomeOfStatus,
+	parentChange,
 	parseWatchQuery,
 	prWatchName,
 	resumeArgs,
@@ -401,6 +402,9 @@ const prData = (state, extra = {}) => ({
 	commitOid: "h1",
 	reviews: [],
 	contexts: [],
+	base: "main",
+	baseOid: "m1",
+	defaultBranch: "main",
 	...extra,
 });
 const first = diffWatch(
@@ -513,6 +517,34 @@ check(
 );
 check("a closed pull request ends the watch", diffWatch(watch(), prData("CLOSED")).events[0].event === "closed");
 
+heading("stacked parents");
+check(
+	"every open poll records the base branch and its commit",
+	diffWatch(watch({ seeded: false, head: null }), prData("OPEN", { base: "feat", baseOid: "f1" })).next.base ===
+		"feat" &&
+		diffWatch(watch({ base: "feat", baseOid: "f1" }), prData("OPEN", { base: "feat", baseOid: "f2" })).next.baseOid ===
+			"f2",
+);
+const stacked = watch({ base: "feat", baseOid: "f1" });
+check(
+	"a parent that gained commits is a moved parent",
+	JSON.stringify(parentChange(stacked, prData("OPEN", { base: "feat", baseOid: "f2" }))) ===
+		JSON.stringify({ kind: "moved", parent: "feat", base: "feat", oid: "f2" }),
+);
+check(
+	"a pull request GitHub moved onto the default branch had its parent merged",
+	JSON.stringify(parentChange(stacked, prData("OPEN", { base: "main", baseOid: "m2" }))) ===
+		JSON.stringify({ kind: "merged", parent: "feat", base: "main", oid: "m2" }),
+);
+check(
+	"an unchanged parent, a pull request on the default branch, one never polled with a base and one no longer open change nothing",
+	parentChange(stacked, prData("OPEN", { base: "feat", baseOid: "f1" })) === null &&
+		parentChange(watch({ base: "main", baseOid: "m1" }), prData("OPEN", { baseOid: "m2" })) === null &&
+		parentChange(watch({ base: null, baseOid: null }), prData("OPEN", { base: "feat", baseOid: "f2" })) === null &&
+		parentChange(stacked, prData("MERGED", { base: "feat", baseOid: "f2" })) === null &&
+		parentChange(stacked, null) === null,
+);
+
 heading("watch query");
 const entries = [
 	{ alias: "w0", owner: "o", name: "r", number: 7 },
@@ -531,6 +563,9 @@ const verifiedFields = [
 	"state",
 	"isDraft",
 	"headRefOid",
+	"baseRefName",
+	"baseRefOid",
+	"baseRepository { defaultBranchRef { name } }",
 	"reviews(last: 50) { nodes { id author { login } state body submittedAt } }",
 	"statusCheckRollup { commit { oid } contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } }",
 ].join("\n");
@@ -548,7 +583,9 @@ check(
 		liveParsed.get("w0").data.state === "OPEN" &&
 		liveParsed.get("w0").data.reviews.length > 0 &&
 		liveParsed.get("w0").data.contexts.length > 0 &&
-		liveParsed.get("w0").data.commitOid === liveParsed.get("w0").data.headRefOid,
+		liveParsed.get("w0").data.commitOid === liveParsed.get("w0").data.headRefOid &&
+		liveParsed.get("w0").data.base === "main" &&
+		liveParsed.get("w0").data.defaultBranch === "main",
 );
 check(
 	"the captured live answer names the pull request GitHub cannot find",
@@ -569,6 +606,9 @@ const response = () => ({
 				state: "OPEN",
 				isDraft: false,
 				headRefOid: "h1",
+				baseRefName: "feat",
+				baseRefOid: "f1",
+				baseRepository: { defaultBranchRef: { name: "main" } },
 				reviews: {
 					nodes: [
 						reviewNode("r1", "alice", "COMMENTED", "hi"),
@@ -585,6 +625,9 @@ const response = () => ({
 				state: "OPEN",
 				isDraft: true,
 				headRefOid: "h8",
+				baseRefName: "main",
+				baseRefOid: "m1",
+				baseRepository: null,
 				reviews: { nodes: [] },
 				statusCheckRollup: null,
 			},
@@ -610,6 +653,16 @@ check(
 		parsed.get("w1").data.commitOid === null,
 );
 check("the rollup's commit is the commit its checks belong to", parsed.get("w0").data.commitOid === "h1");
+check(
+	"each pull request carries its base branch, base commit and its repository's default branch",
+	parsed.get("w0").data.base === "feat" &&
+		parsed.get("w0").data.baseOid === "f1" &&
+		parsed.get("w0").data.defaultBranch === "main",
+);
+check(
+	"a base repository GitHub cannot show leaves the default branch unknown",
+	parsed.get("w1").data.defaultBranch === "",
+);
 const pathless = parseWatchQuery({ ...response(), errors: [{ message: "Something went wrong." }] }, ["w0", "w1"]);
 check(
 	"an error naming no alias beside the data leaves every pull request's result standing",
