@@ -11484,6 +11484,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			pinnedMessageId = previous.pinned;
 			pinPendingUntil = previous.pinPendingUntil;
 			closeOfferMessageId = previous.closeOffer;
+			lastSummary = previous.summary;
+			lastSummaryAt = previous.summaryAt;
 			replyQuestionMessageId = previous.replyQuestion;
 		}
 		const left = new Set(leftIds.splice(0));
