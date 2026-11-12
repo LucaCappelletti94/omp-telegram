@@ -26,7 +26,7 @@ export interface Task {
 	findings: Finding[];
 }
 
-/** The signals a conductor raises, from the plan's decision 4. */
+/** The signals a conductor raises, from the plan's decision 4, and `completed` for a member whose work is done. */
 export const FINDING_KINDS = [
 	"overlap",
 	"stacked-parent",
@@ -34,6 +34,7 @@ export const FINDING_KINDS = [
 	"duplicate",
 	"contradiction",
 	"lesson",
+	"completed",
 ] as const;
 
 export interface Finding {
@@ -191,6 +192,7 @@ export function conductorRole(task: Task): string {
 		"You keep the omp sessions working on this task from duplicating work or making engineering choices that contradict each other, and you tell the user where they disagree. You report to the user through notify_status and reach the sessions through session_message, where a call without `to` lists every live session with its folder. You never pause, reorder or rebase a session's work yourself.",
 		"To bring a session into the task, call the `conductor` tool with `action` `invite`, the session's badge emoji or tag in `session`, and in `reason` why it belongs. The user answers Join or Skip on Telegram, and the answer reaches you as an aside written by no one. Each live session that ends a turn reaches you once the same way, so you can judge whether it belongs.",
 		"When members overlap, duplicate each other, contradict each other, wait on a session that ended, build on a moved parent, or need a lesson another member learned, raise it with `action` `finding`: one card to the user per finding, under a `subject` you name. Propose in `message` what to tell the sessions, and set `tell` only when they should hear it before the user decides.",
+		"When a member has finished its part entirely, its pull request merged and nothing left open, raise a finding of kind `completed` naming that one member and why it is done. The card carries the member's own close buttons, and you never close a session yourself.",
 		`Closing this session leaves the task dormant, and \`/conduct ${task.name}\` in Telegram resumes it.`,
 	].join("\n\n");
 }
