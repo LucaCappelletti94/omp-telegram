@@ -6392,7 +6392,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						turnActive ||
 						pendingAsk !== null ||
 						entry.messageId === undefined ||
-						closeOfferMessageId !== entry.messageId
+						(closeOfferMessageId !== entry.messageId &&
+							// The conductor's open completion card about this session carries its close buttons too.
+							!listTasks(TASKS_DIR).some((task) =>
+								task.findings.some(
+									(f) =>
+										f.kind === "completed" &&
+										f.state === "open" &&
+										f.messageId === entry.messageId &&
+										f.sessions.includes(sessionId),
+								),
+							))
 					) {
 						// A destructive press from an old or duplicated keyboard is an accident waiting to happen.
 						staleNotice(owner, "That close offer is no longer current, so the session stayed open.");
@@ -7978,6 +7988,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			sessions.push(id);
 		}
 		if (sessions.length === 0) return refuse("Name in `sessions` the members the finding is about.");
+		// A completion card carries the member's own close buttons, so it needs that one member's running record.
+		const finished = kind === "completed" && sessions.length === 1 ? readSessionRecord(String(sessions[0])) : null;
+		if (kind === "completed" && finished === null) {
+			return refuse(
+				"A completed finding names exactly one member that is still running, whose close buttons the card carries.",
+			);
+		}
 		const finding: Finding = {
 			id: randomUUID().replaceAll("-", "").slice(0, 8),
 			kind: kind as Finding["kind"],
@@ -8008,8 +8025,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			text,
 			...(suggested === "" ? [] : ["", `Suggested message: ${suggested}`]),
 		].join("\n");
+		const keyboard: InlineButton[][] =
+			finished === null
+				? findingButtons(finding)
+				: [
+						[
+							{ text: "Close this session", callback_data: `k:${finished.tag}`, style: "danger" },
+							{ text: "Close and clear", callback_data: `x:${finished.tag}`, style: "danger" },
+						],
+						[{ text: "Not done", callback_data: `f:${finding.id}:n` }],
+					];
 		const sent = await notify(ctx, "notice", "\u{1F50E} Finding", body, {
-			reply_markup: { inline_keyboard: findingButtons(finding) },
+			reply_markup: { inline_keyboard: keyboard },
 		});
 		const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
 		await updateTask(TASKS_DIR, conducted.slug, (task) => ({
@@ -8075,21 +8102,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				sendAsConductor(from, finding.sessions, finding.suggested);
 				toast = "Sent to the sessions.";
 			} else {
-				const chosen = finding.state === "resolved" ? "Resolved" : "Not a problem";
+				const done = finding.kind === "completed";
+				const chosen = finding.state === "resolved" ? "Resolved" : done ? "Not done" : "Not a problem";
 				if (finding.state === "rejected") {
 					sendLead(
 						task,
-						`The user marked the finding on ${finding.subject} as not a problem. A reply the user writes to its card reaches you as a message.`,
+						done
+							? `The user says ${titleOf(String(finding.sessions[0]))} is not done, so its completion under ${finding.subject} is not raised again. A reply the user writes to its card reaches you as a message.`
+							: `The user marked the finding on ${finding.subject} as not a problem. A reply the user writes to its card reaches you as a message.`,
 					);
 				}
-				toast = finding.state === "resolved" ? "Resolved." : "Marked as not a problem.";
+				toast = `${chosen}.`;
 				await callTelegram(
 					cfg,
 					"editMessageReplyMarkup",
 					{
 						chat_id: cfg.chatId,
 						message_id: messageId,
-						reply_markup: { inline_keyboard: settledKeyboard(["Resolved", "Not a problem"], new Set([chosen])) },
+						reply_markup: {
+							inline_keyboard: settledKeyboard(done ? ["Not done"] : ["Resolved", "Not a problem"], new Set([chosen])),
+						},
 					},
 					15_000,
 				);
@@ -11479,6 +11511,24 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					task: current.conductor === sessionId ? { ...current, state: "dormant", closing: false } : null,
 					result: null,
 				}));
+			}
+			// The close itself answers this session's open completion cards.
+			for (const listed of listTasks(TASKS_DIR)) {
+				const cards = listed.findings.filter(
+					(f): f is Finding & { messageId: number } =>
+						f.kind === "completed" && f.state === "open" && f.messageId !== null && f.sessions.includes(sessionId),
+				);
+				if (cards.length === 0) continue;
+				await updateTask(TASKS_DIR, listed.slug, (task) => ({
+					task: {
+						...task,
+						findings: task.findings.map((f) =>
+							cards.some((card) => card.id === f.id) ? { ...f, state: "resolved" as const } : f,
+						),
+					},
+					result: null,
+				}));
+				for (const { messageId } of cards) detach(() => stripKeyboard(messageId), "completion card settle");
 			}
 			await leaveTasks(sessionId, "was closed");
 		}

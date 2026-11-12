@@ -20120,6 +20120,139 @@ heading("conductor findings reach Luca as cards");
 	);
 }
 
+heading("completion cards close finished members");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "m1", "m2", "m3"].map((name, i) => [name, `0d0e0800-0000-7000-8000-00000000000${i + 1}`]),
+	);
+	const taskFile = join(tasksDir, "ship.json");
+	writeFileSync(
+		taskFile,
+		JSON.stringify({
+			name: "Ship",
+			slug: "ship",
+			brief: "b",
+			conductor: ids.conductor,
+			state: "live",
+			launchedAt: 0,
+			members: [ids.m1, ids.m2, ids.m3].map((session) => ({ session, joinedAt: 1 })),
+			candidates: [],
+			led: [],
+			closing: false,
+			findings: [],
+		}),
+	);
+	const task = () => JSON.parse(readFileSync(taskFile, "utf8"));
+	const findingAbout = (id) => task().findings.find((f) => f.sessions[0] === id);
+	const poller = spawn(ids.poller, "/home/dev/work/ship");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "ship"));
+	await conductor.fire("session_start");
+	const members = {};
+	const shutdowns = {};
+	for (const name of ["m1", "m2", "m3"]) {
+		members[name] = spawn(ids[name], `/home/dev/work/${name}`);
+		shutdowns[name] = 0;
+		members[name].ctx.shutdown = () => {
+			shutdowns[name] += 1;
+		};
+		await members[name].fire("session_start");
+	}
+	const tag = (name) => record(ids[name]).tag;
+	const complete = (name, extra = {}) =>
+		conductor.tools.get("conductor").execute(
+			"c",
+			{
+				action: "finding",
+				kind: "completed",
+				sessions: [tag(name)],
+				text: "Its PR merged and its worktree is clean.",
+				subject: `completed:${name}`,
+				...extra,
+			},
+			undefined,
+			undefined,
+			conductor.ctx,
+		);
+	const tap = async (data, update, messageId) => {
+		api.queued = [
+			{
+				update_id: update,
+				callback_query: {
+					id: `done${update}`,
+					data,
+					from: { id: CHAT },
+					message: { message_id: messageId, chat: { id: CHAT } },
+				},
+			},
+		];
+		await poller.pump(400);
+		return lastCall("answerCallbackQuery").body.text;
+	};
+
+	const both = await complete("m1", { sessions: [tag("m1"), tag("m2")], subject: "completed:both" });
+	check(
+		"a completion card names exactly one member",
+		both.isError === true && both.content[0].text.includes("one member"),
+	);
+
+	await complete("m1");
+	const card = lastCall("sendMessage").body;
+	const data = card.reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
+	const first = findingAbout(ids.m1);
+	check(
+		"a completion card carries the member's own close buttons and Not done",
+		data.includes(`k:${tag("m1")}`) &&
+			data.includes(`x:${tag("m1")}`) &&
+			data.includes(`f:${first.id}:n`) &&
+			data.length === 3,
+	);
+
+	await tap(`k:${tag("m1")}`, 9998, first.messageId);
+	await members.m1.pump(200);
+	check("its close button closes the member through its own shutdown path", shutdowns.m1 === 1);
+	await members.m1.fire("session_shutdown");
+	check(
+		"the member closing resolves the finding and settles its card",
+		findingAbout(ids.m1).state === "resolved" &&
+			called("editMessageReplyMarkup").some(
+				(c) => c.body.message_id === first.messageId && c.body.reply_markup.inline_keyboard.length === 0,
+			),
+	);
+
+	await complete("m2");
+	const second = findingAbout(ids.m2);
+	await tap(`k:${tag("m2")}`, 9999, 424242);
+	await members.m2.pump(200);
+	check("a close press from another message leaves the member open", shutdowns.m2 === 0);
+	await tap(`f:${second.id}:n`, 10000, second.messageId);
+	await conductor.pump(150);
+	check(
+		"Not done rejects the completion and tells the conductor",
+		findingAbout(ids.m2).state === "rejected" &&
+			conductor.customs.some((c) => String(c.message.content).includes("not done")),
+	);
+	await tap(`k:${tag("m2")}`, 10001, second.messageId);
+	await members.m2.pump(200);
+	check("a settled completion card no longer closes the member", shutdowns.m2 === 0);
+
+	await complete("m3");
+	const third = findingAbout(ids.m3);
+	await members.m3.fire("session_shutdown");
+	check(
+		"a member closing before Luca answers settles its completion card as closed",
+		findingAbout(ids.m3).state === "resolved" &&
+			called("editMessageReplyMarkup").some((c) => c.body.message_id === third.messageId),
+	);
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
