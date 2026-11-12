@@ -19642,7 +19642,7 @@ heading("a moved session keeps its tasks and leases");
 				{ pair: `${ids.conductor} ${ids.led}`, files: ["tasks.ts"] },
 			],
 			deadWaits: [`${ids.member} ${ids.candidate}`, `${ids.candidate} ${ids.member}`, `${ids.conductor} ${ids.led}`],
-			finished: [`${ids.member} idle`, `${ids.member} done`, `${ids.conductor} done`],
+			finished: [`${ids.member} idle 123456`, `${ids.member} done`, `${ids.conductor} done`],
 		}),
 	);
 	const task = () => JSON.parse(readFileSync(taskFile, "utf8"));
@@ -19705,9 +19705,9 @@ heading("a moved session keeps its tasks and leases");
 			]),
 	);
 	check(
-		"finished keys move with the member and preserve their states",
+		"finished keys move with the member and preserve their states and turn ends",
 		JSON.stringify(task().finished) ===
-			JSON.stringify([`${ids.member2} idle`, `${ids.member2} done`, `${ids.conductor} done`]),
+			JSON.stringify([`${ids.member2} idle 123456`, `${ids.member2} done`, `${ids.conductor} done`]),
 	);
 	await moveTo(ids.candidate, ids.candidate2);
 	check(
@@ -22030,6 +22030,7 @@ heading("a member that looks finished");
 			closing: false,
 			findings: [],
 			register: [],
+			finished: [`${ids.waiting} done`, `${ids.busy} done`],
 		}),
 	);
 	writeFileSync(
@@ -22040,6 +22041,16 @@ heading("a member that looks finished");
 			slug: "old",
 			conductor: "0d0e1100-0000-7000-8000-0000000000ff",
 			state: "dormant",
+			finished: [`${ids.done} abandoned`, `${ids.idle} idle 1`],
+		}),
+	);
+	writeFileSync(
+		join(tasksDir, "unread.json"),
+		JSON.stringify({
+			...JSON.parse(readFileSync(join(tasksDir, "api.json"), "utf8")),
+			name: "unread",
+			slug: "unread",
+			members: ["waiting", "busy"].map((name) => ({ session: ids[name], joinedAt: Date.now() })),
 		}),
 	);
 	const poller = spawn(ids.poller, "/home/dev/work/finished");
@@ -22047,15 +22058,16 @@ heading("a member that looks finished");
 	const conductor = spawn(ids.conductor, join(tasksDir, "api"));
 	await conductor.fire("session_start");
 	const summaryAt = Date.now();
+	const extra = {
+		waiting: { question: 77 },
+		idle: { closeOffer: 7, summaryAt },
+		recent: { closeOffer: 8, summaryAt: Date.now() },
+	};
 	// Each member's record as its own omp would leave it, rewritten before every check so it stays fresh.
 	const records = () => {
 		const base = { ...record(ids.conductor), closeOffer: null, question: null, replyQuestion: null, standing: null };
-		const extra = {
-			waiting: { question: 77 },
-			idle: { closeOffer: 7, summaryAt },
-			recent: { closeOffer: 8, summaryAt: Date.now() },
-		};
 		for (const name of members.filter((name) => name !== "busy")) {
+			if (name === "recent") extra.recent.summaryAt = Date.now();
 			writeFileSync(
 				join(sessionsDir, `${ids[name]}.json`),
 				JSON.stringify({ ...base, tag: `f${name}`, heartbeat: Date.now(), ...(extra[name] ?? {}) }),
@@ -22126,13 +22138,98 @@ heading("a member that looks finished");
 	check("a member waiting on the user is not led about", !text.includes(ids.waiting));
 	await check10();
 	check("each state leads once", (await finished()).length === 3);
+	const keys = () => JSON.parse(readFileSync(join(tasksDir, "api.json"), "utf8")).finished;
+	const observeFinishedCheck = async (onLock) => {
+		const realWrite = fs.writeFileSync;
+		const realRename = fs.renameSync;
+		const observed = { locks: 0, writes: 0 };
+		fs.writeFileSync = (path, ...args) => {
+			if (String(path) === join(tasksDir, "tasks.lock") && new Error().stack.includes("checkFinished")) {
+				observed.locks++;
+				onLock();
+			}
+			return realWrite(path, ...args);
+		};
+		fs.renameSync = (from, to) => {
+			if (String(to) === join(tasksDir, "api.json") && new Error().stack.includes("checkFinished")) {
+				observed.writes++;
+			}
+			return realRename(from, to);
+		};
+		syncBuiltinESMExports();
+		try {
+			await check10();
+		} finally {
+			fs.writeFileSync = realWrite;
+			fs.renameSync = realRename;
+			syncBuiltinESMExports();
+		}
+		return observed;
+	};
+	check("an idle key names its turn end", keys().includes(`${ids.idle} idle ${summaryAt}`));
+	check("an unread member keeps its finished key", keys().includes(`${ids.busy} done`));
+	for (const field of ["question", "replyQuestion", "standing"]) {
+		extra.done = { [field]: field === "standing" ? { messageId: 77, options: [] } : 77 };
+		await check10();
+		check(`a member waiting through ${field} keeps its done key`, keys().includes(`${ids.done} done`));
+	}
+	delete extra.done;
+	const steady = await observeFinishedCheck(() => {});
+	check(
+		"unchanged finished states neither take the task lock nor rewrite the task",
+		steady.locks === 0 && steady.writes === 0,
+	);
+	check("a member that stays done leads once across repeated checks and questions", (await finished()).length === 3);
+	node("done", "working");
+	extra.idle.closeOffer = null;
+	await check10();
+	check(
+		"working again drops the done and idle keys",
+		!keys().includes(`${ids.done} done`) && !keys().some((key) => key.startsWith(`${ids.idle} idle`)),
+	);
+	node("done", "done");
+	extra.idle = { closeOffer: 9, summaryAt: Date.now() };
+	await check10();
+	check("a member reaching done again leads again", (await finished()).length === 4);
+	await check10();
+	await check10();
+	check(
+		"a later green close offer leads again after half an hour",
+		(await finished()).length === 5 && keys().includes(`${ids.idle} idle ${extra.idle.summaryAt}`),
+	);
+	extra.idle.summaryAt = Date.now() - 31 * 60_000;
+	await check10();
+	check(
+		"a new idle turn end replaces its older key even between checks",
+		(await finished()).length === 6 &&
+			keys()
+				.filter((key) => key.startsWith(`${ids.idle} idle`))
+				.join() === `${ids.idle} idle ${extra.idle.summaryAt}`,
+	);
 	node("idle", "abandoned");
 	await check10();
-	const later = (await finished()).slice(3);
+	const later = (await finished()).slice(6);
 	check("a new state of the same member leads again", later.length === 1 && later[0].includes(ids.idle));
+	check("a status replaces the member's idle key", !keys().some((key) => key.startsWith(`${ids.idle} idle`)));
+	for (const status of ["done", "not-needed", "abandoned"]) {
+		node("done", status);
+		await check10();
+		node("done", "working");
+		await check10();
+		check(`leaving ${status} drops its key`, !keys().includes(`${ids.done} ${status}`));
+	}
+	writeFileSync(
+		join(prDir, `${ids.merged}.json`),
+		JSON.stringify({ ...JSON.parse(readFileSync(join(prDir, `${ids.merged}.json`), "utf8")), state: "open" }),
+	);
+	node("idle", "working");
+	extra.idle.closeOffer = null;
+	await check10();
+	check("leaving merged drops its key when no member looks finished", !keys().includes(`${ids.merged} merged`));
 	check(
-		"a dormant task's file is never rewritten for it",
-		!("finished" in JSON.parse(readFileSync(join(tasksDir, "old.json"), "utf8"))),
+		"a dormant task keeps its finished keys",
+		JSON.parse(readFileSync(join(tasksDir, "old.json"), "utf8")).finished.join() ===
+			[`${ids.done} abandoned`, `${ids.idle} idle 1`].join(),
 	);
 	const previous = { ...record(ids.recent), heartbeat: 0, summary: "Member work is complete." };
 	writeFileSync(join(sessionsDir, `${ids.recent}.json`), JSON.stringify(previous));
@@ -22151,9 +22248,40 @@ heading("a member that looks finished");
 	await settle(500);
 	check(
 		"a restarted member with a recent green close offer is not led as idle on its first check",
-		!(await finished()).join("\n").includes(ids.recent) &&
-			!JSON.parse(readFileSync(join(tasksDir, "api.json"), "utf8")).finished.includes(`${ids.recent} idle`),
+		!(await finished()).join("\n").includes(ids.recent) && !keys().some((key) => key.startsWith(`${ids.recent} idle`)),
 	);
+	check(
+		"a task with no readable member states keeps its keys",
+		JSON.parse(readFileSync(join(tasksDir, "unread.json"), "utf8")).finished.join() ===
+			[`${ids.waiting} done`, `${ids.busy} done`].join(),
+	);
+	const taskFile = join(tasksDir, "api.json");
+	const taskLock = join(tasksDir, "tasks.lock");
+	const beforeRace = JSON.parse(readFileSync(taskFile, "utf8"));
+	writeFileSync(
+		taskFile,
+		JSON.stringify({ ...beforeRace, finished: [...beforeRace.finished, `${ids.done} abandoned`] }),
+	);
+	const raced = await observeFinishedCheck(() => {
+		writeFileSync(taskFile, JSON.stringify(beforeRace));
+	});
+	check(
+		"a finished check changed by another writer takes the lock without rewriting the task",
+		raced.locks === 1 && raced.writes === 0,
+	);
+	const beforeDormant = { ...JSON.parse(readFileSync(taskFile, "utf8")), finished: [`${ids.done} abandoned`] };
+	writeFileSync(taskFile, JSON.stringify(beforeDormant));
+	jump(10 * 60_000 + 1_000);
+	records();
+	writeFileSync(taskLock, "");
+	utimesSync(taskLock, new Date(Date.now()), new Date(Date.now()));
+	conductor.heartbeat();
+	poller.heartbeat();
+	await settle(100);
+	writeFileSync(taskFile, JSON.stringify({ ...beforeDormant, state: "dormant" }));
+	rmSync(taskLock);
+	await settle(500);
+	check("a task made dormant during the check keeps its keys", keys().join() === `${ids.done} abandoned`);
 	clockSkew = 0;
 }
 

@@ -8572,11 +8572,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return { repo: origin.stdout, top: top.stdout, branch: branch.stdout, files };
 	}
 
-	/**
-	 * Leads each live task's conductor once per state in which a member looks finished: its graph status done,
-	 * not-needed or abandoned, its pull request merged, or a green close offer from its last turn left standing for half
-	 * an hour. A member waiting on the user, or one without a session record, is left alone.
-	 */
+	/** Leads live conductors once per finished status or idle turn end, leaving members waiting on the user alone. */
 	async function checkFinished(): Promise<void> {
 		const { nodes, prs } = graphSnapshot();
 		const byId = new Map(nodes.map((node) => [node.session, node]));
@@ -8590,6 +8586,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const now = Date.now();
 		for (const listed of listTasks(TASKS_DIR)) {
 			if (listed.state !== "live") continue;
+			const states = new Map<string, string>();
 			const looks = listed.members.flatMap(({ session }) => {
 				const record = readSessionRecord(session);
 				if (record === null || record.question !== null || record.replyQuestion !== null || record.standing !== null) {
@@ -8598,14 +8595,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const node = byId.get(session);
 				const status = node === undefined ? undefined : displayedStatus(node, prs.get(session));
 				const reason = status === undefined ? undefined : statusReasons[status];
-				if (reason !== undefined) return [{ session, state: status as string, reason }];
-				return record.closeOffer !== null && now - record.summaryAt >= FINISHED_IDLE_MS
-					? [{ session, state: "idle", reason: idleReason }]
-					: [];
+				const idle = reason === undefined && record.closeOffer !== null && now - record.summaryAt >= FINISHED_IDLE_MS;
+				const state = reason === undefined ? (idle ? `idle ${record.summaryAt}` : "") : (status as string);
+				states.set(session, `${session} ${state}`);
+				return reason !== undefined || idle ? [{ session, state, reason: reason ?? idleReason }] : [];
 			});
-			if (looks.length === 0) continue;
+			const keep = (key: string): boolean => {
+				const state = states.get(key.slice(0, key.indexOf(" ")));
+				return state === undefined || state === key;
+			};
+			if (
+				listed.finished.every(keep) &&
+				looks.every(({ session, state }) => listed.finished.includes(`${session} ${state}`))
+			) {
+				continue;
+			}
 			await updateTask(TASKS_DIR, listed.slug, (task) => {
+				if (task.state !== "live") return { task: null, result: null };
+				const retained = task.finished.filter(keep);
 				const fresh = looks.filter(({ session, state }) => !task.finished.includes(`${session} ${state}`));
+				if (retained.length === task.finished.length && fresh.length === 0) return { task: null, result: null };
 				for (const { session, reason } of fresh) {
 					sendLead(
 						task,
@@ -8613,7 +8622,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						{ about: session },
 					);
 				}
-				const finished = [...task.finished, ...fresh.map(({ session, state }) => `${session} ${state}`)];
+				const finished = [...retained, ...fresh.map(({ session, state }) => `${session} ${state}`)];
 				return { task: { ...task, finished }, result: null };
 			});
 		}
