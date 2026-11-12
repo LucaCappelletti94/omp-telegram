@@ -21570,6 +21570,26 @@ heading("a member that looks finished");
 		"a dormant task's file is never rewritten for it",
 		!("finished" in JSON.parse(readFileSync(join(tasksDir, "old.json"), "utf8"))),
 	);
+	const previous = { ...record(ids.recent), heartbeat: 0, summary: "Member work is complete." };
+	writeFileSync(join(sessionsDir, `${ids.recent}.json`), JSON.stringify(previous));
+	const restarted = spawn(ids.recent, "/home/dev/work/recent");
+	await restarted.fire("session_start");
+	check(
+		"a restarted member keeps the summary and time of its green close offer",
+		record(ids.recent).closeOffer === previous.closeOffer &&
+			record(ids.recent).summary === previous.summary &&
+			record(ids.recent).summaryAt === previous.summaryAt,
+	);
+	jump(10 * 60_000 + 1_000);
+	restarted.heartbeat();
+	conductor.heartbeat();
+	poller.heartbeat();
+	await settle(500);
+	check(
+		"a restarted member with a recent green close offer is not led as idle on its first check",
+		!(await finished()).join("\n").includes(ids.recent) &&
+			!JSON.parse(readFileSync(join(tasksDir, "api.json"), "utf8")).finished.includes(`${ids.recent} idle`),
+	);
 	clockSkew = 0;
 }
 
