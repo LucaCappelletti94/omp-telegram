@@ -20426,6 +20426,25 @@ heading("the task register");
 			(await leads(conductor)).some((t) => t.includes("Write the API page") && t.includes("done")),
 	);
 
+	for (const outcome of ["done", "abandoned"]) {
+		const title = `Close claim as ${outcome}`;
+		await text("b", { action: "claim", task: "docs", title });
+		const entry = register().find((e) => e.title === title).id;
+		const before = (await leads(conductor)).length;
+		await text("b", { action: "close", task: "docs", entry, outcome, by: ` ${decisionId} ` });
+		check(
+			`closing a claim as ${outcome} ignores a stray replacement decision`,
+			register().find((e) => e.id === entry).status === outcome &&
+				register().find((e) => e.id === decisionId).supersedes === "",
+		);
+		const closingLeads = (await leads(conductor)).slice(before);
+		check(
+			`the lead for a claim closed as ${outcome} does not mention supersession`,
+			closingLeads.some((t) => t.includes(title) && t.includes(`as ${outcome}`)) &&
+				closingLeads.every((t) => !t.includes("superseded")),
+		);
+	}
+
 	await sessions.a.fire("session_shutdown");
 	check(
 		"an author leaving abandons its open claims and keeps its decisions",

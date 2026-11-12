@@ -8487,7 +8487,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					: "A decision closes as superseded, by the decision that replaces it.",
 			);
 		}
-		const by = (q.by ?? "").trim();
+		const by = outcome === "superseded" ? (q.by ?? "").trim() : "";
 		if (outcome === "superseded" && !task.register.some((e) => e.id === by && e.id !== id && e.kind === "decision")) {
 			return refuse("Name in `by` the decision that supersedes this one.");
 		}
