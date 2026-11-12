@@ -19255,6 +19255,9 @@ heading("conductor invites and members");
 		(await refusal(conductor, tagOf(worker))).includes("card"),
 	);
 
+	const transcripts = join(root, "sessions", "members");
+	mkdirSync(transcripts, { recursive: true });
+	writeFileSync(join(transcripts, `2026-01-01T00-00-00Z_${worker.id}.jsonl`), "{}\n".repeat(3));
 	const joined = await tap(joinButton, 9980);
 	check(
 		"Join adds the session to the members and settles the card",
@@ -19262,6 +19265,10 @@ heading("conductor invites and members");
 			task().candidates.length === 0 &&
 			joined.length > 0 &&
 			lastCall("editMessageText").body.text.includes("joined"),
+	);
+	check(
+		"a joined member starts updates and reviews at its transcript line count",
+		task().members.some((m) => m.session === worker.id && m.updateLine === 3 && m.reviewLine === 3),
 	);
 	await conductor.pump(200);
 	check(
@@ -19872,6 +19879,9 @@ heading("an upstream launch of a member joins its requester's tasks");
 		process.env.OMP_TELEGRAM_LAUNCH = id;
 	};
 	launch("0d0e0600-launch-0001", ids.parent);
+	const transcripts = join(root, "sessions", "launch-members");
+	mkdirSync(transcripts, { recursive: true });
+	writeFileSync(join(transcripts, `2026-01-01T00-00-00Z_${ids.child}.jsonl`), "{}\n".repeat(4));
 	const child = spawn(ids.child, "/home/dev/widget.upstreams/fix");
 	await child.fire("session_start");
 	await settle(200);
@@ -19879,6 +19889,10 @@ heading("an upstream launch of a member joins its requester's tasks");
 		"a member's launched child joins every task of its requester and nothing else",
 		taskOf("joined").members.some((m) => m.session === ids.child) &&
 			!taskOf("apart").members.some((m) => m.session === ids.child),
+	);
+	check(
+		"a launched member starts updates and reviews at its transcript line count",
+		taskOf("joined").members.some((m) => m.session === ids.child && m.updateLine === 4 && m.reviewLine === 4),
 	);
 	check("a child joining a closing task keeps its conductor open", taskOf("joined").closing === false);
 	check(

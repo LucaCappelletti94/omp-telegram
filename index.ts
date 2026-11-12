@@ -7878,10 +7878,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return { path, lines };
 	}
 
-	/** A session joining a task now, its silence clock started and its transcript read on from where it stands. */
-	function newMember(session: string): Member {
+	/** A session joining a task with its transcript line count taken before the task lock. */
+	function newMember(session: string, line: number): Member {
 		const now = Date.now();
-		const line = transcriptLines(session).lines;
 		return {
 			session,
 			joinedAt: now,
@@ -7975,6 +7974,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const [, card, answer] = data.split(":");
 		const open = (task: Task) => task.candidates.find((c) => c.card === card && c.state === "proposed");
 		const owner = listTasks(TASKS_DIR).find((task) => open(task) !== undefined);
+		const invited = owner === undefined ? undefined : open(owner);
+		const line = invited === undefined ? 0 : transcriptLines(invited.session).lines;
 		const settled =
 			owner === undefined
 				? null
@@ -7993,7 +7994,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						if (!isLiveSession(session)) {
 							return { task: { ...task, candidates: others }, result: { task, session, outcome: "gone" as const } };
 						}
-						const members = [...task.members, newMember(session)];
+						const members = [...task.members, newMember(session, line)];
 						return {
 							task: { ...task, candidates: others, members, closing: false },
 							result: { task, session, outcome: "joined" as const },
@@ -9880,11 +9881,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	async function joinRequesterTasks(parent: string): Promise<void> {
 		const self = sessionId;
 		const text = `${titleOf(self)} joined as an upstream launch of ${titleOf(parent)}.`;
+		const line = transcriptLines(self).lines;
 		for (const listed of listTasks(TASKS_DIR)) {
 			if (!listed.members.some((member) => member.session === parent)) continue;
 			const joined = await updateTask(TASKS_DIR, listed.slug, (task) => {
 				if (task.members.some((member) => member.session === self)) return { task: null, result: null };
-				const members = [...task.members, newMember(self)];
+				const members = [...task.members, newMember(self, line)];
 				return { task: { ...task, members, closing: false }, result: task };
 			});
 			if (joined !== null) sendLead(joined, text);
