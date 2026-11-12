@@ -19837,8 +19837,15 @@ heading("members leaving a task and its conductor closing");
 	];
 	await poller.pump(400);
 	check("a session joining a closing task clears the closing", taskOf("leave").closing === false);
+	await conductor.fire("agent_start");
 	await c.fire("session_shutdown");
 	check("its leaving marks the task closing again", taskOf("leave").closing === true);
+	await endTurn(conductor, "The current review is complete.");
+	await conductor.fire("agent_start");
+	check(
+		"a conductor handling its closing lead stays open throughout the turn",
+		(await leads()).some((text) => text.includes("closing notice")) && shutdowns === 0,
+	);
 
 	const before = called("sendMessage").length;
 	await endTurn(conductor, "Closing: every member is done.");
@@ -19874,6 +19881,12 @@ heading("members leaving a task and its conductor closing");
 	await endTurn(silent, "Nobody hears this.");
 	await silent.pump(150);
 	const early = silentShutdowns;
+	await silent.fire("agent_start");
+	performance.now = () => realNow() + 31_000;
+	await silent.pump(150);
+	performance.now = realNow;
+	check("a closing conductor stays open during a turn even after the notice wait expires", silentShutdowns === 0);
+	await endTurn(silent, "The closing turn is complete.");
 	performance.now = () => realNow() + 31_000;
 	await silent.pump(150);
 	performance.now = realNow;
