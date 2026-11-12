@@ -22447,8 +22447,12 @@ heading("a member that looks finished");
 	check("an unread member keeps its finished key", keys().includes(`${ids.busy} done`));
 	for (const field of ["question", "replyQuestion", "standing"]) {
 		extra.done = { [field]: field === "standing" ? { messageId: 77, options: [] } : 77 };
-		await check10();
+		const waiting = await observeFinishedCheck(() => {});
 		check(`a member waiting through ${field} keeps its done key`, keys().includes(`${ids.done} done`));
+		check(
+			`a member staying done through ${field} neither leads again nor takes the task lock`,
+			(await finished()).length === 3 && waiting.locks === 0 && waiting.writes === 0,
+		);
 	}
 	delete extra.done;
 	const steady = await observeFinishedCheck(() => {});
@@ -22532,6 +22536,46 @@ heading("a member that looks finished");
 		JSON.parse(readFileSync(join(tasksDir, "unread.json"), "utf8")).finished.join() ===
 			[`${ids.waiting} done`, `${ids.busy} done`].join(),
 	);
+	for (const field of ["question", "replyQuestion", "standing"]) {
+		node("done", "done");
+		await check10();
+		const before = (await finished()).length;
+		extra.done = { [field]: field === "standing" ? { messageId: 77, options: [] } : 77 };
+		node("done", "working");
+		await check10();
+		check(
+			`a member working while waiting through ${field} drops its done key without leading`,
+			!keys().includes(`${ids.done} done`) && (await finished()).length === before,
+		);
+		delete extra.done;
+		node("done", "done");
+		await check10();
+		check(
+			`a member reaching done after working through ${field} leads again`,
+			keys().includes(`${ids.done} done`) && (await finished()).length === before + 1,
+		);
+		node("done", "working");
+		await check10();
+		const beforeWaiting = (await finished()).length;
+		extra.done = { [field]: field === "standing" ? { messageId: 77, options: [] } : 77 };
+		node("done", "done");
+		const waiting = await observeFinishedCheck(() => {});
+		check(
+			`a member newly done while waiting through ${field} neither leads nor takes the task lock`,
+			!keys().includes(`${ids.done} done`) &&
+				(await finished()).length === beforeWaiting &&
+				waiting.locks === 0 &&
+				waiting.writes === 0,
+		);
+		delete extra.done;
+		await check10();
+		check(
+			`a newly done member leads when ${field} clears`,
+			keys().includes(`${ids.done} done`) && (await finished()).length === beforeWaiting + 1,
+		);
+		node("done", "working");
+		await check10();
+	}
 	const taskFile = join(tasksDir, "api.json");
 	const taskLock = join(tasksDir, "tasks.lock");
 	const beforeRace = JSON.parse(readFileSync(taskFile, "utf8"));
