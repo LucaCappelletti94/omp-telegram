@@ -19510,6 +19510,56 @@ heading("conductors hear of sessions they have not judged");
 		"sessions no longer live are dropped from those already led about",
 		!taskOf("docs").led.includes(ids.worker) && taskOf("docs").led.includes(ids.late),
 	);
+
+	writeTask("starting", "", "live");
+	writeTask("also-starting", "", "live");
+	const idle = spawn("0d0e0300-0000-7000-8000-000000000007", "/home/dev/work/idle");
+	await idle.fire("session_start");
+	await endTurn(idle, "The idle worker finished its only turn.");
+	const heldDir = join(stateDir, "graph/task-pending", "starting");
+	check(
+		"a starting conductor holds its worker lead under the task and records the worker as led",
+		existsSync(heldDir) &&
+			readdirSync(heldDir).length === 1 &&
+			taskOf("starting").led.includes(idle.id) &&
+			!readdirSync(join(stateDir, "graph/pending")).some((file) => file.startsWith("lead-")),
+	);
+	const firstHeld = existsSync(heldDir) ? readdirSync(heldDir)[0] : undefined;
+	const heldAt = firstHeld === undefined ? 0 : JSON.parse(readFileSync(join(heldDir, firstHeld), "utf8")).at;
+	process.env.OMP_TELEGRAM_CONDUCT = "starting";
+	const starting = spawn("0d0e0300-0000-7000-8000-000000000008", join(tasksDir, "starting"));
+	await starting.fire("session_start");
+	const claimedLeads = await leadsTo(starting);
+	check(
+		"an idle worker reaches the conductor once it claims the task without another worker turn",
+		claimedLeads.length === 1 &&
+			claimedLeads[0].message.content.includes("The idle worker finished its only turn.") &&
+			claimedLeads[0].message.details.leads[0].at === heldAt &&
+			claimedLeads[0].message.details.about === idle.id &&
+			taskOf("starting").conductor === starting.id,
+	);
+	check(
+		"claiming one task leaves another starting task's leads held",
+		existsSync(join(stateDir, "graph/task-pending", "also-starting")) &&
+			readdirSync(join(stateDir, "graph/task-pending", "also-starting")).length === 1 &&
+			taskOf("also-starting").conductor === "",
+	);
+	await endTurn(idle, "The worker has no new lead.");
+	check(
+		"the claimed conductor receives its held worker lead only once",
+		(await leadsTo(starting)).length === 1 && (!existsSync(heldDir) || readdirSync(heldDir).length === 0),
+	);
+
+	const offlineId = "0d0e0300-0000-7000-8000-000000000009";
+	writeTask("offline", offlineId, "live");
+	await endTurn(late, "The offline conductor has a worker to consider.");
+	const offlineDir = join(stateDir, "graph/pending", offlineId);
+	check(
+		"a named offline conductor keeps its lead behind its own resume card",
+		existsSync(join(offlineDir, "card.json")) &&
+			readdirSync(offlineDir).filter((file) => file.startsWith("lead-")).length === 1 &&
+			!existsSync(join(stateDir, "graph/task-pending", "offline")),
+	);
 }
 
 heading("a moved session keeps its tasks and leases");

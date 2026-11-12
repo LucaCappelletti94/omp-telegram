@@ -896,6 +896,7 @@ const NODES_DIR = join(GRAPH_DIR, "nodes");
 const PR_DIR = join(GRAPH_DIR, "pr");
 const LAUNCHES_DIR = join(GRAPH_DIR, "launches");
 const PENDING_DIR = join(GRAPH_DIR, "pending");
+const TASK_PENDING_DIR = join(GRAPH_DIR, "task-pending");
 const WATCH_DIR = join(GRAPH_DIR, "watches");
 const REQUESTS_DIR = join(GRAPH_DIR, "requests");
 const RENDER_DIR = join(GRAPH_DIR, "render");
@@ -7859,14 +7860,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Hands news about a task to `to`, its conductor unless named, held behind a resume card while that session is down.
+	 * Queues task news for `to`, defaulting to its conductor or held for the task until a conductor claims it.
 	 * `about` names the session the news concerns, so a busy conductor gets that session's leads in one aside.
 	 */
 	function sendLead(task: Task, text: string, route: { to?: string; about?: string } = {}): void {
 		const to = route.to ?? task.conductor;
 		const item: PendingItem = { kind: "lead", at: Date.now(), task: task.name, text, about: route.about };
-		writePrivateJson(join(PENDING_DIR, to), `lead-${Date.now()}-${randomUUID().slice(0, 8)}.json`, item);
-		if (!isLiveSession(to)) detach(() => raiseResumeCard(to), "resume card");
+		const dir = to === "" ? join(TASK_PENDING_DIR, task.slug) : join(PENDING_DIR, to);
+		writePrivateJson(dir, `lead-${Date.now()}-${randomUUID().slice(0, 8)}.json`, item);
+		if (to !== "" && !isLiveSession(to)) detach(() => raiseResumeCard(to), "resume card");
 	}
 
 	/** Where a session's transcript is and how many lines it holds, 0 when it has none. */
@@ -7955,7 +7957,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!registered || tasks.some((task) => task.conductor === sessionId)) return;
 		const text = `${badge(ctx)} (tag ${sessionTag}) in ${ctx.cwd} ended a turn: ${headline} Invite it with the conductor tool if it works on this task.`;
 		for (const { slug } of tasks) {
-			const led = await updateTask(TASKS_DIR, slug, (task) => {
+			await updateTask(TASKS_DIR, slug, (task) => {
 				const judged =
 					task.state !== "live" ||
 					task.led.includes(sessionId) ||
@@ -7963,9 +7965,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					task.candidates.some((candidate) => candidate.session === sessionId);
 				if (judged) return { task: null, result: null };
 				const still = task.led.filter((id) => isLiveSession(id));
-				return { task: { ...task, led: [...still, sessionId] }, result: task };
+				sendLead(task, text, { about: sessionId });
+				return { task: { ...task, led: [...still, sessionId] }, result: null };
 			});
-			if (led !== null) sendLead(led, text, { about: sessionId });
 		}
 	}
 
@@ -9858,10 +9860,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		delete process.env[CONDUCT_ENV];
 		const slug = named ?? listTasks(TASKS_DIR).find((task) => task.conductor === sessionId)?.slug;
 		if (slug === undefined) return;
-		await updateTask(TASKS_DIR, slug, (task) => ({
-			task: { ...task, conductor: sessionId, state: "live", launchedAt: 0 },
-			result: null,
-		}));
+		await updateTask(TASKS_DIR, slug, (task) => {
+			const held = join(TASK_PENDING_DIR, slug);
+			for (const name of listJson(held)) {
+				writePrivateJson(join(PENDING_DIR, sessionId), name, readJsonFile(join(held, name)));
+				removeStatePath(held, name);
+			}
+			return {
+				task: { ...task, conductor: sessionId, state: "live", launchedAt: 0 },
+				result: null,
+			};
+		});
 	}
 
 	function claimLaunch(ctx: ExtensionContext): void {
