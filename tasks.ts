@@ -22,6 +22,33 @@ export interface Task {
 	led: string[];
 	/** Set once the last member left while the conductor was live, until it closes or a session joins. */
 	closing: boolean;
+	/** What the conductor raised to Luca, one card each. */
+	findings: Finding[];
+}
+
+/** The signals a conductor raises, from the plan's decision 4. */
+export const FINDING_KINDS = [
+	"overlap",
+	"stacked-parent",
+	"dead-wait",
+	"duplicate",
+	"contradiction",
+	"lesson",
+] as const;
+
+export interface Finding {
+	/** The card's own id, which its buttons carry. */
+	id: string;
+	kind: (typeof FINDING_KINDS)[number];
+	sessions: string[];
+	/** Named by the conductor; once Luca settles a finding its subject is never raised again. */
+	subject: string;
+	text: string;
+	/** What the conductor proposes to tell the sessions, empty for none. */
+	suggested: string;
+	messageId: number | null;
+	/** `told` once the suggested message went out, `resolved` or `rejected` once Luca settled the card. */
+	state: "open" | "told" | "resolved" | "rejected";
 }
 
 export interface Member {
@@ -80,6 +107,18 @@ function parseTask(raw: unknown, slug: string): Task | null {
 			typeof c?.session === "string" && typeof c.card === "string" && (c.state === "proposed" || c.state === "skipped"),
 	);
 	const led = (Array.isArray(t.led) ? t.led : []).filter((id): id is string => typeof id === "string");
+	const findings = (Array.isArray(t.findings) ? t.findings : []).filter(
+		(f): f is Finding =>
+			typeof f?.id === "string" &&
+			(FINDING_KINDS as readonly unknown[]).includes(f.kind) &&
+			Array.isArray(f.sessions) &&
+			f.sessions.every((s: unknown) => typeof s === "string") &&
+			typeof f.subject === "string" &&
+			typeof f.text === "string" &&
+			typeof f.suggested === "string" &&
+			(f.messageId === null || typeof f.messageId === "number") &&
+			["open", "told", "resolved", "rejected"].includes(f.state),
+	);
 	return {
 		name: t.name,
 		slug,
@@ -91,6 +130,7 @@ function parseTask(raw: unknown, slug: string): Task | null {
 		candidates,
 		led,
 		closing: t.closing === true,
+		findings,
 	};
 }
 
@@ -150,6 +190,7 @@ export function conductorRole(task: Task): string {
 		task.brief,
 		"You keep the omp sessions working on this task from duplicating work or making engineering choices that contradict each other, and you tell the user where they disagree. You report to the user through notify_status and reach the sessions through session_message, where a call without `to` lists every live session with its folder. You never pause, reorder or rebase a session's work yourself.",
 		"To bring a session into the task, call the `conductor` tool with `action` `invite`, the session's badge emoji or tag in `session`, and in `reason` why it belongs. The user answers Join or Skip on Telegram, and the answer reaches you as an aside written by no one. Each live session that ends a turn reaches you once the same way, so you can judge whether it belongs.",
+		"When members overlap, duplicate each other, contradict each other, wait on a session that ended, build on a moved parent, or need a lesson another member learned, raise it with `action` `finding`: one card to the user per finding, under a `subject` you name. Propose in `message` what to tell the sessions, and set `tell` only when they should hear it before the user decides.",
 		`Closing this session leaves the task dormant, and \`/conduct ${task.name}\` in Telegram resumes it.`,
 	].join("\n\n");
 }
