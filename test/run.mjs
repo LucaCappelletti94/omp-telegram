@@ -19533,6 +19533,13 @@ heading("a moved session keeps its tasks and leases");
 			members: [{ session: ids.member, joinedAt: 1 }],
 			candidates: [{ session: ids.candidate, card: "0a1b2c3d", state: "proposed" }],
 			led: [ids.led],
+			followed: ids.member,
+			overlaps: [
+				{ pair: `${ids.member} ${ids.candidate}`, files: ["index.ts"] },
+				{ pair: `${ids.conductor} ${ids.led}`, files: ["tasks.ts"] },
+			],
+			deadWaits: [`${ids.member} ${ids.candidate}`, `${ids.candidate} ${ids.member}`, `${ids.conductor} ${ids.led}`],
+			finished: [`${ids.member} idle`, `${ids.member} done`, `${ids.conductor} done`],
 		}),
 	);
 	const task = () => JSON.parse(readFileSync(taskFile, "utf8"));
@@ -19576,6 +19583,29 @@ heading("a moved session keeps its tasks and leases");
 			leases().queue.every((q) => q.session === ids.member2) &&
 			leases().granted.length === 1,
 	);
+	check("the followed member moves to its continuation id", task().followed === ids.member2);
+	check(
+		"overlap keys move with the member and keep their sorted pair and files",
+		JSON.stringify(task().overlaps) ===
+			JSON.stringify([
+				{ pair: `${ids.candidate} ${ids.member2}`, files: ["index.ts"] },
+				{ pair: `${ids.conductor} ${ids.led}`, files: ["tasks.ts"] },
+			]),
+	);
+	check(
+		"dead wait keys move either endpoint without reversing their direction",
+		JSON.stringify(task().deadWaits) ===
+			JSON.stringify([
+				`${ids.member2} ${ids.candidate}`,
+				`${ids.candidate} ${ids.member2}`,
+				`${ids.conductor} ${ids.led}`,
+			]),
+	);
+	check(
+		"finished keys move with the member and preserve their states",
+		JSON.stringify(task().finished) ===
+			JSON.stringify([`${ids.member2} idle`, `${ids.member2} done`, `${ids.conductor} done`]),
+	);
 	await moveTo(ids.candidate, ids.candidate2);
 	check(
 		"a proposed candidate keeps its open card under the new id",
@@ -19583,6 +19613,7 @@ heading("a moved session keeps its tasks and leases");
 			task().candidates[0].session === ids.candidate2 &&
 			task().candidates[0].card === "0a1b2c3d",
 	);
+	check("moving another session preserves the followed member", task().followed === ids.member2);
 	await moveTo(ids.led, ids.led2);
 	check("an announced session stays announced under the new id", task().led.join() === ids.led2);
 	check("the conductor stays as it was", task().conductor === ids.conductor);
