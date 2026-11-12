@@ -24,6 +24,27 @@ export interface Task {
 	closing: boolean;
 	/** What the conductor raised to Luca, one card each. */
 	findings: Finding[];
+	/** Claims and decisions the members recorded, ADR style. */
+	register: Entry[];
+}
+
+export const ENTRY_STATUSES = ["proposed", "accepted", "objected", "superseded", "done", "abandoned"] as const;
+
+/** A member's claim on a piece of work or its proposed decision, settled by the conductor or by time. */
+export interface Entry {
+	id: string;
+	kind: "claim" | "decision";
+	author: string;
+	title: string;
+	body: string;
+	status: (typeof ENTRY_STATUSES)[number];
+	/** The entry this one replaced, empty for none. */
+	supersedes: string;
+	proposedAt: number;
+	/** When the entry left `proposed`, 0 before. */
+	decidedAt: number;
+	/** Why the conductor objected, or empty. */
+	reason: string;
 }
 
 /** The signals a conductor raises, from the plan's decision 4, and `completed` for a member whose work is done. */
@@ -120,6 +141,19 @@ function parseTask(raw: unknown, slug: string): Task | null {
 			(f.messageId === null || typeof f.messageId === "number") &&
 			["open", "told", "resolved", "rejected"].includes(f.state),
 	);
+	const register = (Array.isArray(t.register) ? t.register : []).filter(
+		(e): e is Entry =>
+			typeof e?.id === "string" &&
+			(e.kind === "claim" || e.kind === "decision") &&
+			typeof e.author === "string" &&
+			typeof e.title === "string" &&
+			typeof e.body === "string" &&
+			(ENTRY_STATUSES as readonly unknown[]).includes(e.status) &&
+			typeof e.supersedes === "string" &&
+			typeof e.proposedAt === "number" &&
+			typeof e.decidedAt === "number" &&
+			typeof e.reason === "string",
+	);
 	return {
 		name: t.name,
 		slug,
@@ -132,6 +166,7 @@ function parseTask(raw: unknown, slug: string): Task | null {
 		led,
 		closing: t.closing === true,
 		findings,
+		register,
 	};
 }
 
@@ -203,6 +238,6 @@ export function memberRole(tasks: { name: string; conductor: string }[]): string
 	return [
 		`This session is a member of ${tasks.length === 1 ? "a task" : `${tasks.length} tasks`}:`,
 		...lines,
-		"A conductor keeps the sessions of its task from duplicating work or contradicting each other. Tell it through session_message when you start work another member could also take up, or make an engineering choice the others should follow, and expect it to message you when another member's work touches yours.",
+		"A conductor keeps the sessions of its task from duplicating work or contradicting each other. Before starting work another member could also take up, record a claim with the `conductor` tool's `claim`, and record an engineering choice the others should follow with `propose`. `register` lists what the others hold, and `close` settles your own entries. Expect the conductor to message you when another member's work touches yours.",
 	].join("\n");
 }

@@ -95,6 +95,7 @@ import {
 import {
 	changeTask,
 	conductorRole,
+	type Entry,
 	FINDING_KINDS,
 	type Finding,
 	listTasks,
@@ -911,6 +912,8 @@ const CONDUCT_ENV = "OMP_TELEGRAM_CONDUCT";
 const RESUME_START_MS = 60_000;
 /** How long a closing conductor waits for its closing notice to reach Telegram before it closes anyway. */
 const CLOSE_NOTICE_WAIT_MS = 30_000;
+/** How long a proposed register entry waits for the conductor before it stands accepted. */
+const REGISTER_WAIT_MS = 10 * 60_000;
 /** What a tap gets when its window is already opening. */
 const ALREADY_STARTING = "That session is already starting.";
 /** A pending or failed launch request is answered by expiry seven days after it was made. */
@@ -7771,6 +7774,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				led: [],
 				closing: false,
 				findings: [],
+				register: [],
 			};
 			return { task: fresh, result: { kind: "open", task: fresh } };
 		});
@@ -7808,11 +7812,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callbackId, text: toast }, 10_000);
 	}
 
-	/** Hands a conductor news about its task, held behind a resume card while the conductor is down. */
-	function sendLead(task: Task, text: string): void {
+	/** Hands news about a task to `to`, its conductor unless named, held behind a resume card while that session is down. */
+	function sendLead(task: Task, text: string, to = task.conductor): void {
 		const item: PendingItem = { kind: "lead", at: Date.now(), task: task.name, text };
-		writePrivateJson(join(PENDING_DIR, task.conductor), `lead-${Date.now()}-${randomUUID().slice(0, 8)}.json`, item);
-		if (!isLiveSession(task.conductor)) detach(() => raiseResumeCard(task.conductor), "resume card");
+		writePrivateJson(join(PENDING_DIR, to), `lead-${Date.now()}-${randomUUID().slice(0, 8)}.json`, item);
+		if (!isLiveSession(to)) detach(() => raiseResumeCard(to), "resume card");
 	}
 
 	/**
@@ -8138,11 +8142,152 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callbackId, text: toast }, 10_000);
 	}
 
+	/** The register's member actions: `register`, `claim`, `propose` and `close` on a task this session belongs to. */
+	async function memberAction(
+		params: Record<string, unknown>,
+		refuse: (text: string) => ToolReply,
+	): Promise<ToolReply> {
+		// omp validated the parameters against the tool's schema, so each is its declared type or absent.
+		const q = params as {
+			action: string;
+			task?: string;
+			title?: string;
+			body?: string;
+			filter?: string;
+			entry?: string;
+			outcome?: string;
+			by?: string;
+		};
+		const reply = (text: string): ToolReply => ({ content: [{ type: "text", text }], details: {} });
+		const mine = listTasks(TASKS_DIR).filter((task) => task.members.some((member) => member.session === sessionId));
+		if (mine.length === 0) {
+			return refuse(
+				"This session is a member of no task, so it has no register. A conductor invites sessions into its task.",
+			);
+		}
+		const named = (q.task ?? "").trim();
+		const task =
+			named === ""
+				? mine.length === 1
+					? mine[0]
+					: undefined
+				: mine.find((t) => t.name === named || t.slug === taskSlug(named));
+		const names = mine.map((t) => `"${t.name}"`).join(", ");
+		if (task === undefined) {
+			return refuse(
+				named === ""
+					? `This session is a member of several tasks, ${names}. Name one in \`task\`.`
+					: `This session is not a member of a task named "${named}". Its tasks: ${names}.`,
+			);
+		}
+		const line = (e: Entry): string =>
+			`- ${e.id} ${e.kind}, ${e.status}, by ${titleOf(e.author)}: ${e.title}${e.body === "" ? "" : `. ${e.body}`}`;
+		if (q.action === "register") {
+			const filter = (q.filter ?? "").trim().toLowerCase();
+			const shown = task.register.filter((e) => `${e.title}\n${e.body}`.toLowerCase().includes(filter));
+			return reply(
+				shown.length === 0
+					? `No entry of the task "${task.name}" matches.`
+					: `The register of "${task.name}":\n${shown.map(line).join("\n")}`,
+			);
+		}
+		if (q.action === "claim" || q.action === "propose") {
+			const title = (q.title ?? "").trim();
+			if (title === "")
+				return refuse("Give the entry a `title`, which the conductor and the other members read in the register.");
+			const entry: Entry = {
+				id: randomUUID().replaceAll("-", "").slice(0, 8),
+				kind: q.action === "claim" ? "claim" : "decision",
+				author: sessionId,
+				title,
+				body: (q.body ?? "").trim(),
+				status: "proposed",
+				supersedes: "",
+				proposedAt: Date.now(),
+				decidedAt: 0,
+				reason: "",
+			};
+			await updateTask(TASKS_DIR, task.slug, (current) => ({
+				task: { ...current, register: [...current.register, entry] },
+				result: null,
+			}));
+			sendLead(
+				task,
+				`${titleOf(sessionId)} proposes the ${entry.kind} ${entry.id}: ${title}.${entry.body === "" ? "" : ` ${entry.body}`} It stands accepted in ten minutes.`,
+			);
+			const open = [...task.register, entry].filter((e) => e.status === "proposed" || e.status === "accepted");
+			return reply(
+				`Recorded ${entry.kind} ${entry.id} as proposed. It stands accepted in ten minutes unless the conductor objects. Open entries of "${task.name}":\n${open.map(line).join("\n")}`,
+			);
+		}
+		const id = (q.entry ?? "").trim();
+		const target = task.register.find((e) => e.id === id);
+		if (target === undefined) return refuse(`No entry ${id} in the task "${task.name}". \`register\` lists them.`);
+		if (target.author !== sessionId)
+			return refuse(`Entry ${id} is not yours to close, since ${titleOf(target.author)} wrote it.`);
+		if (["superseded", "done", "abandoned"].includes(target.status))
+			return refuse(`Entry ${id} is already ${target.status}.`);
+		const outcome = q.outcome ?? "";
+		if (outcome !== "done" && outcome !== "abandoned" && outcome !== "superseded") {
+			return refuse("`outcome` is done, abandoned or superseded.");
+		}
+		if ((outcome === "superseded") !== (target.kind === "decision")) {
+			return refuse(
+				target.kind === "claim"
+					? "A claim closes as done or abandoned."
+					: "A decision closes as superseded, by the decision that replaces it.",
+			);
+		}
+		const by = (q.by ?? "").trim();
+		if (outcome === "superseded" && !task.register.some((e) => e.id === by && e.id !== id && e.kind === "decision")) {
+			return refuse("Name in `by` the decision that supersedes this one.");
+		}
+		await updateTask(TASKS_DIR, task.slug, (current) => ({
+			task: {
+				...current,
+				register: current.register.map((e) =>
+					e.id === id ? { ...e, status: outcome, decidedAt: Date.now() } : e.id === by ? { ...e, supersedes: id } : e,
+				),
+			},
+			result: null,
+		}));
+		sendLead(
+			task,
+			`${titleOf(sessionId)} closed its ${target.kind} ${id}, ${target.title}, as ${outcome}${by === "" ? "" : `, superseded by ${by}`}.`,
+		);
+		return reply(`Closed ${target.kind} ${id} as ${outcome}.`);
+	}
+
+	/** Entries the conductor left unanswered for ten minutes stand accepted, and their authors are told. */
+	async function acceptStale(): Promise<void> {
+		const now = Date.now();
+		const due = (e: Entry): boolean => e.status === "proposed" && now - e.proposedAt >= REGISTER_WAIT_MS;
+		for (const listed of listTasks(TASKS_DIR)) {
+			if (!listed.register.some(due)) continue;
+			await updateTask(TASKS_DIR, listed.slug, (task) => {
+				for (const e of task.register.filter(due)) {
+					sendLead(
+						task,
+						`Your ${e.kind} ${e.id}, ${e.title}, stands accepted, since the conductor did not object within ten minutes.`,
+						e.author,
+					);
+				}
+				return {
+					task: {
+						...task,
+						register: task.register.map((e) => (due(e) ? { ...e, status: "accepted" as const, decidedAt: now } : e)),
+					},
+					result: null,
+				};
+			});
+		}
+	}
+
 	registerTool({
 		name: "conductor",
 		label: "Conductor",
 		description:
-			"Act as the conductor of a task opened with `/conduct`. `action` `invite` proposes the live session named in `session`, by its badge emoji or tag, for the task this session conducts, and `reason` tells the user why it belongs. The user answers Join or Skip on a Telegram card, and the answer arrives as an aside written by no one. A session conducting a task, a member and a session the user skipped cannot be invited. `action` `finding` sends the user one card about members named in `sessions`: `kind` is one of overlap, stacked-parent, dead-wait, duplicate, contradiction, lesson or completed, `text` says what you found, and `subject` is a short key such as `overlap:src/lease.ts`. A subject is raised once, and one the user settled is never raised again, so name a new subject when the situation changes. An optional `message` is what you propose to tell the sessions: the card offers to send it, or `tell` sends it at once, as a message from you. A `completed` finding names the one member that finished, and its card carries that member's close buttons.",
+			"Coordinate the sessions of a task opened with `/conduct`. A member records its work in the task register before starting it: `action` `register` lists the entries, filtered by `filter` text; `claim` records a claim on a piece of work and `propose` a decision, each with a `title` and a `body`, and the answer lists the open entries first; `close` settles one of your own `entry` ids with `outcome` done or abandoned for a claim, or superseded with the replacing decision's id in `by`. An entry the conductor does not object to within ten minutes stands accepted. A member of several tasks names one in `task`. The conductor's actions: `invite` proposes the live session named in `session`, by its badge emoji or tag, for the task this session conducts, and `reason` tells the user why it belongs. The user answers Join or Skip on a Telegram card, and the answer arrives as an aside written by no one. A session conducting a task, a member and a session the user skipped cannot be invited. `finding` sends the user one card about members named in `sessions`: `kind` is one of overlap, stacked-parent, dead-wait, duplicate, contradiction, lesson or completed, `text` says what you found, and `subject` is a short key such as `overlap:src/lease.ts`. A subject is raised once, and one the user settled is never raised again, so name a new subject when the situation changes. An optional `message` is what you propose to tell the sessions: the card offers to send it, or `tell` sends it at once, as a message from you. A `completed` finding names the one member that finished, and its card carries that member's close buttons.",
 		approval: "read",
 		parameters: z.object({
 			action: z.string(),
@@ -8154,6 +8299,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			subject: z.string().optional(),
 			message: z.string().optional(),
 			tell: z.boolean().optional(),
+			task: z.string().optional(),
+			title: z.string().optional(),
+			body: z.string().optional(),
+			filter: z.string().optional(),
+			entry: z.string().optional(),
+			outcome: z.string().optional(),
+			by: z.string().optional(),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const refuse = (text: string) => ({
@@ -8171,7 +8323,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const p = params as Record<string, unknown>;
 			const session = typeof p.session === "string" ? p.session.trim() : "";
 			const reason = typeof p.reason === "string" ? p.reason.trim() : "";
-			if (p.action !== "invite" && p.action !== "finding") return refuse("`action` is `invite` or `finding`.");
+			if (typeof p.action === "string" && ["register", "claim", "propose", "close"].includes(p.action)) {
+				return memberAction(p, refuse);
+			}
+			if (p.action !== "invite" && p.action !== "finding") {
+				return refuse("`action` is one of `register`, `claim`, `propose`, `close`, `invite` or `finding`.");
+			}
 			const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId && task.state === "live");
 			if (conducted === undefined) {
 				return refuse(
@@ -10651,6 +10808,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					launchRequestTick();
 					priorityTick();
 					detach(() => sweepMembers(), "member sweep");
+					detach(() => acceptStale(), "register acceptance");
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
 					detachBackground(() => redrawCrashCards(), "crash cards");
@@ -10851,6 +11009,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					...task.led,
 					...task.members.map((member) => member.session),
 					...task.candidates.map((candidate) => candidate.session),
+					...task.register.map((entry) => entry.author),
 				].some((id) => left.has(id));
 			for (const task of listTasks(TASKS_DIR)) {
 				if (!names(task)) continue;
@@ -10863,6 +11022,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								members: current.members.map((m) => (left.has(m.session) ? { ...m, session: sessionId } : m)),
 								candidates: current.candidates.map((c) => (left.has(c.session) ? { ...c, session: sessionId } : c)),
 								led: rename(current.led),
+								register: current.register.map((e) => (left.has(e.author) ? { ...e, author: sessionId } : e)),
 							}
 						: null,
 					result: null,
@@ -11226,7 +11386,18 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const heard = isLiveSession(task.conductor);
 				const state = last && !heard ? ("dormant" as const) : task.state;
 				return {
-					task: { ...task, members, state, closing: last ? heard : task.closing },
+					task: {
+						...task,
+						members,
+						state,
+						closing: last ? heard : task.closing,
+						// The leaving author's open claims are free again, and its decisions stand.
+						register: task.register.map((e) =>
+							e.author === session && e.kind === "claim" && (e.status === "proposed" || e.status === "accepted")
+								? { ...e, status: "abandoned" as const, decidedAt: Date.now() }
+								: e,
+						),
+					},
 					result: { task, last, heard },
 				};
 			});
