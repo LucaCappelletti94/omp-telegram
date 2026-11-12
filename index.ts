@@ -9308,6 +9308,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			reviews: w.reviews as string[],
 			base: typeof w.base === "string" ? w.base : null,
 			baseOid: typeof w.baseOid === "string" ? w.baseOid : null,
+			baseSince: typeof w.baseSince === "number" ? w.baseSince : w.at,
+			parentMerge: typeof w.parentMerge === "number" ? w.parentMerge : null,
 		};
 	}
 
@@ -9333,6 +9335,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			reviews: [],
 			base: null,
 			baseOid: null,
+			baseSince: Date.now(),
+			parentMerge: null,
 		} satisfies PrWatch);
 	}
 
@@ -9359,7 +9363,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (watchPollInFlight) return;
 		watchPollInFlight = true;
 		try {
-			const unique = new Map<string, { owner: string; name: string; number: number }>();
+			const keyOf = (pr: Omit<WatchQueryEntry, "alias">) =>
+				`${pr.owner}\u0000${pr.name}\u0000${String(pr.number).padStart(20, "0")}\u0000${pr.base ?? ""}`;
+			const unique = new Map<string, Omit<WatchQueryEntry, "alias">>();
 			const watches: { session: string; entry: string; watch: PrWatch }[] = [];
 			for (const session of listWatchDirs()) {
 				for (const entry of listJson(join(WATCH_DIR, session))) {
@@ -9373,8 +9379,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					}
 					// An ended watch only keeps a later mention of its pull request from starting a second one.
 					if (watch.ended) continue;
-					const key = `${watch.owner}\u0000${watch.name}\u0000${watch.number}`;
-					if (!unique.has(key)) unique.set(key, { owner: watch.owner, name: watch.name, number: watch.number });
+					const key = keyOf(watch);
+					if (!unique.has(key))
+						unique.set(key, { owner: watch.owner, name: watch.name, number: watch.number, base: watch.base });
 					watches.push({ session, entry, watch });
 				}
 			}
@@ -9383,11 +9390,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				return;
 			}
 			// Sorted so the same set of watches always gets the same aliases, across ticks and processes.
-			const keyOf = (pr: { owner: string; name: string; number: number }) =>
-				`${pr.owner}\u0000${pr.name}\u0000${String(pr.number).padStart(20, "0")}`;
 			const entries: WatchQueryEntry[] = [...unique.values()]
 				.sort((a, b) => keyOf(a).localeCompare(keyOf(b)))
-				.map((pr, i) => ({ alias: `w${i}`, owner: pr.owner, name: pr.name, number: pr.number }));
+				.map((pr, i) => ({ ...pr, alias: `w${i}` }));
 			const queried = await run("gh", ["api", "graphql", "-f", `query=${buildWatchQuery(entries)}`], 120_000);
 			let answer: WatchQueryAnswer = {};
 			try {
@@ -9404,11 +9409,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				sweepWatches();
 				return;
 			}
-			// One fetch per unique pull request, shared by every session that watches it. The parse fills
-			// every alias of the query, so the lookups below always land.
+			// Watches share a fetch only when they remember the same parent branch.
 			const byKey = new Map<string, WatchFetch>();
-			for (const entry of entries)
-				byKey.set(`${entry.owner}\u0000${entry.name}\u0000${entry.number}`, fetched.get(entry.alias) as WatchFetch);
+			for (const entry of entries) byKey.set(keyOf(entry), fetched.get(entry.alias) as WatchFetch);
 			// The query can outlast a lock handover or a change to a watch, so only the holder writes, and only over
 			// the state it read before the query.
 			if (!ownsLock()) return;
@@ -9416,7 +9419,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			for (const { session, entry, watch } of watches) {
 				const current = prWatchOf(readJsonFile(join(WATCH_DIR, session, entry)));
 				if (current === null || JSON.stringify(current) !== JSON.stringify(watch)) continue;
-				const got = byKey.get(`${watch.owner}\u0000${watch.name}\u0000${watch.number}`) as WatchFetch;
+				const got = byKey.get(keyOf(watch)) as WatchFetch;
 				// A per-PR error that is not a disappearance keeps this watch's state.
 				if (got.data === null && !got.gone) continue;
 				const { events, next } = diffWatch(watch, got.data);
@@ -9472,7 +9475,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					const pr = `${watch.owner}/${watch.name}#${watch.number}`;
 					const what =
 						parent.kind === "merged"
-							? `stacked on \`${parent.parent}\`, which merged, so GitHub now bases it on \`${parent.base}\` and it needs a rebase onto it.`
+							? `stacked on \`${parent.parent}\`, which merged in ${parent.merge.url}. Its current base is \`${parent.base}\`. Check whether it needs a rebase.`
 							: `stacked on \`${parent.parent}\`, which moved to ${parent.oid.slice(0, 12)}, so it may need a rebase.`;
 					for (const task of listTasks(TASKS_DIR)) {
 						if (task.state !== "live" || !task.members.some((m) => m.session === session)) continue;

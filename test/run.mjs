@@ -21815,19 +21815,19 @@ esac
 		{ mode: 0o755 },
 	);
 	process.env.PATH = `${bin}:${savedPath}`;
-	const pull = (base, baseOid) => ({
+	const pull = (base, baseOid, parentMerge) => ({
 		number: 21,
 		state: "OPEN",
 		isDraft: false,
 		headRefOid: "h1",
 		baseRefName: base,
 		baseRefOid: baseOid,
-		baseRepository: { defaultBranchRef: { name: "main" } },
+		baseRepository: { defaultBranchRef: { name: "main" }, pullRequests: { nodes: parentMerge ? [parentMerge] : [] } },
 		reviews: { nodes: [] },
 		statusCheckRollup: null,
 	});
-	const serveBase = (base, baseOid) =>
-		writeFileSync(table, JSON.stringify({ "someorg/widget/21": pull(base, baseOid) }));
+	const serveBase = (base, baseOid, parentMerge) =>
+		writeFileSync(table, JSON.stringify({ "someorg/widget/21": pull(base, baseOid, parentMerge) }));
 	serveBase("feat-parent", "f1");
 	const ids = Object.fromEntries(
 		["poller", "conductor", "member", "watcher", "owner", "name", "number"].map((name, i) => [
@@ -21945,12 +21945,28 @@ esac
 			updatedAt: Date.now(),
 		}),
 	);
-	serveBase("main", "m9");
+	const parentMerge = {
+		number: 20,
+		mergedAt: new Date(Date.now() + clockSkew).toISOString(),
+		url: "https://github.com/someorg/widget/pull/20",
+	};
+	serveBase("feat-parent", "f2", parentMerge);
 	await poll();
 	const merged = (await parents()).slice(1);
 	check(
-		"a parent that merged leads again, saying the pull request now needs a rebase onto the default branch",
-		merged.length === 1 && merged[0].includes("which merged") && merged[0].includes("`main`"),
+		"a merged parent with its branch kept leads without claiming GitHub moved the child",
+		merged.length === 1 &&
+			merged[0].includes("which merged") &&
+			merged[0].includes(parentMerge.url) &&
+			!merged[0].includes("GitHub now bases"),
+	);
+	await poll();
+	check("a kept parent's merge leads only once", (await parents()).length === 2);
+	serveBase("main", "m9", parentMerge);
+	await poll();
+	check(
+		"moving a child after its reported parent merge reports only movement",
+		(await parents()).at(-1).includes("moved to m9"),
 	);
 	check(
 		"the member's node identifies its own pull request without a PR record",
