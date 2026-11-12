@@ -9411,8 +9411,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					if (!live) detach(() => raiseResumeCard(session), "resume card");
 				});
 				writePrivateJson(join(WATCH_DIR, session), entry, next);
-				// A member's stacked pull request whose parent moved or merged may need a rebase, which its conductor hears of.
-				if (parent !== null) {
+				// Only the member's own stacked pull request leads its conductor about a changed parent.
+				const own = prWatchKeyOf(readPr(session)?.url ?? readNode(session)?.pr ?? "");
+				if (parent !== null && own?.owner === watch.owner && own.name === watch.name && own.number === watch.number) {
 					const pr = `${watch.owner}/${watch.name}#${watch.number}`;
 					const what =
 						parent.kind === "merged"

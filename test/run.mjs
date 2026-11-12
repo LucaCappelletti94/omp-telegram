@@ -21204,7 +21204,10 @@ esac
 		writeFileSync(table, JSON.stringify({ "someorg/widget/21": pull(base, baseOid) }));
 	serveBase("feat-parent", "f1");
 	const ids = Object.fromEntries(
-		["poller", "conductor", "member"].map((name, i) => [name, `0d0e0f00-0000-7000-8000-00000000000${i + 1}`]),
+		["poller", "conductor", "member", "watcher", "owner", "name", "number"].map((name, i) => [
+			name,
+			`0d0e0f00-0000-7000-8000-00000000000${i + 1}`,
+		]),
 	);
 	const task = (slug, conductor, state, members) =>
 		writeFileSync(
@@ -21224,7 +21227,7 @@ esac
 				register: [],
 			}),
 		);
-	task("api", ids.conductor, "live", [ids.member]);
+	task("api", ids.conductor, "live", [ids.member, ids.watcher, ids.owner, ids.name, ids.number]);
 	task("other", "0d0e0f00-0000-7000-8000-0000000000fe", "live", []);
 	task("old", "0d0e0f00-0000-7000-8000-0000000000ff", "dormant", [ids.member]);
 	const poller = spawn(ids.poller, "/home/dev/work/parent");
@@ -21242,9 +21245,35 @@ esac
 			undefined,
 			member.ctx,
 		);
+	const prDir = join(stateDir, "graph/pr");
+	mkdirSync(prDir, { recursive: true });
+	const ownPr = (session, url) =>
+		writeFileSync(
+			join(prDir, `${session}.json`),
+			JSON.stringify({ url, state: "pr-open", checkedAt: Date.now(), changedAt: Date.now(), emitted: [] }),
+		);
+	ownPr(ids.member, "https://github.com/someorg/widget/pull/21");
+	ownPr(ids.owner, "https://github.com/anotherorg/widget/pull/21");
+	ownPr(ids.name, "https://github.com/someorg/anotherrepo/pull/21");
+	ownPr(ids.number, "https://github.com/someorg/widget/pull/22");
+	const watchers = [];
+	for (const name of ["watcher", "owner", "name", "number"]) {
+		const watcher = spawn(ids[name], `/home/dev/work/${name}`);
+		await watcher.fire("session_start");
+		await watcher.tools
+			.get("pr_watch")
+			.execute(
+				"w",
+				{ action: "add", url: "https://github.com/someorg/widget/pull/21" },
+				undefined,
+				undefined,
+				watcher.ctx,
+			);
+		watchers.push(watcher);
+	}
 	const poll = async () => {
 		jump(61_000);
-		for (const s of [conductor, member]) s.heartbeat();
+		for (const s of [conductor, member, ...watchers]) s.heartbeat();
 		poller.heartbeat();
 		await settle(1200);
 	};
@@ -21267,12 +21296,43 @@ esac
 			moved[0].includes("`feat-parent`") &&
 			moved[0].includes("moved to f2"),
 	);
+	check(
+		"watching another member's pull request does not lead the conductor about the watcher",
+		moved.every((lead) => ![ids.watcher, ids.owner, ids.name, ids.number].some((id) => lead.includes(id))),
+	);
+	rmSync(join(prDir, `${ids.member}.json`));
+	const nodesDir = join(stateDir, "graph/nodes");
+	mkdirSync(nodesDir, { recursive: true });
+	writeFileSync(
+		join(nodesDir, `${ids.member}.json`),
+		JSON.stringify({
+			session: ids.member,
+			label: "member",
+			emoji: "",
+			tag: "member",
+			cwd: "/home/dev/work/member",
+			status: "done",
+			note: "",
+			edges: [],
+			pr: "https://github.com/someorg/widget/pull/21",
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+		}),
+	);
 	serveBase("main", "m9");
 	await poll();
 	const merged = (await parents()).slice(1);
 	check(
 		"a parent that merged leads again, saying the pull request now needs a rebase onto the default branch",
 		merged.length === 1 && merged[0].includes("which merged") && merged[0].includes("`main`"),
+	);
+	check(
+		"the member's node identifies its own pull request without a PR record",
+		!existsSync(join(prDir, `${ids.member}.json`)) && merged.length === 1 && merged[0].includes(ids.member),
+	);
+	check(
+		"a merged parent does not lead the conductor about members that only watch the pull request",
+		merged.every((lead) => ![ids.watcher, ids.owner, ids.name, ids.number].some((id) => lead.includes(id))),
 	);
 	check(
 		"a dormant task's conductor is not led about it",
