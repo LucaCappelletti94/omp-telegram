@@ -20986,7 +20986,12 @@ heading("member updates and the conductor's silence check");
 		return s.customs.map((c) => String(c.message.content)).filter((t) => t.startsWith("Automatic conductor update"));
 	};
 	const silenceTick = async (ms) => {
-		jump(ms);
+		const current = task();
+		for (const m of current.members) {
+			m.updatedAt -= ms;
+			m.checkedAt -= ms;
+		}
+		writeFileSync(taskFile, JSON.stringify(current));
 		writeWaiter();
 		author.heartbeat();
 		conductor.heartbeat();
@@ -21083,6 +21088,153 @@ heading("member updates and the conductor's silence check");
 				.slice(beforeDormant)
 				.some((c) => c.body.reply_markup?.inline_keyboard.flat().some((b) => b.callback_data === `r:${ids.conductor}`)),
 	);
+	clockSkew = 0;
+}
+
+heading("the poller excludes sleep from member silence");
+for (const first of ["heartbeat", "drain"]) {
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "recent", "overdue", "fresh"].map((name, i) => [
+			name,
+			`0d0e170${first === "heartbeat" ? "0" : "1"}-0000-7000-8000-00000000000${i + 1}`,
+		]),
+	);
+	const poller = spawn(ids.poller, "/home/dev/work/wake");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "api"));
+	await conductor.fire("session_start");
+	const hour = 3_600_000;
+	const beforeSleep = Date.now();
+	const taskFile = join(tasksDir, "api.json");
+	const writeTask = (slug, state) =>
+		writeFileSync(
+			join(tasksDir, `${slug}.json`),
+			JSON.stringify({
+				name: slug,
+				slug,
+				brief: "b",
+				conductor: ids.conductor,
+				state,
+				launchedAt: 0,
+				silenceHours: 6,
+				members: [
+					{
+						session: ids.recent,
+						joinedAt: beforeSleep,
+						updatedAt: beforeSleep - hour,
+						checkedAt: beforeSleep - 2 * hour,
+					},
+					{
+						session: ids.overdue,
+						joinedAt: beforeSleep,
+						updatedAt: beforeSleep - 7 * hour,
+						checkedAt: beforeSleep - 8 * hour,
+					},
+					{ session: ids.fresh, joinedAt: beforeSleep, updatedAt: beforeSleep, checkedAt: beforeSleep },
+				],
+			}),
+		);
+	writeTask("api", "live");
+	writeTask("old", "dormant");
+	for (const name of ["recent", "overdue", "fresh"]) {
+		writeFileSync(
+			join(sessionsDir, `${ids[name]}.json`),
+			JSON.stringify({ ...record(ids.poller), tag: name, heartbeat: Date.now() }),
+		);
+	}
+	const task = () => JSON.parse(readFileSync(taskFile, "utf8"));
+	const member = (name) => task().members.find((m) => m.session === ids[name]);
+	const leads = () =>
+		conductor.customs.map((c) => String(c.message.content)).filter((t) => t.includes("sent no update"));
+	const asleep = task();
+	jump(10 * hour);
+	const wokeAt = Date.now();
+	const waking = task();
+	waking.members.find((m) => m.session === ids.fresh).updatedAt = wokeAt;
+	waking.members.find((m) => m.session === ids.fresh).checkedAt = wokeAt;
+	writeFileSync(taskFile, JSON.stringify(waking));
+	await conductor.pump(20);
+	check(`${first} wake does not shift clocks in a non-poller`, member("recent").updatedAt === beforeSleep - hour);
+	if (first === "drain") await poller.pump(20);
+	const taskLock = join(tasksDir, "tasks.lock");
+	writeFileSync(taskLock, "");
+	utimesSync(taskLock, new Date(Date.now()), new Date(Date.now()));
+	poller.heartbeat();
+	poller.heartbeat();
+	await settle(20);
+	check(`${first} wake leaves locked task clocks untouched`, member("recent").updatedAt === beforeSleep - hour);
+	rmSync(taskLock);
+	await settle(150);
+	await conductor.pump(100);
+	check(
+		`${first} wake keeps one hour of silence below the six-hour limit after ten hours asleep`,
+		!member("recent").silenceLed && !leads().some((t) => t.includes(ids.recent)),
+	);
+	check(
+		`${first} wake moves both silence clocks by one measured gap`,
+		Math.abs(member("recent").updatedAt - (wokeAt - hour)) < 1_000 &&
+			Math.abs(member("recent").checkedAt - (wokeAt - 2 * hour)) < 1_000,
+	);
+	check(
+		`${first} wake still leads for a member overdue before sleep`,
+		member("overdue").silenceLed && leads().filter((t) => t.includes(ids.overdue)).length === 1,
+	);
+	check(
+		`${first} wake caps freshly written clocks at the waking time`,
+		member("fresh").updatedAt >= wokeAt &&
+			member("fresh").updatedAt <= Date.now() &&
+			member("fresh").checkedAt >= wokeAt &&
+			member("fresh").checkedAt <= Date.now(),
+	);
+	check(
+		`${first} wake leaves dormant task clocks untouched`,
+		JSON.stringify(JSON.parse(readFileSync(join(tasksDir, "old.json"), "utf8")).members) ===
+			JSON.stringify(
+				asleep.members.map(({ session, joinedAt, updatedAt, checkedAt }) => ({
+					session,
+					joinedAt,
+					updatedAt,
+					checkedAt,
+				})),
+			),
+	);
+	const shifted = member("recent");
+	await poller.pump(10);
+	conductor.heartbeat();
+	poller.heartbeat();
+	await settle(100);
+	check(
+		`${first} wake is applied only once across both processes and both timers`,
+		member("recent").updatedAt === shifted.updatedAt && member("recent").checkedAt === shifted.checkedAt,
+	);
+	for (let awake = 0; awake < 5 * hour - 4_000; awake += 4_000) {
+		jump(4_000);
+		poller.timers[1]();
+	}
+	poller.heartbeat();
+	await settle(100);
+	check(`${first} wake preserves the remaining awake silence interval`, !member("recent").silenceLed);
+	jump(4_000);
+	poller.timers[1]();
+	poller.heartbeat();
+	await settle(150);
+	await conductor.pump(100);
+	check(
+		`${first} wake leads once when awake silence reaches the six-hour limit`,
+		member("recent").silenceLed && leads().filter((t) => t.includes(ids.recent)).length === 1,
+	);
+	await poller.pump(10);
+	poller.heartbeat();
+	await settle(100);
+	await conductor.pump(100);
+	check(`${first} wake does not repeat a silence lead`, leads().filter((t) => t.includes(ids.recent)).length === 1);
 	clockSkew = 0;
 }
 
