@@ -80,6 +80,20 @@ heading("task files");
 				state: "open",
 			},
 		],
+		register: [
+			{
+				id: "1a2b3c4d",
+				kind: "claim",
+				author: "m",
+				title: "t",
+				body: "b",
+				status: "proposed",
+				supersedes: "",
+				proposedAt: 1,
+				decidedAt: 0,
+				reason: "",
+			},
+		],
 	};
 	const made = await changeTask(dir, "docs-pass", (task) => ({ task: task === null ? fresh : task, result: task }));
 	check("an absent task reads as null inside the change", made === null);
@@ -122,7 +136,7 @@ heading("task files");
 		"an update of a slug outside the pattern gives null",
 		(await updateTask(dir, "../escape", () => ({ task: fresh, result: "seen" }))) === null,
 	);
-	const { members, candidates, led, closing, findings, ...older } = fresh;
+	const { members, candidates, led, closing, findings, register, ...older } = fresh;
 	writeFileSync(join(dir, "older.json"), JSON.stringify({ ...older, slug: "older" }));
 	const plain = readTask(dir, "older");
 	check(
@@ -131,7 +145,8 @@ heading("task files");
 			plain.candidates.length === 0 &&
 			plain.led.length === 0 &&
 			plain.closing === false &&
-			plain.findings.length === 0,
+			plain.findings.length === 0 &&
+			plain.register.length === 0,
 	);
 	writeFileSync(
 		join(dir, "mixed.json"),
@@ -157,6 +172,19 @@ heading("task files");
 				{ ...findings[0], state: "lost" },
 				{ ...findings[0], messageId: 42 },
 			],
+			register: [
+				{ ...register[0], id: 5 },
+				{ ...register[0], kind: "wish" },
+				{ ...register[0], author: 1 },
+				{ ...register[0], title: 1 },
+				{ ...register[0], body: 1 },
+				{ ...register[0], status: "lost" },
+				{ ...register[0], supersedes: 1 },
+				{ ...register[0], proposedAt: "1" },
+				{ ...register[0], decidedAt: "0" },
+				{ ...register[0], reason: 1 },
+				{ ...register[0], kind: "decision" },
+			],
 		}),
 	);
 	const mixed = readTask(dir, "mixed");
@@ -165,7 +193,8 @@ heading("task files");
 		JSON.stringify(mixed.members) === JSON.stringify(members) &&
 			JSON.stringify(mixed.candidates) === JSON.stringify(candidates) &&
 			JSON.stringify(mixed.led) === JSON.stringify(led) &&
-			JSON.stringify(mixed.findings) === JSON.stringify([{ ...findings[0], messageId: 42 }]),
+			JSON.stringify(mixed.findings) === JSON.stringify([{ ...findings[0], messageId: 42 }]) &&
+			JSON.stringify(mixed.register) === JSON.stringify([{ ...register[0], kind: "decision" }]),
 	);
 	rmSync(dir, { recursive: true, force: true });
 }
@@ -206,7 +235,10 @@ heading("the member's instruction");
 		"several tasks are counted and each listed",
 		two.includes("2 tasks:") && two.includes('"Quotas", conducted by the session b'),
 	);
-	check("the instruction says when to tell the conductor", one.includes("session_message"));
+	check(
+		"the instruction says how to claim work and record decisions",
+		one.includes("`claim`") && one.includes("`propose`"),
+	);
 }
 
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);

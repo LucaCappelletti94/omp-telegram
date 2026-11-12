@@ -20253,6 +20253,193 @@ heading("completion cards close finished members");
 	);
 }
 
+heading("the task register");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "a", "b", "outsider", "b2"].map((name, i) => [
+			name,
+			`0d0e0900-0000-7000-8000-00000000000${i + 1}`,
+		]),
+	);
+	const writeTask = (slug, name, conductor, members) =>
+		writeFileSync(
+			join(tasksDir, `${slug}.json`),
+			JSON.stringify({
+				name,
+				slug,
+				brief: "b",
+				conductor,
+				state: "live",
+				launchedAt: 0,
+				members: members.map((session) => ({ session, joinedAt: 1 })),
+				candidates: [],
+				led: [],
+				closing: false,
+				findings: [],
+			}),
+		);
+	writeTask("docs", "Docs", ids.conductor, [ids.a, ids.b]);
+	writeTask("other", "Other", "0d0e0900-0000-7000-8000-0000000000ff", [ids.b]);
+	const register = (slug = "docs") => JSON.parse(readFileSync(join(tasksDir, `${slug}.json`), "utf8")).register;
+	const poller = spawn(ids.poller, "/home/dev/work/register");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "docs"));
+	await conductor.fire("session_start");
+	const sessions = {};
+	for (const name of ["a", "b", "outsider"]) {
+		sessions[name] = spawn(ids[name], `/home/dev/work/${name}`);
+		await sessions[name].fire("session_start");
+	}
+	const act = (name, params) =>
+		sessions[name].tools.get("conductor").execute("r", params, undefined, undefined, sessions[name].ctx);
+	const text = async (name, params) => (await act(name, params)).content[0].text;
+	const leads = async (s) => {
+		await s.pump(150);
+		return s.customs.map((c) => String(c.message.content)).filter((t) => t.startsWith("Automatic conductor update"));
+	};
+
+	check(
+		"a session in no task cannot use the register",
+		(await text("outsider", { action: "register" })).includes("member of no task"),
+	);
+	check(
+		"a member of several tasks must name one",
+		(await text("b", { action: "claim", title: "Something" })).includes("several tasks"),
+	);
+	check(
+		"a task named that the session is not in is refused",
+		(await text("a", { action: "register", task: "Other" })).includes("not a member"),
+	);
+	const bClaim = await text("b", { action: "claim", task: "docs", title: "Write the API page", body: "docs/api.md" });
+	check("naming the task resolves it, by slug or name", bClaim.includes("Recorded claim") && register().length === 1);
+	check("a claim without a title is refused", (await text("a", { action: "claim" })).includes("title"));
+	const aClaim = await text("a", { action: "claim", title: "Port lease.ts", body: "Moving lease.ts to the new lock." });
+	const claimId = register().find((e) => e.title === "Port lease.ts").id;
+	check(
+		"a claim is recorded as proposed and its answer lists the task's open entries",
+		register().find((e) => e.id === claimId).status === "proposed" &&
+			register().find((e) => e.id === claimId).kind === "claim" &&
+			aClaim.includes("Write the API page") &&
+			aClaim.includes(claimId),
+	);
+	check(
+		"the conductor hears of the claim",
+		(await leads(conductor)).some((t) => t.includes("Port lease.ts") && t.includes("claim")),
+	);
+	await text("a", { action: "propose", title: "Use one lock file", body: "tasks.lock guards both." });
+	const decisionId = register().find((e) => e.kind === "decision").id;
+	const listed = await text("a", { action: "register", filter: "LEASE" });
+	check(
+		"the register lists entries matching a filter, case-insensitively",
+		listed.includes("Port lease.ts") && !listed.includes("Write the API page"),
+	);
+	check(
+		"a filter matching nothing says so",
+		(await text("a", { action: "register", filter: "zebra" })).includes("No entry"),
+	);
+	const everything = await text("a", { action: "register" });
+	check(
+		"the register without a filter lists every entry",
+		everything.includes("Port lease.ts") && everything.includes("Write the API page"),
+	);
+
+	jump(10 * 60_000 + 1_000);
+	await text("a", { action: "propose", title: "Fresh idea" });
+	poller.heartbeat();
+	await settle(300);
+	check(
+		"entries the conductor did not answer within ten minutes stand accepted, younger ones wait",
+		register()
+			.filter((e) => e.title !== "Fresh idea")
+			.every((e) => e.status === "accepted") &&
+			register().find((e) => e.title === "Fresh idea").status === "proposed" &&
+			register().find((e) => e.title === "Fresh idea").body === "",
+	);
+	check(
+		"closing without an entry is refused",
+		(await text("a", { action: "close", outcome: "done" })).includes("No entry"),
+	);
+	check(
+		"closing without an outcome is refused",
+		(await text("a", { action: "close", entry: claimId })).includes("outcome"),
+	);
+	check(
+		"their authors are told",
+		(await leads(sessions.a)).some((t) => t.includes("Port lease.ts") && t.includes("accepted")),
+	);
+
+	check(
+		"a session cannot close an entry it did not write",
+		(await text("b", { action: "close", task: "docs", entry: claimId, outcome: "done" })).includes("not yours"),
+	);
+	check(
+		"closing an unknown entry is refused",
+		(await text("a", { action: "close", entry: "00000000", outcome: "done" })).includes("No entry"),
+	);
+	check(
+		"a claim cannot be superseded",
+		(await text("a", { action: "close", entry: claimId, outcome: "superseded", by: decisionId })).includes("claim"),
+	);
+	await text("a", { action: "propose", title: "Use two lock files", body: "One per file." });
+	const newer = register().find((e) => e.title === "Use two lock files").id;
+	check(
+		"a decision is superseded only by naming the entry that replaces it",
+		(await text("a", { action: "close", entry: decisionId, outcome: "superseded" })).includes("`by`"),
+	);
+	await text("a", { action: "close", entry: decisionId, outcome: "superseded", by: newer });
+	check(
+		"a superseded decision points at its replacement",
+		register().find((e) => e.id === decisionId).status === "superseded" &&
+			register().find((e) => e.id === newer).supersedes === decisionId,
+	);
+	check(
+		"an entry already closed cannot be closed again",
+		(await text("a", { action: "close", entry: decisionId, outcome: "superseded", by: newer })).includes("already"),
+	);
+	check(
+		"a decision cannot be marked done",
+		(await text("a", { action: "close", entry: newer, outcome: "done" })).includes("decision"),
+	);
+	check(
+		"an outcome other than done, abandoned or superseded is refused",
+		(await text("a", { action: "close", entry: claimId, outcome: "won" })).includes("outcome"),
+	);
+	await text("b", {
+		action: "close",
+		task: "docs",
+		entry: register().find((e) => e.author === ids.b).id,
+		outcome: "done",
+	});
+	check(
+		"closing a claim marks it done and tells the conductor",
+		register().find((e) => e.author === ids.b).status === "done" &&
+			(await leads(conductor)).some((t) => t.includes("Write the API page") && t.includes("done")),
+	);
+
+	await sessions.a.fire("session_shutdown");
+	check(
+		"an author leaving abandons its open claims and keeps its decisions",
+		register().find((e) => e.id === claimId).status === "abandoned" &&
+			register().find((e) => e.id === newer).status === "proposed",
+	);
+
+	await text("b", { action: "claim", task: "docs", title: "Follow up", body: "" });
+	const moving = sessions.b;
+	moving.move(ids.b2);
+	await moving.pump(200);
+	check(
+		"an author moved to a continuation id keeps its entries",
+		register().find((e) => e.title === "Follow up").author === ids.b2,
+	);
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
