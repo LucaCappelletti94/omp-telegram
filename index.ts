@@ -6418,7 +6418,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								task.findings.some(
 									(f) =>
 										f.kind === "completed" &&
-										f.state === "open" &&
+										(f.state === "open" || f.state === "told") &&
 										f.messageId === entry.messageId &&
 										f.sessions.includes(sessionId),
 								),
@@ -12213,7 +12213,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			for (const listed of listTasks(TASKS_DIR)) {
 				const cards = listed.findings.filter(
 					(f): f is Finding & { messageId: number } =>
-						f.kind === "completed" && f.state === "open" && f.messageId !== null && f.sessions.includes(sessionId),
+						f.kind === "completed" &&
+						(f.state === "open" || f.state === "told") &&
+						f.messageId !== null &&
+						f.sessions.includes(sessionId),
 				);
 				if (cards.length === 0) continue;
 				await updateTask(TASKS_DIR, listed.slug, (task) => ({
