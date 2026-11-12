@@ -2416,6 +2416,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Since when this process has run without a gap, so a heartbeat that aged while it slept proves nothing. */
 	let awakeSince = Date.now();
 	let lastRunAt = awakeSince;
+	let silenceWakeGap = 0;
+	let silenceInFlight = false;
 	let lastLocalInput = Date.now();
 	let pollInFlight = false;
 	let drainInFlight = false;
@@ -3108,8 +3110,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Restarts `awakeSince` when this process has not run for a while, as after the machine slept, and says so. */
 	function noteWake(): boolean {
 		const now = Date.now();
-		const woke = now - lastRunAt > WAKE_GAP_MS;
-		if (woke) awakeSince = now;
+		const gap = now - lastRunAt;
+		const woke = gap > WAKE_GAP_MS;
+		if (woke) {
+			awakeSince = now;
+			if (ownsLock()) silenceWakeGap += gap;
+		}
 		lastRunAt = now;
 		return woke;
 	}
@@ -8715,6 +8721,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 */
 	async function checkSilence(): Promise<void> {
 		const now = Date.now();
+		const gap = silenceWakeGap;
+		silenceWakeGap = 0;
+		if (gap > 0) {
+			for (const listed of listTasks(TASKS_DIR)) {
+				await updateTask(TASKS_DIR, listed.slug, (task) => {
+					if (task.state !== "live") return { task: null, result: null };
+					const members = task.members.map((m) => ({
+						...m,
+						updatedAt: Math.min(now, m.updatedAt + gap),
+						checkedAt: Math.min(now, m.checkedAt + gap),
+					}));
+					return { task: { ...task, members }, result: null };
+				});
+			}
+		}
 		for (const listed of listTasks(TASKS_DIR)) {
 			if (listed.state !== "live") continue;
 			const limit = listed.silenceHours * 3_600_000;
@@ -11324,6 +11345,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				reapHeldMessages();
 				if (ownsLock()) refreshLock();
 				else acquireLock();
+				noteWake();
 				syncOwnNode(ctx);
 				const stampNow = codeStampOfFiles();
 				// Code older than the disk yields the fleet locks while a session on the current code is live,
@@ -11344,7 +11366,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					priorityTick();
 					detach(() => sweepMembers(), "member sweep");
 					detach(() => acceptStale(), "register acceptance");
-					detach(() => checkSilence(), "silence check");
+					if (!silenceInFlight) {
+						silenceInFlight = true;
+						detach(async () => {
+							try {
+								await checkSilence();
+							} finally {
+								silenceInFlight = false;
+							}
+						}, "silence check");
+					}
 					if (Date.now() - lastOverlapCheck >= OVERLAP_CHECK_MS) {
 						lastOverlapCheck = Date.now();
 						detach(() => checkOverlaps(""), "overlap check");
