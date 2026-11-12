@@ -8538,19 +8538,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** What a member's folder changes against its repository's default branch, or null outside a checkout with an `origin`. */
-	async function branchFiles(cwd: string): Promise<{ repo: string; branch: string; files: string[] } | null> {
+	/** A worktree's changes against its repository's default branch, or null when any git query fails. */
+	async function branchFiles(
+		cwd: string,
+	): Promise<{ repo: string; top: string; branch: string; files: string[] } | null> {
 		const git = (...args: string[]) => run("git", ["-C", cwd, ...args], 10_000);
 		const origin = await git("config", "--get", "remote.origin.url");
 		const base = await git("merge-base", "origin/HEAD", "HEAD");
 		if (!origin.ok || !base.ok) return null;
-		const [branch, changed, untracked] = await Promise.all([
+		const [top, branch, changed, untracked] = await Promise.all([
+			git("rev-parse", "--show-toplevel"),
 			git("rev-parse", "--abbrev-ref", "HEAD"),
 			git("diff", "--name-only", base.stdout),
-			git("ls-files", "--others", "--exclude-standard"),
+			git("ls-files", "--others", "--exclude-standard", "--full-name", "--", ":/"),
 		]);
+		if (!top.ok || !branch.ok || !changed.ok || !untracked.ok) return null;
 		const files = [...new Set(`${changed.stdout}\n${untracked.stdout}`.split("\n").filter((f) => f !== ""))].sort();
-		return { repo: origin.stdout, branch: branch.stdout, files };
+		return { repo: origin.stdout, top: top.stdout, branch: branch.stdout, files };
 	}
 
 	/**
@@ -8649,7 +8653,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const folders = new Map(allRecords().map(({ id, record }) => [id, record.cwd]));
 		for (const listed of listTasks(TASKS_DIR)) {
 			if (listed.state !== "live" || (only !== "" && !listed.members.some((m) => m.session === only))) continue;
-			const work = new Map<string, { repo: string; branch: string; files: string[] }>();
+			const work = new Map<string, { repo: string; top: string; branch: string; files: string[] }>();
 			for (const { session } of listed.members.filter((m) => folders.has(m.session))) {
 				const found = await branchFiles(folders.get(session) as string);
 				if (found !== null) work.set(session, found);
@@ -8660,10 +8664,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				for (const y of ids.slice(i + 1)) {
 					if (only !== "" && x !== only && y !== only) continue;
 					const [wx, wy] = [work.get(x), work.get(y)] as [
-						{ repo: string; files: string[] },
-						{ repo: string; files: string[] },
+						{ repo: string; top: string; files: string[] },
+						{ repo: string; top: string; files: string[] },
 					];
-					if (wx.repo !== wy.repo) continue;
+					if (wx.repo !== wy.repo || wx.top === wy.top) continue;
 					const theirs = new Set(wy.files);
 					shared.set(
 						`${x} ${y}`,
