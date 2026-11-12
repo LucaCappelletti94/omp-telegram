@@ -20868,12 +20868,16 @@ heading("the conductor follows its top focus member");
 		(await reviews()).length === 1 && memberOf(ids.a).reviewLine === 5,
 	);
 
+	// Every turn end casts a ballot of its own, so each live session's ballot is set here to fix the tally.
 	mkdirSync(join(stateDir, "ballots"), { recursive: true });
-	for (const voter of [ids.poller, ids.conductor]) {
-		writeFileSync(
-			join(stateDir, "ballots", `${voter}.json`),
-			JSON.stringify({ focus: [ids.b, ids.a], resources: [], at: Date.now() }),
-		);
+	const ballots = {
+		[ids.poller]: [ids.b, ids.a, ids.conductor],
+		[ids.conductor]: [ids.b, ids.a, ids.poller],
+		[ids.a]: [ids.b, ids.conductor, ids.poller],
+		[ids.b]: [ids.conductor, ids.poller, ids.a],
+	};
+	for (const [voter, focus] of Object.entries(ballots)) {
+		writeFileSync(join(stateDir, "ballots", `${voter}.json`), JSON.stringify({ focus, resources: [], at: Date.now() }));
 	}
 	await tally();
 	check(
