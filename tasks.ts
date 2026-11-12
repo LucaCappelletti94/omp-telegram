@@ -30,6 +30,14 @@ export interface Task {
 	silenceHours: number;
 	/** The member with the most focus points, whose every turn the conductor reviews, empty before the first tally. */
 	followed: string;
+	/** The files each pair of members last led about as changed by both, so a lead names a new set only once. */
+	overlaps: Overlap[];
+}
+
+export interface Overlap {
+	/** The two members' session ids, sorted and joined by a space. */
+	pair: string;
+	files: string[];
 }
 
 /** The silence limit of a task whose conductor never set one, from the plan's decision 5. */
@@ -198,6 +206,10 @@ function parseTask(raw: unknown, slug: string): Task | null {
 		register,
 		silenceHours: typeof t.silenceHours === "number" && t.silenceHours > 0 ? t.silenceHours : DEFAULT_SILENCE_HOURS,
 		followed: typeof t.followed === "string" ? t.followed : "",
+		overlaps: (Array.isArray(t.overlaps) ? t.overlaps : []).filter(
+			(o): o is Overlap =>
+				typeof o?.pair === "string" && Array.isArray(o.files) && o.files.every((f: unknown) => typeof f === "string"),
+		),
 	};
 }
 
@@ -257,7 +269,7 @@ export function conductorRole(task: Task): string {
 		task.brief,
 		"You keep the omp sessions working on this task from duplicating work or making engineering choices that contradict each other, and you tell the user where they disagree. You report to the user through notify_status and reach the sessions through session_message, where a call without `to` lists every live session with its folder. You never pause, reorder or rebase a session's work yourself.",
 		"To bring a session into the task, call the `conductor` tool with `action` `invite`, the session's badge emoji or tag in `session`, and in `reason` why it belongs. The user answers Join or Skip on Telegram, and the answer reaches you as an aside written by no one. Each live session that ends a turn reaches you once the same way, so you can judge whether it belongs.",
-		"When members overlap, duplicate each other, contradict each other, wait on a session that ended, build on a moved parent, or need a lesson another member learned, raise it with `action` `finding`: one card to the user per finding, under a `subject` you name. Propose in `message` what to tell the sessions, and set `tell` only when they should hear it before the user decides.",
+		"When members overlap, duplicate each other, contradict each other, wait on a session that ended, build on a moved parent, or need a lesson another member learned, raise it with `action` `finding`: one card to the user per finding, under a `subject` you name. Propose in `message` what to tell the sessions, and set `tell` only when they should hear it before the user decides. Two members of one repository changing the same files reach you as an aside naming their branches and those files, once per set of files.",
 		"When a member has finished its part entirely, its pull request merged and nothing left open, raise a finding of kind `completed` naming that one member and why it is done. The card carries the member's own close buttons, and you never close a session yourself.",
 		"Members record claims and proposed decisions in the task register, and each new or closed entry reaches you as an aside. Judge each proposed entry against the others: `action` `accept` with its `entry` id, or `object` with a `reason` when it duplicates or contradicts another member's work. An objection goes to the user, who upholds or overrules it. An entry you leave unanswered for ten minutes stands accepted.",
 		`A member tells you what changed with \`update\`, which reaches you as an aside. One that sends no update for ${task.silenceHours} hours reaches you with the lines of its transcript since its last update: read them, message it only if it did work worth an update or looks stuck, then call \`action\` \`checked\` with the session id the aside gives. A member waiting on the user is left alone. When the user asks for another limit, set it with \`action\` \`silence\` and \`hours\`.`,

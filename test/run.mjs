@@ -1,6 +1,6 @@
 // Full suite against a stubbed Telegram API; sends nothing.
 
-import { spawn as startProcess } from "node:child_process";
+import { execFileSync, spawn as startProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs, {
 	chmodSync,
@@ -20983,6 +20983,162 @@ heading("leads wait out the conductor's step and arrive merged per member");
 	const idle = (await leads()).slice(before + merged.length);
 	check("an idle conductor gets a lead at once", idle.length === 1 && idle[0].includes("Docs done."));
 	rmSync(join(stateDir, "ballots"), { recursive: true, force: true });
+	clockSkew = 0;
+}
+
+heading("members changing the same files in one repository");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "a", "b", "c", "d"].map((name, i) => [name, `0d0e0e00-0000-7000-8000-00000000000${i + 1}`]),
+	);
+	const git = (cwd, ...args) =>
+		execFileSync(
+			"/usr/bin/git",
+			["-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "init.defaultBranch=main", ...args],
+			{ cwd, stdio: "pipe" },
+		).toString();
+	const base = join(root, "overlap");
+	mkdirSync(base, { recursive: true });
+	const repo = (name) => {
+		git(base, "init", "-q", "--bare", `${name}.git`);
+		const seed = join(base, `${name}-seed`);
+		git(base, "clone", "-q", `${name}.git`, seed);
+		mkdirSync(join(seed, "src"), { recursive: true });
+		writeFileSync(join(seed, "src/lease.ts"), "one\n");
+		writeFileSync(join(seed, "README.md"), "readme\n");
+		git(seed, "add", ".");
+		git(seed, "commit", "-q", "-m", "seed");
+		git(seed, "push", "-q", "origin", "HEAD:main");
+	};
+	repo("api");
+	repo("other");
+	const clone = (from, name, branch) => {
+		const dir = join(base, name);
+		git(base, "clone", "-q", `${from}.git`, dir);
+		git(dir, "checkout", "-q", "-b", branch);
+		return dir;
+	};
+	const dirs = {
+		a: clone("api", "a", "feat-a"),
+		b: clone("api", "b", "feat-b"),
+		c: clone("other", "c", "feat-c"),
+		d: join(base, "not-a-checkout"),
+	};
+	mkdirSync(dirs.d, { recursive: true });
+	writeFileSync(
+		join(tasksDir, "api.json"),
+		JSON.stringify({
+			name: "api",
+			slug: "api",
+			brief: "b",
+			conductor: ids.conductor,
+			state: "live",
+			launchedAt: 0,
+			members: ["a", "b", "c", "d"].map((name) => ({ session: ids[name], joinedAt: Date.now() })),
+			candidates: [],
+			led: [],
+			closing: false,
+			findings: [],
+			register: [],
+		}),
+	);
+	const taskOf = (slug) => JSON.parse(readFileSync(join(tasksDir, `${slug}.json`), "utf8"));
+	writeFileSync(
+		join(tasksDir, "old.json"),
+		JSON.stringify({
+			...taskOf("api"),
+			name: "old",
+			slug: "old",
+			conductor: "0d0e0e00-0000-7000-8000-0000000000ff",
+			state: "dormant",
+		}),
+	);
+	writeFileSync(
+		join(tasksDir, "empty.json"),
+		JSON.stringify({
+			...taskOf("api"),
+			name: "empty",
+			slug: "empty",
+			conductor: "0d0e0e00-0000-7000-8000-0000000000fe",
+			members: [],
+		}),
+	);
+	const poller = spawn(ids.poller, "/home/dev/work/overlap");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "api"));
+	await conductor.fire("session_start");
+	const sessions = {};
+	for (const name of ["a", "b", "c", "d"]) {
+		sessions[name] = spawn(ids[name], dirs[name]);
+		await sessions[name].fire("session_start");
+	}
+	await settle(300);
+	const endTurn = async (s) => {
+		await s.tools
+			.get("notify_status")
+			.execute("overlap", { summary: "Turn done.", urgency: "green", effect: "none" }, undefined, undefined, s.ctx);
+		await s.fire("session_stop");
+		await settle(400);
+	};
+	const overlaps = async () => {
+		await conductor.pump(300);
+		return conductor.customs.map((c) => String(c.message.content)).filter((t) => t.includes("both change"));
+	};
+	const pollerCheck = async () => {
+		jump(10 * 60_000 + 1_000);
+		for (const s of [conductor, ...Object.values(sessions)]) s.heartbeat();
+		poller.heartbeat();
+		await settle(800);
+	};
+
+	writeFileSync(join(dirs.a, "src/lease.ts"), "two\n");
+	git(dirs.a, "commit", "-q", "-am", "lease");
+	writeFileSync(join(dirs.a, "notes.md"), "a\n");
+	writeFileSync(join(dirs.b, "src/lease.ts"), "three\n");
+	writeFileSync(join(dirs.b, "README.md"), "b\n");
+	git(dirs.b, "commit", "-q", "-m", "readme", "README.md");
+	writeFileSync(join(dirs.c, "src/lease.ts"), "four\n");
+	await endTurn(sessions.a);
+	const first = await overlaps();
+	check(
+		"a member's turn end leads its conductor about files another member of the repository also changes",
+		first.length === 1 &&
+			first[0].includes("feat-a") &&
+			first[0].includes("feat-b") &&
+			first[0].includes("src/lease.ts") &&
+			!first[0].includes("README.md") &&
+			!first[0].includes("notes.md"),
+	);
+	check("a member of another repository never overlaps", first.length === 1 && !first[0].includes("feat-c"));
+	await endTurn(sessions.a);
+	check("the same shared files lead only once", (await overlaps()).length === 1);
+	writeFileSync(join(dirs.b, "notes.md"), "b\n");
+	await endTurn(sessions.b);
+	const grown = (await overlaps()).slice(1);
+	check(
+		"untracked files count, and a changed set of shared files leads again",
+		grown.length === 1 && grown[0].includes("notes.md") && grown[0].includes("src/lease.ts"),
+	);
+
+	git(dirs.b, "checkout", "-q", "src/lease.ts");
+	rmSync(join(dirs.b, "notes.md"));
+	await pollerCheck();
+	check("files no longer shared lead nowhere", (await overlaps()).length === 2);
+	writeFileSync(join(dirs.b, "src/lease.ts"), "five\n");
+	await pollerCheck();
+	const again = (await overlaps()).slice(2);
+	check(
+		"the poller's ten-minute check leads again once files are shared after a pause",
+		again.length === 1 && again[0].includes("src/lease.ts") && !again[0].includes("notes.md"),
+	);
+	check("a dormant task's members are not compared, so its file is never rewritten", !("overlaps" in taskOf("old")));
 	clockSkew = 0;
 }
 
