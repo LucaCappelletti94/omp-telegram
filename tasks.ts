@@ -28,6 +28,8 @@ export interface Task {
 	register: Entry[];
 	/** How long a member may go without an update before the conductor checks on it. */
 	silenceHours: number;
+	/** The member with the most focus points, whose every turn the conductor reviews, empty before the first tally. */
+	followed: string;
 }
 
 /** The silence limit of a task whose conductor never set one, from the plan's decision 5. */
@@ -91,6 +93,8 @@ export interface Member {
 	checkedAt: number;
 	/** Set once a silence check reached the conductor, until it calls `checked` or the member updates. */
 	silenceLed: boolean;
+	/** How far the conductor has reviewed its transcript while following it. */
+	reviewLine: number;
 }
 
 export interface Candidate {
@@ -145,6 +149,7 @@ function parseTask(raw: unknown, slug: string): Task | null {
 			updateLine: typeof m.updateLine === "number" && m.updateLine >= 0 ? m.updateLine : 0,
 			checkedAt: typeof m.checkedAt === "number" ? m.checkedAt : 0,
 			silenceLed: m.silenceLed === true,
+			reviewLine: typeof m.reviewLine === "number" && m.reviewLine >= 0 ? m.reviewLine : 0,
 		}));
 	const candidates = (Array.isArray(t.candidates) ? t.candidates : []).filter(
 		(c): c is Candidate =>
@@ -192,6 +197,7 @@ function parseTask(raw: unknown, slug: string): Task | null {
 		findings,
 		register,
 		silenceHours: typeof t.silenceHours === "number" && t.silenceHours > 0 ? t.silenceHours : DEFAULT_SILENCE_HOURS,
+		followed: typeof t.followed === "string" ? t.followed : "",
 	};
 }
 
@@ -255,6 +261,7 @@ export function conductorRole(task: Task): string {
 		"When a member has finished its part entirely, its pull request merged and nothing left open, raise a finding of kind `completed` naming that one member and why it is done. The card carries the member's own close buttons, and you never close a session yourself.",
 		"Members record claims and proposed decisions in the task register, and each new or closed entry reaches you as an aside. Judge each proposed entry against the others: `action` `accept` with its `entry` id, or `object` with a `reason` when it duplicates or contradicts another member's work. An objection goes to the user, who upholds or overrules it. An entry you leave unanswered for ten minutes stands accepted.",
 		`A member tells you what changed with \`update\`, which reaches you as an aside. One that sends no update for ${task.silenceHours} hours reaches you with the lines of its transcript since its last update: read them, message it only if it did work worth an update or looks stuck, then call \`action\` \`checked\` with the session id the aside gives. A member waiting on the user is left alone. When the user asks for another limit, set it with \`action\` \`silence\` and \`hours\`.`,
+		"You follow the member on top of the focus vote the live sessions cast, where a window the user marked comes first. Each of its turns that ends without a question to the user reaches you with the transcript lines that turn wrote. Read them and check them against the register and the other members' work. When the vote puts another member on top, you follow that one from then on.",
 		`Closing this session leaves the task dormant, and \`/conduct ${task.name}\` in Telegram resumes it.`,
 	].join("\n\n");
 }

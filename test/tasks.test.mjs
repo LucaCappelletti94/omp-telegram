@@ -64,7 +64,9 @@ heading("task files");
 		conductor: "",
 		state: "live",
 		launchedAt: 5,
-		members: [{ session: "m", joinedAt: 1, updatedAt: 3, updateLine: 12, checkedAt: 4, silenceLed: true }],
+		members: [
+			{ session: "m", joinedAt: 1, updatedAt: 3, updateLine: 12, checkedAt: 4, silenceLed: true, reviewLine: 9 },
+		],
 		candidates: [{ session: "c", card: "0a1b2c3d", state: "skipped" }],
 		led: ["s"],
 		closing: true,
@@ -96,6 +98,7 @@ heading("task files");
 			},
 		],
 		silenceHours: 2,
+		followed: "m",
 	};
 	const made = await changeTask(dir, "docs-pass", (task) => ({ task: task === null ? fresh : task, result: task }));
 	check("an absent task reads as null inside the change", made === null);
@@ -138,18 +141,19 @@ heading("task files");
 		"an update of a slug outside the pattern gives null",
 		(await updateTask(dir, "../escape", () => ({ task: fresh, result: "seen" }))) === null,
 	);
-	const { members, candidates, led, closing, findings, register, silenceHours, ...older } = fresh;
+	const { members, candidates, led, closing, findings, register, silenceHours, followed, ...older } = fresh;
 	writeFileSync(join(dir, "older.json"), JSON.stringify({ ...older, slug: "older" }));
 	const plain = readTask(dir, "older");
 	check(
-		"a task written before membership reads with no members, candidates, leads or findings, and a 4-hour silence limit",
+		"a task written before membership reads with no members, candidates, leads or findings, a 4-hour silence limit and no member followed",
 		plain.members.length === 0 &&
 			plain.candidates.length === 0 &&
 			plain.led.length === 0 &&
 			plain.closing === false &&
 			plain.findings.length === 0 &&
 			plain.register.length === 0 &&
-			plain.silenceHours === 4,
+			plain.silenceHours === 4 &&
+			plain.followed === "",
 	);
 	writeFileSync(
 		join(dir, "mixed.json"),
@@ -159,10 +163,19 @@ heading("task files");
 			members: [
 				null,
 				{ session: 1, joinedAt: 2 },
-				{ session: "o", joinedAt: 7, updatedAt: "8", updateLine: -1, checkedAt: null, silenceLed: "yes" },
+				{
+					session: "o",
+					joinedAt: 7,
+					updatedAt: "8",
+					updateLine: -1,
+					checkedAt: null,
+					silenceLed: "yes",
+					reviewLine: -2,
+				},
 				...members,
 			],
 			silenceHours: 0,
+			followed: 5,
 			candidates: [
 				{ session: "c", card: "x", state: "joined" },
 				{ session: "c", card: 3, state: "proposed" },
@@ -201,7 +214,15 @@ heading("task files");
 		"malformed members, candidates, leads and findings are dropped, well-formed ones kept",
 		JSON.stringify(mixed.members) ===
 			JSON.stringify([
-				{ session: "o", joinedAt: 7, updatedAt: 7, updateLine: 0, checkedAt: 0, silenceLed: false },
+				{
+					session: "o",
+					joinedAt: 7,
+					updatedAt: 7,
+					updateLine: 0,
+					checkedAt: 0,
+					silenceLed: false,
+					reviewLine: 0,
+				},
 				...members,
 			]) &&
 			JSON.stringify(mixed.candidates) === JSON.stringify(candidates) &&
@@ -210,6 +231,7 @@ heading("task files");
 			JSON.stringify(mixed.register) === JSON.stringify([{ ...register[0], kind: "decision", upheld: false }]),
 	);
 	check("a silence limit that is not a positive number reads as 4 hours", mixed.silenceHours === 4);
+	check("a followed member that is not a session id reads as none", mixed.followed === "");
 	rmSync(dir, { recursive: true, force: true });
 }
 

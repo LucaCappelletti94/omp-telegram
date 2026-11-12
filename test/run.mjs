@@ -20758,6 +20758,141 @@ heading("member updates and the conductor's silence check");
 	clockSkew = 0;
 }
 
+heading("the conductor follows its top focus member");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	for (const name of ["poller.lock", "priority.json", "ballots"]) {
+		rmSync(join(stateDir, name), { recursive: true, force: true });
+	}
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "a", "b", "idle", "sleeper"].map((name, i) => [
+			name,
+			`0d0e0c00-0000-7000-8000-00000000000${i + 1}`,
+		]),
+	);
+	const transcripts = join(root, "sessions", "focus");
+	mkdirSync(transcripts, { recursive: true });
+	const transcript = (id) => join(transcripts, `2026-01-01T00-00-00Z_${id}.jsonl`);
+	const write = (id, lines) => writeFileSync(transcript(id), "{}\n".repeat(lines));
+	write(ids.a, 2);
+	write(ids.b, 2);
+	const joinedAt = Date.now();
+	const writeTask = (slug, conductor, state, members, followed) =>
+		writeFileSync(
+			join(tasksDir, `${slug}.json`),
+			JSON.stringify({
+				name: slug,
+				slug,
+				brief: "b",
+				conductor,
+				state,
+				launchedAt: 0,
+				members: members.map((session) => ({ session, joinedAt })),
+				candidates: [],
+				led: [],
+				closing: false,
+				findings: [],
+				register: [],
+				followed,
+			}),
+		);
+	writeTask("api", ids.conductor, "live", [ids.b, ids.a], "");
+	writeTask("empty", ids.idle, "live", [], "");
+	writeTask("old", ids.sleeper, "dormant", [ids.a], ids.a);
+	const taskOf = (slug) => JSON.parse(readFileSync(join(tasksDir, `${slug}.json`), "utf8"));
+	const memberOf = (id) => taskOf("api").members.find((m) => m.session === id);
+	const poller = spawn(ids.poller, "/home/dev/work/focus");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "api"));
+	await conductor.fire("session_start");
+	const a = spawn(ids.a, "/home/dev/work/a");
+	await a.fire("session_start");
+	const b = spawn(ids.b, "/home/dev/work/b");
+	await b.fire("session_start");
+	const tally = async () => {
+		jump(31_000);
+		for (const s of [conductor, a, b]) s.heartbeat();
+		poller.heartbeat();
+		await settle(400);
+	};
+	const endTurn = async (s, params) => {
+		const status = params.urgency === "green" ? { effect: "none", ...params } : params;
+		await s.tools.get("notify_status").execute("focus", status, undefined, undefined, s.ctx);
+		await s.fire("session_stop");
+		await settle(200);
+	};
+	const reviews = async () => {
+		await conductor.pump(150);
+		return conductor.customs
+			.map((c) => String(c.message.content))
+			.filter((t) => t.startsWith("Automatic conductor update") && t.includes("Review it"));
+	};
+
+	await tally();
+	check(
+		"with no votes the first member by id is followed from its transcript's end",
+		taskOf("api").followed === ids.a && memberOf(ids.a).reviewLine === 2,
+	);
+	check(
+		"a task without members follows no one, and a dormant task keeps whom it followed",
+		taskOf("empty").followed === "" && taskOf("old").followed === ids.a,
+	);
+
+	write(ids.a, 5);
+	await endTurn(a, { summary: "Parser landed.", urgency: "green" });
+	const first = await reviews();
+	check(
+		"the followed member's turn end leads its conductor with the lines that turn wrote",
+		first.length === 1 &&
+			first[0].includes("Parser landed.") &&
+			first[0].includes(`${transcript(ids.a)}:3-5`) &&
+			memberOf(ids.a).reviewLine === 5,
+	);
+	check(
+		"a dormant task's conductor is not led about the member it followed",
+		!existsSync(join(stateDir, "graph/pending", ids.sleeper)),
+	);
+	write(ids.b, 3);
+	await endTurn(b, { summary: "Docs touched.", urgency: "green" });
+	await endTurn(a, { summary: "Nothing new.", urgency: "green" });
+	check("other members' turns and a turn that wrote nothing lead nowhere", (await reviews()).length === 1);
+	write(ids.a, 6);
+	await endTurn(a, { summary: "Which parser?", urgency: "orange", options: opts("Fast", "Strict") });
+	check(
+		"a turn that ends waiting on the user leads nowhere and keeps the review where it was",
+		(await reviews()).length === 1 && memberOf(ids.a).reviewLine === 5,
+	);
+
+	mkdirSync(join(stateDir, "ballots"), { recursive: true });
+	for (const voter of [ids.poller, ids.conductor]) {
+		writeFileSync(
+			join(stateDir, "ballots", `${voter}.json`),
+			JSON.stringify({ focus: [ids.b, ids.a], resources: [], at: Date.now() }),
+		);
+	}
+	await tally();
+	check(
+		"when the vote puts another member on top it is followed from its transcript's current end",
+		taskOf("api").followed === ids.b && memberOf(ids.b).reviewLine === 3,
+	);
+	write(ids.a, 8);
+	await endTurn(a, { summary: "Parser tuned.", urgency: "green" });
+	write(ids.b, 4);
+	await endTurn(b, { summary: "Docs done.", urgency: "green" });
+	const second = (await reviews()).slice(1);
+	check(
+		"only the new top member's turns lead its conductor",
+		second.length === 1 && second[0].includes("Docs done.") && second[0].includes(`${transcript(ids.b)}:4-4`),
+	);
+	rmSync(join(stateDir, "ballots"), { recursive: true, force: true });
+	clockSkew = 0;
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
