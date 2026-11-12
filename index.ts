@@ -11535,6 +11535,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 								candidates: current.candidates.map((c) => (left.has(c.session) ? { ...c, session: sessionId } : c)),
 								led: rename(current.led),
 								register: current.register.map((e) => (left.has(e.author) ? { ...e, author: sessionId } : e)),
+								followed: left.has(current.followed) ? sessionId : current.followed,
+								overlaps: current.overlaps.map((o) => ({ ...o, pair: rename(o.pair.split(" ")).sort().join(" ") })),
+								deadWaits: current.deadWaits.map((key) => rename(key.split(" ")).join(" ")),
+								finished: current.finished.map((key) => rename(key.split(" ")).join(" ")),
 							}
 						: null,
 					result: null,
