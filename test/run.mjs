@@ -21082,7 +21082,7 @@ heading("members changing the same files in one repository");
 	await conductor.fire("session_start");
 	const sessions = {};
 	for (const name of ["a", "b", "c", "d"]) {
-		sessions[name] = spawn(ids[name], dirs[name]);
+		sessions[name] = spawn(ids[name], name === "b" ? join(dirs.b, "src") : dirs[name]);
 		await sessions[name].fire("session_start");
 	}
 	await settle(300);
@@ -21132,6 +21132,10 @@ heading("members changing the same files in one repository");
 		"untracked files count, and a changed set of shared files leads again",
 		grown.length === 1 && grown[0].includes("notes.md") && grown[0].includes("src/lease.ts"),
 	);
+	check(
+		"a member in a subfolder matches untracked files outside that subfolder by repository path",
+		grown.length === 1 && grown[0].includes("`notes.md`"),
+	);
 
 	git(dirs.b, "checkout", "-q", "src/lease.ts");
 	rmSync(join(dirs.b, "notes.md"));
@@ -21145,6 +21149,90 @@ heading("members changing the same files in one repository");
 		again.length === 1 && again[0].includes("src/lease.ts") && !again[0].includes("notes.md"),
 	);
 	check("a dormant task's members are not compared, so its file is never rewritten", !("overlaps" in taskOf("old")));
+
+	writeFileSync(join(dirs.a, "src/new.ts"), "a\n");
+	writeFileSync(join(dirs.b, "src/new.ts"), "b\n");
+	const beforeNested = (await overlaps()).length;
+	await endTurn(sessions.b);
+	check(
+		"a member in a subfolder matches untracked files inside it by repository path",
+		(await overlaps()).slice(beforeNested).some((text) => text.includes("`src/new.ts`")),
+	);
+
+	const savedPath = process.env.PATH;
+	const bin = join(base, "bin");
+	const failure = join(base, "git-failure");
+	mkdirSync(bin);
+	writeFileSync(
+		join(bin, "git"),
+		`#!/bin/sh
+if [ "$2" = "${join(dirs.b, "src")}" ] && [ -f "${failure}" ]; then
+	case "$3 $4" in
+		"$(cat "${failure}")") exit 1 ;;
+	esac
+fi
+exec /usr/bin/git "$@"
+`,
+		{ mode: 0o755 },
+	);
+	process.env.PATH = `${bin}:${savedPath}`;
+	try {
+		for (const [i, command] of [
+			"rev-parse --show-toplevel",
+			"rev-parse --abbrev-ref",
+			"diff --name-only",
+			"ls-files --others",
+		].entries()) {
+			const file = `src/failure-${i}.ts`;
+			writeFileSync(join(dirs.a, file), "a\n");
+			writeFileSync(join(dirs.b, file), "b\n");
+			for (const dir of [dirs.a, dirs.b]) {
+				git(dir, "add", file);
+				git(dir, "commit", "-q", "-m", "shared file");
+			}
+			const beforeFailure = (await overlaps()).length;
+			const remembered = JSON.stringify(taskOf("api").overlaps);
+			writeFileSync(failure, command);
+			await endTurn(sessions.a);
+			check(
+				`a failed ${command} leaves the overlap snapshot and leads unchanged`,
+				(await overlaps()).length === beforeFailure && JSON.stringify(taskOf("api").overlaps) === remembered,
+			);
+			rmSync(failure);
+			await endTurn(sessions.a);
+			const recovered = (await overlaps()).slice(beforeFailure);
+			check(
+				`a recovered ${command} reports the complete overlap`,
+				recovered.length === 1 && recovered[0].includes(file) && recovered[0].includes("src/lease.ts"),
+			);
+		}
+	} finally {
+		process.env.PATH = savedPath;
+	}
+
+	const sameId = "0d0e0e00-0000-7000-8000-000000000007";
+	const same = spawn(sameId, join(dirs.a, "src"));
+	await same.fire("session_start");
+	writeFileSync(
+		join(tasksDir, "api.json"),
+		JSON.stringify({
+			...taskOf("api"),
+			members: [
+				{ session: ids.a, joinedAt: Date.now() },
+				{ session: sameId, joinedAt: Date.now() },
+			],
+			overlaps: [],
+		}),
+	);
+	const beforeSame = (await overlaps()).length;
+	await endTurn(sessions.a);
+	check(
+		"two members in one worktree lead nothing even from different subfolders",
+		(await overlaps()).length === beforeSame && taskOf("api").overlaps.length === 0,
+	);
+	writeFileSync(join(dirs.a, "src/another.ts"), "shared checkout\n");
+	await endTurn(same);
+	check("another change in one shared worktree leads nothing", (await overlaps()).length === beforeSame);
 	clockSkew = 0;
 }
 
