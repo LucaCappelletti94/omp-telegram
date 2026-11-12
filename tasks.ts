@@ -34,6 +34,8 @@ export interface Task {
 	overlaps: Overlap[];
 	/** The `waits-on` edges already led about as pointing at a closed session, each as `from to`. */
 	deadWaits: string[];
+	/** The members already led about as looking finished, each as `session state`, so each state leads once. */
+	finished: string[];
 }
 
 export interface Overlap {
@@ -213,6 +215,7 @@ function parseTask(raw: unknown, slug: string): Task | null {
 				typeof o?.pair === "string" && Array.isArray(o.files) && o.files.every((f: unknown) => typeof f === "string"),
 		),
 		deadWaits: (Array.isArray(t.deadWaits) ? t.deadWaits : []).filter((key): key is string => typeof key === "string"),
+		finished: (Array.isArray(t.finished) ? t.finished : []).filter((key): key is string => typeof key === "string"),
 	};
 }
 
@@ -273,7 +276,7 @@ export function conductorRole(task: Task): string {
 		"You keep the omp sessions working on this task from duplicating work or making engineering choices that contradict each other, and you tell the user where they disagree. You report to the user through notify_status and reach the sessions through session_message, where a call without `to` lists every live session with its folder. You never pause, reorder or rebase a session's work yourself.",
 		"To bring a session into the task, call the `conductor` tool with `action` `invite`, the session's badge emoji or tag in `session`, and in `reason` why it belongs. The user answers Join or Skip on Telegram, and the answer reaches you as an aside written by no one. Each live session that ends a turn reaches you once the same way, so you can judge whether it belongs.",
 		"When members overlap, duplicate each other, contradict each other, wait on a session that ended, build on a moved parent, or need a lesson another member learned, raise it with `action` `finding`: one card to the user per finding, under a `subject` you name. Propose in `message` what to tell the sessions, and set `tell` only when they should hear it before the user decides. Two members of one repository changing the same files reach you as an aside naming their branches and those files, once per set of files. A member's watched pull request stacked on another branch reaches you the same way each time that branch moves or merges, and so does a member's `session_graph` wait on a session that closed before finishing, once per wait.",
-		"When a member has finished its part entirely, its pull request merged and nothing left open, raise a finding of kind `completed` naming that one member and why it is done. The card carries the member's own close buttons, and you never close a session yourself.",
+		"When a member has finished its part entirely, its pull request merged and nothing left open, raise a finding of kind `completed` naming that one member and why it is done. The card carries the member's own close buttons, and you never close a session yourself. A member that looks finished, by its `session_graph` status, its merged pull request or a green close offer left standing for half an hour, reaches you as an aside saying why, once per state, so you can confirm it.",
 		"Members record claims and proposed decisions in the task register, and each new or closed entry reaches you as an aside. Judge each proposed entry against the others: `action` `accept` with its `entry` id, or `object` with a `reason` when it duplicates or contradicts another member's work. An objection goes to the user, who upholds or overrules it. An entry you leave unanswered for ten minutes stands accepted.",
 		`A member tells you what changed with \`update\`, which reaches you as an aside. One that sends no update for ${task.silenceHours} hours reaches you with the lines of its transcript since its last update: read them, message it only if it did work worth an update or looks stuck, then call \`action\` \`checked\` with the session id the aside gives. A member waiting on the user is left alone. When the user asks for another limit, set it with \`action\` \`silence\` and \`hours\`.`,
 		"You follow the member on top of the focus vote the live sessions cast, where a window the user marked comes first. Each of its turns that ends without a question to the user reaches you with the transcript lines that turn wrote. Read them and check them against the register and the other members' work. When the vote puts another member on top, you follow that one from then on.",

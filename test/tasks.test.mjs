@@ -101,6 +101,7 @@ heading("task files");
 		followed: "m",
 		overlaps: [{ pair: "m n", files: ["src/a.ts"] }],
 		deadWaits: ["m t"],
+		finished: ["m done"],
 	};
 	const made = await changeTask(dir, "docs-pass", (task) => ({ task: task === null ? fresh : task, result: task }));
 	check("an absent task reads as null inside the change", made === null);
@@ -154,6 +155,7 @@ heading("task files");
 		followed,
 		overlaps,
 		deadWaits,
+		finished,
 		...older
 	} = fresh;
 	writeFileSync(join(dir, "older.json"), JSON.stringify({ ...older, slug: "older" }));
@@ -169,7 +171,8 @@ heading("task files");
 			plain.silenceHours === 4 &&
 			plain.followed === "" &&
 			plain.overlaps.length === 0 &&
-			plain.deadWaits.length === 0,
+			plain.deadWaits.length === 0 &&
+			plain.finished.length === 0,
 	);
 	writeFileSync(
 		join(dir, "mixed.json"),
@@ -194,6 +197,7 @@ heading("task files");
 			followed: 5,
 			overlaps: [null, { pair: 1, files: [] }, { pair: "x y", files: [2] }, { pair: "x y", files: "a" }, ...overlaps],
 			deadWaits: [1, ...deadWaits],
+			finished: [false, ...finished],
 			candidates: [
 				{ session: "c", card: "x", state: "joined" },
 				{ session: "c", card: 3, state: "proposed" },
@@ -255,6 +259,7 @@ heading("task files");
 		JSON.stringify(mixed.overlaps) === JSON.stringify(overlaps),
 	);
 	check("dead waits that are not strings are dropped", JSON.stringify(mixed.deadWaits) === JSON.stringify(deadWaits));
+	check("finished leads that are not strings are dropped", JSON.stringify(mixed.finished) === JSON.stringify(finished));
 	rmSync(dir, { recursive: true, force: true });
 }
 
