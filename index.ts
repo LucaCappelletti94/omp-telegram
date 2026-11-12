@@ -120,9 +120,11 @@ const LEGACY_LOCK_DIR = join(STATE_DIR, "poller.lock.d");
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
 /** Where omp keeps transcripts, one project subdirectory per working tree. */
 const OMP_SESSIONS_DIR = join(AGENT_DIR, "sessions");
-/** One marker per session a restart wave is killing, so the reaper cannot reap it mid-restart. */
+/** Tells shutdown to retain the session's state for its restart. */
 const RESTART_MARKER_DIR = join(STATE_DIR, "restart-pending");
-/** A marker protects its record for this long: the confirm wait, plus margin. */
+/** Protects a restarting session's record until the wave confirms or fails. */
+const RESTART_HOLD_DIR = join(STATE_DIR, "restart-held");
+/** Bounds restart retention if the wave cannot finish. */
 const RESTART_MARKER_MS = 5 * 60_000;
 /** How long a process has to exit after its SIGTERM before the wave gives up on it. */
 const RESTART_EXIT_WAIT_MS = 30_000;
@@ -3178,9 +3180,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const record = readSessionRecord(id, true);
 			// A live session refreshes its heartbeat every 15 seconds, so a stale one is gone.
 			if (record !== null && Date.now() - record.heartbeat <= LOCK_STALE_MS) continue;
-			// A restart marker keeps a record the wave is mid-restart on until the marker ages out.
-			const marker = readJsonFile(join(RESTART_MARKER_DIR, `${id}.json`)) as { at?: unknown } | null;
-			if (marker !== null && typeof marker.at === "number" && Date.now() - marker.at < RESTART_MARKER_MS) continue;
+			const hold = readJsonFile(join(RESTART_HOLD_DIR, `${id}.json`)) as { at?: unknown } | null;
+			if (hold !== null && typeof hold.at === "number" && Date.now() - hold.at < RESTART_MARKER_MS) continue;
 			const bootKnown = record !== null && record.boot.length > 0 && BOOT_ID.length > 0;
 			const restarted = bootKnown && record.boot !== BOOT_ID;
 			const halted = record !== null && record.heartbeat === 0 && record.systemShutdownAt > 0;
@@ -4442,9 +4443,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		entry.failNote = "respawn failed, opened a new window";
 	}
 
-	/** Writes the reaper's marker, holds the pane, sends SIGTERM, then performs the restart. */
+	/** Marks shutdown for restart, protects its record, holds the pane and sends SIGTERM. */
 	async function startRestart(entry: RestartEntry): Promise<void> {
 		writePrivateJson(RESTART_MARKER_DIR, `${entry.id}.json`, { at: Date.now(), pid: entry.pid });
+		writePrivateJson(RESTART_HOLD_DIR, `${entry.id}.json`, { at: Date.now() });
 		if (entry.method === "respawn") {
 			// A dead process leaves the pane empty, and tmux closes an empty pane unless it is told to hold it.
 			await run("tmux", ["set-option", "-p", "-t", entry.pane, "remain-on-exit", "on"], 2_000);
@@ -4469,24 +4471,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function restartConfirmations(stampNow: string): void {
 		const now = Date.now();
 		for (const entry of restartEntries.values()) {
-			if (entry.outcome !== "") continue;
-			const record = readSessionRecord(entry.id);
-			const confirmed =
-				record !== null &&
-				record.pid > 0 &&
-				record.pid !== entry.pid &&
-				record.codeStamp === stampNow &&
-				now - record.heartbeat <= LOCK_STALE_MS;
-			if (confirmed) {
-				entry.outcome = "confirmed";
-				reportedRestartFailures.delete(entry.id);
-				removeStatePath(RESTART_MARKER_DIR, `${entry.id}.json`);
-				continue;
+			if (entry.outcome === "") {
+				const record = readSessionRecord(entry.id);
+				const confirmed =
+					record !== null &&
+					record.pid > 0 &&
+					record.pid !== entry.pid &&
+					record.codeStamp === stampNow &&
+					now - record.heartbeat <= LOCK_STALE_MS;
+				if (confirmed) {
+					entry.outcome = "confirmed";
+					reportedRestartFailures.delete(entry.id);
+				} else {
+					if (now - entry.restartedAt <= RESTART_CONFIRM_MS) continue;
+					entry.outcome = "failed";
+					entry.reason = "the resume was not confirmed within 90 s";
+				}
 			}
-			if (now - entry.restartedAt <= RESTART_CONFIRM_MS) continue;
-			entry.outcome = "failed";
-			entry.reason = "the resume was not confirmed within 90 s";
 			removeStatePath(RESTART_MARKER_DIR, `${entry.id}.json`);
+			removeStatePath(RESTART_HOLD_DIR, `${entry.id}.json`);
 		}
 		const toReport = [...restartEntries.values()].filter((entry) => {
 			const note = entry.reason !== "" ? entry.reason : entry.failNote;
