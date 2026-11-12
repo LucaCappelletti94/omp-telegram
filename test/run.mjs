@@ -19502,6 +19502,89 @@ heading("conductors hear of sessions they have not judged");
 	);
 }
 
+heading("a moved session keeps its tasks and leases");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "member", "candidate", "led", "member2", "candidate2", "led2"].map((name, i) => [
+			name,
+			`0d0e0400-0000-7000-8000-00000000000${i + 1}`,
+		]),
+	);
+	const taskFile = join(tasksDir, "moves.json");
+	writeFileSync(
+		taskFile,
+		JSON.stringify({
+			name: "Moves",
+			slug: "moves",
+			brief: "b",
+			conductor: ids.conductor,
+			state: "live",
+			launchedAt: 0,
+			members: [{ session: ids.member, joinedAt: 1 }],
+			candidates: [{ session: ids.candidate, card: "0a1b2c3d", state: "proposed" }],
+			led: [ids.led],
+		}),
+	);
+	const task = () => JSON.parse(readFileSync(taskFile, "utf8"));
+	writeFileSync(
+		join(stateDir, "leases.json"),
+		JSON.stringify({
+			granted: [
+				{
+					id: "0d0e0400-1",
+					session: ids.member,
+					command: "cargo test",
+					grantedAt: Date.now(),
+					holder: null,
+					bound: false,
+					expires: Date.now() + 600_000,
+				},
+			],
+			queue: [{ id: "0d0e0400-2", session: ids.member, command: "cargo build", cwd: "/w", requestedAt: Date.now() }],
+		}),
+	);
+	const leases = () => JSON.parse(readFileSync(join(stateDir, "leases.json"), "utf8"));
+	const poller = spawn(ids.poller, "/home/dev/work/moves");
+	await poller.fire("session_start");
+	const moveTo = async (from, to) => {
+		const s = spawn(from, "/home/dev/work/moves");
+		await s.fire("session_start");
+		s.move(to);
+		await s.pump(200);
+		return s;
+	};
+	await moveTo(ids.member, ids.member2);
+	check(
+		"a member moved to a continuation id stays a member under the new id",
+		task()
+			.members.map((m) => m.session)
+			.join() === ids.member2,
+	);
+	check(
+		"its granted and queued leases move with it",
+		leases().granted.every((g) => g.session === ids.member2) &&
+			leases().queue.every((q) => q.session === ids.member2) &&
+			leases().granted.length === 1,
+	);
+	await moveTo(ids.candidate, ids.candidate2);
+	check(
+		"a proposed candidate keeps its open card under the new id",
+		task().candidates.length === 1 &&
+			task().candidates[0].session === ids.candidate2 &&
+			task().candidates[0].card === "0a1b2c3d",
+	);
+	await moveTo(ids.led, ids.led2);
+	check("an announced session stays announced under the new id", task().led.join() === ids.led2);
+	check("the conductor stays as it was", task().conductor === ids.conductor);
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });

@@ -61,6 +61,8 @@ import {
 	isHeavy,
 	type LeasePolicy,
 	type Machine,
+	moveSessions,
+	parseLeases,
 	settle,
 	unwrapLeased,
 	wrapLeased,
@@ -10565,16 +10567,35 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			removeStatePath(BALLOT_DIR, `${id}.json`);
 		}
 		if (left.size > 0) {
+			const rename = (ids: string[]): string[] => ids.map((id) => (left.has(id) ? sessionId : id));
+			const names = (task: Task): boolean =>
+				[
+					task.conductor,
+					...task.led,
+					...task.members.map((member) => member.session),
+					...task.candidates.map((candidate) => candidate.session),
+				].some((id) => left.has(id));
 			for (const task of listTasks(TASKS_DIR)) {
-				if (!left.has(task.conductor)) continue;
+				if (!names(task)) continue;
 				// The listing came before the lock, so another process may have taken the task meanwhile.
 				await updateTask(TASKS_DIR, task.slug, (current) => ({
-					task: left.has(current.conductor) ? { ...current, conductor: sessionId } : null,
+					task: names(current)
+						? {
+								...current,
+								conductor: left.has(current.conductor) ? sessionId : current.conductor,
+								members: current.members.map((m) => (left.has(m.session) ? { ...m, session: sessionId } : m)),
+								candidates: current.candidates.map((c) => (left.has(c.session) ? { ...c, session: sessionId } : c)),
+								led: rename(current.led),
+							}
+						: null,
 					result: null,
 				}));
 			}
+			// Read first without the lock, so a move that held no lease costs no lock round.
+			if (moveSessions(parseLeases(readJsonFile(join(STATE_DIR, "leases.json"))), left, sessionId) !== null) {
+				await changeLeases(STATE_DIR, (state) => ({ state: moveSessions(state, left, sessionId), result: null }));
+			}
 			// Every other session's ballot naming a left id now means this one.
-			const rename = (ids: string[]): string[] => ids.map((id) => (left.has(id) ? sessionId : id));
 			for (const [voter, ballot] of readBallots()) {
 				if (![...ballot.focus, ...ballot.resources].some((id) => left.has(id))) continue;
 				writePrivateJson(BALLOT_DIR, `${voter}.json`, {
