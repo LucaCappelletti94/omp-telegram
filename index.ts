@@ -907,6 +907,8 @@ const LAUNCH_ENV = "OMP_TELEGRAM_LAUNCH";
 const CONDUCT_ENV = "OMP_TELEGRAM_CONDUCT";
 /** How long a resumed session gets to come live before another Resume tap opens a window again. */
 const RESUME_START_MS = 60_000;
+/** How long a closing conductor waits for its closing notice to reach Telegram before it closes anyway. */
+const CLOSE_NOTICE_WAIT_MS = 30_000;
 /** What a tap gets when its window is already opening. */
 const ALREADY_STARTING = "That session is already starting.";
 /** A pending or failed launch request is answered by expiry seven days after it was made. */
@@ -2412,6 +2414,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let closeOfferGeneration = 0;
 	/** Set once a validated close tap is running, so a queued duplicate cannot run it twice. */
 	let closing = false;
+	/** When this conductor's closing turn ended, so it closes once its notice is out or the wait for it runs out. */
+	let closeAfter: { mono: number; wall: number } | null = null;
 	let replyQuestionMessageId: number | null = null;
 	let replyQuestionGeneration = 0;
 	let statusBlockUsed = false;
@@ -7749,6 +7753,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				members: [],
 				candidates: [],
 				led: [],
+				closing: false,
 			};
 			return { task: fresh, result: { kind: "open", task: fresh } };
 		});
@@ -7844,7 +7849,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						}
 						const members = [...task.members, { session, joinedAt: Date.now() }];
 						return {
-							task: { ...task, candidates: others, members },
+							task: { ...task, candidates: others, members, closing: false },
 							result: { task, session, outcome: "joined" as const },
 						};
 					});
@@ -10375,6 +10380,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					watchTick();
 					launchRequestTick();
 					priorityTick();
+					detach(() => sweepMembers(), "member sweep");
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
 					detachBackground(() => redrawCrashCards(), "crash cards");
@@ -10399,6 +10405,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				detach(() => followSession(ctx), "session follow");
 				detach(() => drainInbox(), "inbox drain");
 				drainPending();
+				closeWhenNoticed();
 				maybeType();
 				maybeDraft();
 				maybeDashboard();
@@ -10912,7 +10919,66 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 	});
 
-	pi.on("session_stop", async (_event, ctx) => endTurn(ctx, false));
+	pi.on("session_stop", async (_event, ctx) => {
+		const verdict = await endTurn(ctx, false);
+		const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId);
+		if (verdict === undefined && conducted?.closing === true)
+			closeAfter = { mono: performance.now(), wall: Date.now() };
+		return verdict;
+	});
+
+	/**
+	 * Closes a conductor whose last member left, once the turn that ended after that has its notice on Telegram or
+	 * the wait for it runs out. A session that joined meanwhile cleared the task's closing, which keeps it open.
+	 */
+	function closeWhenNoticed(): void {
+		if (closeAfter === null || closing) return;
+		if (lastNotifiedAt < closeAfter.wall && performance.now() - closeAfter.mono < CLOSE_NOTICE_WAIT_MS) return;
+		closeAfter = null;
+		const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId);
+		if (conducted?.closing !== true) return;
+		closing = true;
+		detach(() => closeSessionFromTelegram(undefined), "conductor close");
+	}
+
+	/**
+	 * Takes `session` out of every task it is a member of and tells each conductor why. The last member leaving
+	 * asks a live conductor for its closing notice, and leaves the task of a conductor that is down dormant.
+	 */
+	async function leaveTasks(session: string, why: string): Promise<void> {
+		const title = titleOf(session);
+		for (const listed of listTasks(TASKS_DIR)) {
+			if (!listed.members.some((member) => member.session === session)) continue;
+			const left = await updateTask(TASKS_DIR, listed.slug, (task) => {
+				const members = task.members.filter((member) => member.session !== session);
+				if (members.length === task.members.length) return { task: null, result: null };
+				const last = members.length === 0;
+				const heard = isLiveSession(task.conductor);
+				const state = last && !heard ? ("dormant" as const) : task.state;
+				return {
+					task: { ...task, members, state, closing: last ? heard : task.closing },
+					result: { task, last, heard },
+				};
+			});
+			if (left === null || (left.last && !left.heard)) continue;
+			sendLead(
+				left.task,
+				left.last
+					? `${title} ${why}, so the task has no member left. End this turn with your closing notice through notify_status, and this session then closes and the task turns dormant.`
+					: `${title} ${why} and left the task.`,
+			);
+		}
+	}
+
+	/** Members that neither a session record nor an open crash card can bring back leave their tasks. */
+	async function sweepMembers(): Promise<void> {
+		const members = new Set(listTasks(TASKS_DIR).flatMap((task) => task.members.map((member) => member.session)));
+		for (const session of members) {
+			const crash = readCrash(session);
+			if (readSessionRecord(session) !== null || (crash !== null && !crash.dismissed)) continue;
+			await leaveTasks(session, "can no longer be restored");
+		}
+	}
 
 	/** The pane state a turn end leaves, red asking for action, orange or a choice or a question asking for a reply. */
 	function endTurnPaneState(
@@ -11172,10 +11238,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId);
 			if (conducted !== undefined) {
 				await updateTask(TASKS_DIR, conducted.slug, (current) => ({
-					task: current.conductor === sessionId ? { ...current, state: "dormant" } : null,
+					task: current.conductor === sessionId ? { ...current, state: "dormant", closing: false } : null,
 					result: null,
 				}));
 			}
+			await leaveTasks(sessionId, "was closed");
 		}
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		// No poller tick follows the last omp's exit, so the scope its shell keeps is given back its defaults here.

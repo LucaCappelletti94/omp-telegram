@@ -67,6 +67,7 @@ heading("task files");
 		members: [{ session: "m", joinedAt: 1 }],
 		candidates: [{ session: "c", card: "0a1b2c3d", state: "skipped" }],
 		led: ["s"],
+		closing: true,
 	};
 	const made = await changeTask(dir, "docs-pass", (task) => ({ task: task === null ? fresh : task, result: task }));
 	check("an absent task reads as null inside the change", made === null);
@@ -109,12 +110,12 @@ heading("task files");
 		"an update of a slug outside the pattern gives null",
 		(await updateTask(dir, "../escape", () => ({ task: fresh, result: "seen" }))) === null,
 	);
-	const { members, candidates, led, ...older } = fresh;
+	const { members, candidates, led, closing, ...older } = fresh;
 	writeFileSync(join(dir, "older.json"), JSON.stringify({ ...older, slug: "older" }));
 	const plain = readTask(dir, "older");
 	check(
 		"a task written before membership reads with no members, candidates or leads",
-		plain.members.length === 0 && plain.candidates.length === 0 && plain.led.length === 0,
+		plain.members.length === 0 && plain.candidates.length === 0 && plain.led.length === 0 && plain.closing === false,
 	);
 	writeFileSync(
 		join(dir, "mixed.json"),

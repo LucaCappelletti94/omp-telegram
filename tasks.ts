@@ -20,6 +20,8 @@ export interface Task {
 	candidates: Candidate[];
 	/** Live sessions the conductor was already told about, so each reaches it once while it stays live. */
 	led: string[];
+	/** Set once the last member left while the conductor was live, until it closes or a session joins. */
+	closing: boolean;
 }
 
 export interface Member {
@@ -88,6 +90,7 @@ function parseTask(raw: unknown, slug: string): Task | null {
 		members,
 		candidates,
 		led,
+		closing: t.closing === true,
 	};
 }
 

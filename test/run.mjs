@@ -19585,6 +19585,204 @@ heading("a moved session keeps its tasks and leases");
 	check("the conductor stays as it was", task().conductor === ids.conductor);
 }
 
+heading("members leaving a task and its conductor closing");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "a", "b", "c", "ghost", "d"].map((name, i) => [
+			name,
+			`0d0e0500-0000-7000-8000-00000000000${i + 1}`,
+		]),
+	);
+	const writeTask = (slug, conductor, members) =>
+		writeFileSync(
+			join(tasksDir, `${slug}.json`),
+			JSON.stringify({
+				name: slug,
+				slug,
+				brief: "b",
+				conductor,
+				state: "live",
+				launchedAt: 0,
+				members: members.map((session) => ({ session, joinedAt: 1 })),
+				candidates: [],
+				led: [],
+			}),
+		);
+	const taskOf = (slug) => JSON.parse(readFileSync(join(tasksDir, `${slug}.json`), "utf8"));
+	writeTask("leave", ids.conductor, [ids.a, ids.b]);
+	writeTask("orphan", ids.ghost, [ids.d]);
+	const poller = spawn(ids.poller, "/home/dev/work/leave");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "leave"));
+	let shutdowns = 0;
+	conductor.ctx.shutdown = () => {
+		shutdowns += 1;
+	};
+	await conductor.fire("session_start");
+	const sessions = {};
+	for (const name of ["a", "b", "d"]) {
+		sessions[name] = spawn(ids[name], `/home/dev/work/${name}`);
+		await sessions[name].fire("session_start");
+	}
+	const leads = async () => {
+		await conductor.pump(150);
+		return conductor.customs
+			.map((c) => String(c.message.content))
+			.filter((text) => text.startsWith("Automatic conductor update"));
+	};
+	const endTurn = async (s, summary) => {
+		await s.tools.get("notify_status").execute("end", { summary, urgency: "orange" }, undefined, undefined, s.ctx);
+		await s.fire("session_stop");
+		await settle(200);
+	};
+
+	await endTurn(conductor, "Watching the task.");
+	await conductor.pump(150);
+	check("a conductor with members does not close at its turn end", shutdowns === 0);
+
+	await sessions.a.fire("session_shutdown");
+	check(
+		"a member closed by hand leaves the task and its conductor is told",
+		taskOf("leave")
+			.members.map((m) => m.session)
+			.join() === ids.b &&
+			taskOf("leave").closing === false &&
+			(await leads()).some((text) => text.includes("closed")),
+	);
+
+	// b dies without shutting down: its record became a crash record whose card is still open.
+	const crashDir = join(stateDir, "crashed");
+	mkdirSync(crashDir, { recursive: true });
+	const bRecord = record(ids.b);
+	const crashOf = (dismissed) =>
+		JSON.stringify({ record: bRecord, batch: "0d0e0500-batch", machine: false, restoringAt: 0, error: "", dismissed });
+	writeFileSync(join(crashDir, `${ids.b}.json`), crashOf(false));
+	rmSync(join(sessionsDir, `${ids.b}.json`));
+	poller.heartbeat();
+	await settle(300);
+	check("a crashed member stays while its crash card can restore it", taskOf("leave").members.length === 1);
+	writeFileSync(join(crashDir, `${ids.b}.json`), crashOf(true));
+	poller.heartbeat();
+	await settle(300);
+	check(
+		"a crashed member whose card was dismissed leaves, and the last one leaving marks the task closing",
+		taskOf("leave").members.length === 0 && taskOf("leave").closing === true,
+	);
+	check(
+		"the conductor is asked for its closing notice",
+		(await leads()).some((text) => text.includes("closing notice")),
+	);
+
+	// A session that joins before the conductor's turn ends keeps the conductor open.
+	const c = spawn(ids.c, "/home/dev/work/c");
+	await c.fire("session_start");
+	await conductor.tools
+		.get("conductor")
+		.execute("inv", { action: "invite", session: record(ids.c).tag, reason: "r" }, undefined, undefined, conductor.ctx);
+	const joinData = called("sendMessage").at(-1).body.reply_markup.inline_keyboard.flat()[0].callback_data;
+	api.queued = [
+		{
+			update_id: 9990,
+			callback_query: {
+				id: "leave9990",
+				data: joinData,
+				from: { id: CHAT },
+				message: { message_id: 9990, chat: { id: CHAT } },
+			},
+		},
+	];
+	await poller.pump(400);
+	check("a session joining a closing task clears the closing", taskOf("leave").closing === false);
+	await c.fire("session_shutdown");
+	check("its leaving marks the task closing again", taskOf("leave").closing === true);
+
+	const before = called("sendMessage").length;
+	await endTurn(conductor, "Closing: every member is done.");
+	const sentNotice = called("sendMessage")
+		.slice(before)
+		.some((m) => String(m.body.text).includes("every member is done"));
+	await conductor.pump(150);
+	check("the closing conductor's notice goes out and the conductor closes after it", sentNotice && shutdowns === 1);
+
+	// The notice never goes out: another closing conductor still closes once the wait for it runs out.
+	const silentId = "0d0e0500-0000-7000-8000-000000000008";
+	writeTask("silent", silentId, []);
+	writeFileSync(join(tasksDir, "silent.json"), JSON.stringify({ ...taskOf("silent"), closing: true }));
+	const silent = spawn(silentId, join(tasksDir, "silent"));
+	let silentShutdowns = 0;
+	silent.ctx.shutdown = () => {
+		silentShutdowns += 1;
+	};
+	await silent.fire("session_start");
+	const realNow = performance.now.bind(performance);
+	writeConfig({ notifyOnTurnEnd: false });
+	silent.heartbeat();
+	const setClosing = (closing) =>
+		writeFileSync(join(tasksDir, "silent.json"), JSON.stringify({ ...taskOf("silent"), closing }));
+	// A session joins between the turn end and the close, so the conductor stays.
+	await endTurn(silent, "About to close.");
+	setClosing(false);
+	performance.now = () => realNow() + 31_000;
+	await silent.pump(150);
+	performance.now = realNow;
+	check("a conductor whose task gained a member before it closed stays open", silentShutdowns === 0);
+	setClosing(true);
+	await endTurn(silent, "Nobody hears this.");
+	await silent.pump(150);
+	const early = silentShutdowns;
+	performance.now = () => realNow() + 31_000;
+	await silent.pump(150);
+	performance.now = realNow;
+	writeConfig();
+	check(
+		"a closing conductor whose notice is never sent closes once the wait runs out",
+		early === 0 && silentShutdowns === 1,
+	);
+
+	// The member is already gone from the task by the time its own close takes the task lock.
+	const e = spawn("0d0e0500-0000-7000-8000-000000000009", "/home/dev/work/e");
+	await e.fire("session_start");
+	writeTask("raced", ids.conductor, [e.id, ids.d]);
+	const taskLock = join(tasksDir, "tasks.lock");
+	const leadsBefore = existsSync(join(stateDir, "graph/pending", ids.conductor))
+		? readdirSync(join(stateDir, "graph/pending", ids.conductor)).length
+		: 0;
+	writeFileSync(taskLock, "");
+	const closingE = e.fire("session_shutdown");
+	await settle(60);
+	writeFileSync(
+		join(tasksDir, "raced.json"),
+		JSON.stringify({ ...taskOf("raced"), members: [{ session: ids.d, joinedAt: 1 }] }),
+	);
+	rmSync(taskLock);
+	await closingE;
+	const leadsAfter = existsSync(join(stateDir, "graph/pending", ids.conductor))
+		? readdirSync(join(stateDir, "graph/pending", ids.conductor)).length
+		: 0;
+	check(
+		"a member already gone when its close takes the lock changes nothing and tells no one",
+		taskOf("raced")
+			.members.map((m) => m.session)
+			.join() === ids.d && leadsAfter === leadsBefore,
+	);
+	rmSync(join(tasksDir, "raced.json"));
+
+	await sessions.d.fire("session_shutdown");
+	check(
+		"the last member of a task whose conductor is down leaves it dormant without a notice",
+		taskOf("orphan").state === "dormant" &&
+			taskOf("orphan").closing === false &&
+			!existsSync(join(stateDir, "graph/pending", ids.ghost)),
+	);
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
