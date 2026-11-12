@@ -20617,6 +20617,64 @@ heading("conductor verdicts on the register");
 		unsent.includes("could not be sent") && entry("Split the module").status === "proposed",
 	);
 	check("a tap on an objection nobody knows says so", (await tap("v:0000ffff:u", 10013, 1)).includes("no longer"));
+
+	const taskLock = join(tasksDir, "tasks.lock");
+	for (const action of ["accept", "object"]) {
+		for (const moved of ["accepted", "done", "abandoned", "missing entry", "missing task"]) {
+			const title = `${action} racing ${moved}`;
+			await tool(author, { action: "claim", title });
+			const id = entry(title).id;
+			const before = JSON.parse(readFileSync(taskFile, "utf8"));
+			writeFileSync(taskLock, "");
+			const verdict = text(conductor, { action, entry: id, reason: "Wait for review." });
+			await settle(30);
+			const current = {
+				...before,
+				register:
+					moved === "missing entry"
+						? before.register.filter((e) => e.id !== id)
+						: before.register.map((e) => (e.id === id ? { ...e, status: moved } : e)),
+			};
+			if (moved === "missing task") rmSync(taskFile);
+			else writeFileSync(taskFile, JSON.stringify(current));
+			rmSync(taskLock, { force: true });
+			const result = await verdict;
+			const expected = moved.startsWith("missing") ? "gone" : moved;
+			check(
+				`${action} refuses an entry that became ${moved} while waiting for the task lock`,
+				result.includes(`already ${expected}`) &&
+					(moved === "missing task"
+						? !existsSync(taskFile)
+						: moved === "missing entry"
+							? entry(title) === undefined
+							: entry(title).status === moved),
+			);
+			writeFileSync(taskFile, JSON.stringify(before));
+		}
+	}
+
+	await tool(author, { action: "claim", title: "Sending an objection" });
+	const sendingId = entry("Sending an objection").id;
+	const sendGate = Promise.withResolvers();
+	const sendDeadline = setTimeout(() => sendGate.resolve(), 2_000);
+	api.sendMessageGate = sendGate.promise;
+	const sending = tool(conductor, { action: "object", entry: sendingId, reason: "Review first." });
+	await settle(50);
+	check("an objection is claimed before its card is sent", entry("Sending an objection").status === "objected");
+	jump(10 * 60_000 + 1_000);
+	poller.heartbeat();
+	await settle(100);
+	check(
+		"ten minute acceptance leaves an objection whose card is still sending alone",
+		entry("Sending an objection").status === "objected",
+	);
+	await tool(author, { action: "close", entry: sendingId, outcome: "done" });
+	api.sendMessageGate = null;
+	sendGate.resolve();
+	clearTimeout(sendDeadline);
+	await sending;
+	check("a card finishing its send cannot reopen a closed entry", entry("Sending an objection").status === "done");
+	clockSkew = 0;
 }
 
 heading("member updates and the conductor's silence check");

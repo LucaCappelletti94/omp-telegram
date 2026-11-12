@@ -8283,21 +8283,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (target === undefined) return refuse(`No entry ${id} in the task "${conducted.name}".`);
 		if (target.status !== "proposed") return refuse(`Entry ${id} is already ${target.status}, so it takes no verdict.`);
 		const author = titleOf(target.author);
-		const settle = (status: "accepted" | "objected", reason: string) =>
-			updateTask(TASKS_DIR, conducted.slug, (task) => ({
-				task: {
-					...task,
-					register: task.register.map((e) => (e.id === id ? { ...e, status, reason, decidedAt: Date.now() } : e)),
-				},
-				result: null,
-			}));
+		const settle = async (from: Entry["status"], status: Entry["status"], reason: string): Promise<string> =>
+			(await updateTask(TASKS_DIR, conducted.slug, (task) => {
+				const found = task.register.find((e) => e.id === id)?.status ?? "gone";
+				if (found !== from) return { task: null, result: found };
+				const register = task.register.map((e) => (e.id === id ? { ...e, status, reason, decidedAt: Date.now() } : e));
+				return { task: { ...task, register }, result: "applied" };
+			})) ?? "gone";
 		if (q.action === "accept") {
-			await settle("accepted", "");
+			const accepted = await settle("proposed", "accepted", "");
+			if (accepted !== "applied") return refuse(`Entry ${id} is already ${accepted}, so it takes no verdict.`);
 			sendLead(conducted, `The conductor accepted your ${target.kind} ${id}, ${target.title}.`, { to: target.author });
 			return { content: [{ type: "text", text: `Accepted ${target.kind} ${id}.` }], details: {} };
 		}
 		const reason = (q.reason ?? "").trim();
 		if (reason === "") return refuse("Say in `reason` why you object, since the author and the user read it.");
+		const objected = await settle("proposed", "objected", reason);
+		if (objected !== "applied") return refuse(`Entry ${id} is already ${objected}, so it takes no verdict.`);
 		const body = `${author} proposes the ${target.kind} **${target.title}** in the task **${conducted.name}**.${target.body === "" ? "" : `\n${target.body}`}\n\nThe conductor objects: ${reason}`;
 		const sent = await notify(ctx, "notice", "\u{1F6D1} Objection", body, {
 			reply_markup: {
@@ -8310,9 +8312,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			},
 		});
 		if (!isTelegramMessageId(sent?.message_id)) {
+			await settle("objected", "proposed", "");
 			return refuse("The objection card could not be sent, so nothing changed. Try again.");
 		}
-		await settle("objected", reason);
 		sendLead(
 			conducted,
 			`The conductor objects to your ${target.kind} ${id}, ${target.title}: ${reason} Hold off until the user upholds or overrules the objection, and you hear which.`,
