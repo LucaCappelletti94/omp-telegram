@@ -20643,6 +20643,22 @@ heading("the task register");
 		"an author moved to a continuation id keeps its entries",
 		register().find((e) => e.title === "Follow up").author === ids.b2,
 	);
+
+	const departedPending = join(stateDir, "graph/pending", ids.a);
+	rmSync(departedPending, { recursive: true, force: true });
+	const beforeAcceptance = called("sendMessage").length;
+	jump(10 * 60_000 + 1_000);
+	poller.heartbeat();
+	await settle(300);
+	check(
+		"a departed author's decision stands accepted without a pending lead or resume card",
+		register().find((e) => e.id === newer).status === "accepted" &&
+			(!existsSync(departedPending) || readdirSync(departedPending).length === 0) &&
+			!called("sendMessage")
+				.slice(beforeAcceptance)
+				.some((c) => c.body.reply_markup?.inline_keyboard.flat().some((b) => b.callback_data === `r:${ids.a}`)),
+	);
+	clockSkew = 0;
 }
 
 heading("conductor verdicts on the register");
@@ -20848,6 +20864,39 @@ heading("conductor verdicts on the register");
 	await sending;
 	check("a card finishing its send cannot reopen a closed entry", entry("Sending an objection").status === "done");
 	clockSkew = 0;
+
+	for (const title of ["Departed acceptance", "Departed uphold", "Departed overrule"]) {
+		await tool(author, { action: "propose", title });
+	}
+	await author.pump(150);
+	await author.fire("session_shutdown");
+	const departedPending = join(stateDir, "graph/pending", ids.author);
+	rmSync(departedPending, { recursive: true, force: true });
+	const noDepartedLead = () =>
+		!existsSync(departedPending) || !readdirSync(departedPending).some((name) => name.startsWith("lead-"));
+	const beforeDeparted = called("sendMessage").length;
+	await tool(conductor, { action: "accept", entry: entry("Departed acceptance").id });
+	check(
+		"accepting a departed author's decision sends no pending lead",
+		entry("Departed acceptance").status === "accepted" && noDepartedLead(),
+	);
+	for (const [i, answer] of ["uphold", "overrule"].entries()) {
+		const title = `Departed ${answer}`;
+		await tool(conductor, { action: "object", entry: entry(title).id, reason: "Review first." });
+		check(`objecting before ${answer} sends no lead to a departed author`, noDepartedLead());
+		await tap(`v:${entry(title).id}:${answer === "uphold" ? "u" : "o"}`, 10020 + i, 790 + i);
+		check(
+			`${answer} settles a departed author's objection without a pending lead`,
+			(answer === "uphold" ? entry(title).upheld : entry(title).status === "accepted") && noDepartedLead(),
+		);
+	}
+	await settle(100);
+	check(
+		"verdicts and rulings offer no resume card for a departed author",
+		!called("sendMessage")
+			.slice(beforeDeparted)
+			.some((c) => c.body.reply_markup?.inline_keyboard.flat().some((b) => b.callback_data === `r:${ids.author}`)),
+	);
 }
 
 heading("member updates and the conductor's silence check");
@@ -21017,6 +21066,22 @@ heading("member updates and the conductor's silence check");
 	check(
 		"an update clears a pending silence check",
 		!member(ids.author).silenceLed && member(ids.author).updateLine === 5,
+	);
+
+	await conductor.fire("session_shutdown");
+	const dormantPending = join(stateDir, "graph/pending", ids.conductor);
+	rmSync(dormantPending, { recursive: true, force: true });
+	const beforeDormant = called("sendMessage").length;
+	await tool(author, { action: "update", text: "The task is dormant." });
+	await settle(100);
+	check(
+		"a dormant task records a member update without a pending lead or conductor resume card",
+		task().state === "dormant" &&
+			member(ids.author).updateLine === 5 &&
+			(!existsSync(dormantPending) || readdirSync(dormantPending).length === 0) &&
+			!called("sendMessage")
+				.slice(beforeDormant)
+				.some((c) => c.body.reply_markup?.inline_keyboard.flat().some((b) => b.callback_data === `r:${ids.conductor}`)),
 	);
 	clockSkew = 0;
 }

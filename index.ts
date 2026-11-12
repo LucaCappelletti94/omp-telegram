@@ -8301,7 +8301,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (q.action === "accept") {
 			const accepted = await settle("proposed", "accepted", "");
 			if (accepted !== "applied") return refuse(`Entry ${id} is already ${accepted}, so it takes no verdict.`);
-			sendLead(conducted, `The conductor accepted your ${target.kind} ${id}, ${target.title}.`, { to: target.author });
+			if (conducted.members.some((m) => m.session === target.author)) {
+				sendLead(conducted, `The conductor accepted your ${target.kind} ${id}, ${target.title}.`, {
+					to: target.author,
+				});
+			}
 			return { content: [{ type: "text", text: `Accepted ${target.kind} ${id}.` }], details: {} };
 		}
 		const reason = (q.reason ?? "").trim();
@@ -8323,11 +8327,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			await settle("objected", "proposed", "");
 			return refuse("The objection card could not be sent, so nothing changed. Try again.");
 		}
-		sendLead(
-			conducted,
-			`The conductor objects to your ${target.kind} ${id}, ${target.title}: ${reason} Hold off until the user upholds or overrules the objection, and you hear which.`,
-			{ to: target.author },
-		);
+		if (conducted.members.some((m) => m.session === target.author)) {
+			sendLead(
+				conducted,
+				`The conductor objects to your ${target.kind} ${id}, ${target.title}: ${reason} Hold off until the user upholds or overrules the objection, and you hear which.`,
+				{ to: target.author },
+			);
+		}
 		return {
 			content: [
 				{ type: "text", text: `Objected to ${target.kind} ${id}. The user upholds or overrules it on Telegram.` },
@@ -8359,13 +8365,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (settled !== null) {
 			const { task, target } = settled;
 			const chosen = answer === "o" ? "Overrule" : "Uphold";
-			sendLead(
-				task,
-				answer === "o"
-					? `The user overruled the objection to your ${target.kind} ${id}, ${target.title}, so go ahead.`
-					: `The user upheld the objection to your ${target.kind} ${id}, ${target.title}, so do not go ahead with it.`,
-				{ to: target.author },
-			);
+			if (task.members.some((m) => m.session === target.author)) {
+				sendLead(
+					task,
+					answer === "o"
+						? `The user overruled the objection to your ${target.kind} ${id}, ${target.title}, so go ahead.`
+						: `The user upheld the objection to your ${target.kind} ${id}, ${target.title}, so do not go ahead with it.`,
+					{ to: target.author },
+				);
+			}
 			await callTelegram(
 				cfg,
 				"editMessageReplyMarkup",
@@ -8445,7 +8453,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				},
 				result: null,
 			}));
-			sendLead(task, `${titleOf(sessionId)} (session ${sessionId}) sends an update: ${text}`, { about: sessionId });
+			if (task.state === "live") {
+				sendLead(task, `${titleOf(sessionId)} (session ${sessionId}) sends an update: ${text}`, { about: sessionId });
+			}
 			return reply(`Sent your update to the conductor of "${task.name}".`);
 		}
 		if (q.action === "claim" || q.action === "propose") {
@@ -8525,7 +8535,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		for (const listed of listTasks(TASKS_DIR)) {
 			if (!listed.register.some(due)) continue;
 			await updateTask(TASKS_DIR, listed.slug, (task) => {
-				for (const e of task.register.filter(due)) {
+				for (const e of task.register.filter((e) => due(e) && task.members.some((m) => m.session === e.author))) {
 					sendLead(
 						task,
 						`Your ${e.kind} ${e.id}, ${e.title}, stands accepted, since the conductor did not object within ten minutes.`,
