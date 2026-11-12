@@ -130,6 +130,11 @@ export interface WatchReview {
 	body: string;
 	submittedAt: string;
 }
+export interface ParentMerge {
+	number: number;
+	mergedAt: string;
+	url: string;
+}
 
 export interface WatchPrData {
 	number: number;
@@ -145,6 +150,7 @@ export interface WatchPrData {
 	baseOid: string;
 	/** The default branch of the repository it merges into, empty when GitHub could not show that repository. */
 	defaultBranch: string;
+	parentMerge: ParentMerge | null;
 }
 
 export const PR_EVENTS = ["merged", "closed", "review", "ci-red", "ci-green", "gone"] as const;
@@ -171,18 +177,19 @@ export interface PrWatch {
 	/** The base branch and its commit at the last poll, null before a poll recorded them. */
 	base: string | null;
 	baseOid: string | null;
+	/** Merges predating this base selection belong to an earlier use of the branch. */
+	baseSince: number;
+	parentMerge: number | null;
 }
 
 /** What happened to the branch a stacked pull request builds on, which the members' conductor hears of. */
-export interface ParentChange {
-	/** `moved` when the parent branch gained or lost commits, `merged` when GitHub rebased the pull request onto the default branch. */
-	kind: "moved" | "merged";
+export type ParentChange = ({ kind: "moved" } | { kind: "merged"; merge: ParentMerge }) & {
 	/** The branch the pull request was stacked on. */
 	parent: string;
 	/** The branch it now merges into, and that branch's commit. */
 	base: string;
 	oid: string;
-}
+};
 
 export type WatchEvent =
 	| { event: "merged" }
@@ -238,6 +245,7 @@ export interface WatchQueryEntry {
 	owner: string;
 	name: string;
 	number: number;
+	base?: string | null;
 }
 
 /** One batched GraphQL query, with an aliased `repository { pullRequest }` per watched pull request. */
@@ -249,14 +257,16 @@ export function buildWatchQuery(entries: readonly WatchQueryEntry[]): string {
 		"headRefOid",
 		"baseRefName",
 		"baseRefOid",
-		"baseRepository { defaultBranchRef { name } }",
 		"reviews(last: 50) { nodes { id author { login } state body submittedAt } }",
 		"statusCheckRollup { commit { oid } contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } }",
 	].join("\n");
-	const aliases = entries.map(
-		(entry) =>
-			`${entry.alias}: repository(owner: "${entry.owner}", name: "${entry.name}") { pullRequest(number: ${entry.number}) { ${fields} } }`,
-	);
+	const aliases = entries.map((entry) => {
+		const parent = entry.base
+			? ` pullRequests(headRefName: ${JSON.stringify(entry.base)}, states: MERGED, orderBy: {field: CREATED_AT, direction: ASC}, last: 1) { nodes { number mergedAt url } }`
+			: "";
+		const repository = `baseRepository { defaultBranchRef { name }${parent} }`;
+		return `${entry.alias}: repository(owner: "${entry.owner}", name: "${entry.name}") { pullRequest(number: ${entry.number}) { ${fields}\n${repository} } }`;
+	});
 	return `query {\n${aliases.join("\n")}\n}`;
 }
 
@@ -278,7 +288,10 @@ interface GqlPullRequest {
 	baseRefName: string;
 	baseRefOid: string;
 	/** Null when GitHub cannot show the repository the pull request merges into. */
-	baseRepository: { defaultBranchRef: { name: string } | null } | null;
+	baseRepository: {
+		defaultBranchRef: { name: string } | null;
+		pullRequests?: { nodes: ParentMerge[] };
+	} | null;
 	reviews: {
 		nodes: { id: string; author: { login: string } | null; state: string; body: string; submittedAt: string | null }[];
 	};
@@ -344,6 +357,7 @@ function watchPrOf(pr: GqlPullRequest): WatchPrData {
 		base: pr.baseRefName,
 		baseOid: pr.baseRefOid,
 		defaultBranch: pr.baseRepository?.defaultBranchRef?.name ?? "",
+		parentMerge: pr.baseRepository?.pullRequests?.nodes[0] ?? null,
 	};
 }
 
@@ -352,13 +366,24 @@ function watchPrOf(pr: GqlPullRequest): WatchPrData {
  * request GitHub no longer finds. A merged, closed or gone pull request ends the watch, and an ended
  * watch reports nothing again.
  */
-export function diffWatch(watch: PrWatch, data: WatchPrData | null): { events: WatchEvent[]; next: PrWatch } {
+export function diffWatch(
+	watch: PrWatch,
+	data: WatchPrData | null,
+	now = Date.now(),
+): { events: WatchEvent[]; next: PrWatch } {
 	if (watch.ended) return { events: [], next: watch };
 	if (data === null) return { events: [{ event: "gone" }], next: { ...watch, ended: true } };
 	if (data.state === "MERGED") return { events: [{ event: "merged" }], next: { ...watch, ended: true } };
 	if (data.state === "CLOSED") return { events: [{ event: "closed" }], next: { ...watch, ended: true } };
 	const events: WatchEvent[] = [];
-	const next: PrWatch = { ...watch, reviews: [...watch.reviews], base: data.base, baseOid: data.baseOid };
+	const next: PrWatch = {
+		...watch,
+		reviews: [...watch.reviews],
+		base: data.base,
+		baseOid: data.baseOid,
+		baseSince: data.base === watch.base ? watch.baseSince : now,
+		parentMerge: data.parentMerge?.number ?? watch.parentMerge,
+	};
 	// The first poll of an unseeded watch only records what is already true.
 	if (!watch.seeded) {
 		next.seeded = true;
@@ -398,15 +423,13 @@ export function diffWatch(watch: PrWatch, data: WatchPrData | null): { events: W
 	return { events, next };
 }
 
-/**
- * The change to the parent of a pull request stacked on another branch since the last poll, null when the pull request is
- * not open, was never polled with its base, merges into the default branch, or its parent did not change.
- */
+/** A fresh parent merge, or a changed base on an open stacked pull request. */
 export function parentChange(watch: PrWatch, data: WatchPrData | null): ParentChange | null {
-	if (data === null || data.state !== "OPEN" || watch.base === null || watch.base === data.defaultBranch) return null;
-	if (data.base === data.defaultBranch)
-		return { kind: "merged", parent: watch.base, base: data.base, oid: data.baseOid };
-	if (data.baseOid === watch.baseOid) return null;
+	if (data === null || watch.ended || watch.base === null || watch.base === data.defaultBranch) return null;
+	const merge = data.parentMerge;
+	if (merge !== null && merge.number !== watch.parentMerge && Date.parse(merge.mergedAt) > watch.baseSince)
+		return { kind: "merged", parent: watch.base, base: data.base, oid: data.baseOid, merge };
+	if (data.state !== "OPEN" || (data.base === watch.base && data.baseOid === watch.baseOid)) return null;
 	return { kind: "moved", parent: watch.base, base: data.base, oid: data.baseOid };
 }
 

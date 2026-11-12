@@ -385,6 +385,10 @@ const watch = (extra = {}) => ({
 	redSent: false,
 	greenSent: false,
 	reviews: [],
+	base: null,
+	baseOid: null,
+	baseSince: NOW,
+	parentMerge: null,
 	...extra,
 });
 const review = (id, author = "alice", state = "COMMENTED", body = "a note", at = "2026-11-07T10:00:00Z") => ({
@@ -405,6 +409,7 @@ const prData = (state, extra = {}) => ({
 	base: "main",
 	baseOid: "m1",
 	defaultBranch: "main",
+	parentMerge: null,
 	...extra,
 });
 const first = diffWatch(
@@ -531,11 +536,42 @@ check(
 	JSON.stringify(parentChange(stacked, prData("OPEN", { base: "feat", baseOid: "f2" }))) ===
 		JSON.stringify({ kind: "moved", parent: "feat", base: "feat", oid: "f2" }),
 );
+const mergedParent = { number: 6, mergedAt: new Date(NOW + 1000).toISOString(), url: "https://github.com/o/r/pull/6" };
+const keptParent = prData("OPEN", { base: "feat", baseOid: "f1", parentMerge: mergedParent });
+check("a merged parent with its branch kept reports merged", parentChange(stacked, keptParent)?.kind === "merged");
 check(
-	"a pull request GitHub moved onto the default branch had its parent merged",
-	JSON.stringify(parentChange(stacked, prData("OPEN", { base: "main", baseOid: "m2" }))) ===
-		JSON.stringify({ kind: "merged", parent: "feat", base: "main", oid: "m2" }),
+	"a merged parent with its branch deleted and child moved reports merged",
+	parentChange(stacked, prData("OPEN", { base: "main", baseOid: "m2", parentMerge: mergedParent }))?.kind === "merged",
 );
+check(
+	"a deleted parent branch that closes its child still reports the merge",
+	parentChange(stacked, { ...keptParent, state: "CLOSED" })?.kind === "merged",
+);
+check(
+	"a base moved by hand to the default branch reports moved",
+	parentChange(stacked, prData("OPEN", { base: "main", baseOid: "f1" }))?.kind === "moved",
+);
+check(
+	"a merge is recorded and reported only once",
+	diffWatch(stacked, keptParent).next.parentMerge === 6 &&
+		parentChange(diffWatch(stacked, keptParent).next, keptParent) === null,
+);
+check(
+	"an older merge on a reused branch is ignored",
+	parentChange(stacked, {
+		...keptParent,
+		parentMerge: { ...mergedParent, mergedAt: new Date(NOW - 1000).toISOString() },
+	}) === null,
+);
+check(
+	"a newly selected base starts a fresh merge window",
+	diffWatch(stacked, prData("OPEN", { base: "other" }), NOW + 2000).next.baseSince === NOW + 2000,
+);
+check(
+	"commits on the same base preserve its merge window",
+	diffWatch(stacked, prData("OPEN", { base: "feat", baseOid: "f2" }), NOW + 2000).next.baseSince === NOW,
+);
+check("an ended watch does not repeat a parent merge", parentChange({ ...stacked, ended: true }, keptParent) === null);
 check(
 	"an unchanged parent, a pull request on the default branch, one never polled with a base and one no longer open change nothing",
 	parentChange(stacked, prData("OPEN", { base: "feat", baseOid: "f1" })) === null &&
@@ -556,6 +592,13 @@ check(
 	query.includes('w0: repository(owner: "o", name: "r")') &&
 		query.includes('w1: repository(owner: "other", name: "repo")'),
 );
+const quotedParent = 'feat/"quoted\\branch';
+check(
+	"the query asks the base repository for the safely escaped previous parent branch",
+	buildWatchQuery([{ ...entries[0], base: quotedParent }]).includes(
+		`baseRepository { defaultBranchRef { name } pullRequests(headRefName: ${JSON.stringify(quotedParent)}, states: MERGED, orderBy: {field: CREATED_AT, direction: ASC}, last: 1) { nodes { number mergedAt url } } }`,
+	),
+);
 // The exact per-pull-request field set verified live against the GraphQL API. Any drift in
 // buildWatchQuery fails the suite.
 const verifiedFields = [
@@ -565,9 +608,9 @@ const verifiedFields = [
 	"headRefOid",
 	"baseRefName",
 	"baseRefOid",
-	"baseRepository { defaultBranchRef { name } }",
 	"reviews(last: 50) { nodes { id author { login } state body submittedAt } }",
 	"statusCheckRollup { commit { oid } contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } }",
+	"baseRepository { defaultBranchRef { name } }",
 ].join("\n");
 check(
 	"the query matches the shape verified against the live GraphQL API",
@@ -662,6 +705,19 @@ check(
 check(
 	"a base repository GitHub cannot show leaves the default branch unknown",
 	parsed.get("w1").data.defaultBranch === "",
+);
+const parentAnswer = response();
+parentAnswer.data.w0.pullRequest.baseRepository.pullRequests = { nodes: [mergedParent] };
+check(
+	"the parent merge number, time and URL survive data mapping",
+	JSON.stringify(parseWatchQuery(parentAnswer, ["w0"]).get("w0").data.parentMerge) === JSON.stringify(mergedParent),
+);
+parentAnswer.data.w0.pullRequest.baseRepository.pullRequests.nodes = [];
+check(
+	"an empty parent query and an unavailable base repository map to no merge",
+	parseWatchQuery(parentAnswer, ["w0"]).get("w0").data.parentMerge === null &&
+		parsed.get("w1").data.parentMerge === null &&
+		liveParsed.get("w0").data.parentMerge === null,
 );
 const pathless = parseWatchQuery({ ...response(), errors: [{ message: "Something went wrong." }] }, ["w0", "w1"]);
 check(
