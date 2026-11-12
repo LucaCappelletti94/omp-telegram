@@ -11651,8 +11651,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		stepRunning = true;
 	});
 
+	// omp starts the next step at once, so the leads held through this one leave now rather than on the next tick.
 	pi.on("turn_end", async () => {
 		stepRunning = false;
+		drainPending();
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
