@@ -15536,15 +15536,21 @@ const vsRetire = (id) =>
 	old.kill("SIGKILL");
 }
 
-// The same shape with omp's own children, a worker and the Python eval kernel, passes the gate, and a resume
-// nobody confirms is reported once.
+// The same shape with omp's own children, workers named either way omp starts them and the Python eval kernel,
+// passes the gate, and a resume nobody confirms is reported once.
 {
 	const folder = vsFolder("worker-child");
 	const runnerDir = join(root, "omp-python-runner-1000");
 	mkdirSync(runnerDir, { recursive: true });
 	const runner = join(runnerDir, "runner-test.py");
 	writeFileSync(runner, "import time\ntime.sleep(600)\n");
-	const old = dummy("bash", "-c", `( exec -a __omp_worker_test sleep 600 ) & python3 -u '${runner}' & wait`);
+	// omp also starts a worker as its own binary with the worker name as the first argument.
+	writeFileSync(join(runnerDir, "__omp_worker_daemon_broker"), "sleep 600\n");
+	const old = dummy(
+		"bash",
+		"-c",
+		`( exec -a __omp_worker_test sleep 600 ) & ( cd '${runnerDir}' && exec -a /usr/bin/omp bash __omp_worker_daemon_broker ) & python3 -u '${runner}' & wait`,
+	);
 	const stale = spawn("01a1f117-0000-7000-8000-000000000017", folder, "Stale seven");
 	await stale.fire("session_start");
 	const transcript = vsTranscript(stale.id);
