@@ -20133,7 +20133,10 @@ heading("completion cards close finished members");
 	rmSync(tasksDir, { recursive: true, force: true });
 	mkdirSync(tasksDir, { recursive: true });
 	const ids = Object.fromEntries(
-		["poller", "conductor", "m1", "m2", "m3"].map((name, i) => [name, `0d0e0800-0000-7000-8000-00000000000${i + 1}`]),
+		["poller", "conductor", "m1", "m2", "m3", "m4", "m5"].map((name, i) => [
+			name,
+			`0d0e0800-0000-7000-8000-00000000000${i + 1}`,
+		]),
 	);
 	const taskFile = join(tasksDir, "ship.json");
 	writeFileSync(
@@ -20145,7 +20148,7 @@ heading("completion cards close finished members");
 			conductor: ids.conductor,
 			state: "live",
 			launchedAt: 0,
-			members: [ids.m1, ids.m2, ids.m3].map((session) => ({ session, joinedAt: 1 })),
+			members: [ids.m1, ids.m2, ids.m3, ids.m4, ids.m5].map((session) => ({ session, joinedAt: 1 })),
 			candidates: [],
 			led: [],
 			closing: false,
@@ -20160,7 +20163,7 @@ heading("completion cards close finished members");
 	await conductor.fire("session_start");
 	const members = {};
 	const shutdowns = {};
-	for (const name of ["m1", "m2", "m3"]) {
+	for (const name of ["m1", "m2", "m3", "m4", "m5"]) {
 		members[name] = spawn(ids[name], `/home/dev/work/${name}`);
 		shutdowns[name] = 0;
 		members[name].ctx.shutdown = () => {
@@ -20253,6 +20256,32 @@ heading("completion cards close finished members");
 		"a member closing before Luca answers settles its completion card as closed",
 		findingAbout(ids.m3).state === "resolved" &&
 			called("editMessageReplyMarkup").some((c) => c.body.message_id === third.messageId),
+	);
+
+	await complete("m4", { message: "The work is finished.", tell: true });
+	const told = findingAbout(ids.m4);
+	check("a completion sent to its member is recorded as told", told.state === "told");
+	await tap(`k:${tag("m4")}`, 10002, told.messageId);
+	await members.m4.pump(200);
+	check("a told completion card closes its member through its close button", shutdowns.m4 === 1);
+	await members.m4.fire("session_shutdown");
+	check(
+		"closing through a told completion card resolves the finding and removes its buttons",
+		findingAbout(ids.m4).state === "resolved" &&
+			called("editMessageReplyMarkup").some(
+				(c) => c.body.message_id === told.messageId && c.body.reply_markup.inline_keyboard.length === 0,
+			),
+	);
+
+	await complete("m5", { message: "The work is finished.", tell: true });
+	const toldBeforeClose = findingAbout(ids.m5);
+	await members.m5.fire("session_shutdown");
+	check(
+		"a member closing without a button press settles its told completion card",
+		findingAbout(ids.m5).state === "resolved" &&
+			called("editMessageReplyMarkup").some(
+				(c) => c.body.message_id === toldBeforeClose.messageId && c.body.reply_markup.inline_keyboard.length === 0,
+			),
 	);
 }
 
