@@ -99,6 +99,7 @@ heading("task files");
 		],
 		silenceHours: 2,
 		followed: "m",
+		overlaps: [{ pair: "m n", files: ["src/a.ts"] }],
 	};
 	const made = await changeTask(dir, "docs-pass", (task) => ({ task: task === null ? fresh : task, result: task }));
 	check("an absent task reads as null inside the change", made === null);
@@ -141,7 +142,7 @@ heading("task files");
 		"an update of a slug outside the pattern gives null",
 		(await updateTask(dir, "../escape", () => ({ task: fresh, result: "seen" }))) === null,
 	);
-	const { members, candidates, led, closing, findings, register, silenceHours, followed, ...older } = fresh;
+	const { members, candidates, led, closing, findings, register, silenceHours, followed, overlaps, ...older } = fresh;
 	writeFileSync(join(dir, "older.json"), JSON.stringify({ ...older, slug: "older" }));
 	const plain = readTask(dir, "older");
 	check(
@@ -153,7 +154,8 @@ heading("task files");
 			plain.findings.length === 0 &&
 			plain.register.length === 0 &&
 			plain.silenceHours === 4 &&
-			plain.followed === "",
+			plain.followed === "" &&
+			plain.overlaps.length === 0,
 	);
 	writeFileSync(
 		join(dir, "mixed.json"),
@@ -176,6 +178,7 @@ heading("task files");
 			],
 			silenceHours: 0,
 			followed: 5,
+			overlaps: [null, { pair: 1, files: [] }, { pair: "x y", files: [2] }, { pair: "x y", files: "a" }, ...overlaps],
 			candidates: [
 				{ session: "c", card: "x", state: "joined" },
 				{ session: "c", card: 3, state: "proposed" },
@@ -232,6 +235,10 @@ heading("task files");
 	);
 	check("a silence limit that is not a positive number reads as 4 hours", mixed.silenceHours === 4);
 	check("a followed member that is not a session id reads as none", mixed.followed === "");
+	check(
+		"malformed overlap records are dropped, well-formed ones kept",
+		JSON.stringify(mixed.overlaps) === JSON.stringify(overlaps),
+	);
 	rmSync(dir, { recursive: true, force: true });
 }
 

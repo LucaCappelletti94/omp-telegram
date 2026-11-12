@@ -916,6 +916,8 @@ const RESUME_START_MS = 60_000;
 const CLOSE_NOTICE_WAIT_MS = 30_000;
 /** How long a proposed register entry waits for the conductor before it stands accepted. */
 const REGISTER_WAIT_MS = 10 * 60_000;
+/** How often the poller compares the files members of one repository change. */
+const OVERLAP_CHECK_MS = 10 * 60_000;
 /** What a tap gets when its window is already opening. */
 const ALREADY_STARTING = "That session is already starting.";
 /** A pending or failed launch request is answered by expiry seven days after it was made. */
@@ -7178,6 +7180,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let lastWatchPrune = 0;
 	let watchPollInFlight = false;
 	let lastPriorityTick = 0;
+	let lastOverlapCheck = 0;
 	/** The tally and its effects while they run, so a tick never starts a second one and shutdown can wait for it. */
 	let priorityWork: Promise<void> | null = null;
 
@@ -7808,6 +7811,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				register: [],
 				silenceHours: DEFAULT_SILENCE_HOURS,
 				followed: "",
+				overlaps: [],
 			};
 			return { task: fresh, result: { kind: "open", task: fresh } };
 		});
@@ -8519,6 +8523,71 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					},
 					result: null,
 				};
+			});
+		}
+	}
+
+	/** What a member's folder changes against its repository's default branch, or null outside a checkout with an `origin`. */
+	async function branchFiles(cwd: string): Promise<{ repo: string; branch: string; files: string[] } | null> {
+		const git = (...args: string[]) => run("git", ["-C", cwd, ...args], 10_000);
+		const origin = await git("config", "--get", "remote.origin.url");
+		const base = await git("merge-base", "origin/HEAD", "HEAD");
+		if (!origin.ok || !base.ok) return null;
+		const [branch, changed, untracked] = await Promise.all([
+			git("rev-parse", "--abbrev-ref", "HEAD"),
+			git("diff", "--name-only", base.stdout),
+			git("ls-files", "--others", "--exclude-standard"),
+		]);
+		const files = [...new Set(`${changed.stdout}\n${untracked.stdout}`.split("\n").filter((f) => f !== ""))].sort();
+		return { repo: origin.stdout, branch: branch.stdout, files };
+	}
+
+	/**
+	 * Leads each live task's conductor once per new set of files two members of one repository both change, counting
+	 * commits since the default branch, uncommitted changes and untracked files. `only` limits the check to the pairs
+	 * holding that member, as at its turn end, and is empty for the poller's check of every pair.
+	 */
+	async function checkOverlaps(only: string): Promise<void> {
+		const folders = new Map(allRecords().map(({ id, record }) => [id, record.cwd]));
+		for (const listed of listTasks(TASKS_DIR)) {
+			if (listed.state !== "live" || (only !== "" && !listed.members.some((m) => m.session === only))) continue;
+			const work = new Map<string, { repo: string; branch: string; files: string[] }>();
+			for (const { session } of listed.members.filter((m) => folders.has(m.session))) {
+				const found = await branchFiles(folders.get(session) as string);
+				if (found !== null) work.set(session, found);
+			}
+			const shared = new Map<string, string[]>();
+			const ids = [...work.keys()].sort();
+			for (const [i, x] of ids.entries()) {
+				for (const y of ids.slice(i + 1)) {
+					if (only !== "" && x !== only && y !== only) continue;
+					const [wx, wy] = [work.get(x), work.get(y)] as [
+						{ repo: string; files: string[] },
+						{ repo: string; files: string[] },
+					];
+					if (wx.repo !== wy.repo) continue;
+					const theirs = new Set(wy.files);
+					shared.set(
+						`${x} ${y}`,
+						wx.files.filter((f) => theirs.has(f)),
+					);
+				}
+			}
+			await updateTask(TASKS_DIR, listed.slug, (task) => {
+				const current = [...shared].filter(([, files]) => files.length > 0).map(([pair, files]) => ({ pair, files }));
+				for (const { pair, files } of current) {
+					const before = task.overlaps.find((o) => o.pair === pair)?.files;
+					if (JSON.stringify(before) === JSON.stringify(files)) continue;
+					const [x, y] = pair.split(" ") as [string, string];
+					const [wx, wy] = [work.get(x), work.get(y)] as [{ branch: string; repo: string }, { branch: string }];
+					const list = clip(files.map((f) => `\`${f}\``).join(", "), 1500);
+					sendLead(
+						task,
+						`${titleOf(x)} on branch \`${wx.branch}\` and ${titleOf(y)} on branch \`${wy.branch}\` both change ${list} in ${wx.repo}.`,
+					);
+				}
+				const overlaps = [...task.overlaps.filter((o) => !shared.has(o.pair)), ...current];
+				return { task: { ...task, overlaps }, result: null };
 			});
 		}
 	}
@@ -11131,6 +11200,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					detach(() => sweepMembers(), "member sweep");
 					detach(() => acceptStale(), "register acceptance");
 					detach(() => checkSilence(), "silence check");
+					if (Date.now() - lastOverlapCheck >= OVERLAP_CHECK_MS) {
+						lastOverlapCheck = Date.now();
+						detach(() => checkOverlaps(""), "overlap check");
+					}
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
 					detachBackground(() => redrawCrashCards(), "crash cards");
@@ -11791,6 +11864,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (turnSummary !== null) {
 			const headline = turnSummary.text.replace(/\n[\s\S]*$/u, "").trim();
 			detach(() => leadConductors(ctx, headline), "conductor leads");
+			detach(() => checkOverlaps(sessionId), "overlap check");
 			// A turn that ends asking the user something waits on the user, and its lines are reviewed with the next turn.
 			if (turnSummary.urgency === "green" && turnSummary.options === undefined) {
 				detach(() => reviewTurn(headline), "focus review");
