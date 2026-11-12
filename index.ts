@@ -11877,11 +11877,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	});
 
 	/**
-	 * Closes a conductor whose last member left, once the turn that ended after that has its notice on Telegram or
+	 * Closes a conductor between turns once its last member left and its notice reached Telegram or
 	 * the wait for it runs out. A session that joined meanwhile cleared the task's closing, which keeps it open.
 	 */
 	function closeWhenNoticed(): void {
-		if (closeAfter === null || closing) return;
+		if (closeAfter === null || closing || turnActive) return;
 		if (lastNotifiedAt < closeAfter.wall && performance.now() - closeAfter.mono < CLOSE_NOTICE_WAIT_MS) return;
 		closeAfter = null;
 		const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId);
