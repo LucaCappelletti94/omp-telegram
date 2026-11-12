@@ -21931,7 +21931,11 @@ esac
 		headRefOid: "h1",
 		baseRefName: base,
 		baseRefOid: baseOid,
-		baseRepository: { defaultBranchRef: { name: "main" }, pullRequests: { nodes: parentMerge ? [parentMerge] : [] } },
+		baseRepository: {
+			nameWithOwner: "someorg/widget",
+			defaultBranchRef: { name: "main" },
+			pullRequests: { nodes: parentMerge ? [parentMerge] : [] },
+		},
 		reviews: { nodes: [] },
 		statusCheckRollup: null,
 	});
@@ -22058,6 +22062,7 @@ esac
 		number: 20,
 		mergedAt: new Date(Date.now() + clockSkew).toISOString(),
 		url: "https://github.com/someorg/widget/pull/20",
+		headRepository: { nameWithOwner: "someorg/widget" },
 	};
 	serveBase("feat-parent", "f2", parentMerge);
 	await poll();

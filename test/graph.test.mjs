@@ -596,7 +596,7 @@ const quotedParent = 'feat/"quoted\\branch';
 check(
 	"the query asks the base repository for the safely escaped previous parent branch",
 	buildWatchQuery([{ ...entries[0], base: quotedParent }]).includes(
-		`baseRepository { defaultBranchRef { name } pullRequests(headRefName: ${JSON.stringify(quotedParent)}, states: MERGED, orderBy: {field: CREATED_AT, direction: ASC}, last: 1) { nodes { number mergedAt url } } }`,
+		`baseRepository { nameWithOwner defaultBranchRef { name } pullRequests(headRefName: ${JSON.stringify(quotedParent)}, states: MERGED, orderBy: {field: CREATED_AT, direction: ASC}, last: 10) { nodes { number mergedAt url headRepository { nameWithOwner } } } }`,
 	),
 );
 // The exact per-pull-request field set verified live against the GraphQL API. Any drift in
@@ -610,7 +610,7 @@ const verifiedFields = [
 	"baseRefOid",
 	"reviews(last: 50) { nodes { id author { login } state body submittedAt } }",
 	"statusCheckRollup { commit { oid } contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } }",
-	"baseRepository { defaultBranchRef { name } }",
+	"baseRepository { nameWithOwner defaultBranchRef { name } }",
 ].join("\n");
 check(
 	"the query matches the shape verified against the live GraphQL API",
@@ -651,7 +651,7 @@ const response = () => ({
 				headRefOid: "h1",
 				baseRefName: "feat",
 				baseRefOid: "f1",
-				baseRepository: { defaultBranchRef: { name: "main" } },
+				baseRepository: { nameWithOwner: "base/project", defaultBranchRef: { name: "main" } },
 				reviews: {
 					nodes: [
 						reviewNode("r1", "alice", "COMMENTED", "hi"),
@@ -707,7 +707,8 @@ check(
 	parsed.get("w1").data.defaultBranch === "",
 );
 const parentAnswer = response();
-parentAnswer.data.w0.pullRequest.baseRepository.pullRequests = { nodes: [mergedParent] };
+const sameRepositoryParent = { ...mergedParent, headRepository: { nameWithOwner: "base/project" } };
+parentAnswer.data.w0.pullRequest.baseRepository.pullRequests = { nodes: [sameRepositoryParent] };
 check(
 	"the parent merge number, time and URL survive data mapping",
 	JSON.stringify(parseWatchQuery(parentAnswer, ["w0"]).get("w0").data.parentMerge) === JSON.stringify(mergedParent),
@@ -719,6 +720,50 @@ check(
 		parsed.get("w1").data.parentMerge === null &&
 		liveParsed.get("w0").data.parentMerge === null,
 );
+const mappedParent = (nodes) => {
+	const answer = response();
+	answer.data.w0.pullRequest.baseRepository.pullRequests = { nodes };
+	return parseWatchQuery(answer, ["w0"]).get("w0").data;
+};
+const forkParent = {
+	...mergedParent,
+	number: 8,
+	mergedAt: new Date(NOW + 2000).toISOString(),
+	headRepository: { nameWithOwner: "fork/project" },
+};
+check(
+	"a fork merge on the same head name after the base window is not a parent merge",
+	mappedParent([forkParent]).parentMerge === null && parentChange(stacked, mappedParent([forkParent])) === null,
+);
+check(
+	"a deleted head repository never counts as a parent merge",
+	parentChange(stacked, mappedParent([{ ...mergedParent, headRepository: null }])) === null,
+);
+for (const nodes of [
+	[forkParent, sameRepositoryParent],
+	[sameRepositoryParent, forkParent],
+]) {
+	check(
+		"a newer fork merge cannot hide the parent from the child's base repository",
+		parentChange(stacked, mappedParent(nodes))?.merge.number === mergedParent.number,
+	);
+}
+const latestParent = {
+	...sameRepositoryParent,
+	number: 9,
+	mergedAt: new Date(NOW + 3000).toISOString(),
+	url: "https://github.com/base/project/pull/9",
+};
+for (const nodes of [
+	[sameRepositoryParent, latestParent],
+	[latestParent, sameRepositoryParent],
+]) {
+	check(
+		"the most recently merged matching parent wins regardless of creation order",
+		JSON.stringify(mappedParent(nodes).parentMerge) ===
+			JSON.stringify({ number: latestParent.number, mergedAt: latestParent.mergedAt, url: latestParent.url }),
+	);
+}
 const pathless = parseWatchQuery({ ...response(), errors: [{ message: "Something went wrong." }] }, ["w0", "w1"]);
 check(
 	"an error naming no alias beside the data leaves every pull request's result standing",

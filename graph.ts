@@ -262,9 +262,9 @@ export function buildWatchQuery(entries: readonly WatchQueryEntry[]): string {
 	].join("\n");
 	const aliases = entries.map((entry) => {
 		const parent = entry.base
-			? ` pullRequests(headRefName: ${JSON.stringify(entry.base)}, states: MERGED, orderBy: {field: CREATED_AT, direction: ASC}, last: 1) { nodes { number mergedAt url } }`
+			? ` pullRequests(headRefName: ${JSON.stringify(entry.base)}, states: MERGED, orderBy: {field: CREATED_AT, direction: ASC}, last: 10) { nodes { number mergedAt url headRepository { nameWithOwner } } }`
 			: "";
-		const repository = `baseRepository { defaultBranchRef { name }${parent} }`;
+		const repository = `baseRepository { nameWithOwner defaultBranchRef { name }${parent} }`;
 		return `${entry.alias}: repository(owner: "${entry.owner}", name: "${entry.name}") { pullRequest(number: ${entry.number}) { ${fields}\n${repository} } }`;
 	});
 	return `query {\n${aliases.join("\n")}\n}`;
@@ -289,8 +289,9 @@ interface GqlPullRequest {
 	baseRefOid: string;
 	/** Null when GitHub cannot show the repository the pull request merges into. */
 	baseRepository: {
+		nameWithOwner: string;
 		defaultBranchRef: { name: string } | null;
-		pullRequests?: { nodes: ParentMerge[] };
+		pullRequests?: { nodes: (ParentMerge & { headRepository: { nameWithOwner: string } | null })[] };
 	} | null;
 	reviews: {
 		nodes: { id: string; author: { login: string } | null; state: string; body: string; submittedAt: string | null }[];
@@ -333,7 +334,7 @@ export function parseWatchQuery(answer: WatchQueryAnswer, aliases: readonly stri
 	return out;
 }
 
-/** The pull request of one alias, without the reviews still pending, which only their author can see. */
+/** Submitted reviews and the latest parent merge from the pull request's base repository. */
 function watchPrOf(pr: GqlPullRequest): WatchPrData {
 	const reviews: WatchReview[] = [];
 	for (const review of pr.reviews.nodes) {
@@ -346,6 +347,19 @@ function watchPrOf(pr: GqlPullRequest): WatchPrData {
 			submittedAt: review.submittedAt,
 		});
 	}
+	let parentMerge: ParentMerge | null = null;
+	const repository = pr.baseRepository;
+	if (repository !== null) {
+		for (const merge of repository.pullRequests?.nodes ?? []) {
+			if (
+				merge.headRepository !== null &&
+				merge.headRepository.nameWithOwner === repository.nameWithOwner &&
+				(parentMerge === null || Date.parse(merge.mergedAt) > Date.parse(parentMerge.mergedAt))
+			) {
+				parentMerge = { number: merge.number, mergedAt: merge.mergedAt, url: merge.url };
+			}
+		}
+	}
 	return {
 		number: pr.number,
 		state: pr.state,
@@ -357,7 +371,7 @@ function watchPrOf(pr: GqlPullRequest): WatchPrData {
 		base: pr.baseRefName,
 		baseOid: pr.baseRefOid,
 		defaultBranch: pr.baseRepository?.defaultBranchRef?.name ?? "",
-		parentMerge: pr.baseRepository?.pullRequests?.nodes[0] ?? null,
+		parentMerge,
 	};
 }
 
