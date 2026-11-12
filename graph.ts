@@ -140,6 +140,11 @@ export interface WatchPrData {
 	commitOid: string | null;
 	reviews: WatchReview[];
 	contexts: WatchContext[];
+	/** The branch the pull request merges into, and the commit that branch points at. */
+	base: string;
+	baseOid: string;
+	/** The default branch of the repository it merges into, empty when GitHub could not show that repository. */
+	defaultBranch: string;
 }
 
 export const PR_EVENTS = ["merged", "closed", "review", "ci-red", "ci-green", "gone"] as const;
@@ -163,6 +168,20 @@ export interface PrWatch {
 	redSent: boolean;
 	greenSent: boolean;
 	reviews: string[];
+	/** The base branch and its commit at the last poll, null before a poll recorded them. */
+	base: string | null;
+	baseOid: string | null;
+}
+
+/** What happened to the branch a stacked pull request builds on, which the members' conductor hears of. */
+export interface ParentChange {
+	/** `moved` when the parent branch gained or lost commits, `merged` when GitHub rebased the pull request onto the default branch. */
+	kind: "moved" | "merged";
+	/** The branch the pull request was stacked on. */
+	parent: string;
+	/** The branch it now merges into, and that branch's commit. */
+	base: string;
+	oid: string;
 }
 
 export type WatchEvent =
@@ -228,6 +247,9 @@ export function buildWatchQuery(entries: readonly WatchQueryEntry[]): string {
 		"state",
 		"isDraft",
 		"headRefOid",
+		"baseRefName",
+		"baseRefOid",
+		"baseRepository { defaultBranchRef { name } }",
 		"reviews(last: 50) { nodes { id author { login } state body submittedAt } }",
 		"statusCheckRollup { commit { oid } contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } }",
 	].join("\n");
@@ -253,6 +275,10 @@ interface GqlPullRequest {
 	state: string;
 	isDraft: boolean;
 	headRefOid: string;
+	baseRefName: string;
+	baseRefOid: string;
+	/** Null when GitHub cannot show the repository the pull request merges into. */
+	baseRepository: { defaultBranchRef: { name: string } | null } | null;
 	reviews: {
 		nodes: { id: string; author: { login: string } | null; state: string; body: string; submittedAt: string | null }[];
 	};
@@ -315,6 +341,9 @@ function watchPrOf(pr: GqlPullRequest): WatchPrData {
 		commitOid: pr.statusCheckRollup?.commit.oid ?? null,
 		reviews,
 		contexts: pr.statusCheckRollup?.contexts.nodes ?? [],
+		base: pr.baseRefName,
+		baseOid: pr.baseRefOid,
+		defaultBranch: pr.baseRepository?.defaultBranchRef?.name ?? "",
 	};
 }
 
@@ -329,7 +358,7 @@ export function diffWatch(watch: PrWatch, data: WatchPrData | null): { events: W
 	if (data.state === "MERGED") return { events: [{ event: "merged" }], next: { ...watch, ended: true } };
 	if (data.state === "CLOSED") return { events: [{ event: "closed" }], next: { ...watch, ended: true } };
 	const events: WatchEvent[] = [];
-	const next: PrWatch = { ...watch, reviews: [...watch.reviews] };
+	const next: PrWatch = { ...watch, reviews: [...watch.reviews], base: data.base, baseOid: data.baseOid };
 	// The first poll of an unseeded watch only records what is already true.
 	if (!watch.seeded) {
 		next.seeded = true;
@@ -367,6 +396,18 @@ export function diffWatch(watch: PrWatch, data: WatchPrData | null): { events: W
 		next.greenSent = true;
 	}
 	return { events, next };
+}
+
+/**
+ * The change to the parent of a pull request stacked on another branch since the last poll, null when the pull request is
+ * not open, was never polled with its base, merges into the default branch, or its parent did not change.
+ */
+export function parentChange(watch: PrWatch, data: WatchPrData | null): ParentChange | null {
+	if (data === null || data.state !== "OPEN" || watch.base === null || watch.base === data.defaultBranch) return null;
+	if (data.base === data.defaultBranch)
+		return { kind: "merged", parent: watch.base, base: data.base, oid: data.baseOid };
+	if (data.baseOid === watch.baseOid) return null;
+	return { kind: "moved", parent: watch.base, base: data.base, oid: data.baseOid };
 }
 
 /** The base name of a watch file, from the pull request's validated parts. `+` keeps the parts apart, since GitHub names may hold dashes. */

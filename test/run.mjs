@@ -16219,6 +16219,9 @@ echo done >> ${wghLog}
 		state,
 		isDraft: extra.isDraft === true,
 		headRefOid: extra.head ?? "h1",
+		baseRefName: "main",
+		baseRefOid: "m1",
+		baseRepository: { defaultBranchRef: { name: "main" } },
 		reviews: { nodes: extra.reviews ?? [] },
 		statusCheckRollup: {
 			commit: { oid: extra.commitOid ?? extra.head ?? "h1" },
@@ -21139,6 +21142,140 @@ heading("members changing the same files in one repository");
 		again.length === 1 && again[0].includes("src/lease.ts") && !again[0].includes("notes.md"),
 	);
 	check("a dormant task's members are not compared, so its file is never rewritten", !("overlaps" in taskOf("old")));
+	clockSkew = 0;
+}
+
+heading("a member's stacked pull request whose parent moves or merges");
+{
+	clockSkew = 0;
+	writeConfig();
+	const savedPath = process.env.PATH;
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	rmSync(join(stateDir, "graph/watches"), { recursive: true, force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const bin = join(root, "parent-bin");
+	mkdirSync(bin, { recursive: true });
+	const table = join(root, "parent-gh-table.json");
+	const view = join(root, "parent-pr-view.json");
+	const serve = new URL("./watch-gh-serve.mjs", import.meta.url).pathname;
+	writeFileSync(
+		view,
+		JSON.stringify({
+			state: "OPEN",
+			isDraft: false,
+			reviewDecision: "",
+			latestReviews: [],
+			statusCheckRollup: [],
+			url: "https://github.com/someorg/widget/pull/21",
+			number: 21,
+		}),
+	);
+	writeFileSync(
+		join(bin, "gh"),
+		`#!/bin/sh
+case "$1 $2" in
+  "api graphql") node ${serve} ${table} "$4" ;;
+  "pr view") cat ${view} ;;
+  "pr list") printf '[]' ;;
+  *) exit 1 ;;
+esac
+`,
+		{ mode: 0o755 },
+	);
+	process.env.PATH = `${bin}:${savedPath}`;
+	const pull = (base, baseOid) => ({
+		number: 21,
+		state: "OPEN",
+		isDraft: false,
+		headRefOid: "h1",
+		baseRefName: base,
+		baseRefOid: baseOid,
+		baseRepository: { defaultBranchRef: { name: "main" } },
+		reviews: { nodes: [] },
+		statusCheckRollup: null,
+	});
+	const serveBase = (base, baseOid) =>
+		writeFileSync(table, JSON.stringify({ "someorg/widget/21": pull(base, baseOid) }));
+	serveBase("feat-parent", "f1");
+	const ids = Object.fromEntries(
+		["poller", "conductor", "member"].map((name, i) => [name, `0d0e0f00-0000-7000-8000-00000000000${i + 1}`]),
+	);
+	const task = (slug, conductor, state, members) =>
+		writeFileSync(
+			join(tasksDir, `${slug}.json`),
+			JSON.stringify({
+				name: slug,
+				slug,
+				brief: "b",
+				conductor,
+				state,
+				launchedAt: 0,
+				members: members.map((session) => ({ session, joinedAt: Date.now() })),
+				candidates: [],
+				led: [],
+				closing: false,
+				findings: [],
+				register: [],
+			}),
+		);
+	task("api", ids.conductor, "live", [ids.member]);
+	task("other", "0d0e0f00-0000-7000-8000-0000000000fe", "live", []);
+	task("old", "0d0e0f00-0000-7000-8000-0000000000ff", "dormant", [ids.member]);
+	const poller = spawn(ids.poller, "/home/dev/work/parent");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "api"));
+	await conductor.fire("session_start");
+	const member = spawn(ids.member, "/home/dev/work/member");
+	await member.fire("session_start");
+	await member.tools
+		.get("pr_watch")
+		.execute(
+			"w",
+			{ action: "add", url: "https://github.com/someorg/widget/pull/21" },
+			undefined,
+			undefined,
+			member.ctx,
+		);
+	const poll = async () => {
+		jump(61_000);
+		for (const s of [conductor, member]) s.heartbeat();
+		poller.heartbeat();
+		await settle(1200);
+	};
+	const parents = async () => {
+		await conductor.pump(300);
+		return conductor.customs.map((c) => String(c.message.content)).filter((t) => t.includes("stacked on"));
+	};
+
+	await poll();
+	check("the first poll only records the parent", (await parents()).length === 0);
+	await poll();
+	check("an unchanged parent leads nowhere", (await parents()).length === 0);
+	serveBase("feat-parent", "f2");
+	await poll();
+	const moved = await parents();
+	check(
+		"a parent that moved leads the member's conductor, naming the pull request and the parent",
+		moved.length === 1 &&
+			moved[0].includes("someorg/widget#21") &&
+			moved[0].includes("`feat-parent`") &&
+			moved[0].includes("moved to f2"),
+	);
+	serveBase("main", "m9");
+	await poll();
+	const merged = (await parents()).slice(1);
+	check(
+		"a parent that merged leads again, saying the pull request now needs a rebase onto the default branch",
+		merged.length === 1 && merged[0].includes("which merged") && merged[0].includes("`main`"),
+	);
+	check(
+		"a dormant task's conductor is not led about it",
+		!existsSync(join(stateDir, "graph/pending", "0d0e0f00-0000-7000-8000-0000000000ff")),
+	);
+	process.env.PATH = savedPath;
 	clockSkew = 0;
 }
 

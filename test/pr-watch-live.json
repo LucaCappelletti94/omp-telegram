@@ -6,6 +6,9 @@
 				"state": "OPEN",
 				"isDraft": false,
 				"headRefOid": "878c355d83ba57098e0239b9f6a1c3720ff96e00",
+				"baseRefName": "main",
+				"baseRefOid": "8a176d98b37b361084c11f1b466fc3746c696594",
+				"baseRepository": { "defaultBranchRef": { "name": "main" } },
 				"reviews": {
 					"nodes": [
 						{

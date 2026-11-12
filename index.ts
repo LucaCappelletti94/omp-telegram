@@ -43,6 +43,7 @@ import {
 	type PrRecord,
 	type PrState,
 	type PrWatch,
+	parentChange,
 	parseWatchQuery,
 	prWatchName,
 	resumeArgs,
@@ -9159,6 +9160,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			redSent: w.redSent as boolean,
 			greenSent: w.greenSent as boolean,
 			reviews: w.reviews as string[],
+			base: typeof w.base === "string" ? w.base : null,
+			baseOid: typeof w.baseOid === "string" ? w.baseOid : null,
 		};
 	}
 
@@ -9182,7 +9185,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			redSent: false,
 			greenSent: false,
 			reviews: [],
-		});
+			base: null,
+			baseOid: null,
+		} satisfies PrWatch);
 	}
 
 	/** Removes the watch directories whose session has gone stale, at most once a day. */
@@ -9269,6 +9274,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				// A per-PR error that is not a disappearance keeps this watch's state.
 				if (got.data === null && !got.gone) continue;
 				const { events, next } = diffWatch(watch, got.data);
+				const parent = parentChange(watch, got.data);
 				const live = isLiveSession(session);
 				// CI turning red or green is news only while the session runs, so an ended one is not woken for it.
 				const told = live ? events : events.filter((event) => event.event !== "ci-red" && event.event !== "ci-green");
@@ -9314,6 +9320,20 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					if (!live) detach(() => raiseResumeCard(session), "resume card");
 				});
 				writePrivateJson(join(WATCH_DIR, session), entry, next);
+				// A member's stacked pull request whose parent moved or merged may need a rebase, which its conductor hears of.
+				if (parent !== null) {
+					const pr = `${watch.owner}/${watch.name}#${watch.number}`;
+					const what =
+						parent.kind === "merged"
+							? `stacked on \`${parent.parent}\`, which merged, so GitHub now bases it on \`${parent.base}\` and it needs a rebase onto it.`
+							: `stacked on \`${parent.parent}\`, which moved to ${parent.oid.slice(0, 12)}, so it may need a rebase.`;
+					for (const task of listTasks(TASKS_DIR)) {
+						if (task.state !== "live" || !task.members.some((m) => m.session === session)) continue;
+						sendLead(task, `${titleOf(session)} (session ${session}) has the pull request ${pr} ${what}`, {
+							about: session,
+						});
+					}
+				}
 			}
 			sweepWatches();
 		} finally {
