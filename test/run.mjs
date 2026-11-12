@@ -20970,10 +20970,12 @@ heading("leads wait out the conductor's step and arrive merged per member");
 		JSON.stringify({ kind: "lead", at: Date.now(), task: "api", text: "The task as a whole changed." }),
 	);
 	check("leads wait while the conductor is mid-step", (await leads()).length === before);
+	// The next step starts at once, as it does in omp, so the leads must leave at the boundary itself.
 	await conductor.fire("turn_end", { turnIndex: 0, message: {}, toolResults: [] });
+	await conductor.fire("turn_start", { turnIndex: 1, timestamp: Date.now() });
 	const merged = (await leads()).slice(before);
 	check(
-		"at the step's end the task's own leads come first, then one per member in focus order",
+		"at the step's end, even with the next step already running, the task's own leads come first, then one per member in focus order",
 		merged.length === 3 &&
 			merged[0].includes("The task as a whole changed.") &&
 			merged[1].includes("Docs started.") &&
@@ -20981,6 +20983,7 @@ heading("leads wait out the conductor's step and arrive merged per member");
 			merged[2].includes("Lexer done.") &&
 			merged[2].indexOf("Lexer started.") < merged[2].indexOf("Lexer done."),
 	);
+	await conductor.fire("turn_end", { turnIndex: 1, message: {}, toolResults: [] });
 	await conductor.fire("agent_end");
 	await update(b, "Docs done.");
 	const idle = (await leads()).slice(before + merged.length);
