@@ -19722,6 +19722,115 @@ heading("a moved session keeps its tasks and leases");
 	check("the conductor stays as it was", task().conductor === ids.conductor);
 }
 
+heading("a member sweep during a continuation move");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const poller = spawn("0d0e0410-0000-7000-8000-000000000001", "/home/dev/work/moves");
+	await poller.fire("session_start");
+	for (const [i, outcome] of ["register", "shutdown", "replaced", "returned", "missing"].entries()) {
+		const oldId = `0d0e0410-0000-7000-8000-00000000001${i}`;
+		let nextId = `0d0e0410-0000-7000-8000-00000000002${i}`;
+		const member = spawn(oldId, "/home/dev/work/member");
+		await member.fire("session_start");
+		await member.fire("message_end", { message: { role: "assistant", content: [] } });
+		const oldRecord = record(oldId);
+		const file = join(tasksDir, `${outcome}.json`);
+		writeFileSync(
+			file,
+			JSON.stringify({
+				name: outcome,
+				slug: outcome,
+				brief: "Keep membership through a move.",
+				conductor: poller.id,
+				state: "live",
+				launchedAt: 0,
+				members: [{ session: oldId, joinedAt: Date.now() }],
+			}),
+		);
+		const task = () => JSON.parse(readFileSync(file, "utf8"));
+		await member.tools
+			.get("conductor")
+			.execute(
+				"claim-before-move",
+				{ action: "claim", title: "Keep the member's claim" },
+				undefined,
+				undefined,
+				member.ctx,
+			);
+		member.move(nextId);
+		await member.fire("auto_retry_start", { attempt: 2, maxAttempts: 3 });
+		check(`${outcome} retains the old record until registration`, existsSync(join(sessionsDir, `${oldId}.json`)));
+		const peers = await poller.tools
+			.get("session_message")
+			.execute("during-move", {}, undefined, undefined, poller.ctx);
+		check(`${outcome} does not list the old id as live`, !peers.content[0].text.includes(oldRecord.tag));
+		poller.heartbeat();
+		await settle(250);
+		check(
+			`${outcome} keeps membership and the claim during the sweep`,
+			task().members.some((m) => m.session === oldId) &&
+				task().register.some((e) => e.author === oldId && e.status === "proposed"),
+		);
+		if (outcome === "shutdown") {
+			await member.fire("session_shutdown");
+			check("shutdown before registration removes the old record", !existsSync(join(sessionsDir, `${oldId}.json`)));
+			continue;
+		}
+		let replacement;
+		if (outcome === "replaced") {
+			replacement = spawn(oldId, "/home/dev/work/replacement");
+			await replacement.fire("session_start");
+			check("a new owner can register the old id during the gap", record(oldId).instance !== oldRecord.instance);
+			check("the new owner does not inherit the moving instance's tag", record(oldId).tag !== oldRecord.tag);
+		}
+		if (outcome === "returned") {
+			nextId = oldId;
+			member.move(nextId);
+		}
+		if (outcome === "missing") rmSync(join(sessionsDir, `${oldId}.json`));
+		let publishedWithOldRouting = false;
+		const rename = fs.renameSync;
+		fs.renameSync = (from, to) => {
+			rename(from, to);
+			if (String(to) === join(sessionsDir, `${nextId}.json`) && nextId !== oldId && existsSync(inboxOf(oldId))) {
+				publishedWithOldRouting = true;
+			}
+			if (String(to) === file && task().members.some((m) => m.session === nextId)) poller.heartbeat();
+		};
+		syncBuiltinESMExports();
+		try {
+			await member.fire("agent_start");
+			await settle(250);
+		} finally {
+			fs.renameSync = rename;
+			syncBuiltinESMExports();
+		}
+		check(`${outcome} migrates routing before publishing the continuation`, !publishedWithOldRouting);
+		check(
+			`${outcome} keeps membership and the claim under the continuation id`,
+			task().members.some((m) => m.session === nextId) &&
+				task().register.some((e) => e.author === nextId && e.status === "proposed"),
+		);
+		check(`${outcome} keeps the continuation's routing tag`, record(nextId).tag === oldRecord.tag);
+		if (outcome === "returned") {
+			check("registration preserves its reclaimed current record", record(oldId).instance === oldRecord.instance);
+		} else if (replacement === undefined) {
+			check("registration removes the old record", !existsSync(join(sessionsDir, `${oldId}.json`)));
+		} else {
+			check("registration preserves the replacement owner's record", record(oldId).instance !== oldRecord.instance);
+			await replacement.fire("session_shutdown");
+		}
+		await member.fire("session_shutdown");
+	}
+	await poller.fire("session_shutdown");
+}
+
 heading("members leaving a task and its conductor closing");
 {
 	clockSkew = 0;

@@ -466,6 +466,8 @@ interface Config {
 interface SessionRecord {
 	/** Extension instance that writes the record. Two omp processes resumed on one session id differ here. */
 	instance: string;
+	/** Retained only until this instance moves its task entries to a continuation id. */
+	moving: boolean;
 	/**
 	 * The writer saved a turn under this id without omp moving it, so its process holds omp's write lease on
 	 * the session and outranks an instance that has not saved since it started.
@@ -2800,6 +2802,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		lastHealth = turnHealth;
 		const record: SessionRecord = {
 			instance,
+			moving: false,
 			leased: leasedId === sessionId,
 			pid: process.pid,
 			tag: sessionTag,
@@ -2857,12 +2860,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		noteState();
 	}
 
-	function readSessionRecord(id: string): SessionRecord | null {
+	function readSessionRecord(id: string, includeMoving = false): SessionRecord | null {
 		const path = join(SESSIONS_DIR, `${id}.json`);
 		if (!existsSync(path)) return null;
 		try {
 			const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-			return sessionRecordFrom(parsed);
+			const record = sessionRecordFrom(parsed);
+			return !includeMoving && record?.moving === true ? null : record;
 		} catch {
 			return null;
 		}
@@ -2882,6 +2886,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const messageId = (value: unknown): number | null => (typeof value === "number" ? value : null);
 		return {
 			instance: text(raw.instance),
+			moving: raw.moving === true,
 			leased: raw.leased === true,
 			pid: count(raw.pid),
 			tag: text(raw.tag),
@@ -3164,7 +3169,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (!entry.endsWith(".json")) continue;
 			const id = entry.slice(0, -5);
 			if (!isStateToken(id) || id === sessionId) continue;
-			const record = readSessionRecord(id);
+			const record = readSessionRecord(id, true);
 			// A live session refreshes its heartbeat every 15 seconds, so a stale one is gone.
 			if (record !== null && Date.now() - record.heartbeat <= LOCK_STALE_MS) continue;
 			// A restart marker keeps a record the wave is mid-restart on until the marker ages out.
@@ -3279,7 +3284,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// A ballot outlives its voter only while a crash card can still restore it.
 		for (const entry of listJson(BALLOT_DIR)) {
 			const id = entry.slice(0, -5);
-			if (readSessionRecord(id) === null && readCrash(id) === null) removeStatePath(BALLOT_DIR, entry);
+			if (readSessionRecord(id, true) === null && readCrash(id) === null) removeStatePath(BALLOT_DIR, entry);
 		}
 		// A writer killed between the temp write and the rename leaves its temp behind, which no reader wants.
 		for (const dir of [SESSIONS_DIR, STATE_DIR]) {
@@ -8638,7 +8643,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					const crash = readCrash(edge.to);
 					const target = byId.get(edge.to);
 					return (
-						readSessionRecord(edge.to) === null &&
+						readSessionRecord(edge.to, true) === null &&
 						(crash === null || crash.dismissed) &&
 						(target === undefined || !isFinished(displayedStatus(target, prs.get(edge.to))))
 					);
@@ -11406,18 +11411,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		detachBackground(() => retryPendingUnpins(), "startup pin cleanup");
 	});
 
-	/**
-	 * Stops writing the record of an id this instance no longer owns. When omp moved it off the id, its own
-	 * record goes and what it routed follows it to the next registration. When a lease holder took the id over,
-	 * the record and everything it routes belong to that instance, which continues the same conversation.
-	 */
+	/** Stops publishing an old id while its retained record protects task membership through the rename. */
 	function releaseLostId(ctx: ExtensionContext): void {
 		if (!registered) return;
 		const live = ctx.sessionManager.getSessionId();
 		if (live !== sessionId) {
 			registered = false;
-			if (readSessionRecord(sessionId)?.instance === instance) {
-				removeStatePath(SESSIONS_DIR, `${sessionId}.json`);
+			const record = readSessionRecord(sessionId);
+			if (record?.instance === instance) {
+				writePrivateJson(SESSIONS_DIR, `${sessionId}.json`, { ...record, moving: true });
 				leftIds.push(sessionId);
 			}
 			sessionId = live;
@@ -11432,6 +11434,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		pinPendingUntil = 0;
 		closeOfferMessageId = null;
 		replyQuestionMessageId = null;
+	}
+
+	/** Deletes only the records this instance retained for its continuation move. */
+	function retireLeftRecords(): void {
+		for (const id of leftIds.splice(0)) {
+			if (id !== sessionId && readSessionRecord(id, true)?.instance === instance) {
+				removeStatePath(SESSIONS_DIR, `${id}.json`);
+			}
+		}
 	}
 
 	/**
@@ -11469,6 +11480,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const adopted: SessionRecord = {
 				...crash.record,
 				instance,
+				moving: false,
 				leased: false,
 				pid: process.pid,
 				heartbeat: Date.now(),
@@ -11522,8 +11534,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			lastSummaryAt = previous.summaryAt;
 			replyQuestionMessageId = previous.replyQuestion;
 		}
-		const left = new Set(leftIds.splice(0));
+		const left = new Set(leftIds);
 		left.delete(sessionId);
+		const rename = (ids: string[]): string[] => ids.map((id) => (left.has(id) ? sessionId : id));
 		// Queued replies, held agent messages, and the sent and received messages a left id may still list, edit
 		// or clear all belong to this conversation.
 		for (const id of left) {
@@ -11546,40 +11559,6 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			removeStatePath(BALLOT_DIR, `${id}.json`);
 		}
 		if (left.size > 0) {
-			const rename = (ids: string[]): string[] => ids.map((id) => (left.has(id) ? sessionId : id));
-			const names = (task: Task): boolean =>
-				[
-					task.conductor,
-					...task.led,
-					...task.members.map((member) => member.session),
-					...task.candidates.map((candidate) => candidate.session),
-					...task.register.map((entry) => entry.author),
-				].some((id) => left.has(id));
-			for (const task of listTasks(TASKS_DIR)) {
-				if (!names(task)) continue;
-				// The listing came before the lock, so another process may have taken the task meanwhile.
-				await updateTask(TASKS_DIR, task.slug, (current) => ({
-					task: names(current)
-						? {
-								...current,
-								conductor: left.has(current.conductor) ? sessionId : current.conductor,
-								members: current.members.map((m) => (left.has(m.session) ? { ...m, session: sessionId } : m)),
-								candidates: current.candidates.map((c) => (left.has(c.session) ? { ...c, session: sessionId } : c)),
-								led: rename(current.led),
-								register: current.register.map((e) => (left.has(e.author) ? { ...e, author: sessionId } : e)),
-								followed: left.has(current.followed) ? sessionId : current.followed,
-								overlaps: current.overlaps.map((o) => ({ ...o, pair: rename(o.pair.split(" ")).sort().join(" ") })),
-								deadWaits: current.deadWaits.map((key) => rename(key.split(" ")).join(" ")),
-								finished: current.finished.map((key) => rename(key.split(" ")).join(" ")),
-							}
-						: null,
-					result: null,
-				}));
-			}
-			// Read first without the lock, so a move that held no lease costs no lock round.
-			if (moveSessions(parseLeases(readJsonFile(join(STATE_DIR, "leases.json"))), left, sessionId) !== null) {
-				await changeLeases(STATE_DIR, (state) => ({ state: moveSessions(state, left, sessionId), result: null }));
-			}
 			// Every other session's ballot naming a left id now means this one.
 			for (const [voter, ballot] of readBallots()) {
 				if (![...ballot.focus, ...ballot.resources].some((id) => left.has(id))) continue;
@@ -11629,6 +11608,42 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!claimed.ok) {
 			pi.logger.warn("notify-telegram: badge claim unavailable at startup, retrying on the heartbeat");
 		}
+		if (left.size > 0) {
+			const names = (task: Task): boolean =>
+				[
+					task.conductor,
+					...task.led,
+					...task.members.map((member) => member.session),
+					...task.candidates.map((candidate) => candidate.session),
+					...task.register.map((entry) => entry.author),
+				].some((id) => left.has(id));
+			for (const task of listTasks(TASKS_DIR)) {
+				if (!names(task)) continue;
+				// The listing came before the lock, so another process may have taken the task meanwhile.
+				await updateTask(TASKS_DIR, task.slug, (current) => ({
+					task: names(current)
+						? {
+								...current,
+								conductor: left.has(current.conductor) ? sessionId : current.conductor,
+								members: current.members.map((m) => (left.has(m.session) ? { ...m, session: sessionId } : m)),
+								candidates: current.candidates.map((c) => (left.has(c.session) ? { ...c, session: sessionId } : c)),
+								led: rename(current.led),
+								register: current.register.map((e) => (left.has(e.author) ? { ...e, author: sessionId } : e)),
+								followed: left.has(current.followed) ? sessionId : current.followed,
+								overlaps: current.overlaps.map((o) => ({ ...o, pair: rename(o.pair.split(" ")).sort().join(" ") })),
+								deadWaits: current.deadWaits.map((key) => rename(key.split(" ")).join(" ")),
+								finished: current.finished.map((key) => rename(key.split(" ")).join(" ")),
+							}
+						: null,
+					result: null,
+				}));
+			}
+			// Read first without the lock, so a move that held no lease costs no lock round.
+			if (moveSessions(parseLeases(readJsonFile(join(STATE_DIR, "leases.json"))), left, sessionId) !== null) {
+				await changeLeases(STATE_DIR, (state) => ({ state: moveSessions(state, left, sessionId), result: null }));
+			}
+		}
+		retireLeftRecords();
 	}
 
 	pi.on("input", async (_event, ctx) => {
@@ -11975,7 +11990,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const members = new Set(listTasks(TASKS_DIR).flatMap((task) => task.members.map((member) => member.session)));
 		for (const session of members) {
 			const crash = readCrash(session);
-			if (readSessionRecord(session) !== null || (crash !== null && !crash.dismissed)) continue;
+			if (readSessionRecord(session, true) !== null || (crash !== null && !crash.dismissed)) continue;
 			await leaveTasks(session, "can no longer be restored");
 		}
 	}
@@ -12271,6 +12286,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			await leaveTasks(sessionId, "was closed");
 		}
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+		retireLeftRecords();
 		// No poller tick follows the last omp's exit, so the scope its shell keeps is given back its defaults here.
 		const ownUnit = cgroupOf(process.pid)?.unit;
 		if (registered && ownUnit !== undefined) {
