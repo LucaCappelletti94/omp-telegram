@@ -26,7 +26,12 @@ export interface Task {
 	findings: Finding[];
 	/** Claims and decisions the members recorded, ADR style. */
 	register: Entry[];
+	/** How long a member may go without an update before the conductor checks on it. */
+	silenceHours: number;
 }
+
+/** The silence limit of a task whose conductor never set one, from the plan's decision 5. */
+export const DEFAULT_SILENCE_HOURS = 4;
 
 export const ENTRY_STATUSES = ["proposed", "accepted", "objected", "superseded", "done", "abandoned"] as const;
 
@@ -78,6 +83,14 @@ export interface Finding {
 export interface Member {
 	session: string;
 	joinedAt: number;
+	/** When the member last sent its conductor an update, its join until then. */
+	updatedAt: number;
+	/** How many lines its transcript held at that update, where the next silence check starts reading. */
+	updateLine: number;
+	/** When the conductor last checked on it, or its silence was found to be a wait on Luca. */
+	checkedAt: number;
+	/** Set once a silence check reached the conductor, until it calls `checked` or the member updates. */
+	silenceLed: boolean;
 }
 
 export interface Candidate {
@@ -123,9 +136,16 @@ function parseTask(raw: unknown, slug: string): Task | null {
 	if (t.slug !== slug || typeof t.name !== "string" || typeof t.brief !== "string") return null;
 	if (typeof t.conductor !== "string" || typeof t.launchedAt !== "number") return null;
 	if (t.state !== "live" && t.state !== "dormant") return null;
-	const members = (Array.isArray(t.members) ? t.members : []).filter(
-		(m): m is Member => typeof m?.session === "string" && typeof m.joinedAt === "number",
-	);
+	const members = (Array.isArray(t.members) ? t.members : [])
+		.filter((m): m is Member => typeof m?.session === "string" && typeof m.joinedAt === "number")
+		.map((m) => ({
+			session: m.session,
+			joinedAt: m.joinedAt,
+			updatedAt: typeof m.updatedAt === "number" ? m.updatedAt : m.joinedAt,
+			updateLine: typeof m.updateLine === "number" && m.updateLine >= 0 ? m.updateLine : 0,
+			checkedAt: typeof m.checkedAt === "number" ? m.checkedAt : 0,
+			silenceLed: m.silenceLed === true,
+		}));
 	const candidates = (Array.isArray(t.candidates) ? t.candidates : []).filter(
 		(c): c is Candidate =>
 			typeof c?.session === "string" && typeof c.card === "string" && (c.state === "proposed" || c.state === "skipped"),
@@ -171,6 +191,7 @@ function parseTask(raw: unknown, slug: string): Task | null {
 		closing: t.closing === true,
 		findings,
 		register,
+		silenceHours: typeof t.silenceHours === "number" && t.silenceHours > 0 ? t.silenceHours : DEFAULT_SILENCE_HOURS,
 	};
 }
 
@@ -233,6 +254,7 @@ export function conductorRole(task: Task): string {
 		"When members overlap, duplicate each other, contradict each other, wait on a session that ended, build on a moved parent, or need a lesson another member learned, raise it with `action` `finding`: one card to the user per finding, under a `subject` you name. Propose in `message` what to tell the sessions, and set `tell` only when they should hear it before the user decides.",
 		"When a member has finished its part entirely, its pull request merged and nothing left open, raise a finding of kind `completed` naming that one member and why it is done. The card carries the member's own close buttons, and you never close a session yourself.",
 		"Members record claims and proposed decisions in the task register, and each new or closed entry reaches you as an aside. Judge each proposed entry against the others: `action` `accept` with its `entry` id, or `object` with a `reason` when it duplicates or contradicts another member's work. An objection goes to the user, who upholds or overrules it. An entry you leave unanswered for ten minutes stands accepted.",
+		`A member tells you what changed with \`update\`, which reaches you as an aside. One that sends no update for ${task.silenceHours} hours reaches you with the lines of its transcript since its last update: read them, message it only if it did work worth an update or looks stuck, then call \`action\` \`checked\` with the session id the aside gives. A member waiting on the user is left alone. When the user asks for another limit, set it with \`action\` \`silence\` and \`hours\`.`,
 		`Closing this session leaves the task dormant, and \`/conduct ${task.name}\` in Telegram resumes it.`,
 	].join("\n\n");
 }
@@ -243,6 +265,6 @@ export function memberRole(tasks: { name: string; conductor: string }[]): string
 	return [
 		`This session is a member of ${tasks.length === 1 ? "a task" : `${tasks.length} tasks`}:`,
 		...lines,
-		"A conductor keeps the sessions of its task from duplicating work or contradicting each other. Before starting work another member could also take up, record a claim with the `conductor` tool's `claim`, and record an engineering choice the others should follow with `propose`. `register` lists what the others hold, and `close` settles your own entries. Expect the conductor to message you when another member's work touches yours.",
+		"A conductor keeps the sessions of its task from duplicating work or contradicting each other. Before starting work another member could also take up, record a claim with the `conductor` tool's `claim`, and record an engineering choice the others should follow with `propose`. `register` lists what the others hold, and `close` settles your own entries. When you reach a point your conductor should know about, such as a merged pull request, a changed plan or a blocker, tell it with `update` and a `text`. Expect the conductor to message you when another member's work touches yours.",
 	].join("\n");
 }

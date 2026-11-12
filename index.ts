@@ -95,10 +95,12 @@ import {
 import {
 	changeTask,
 	conductorRole,
+	DEFAULT_SILENCE_HOURS,
 	type Entry,
 	FINDING_KINDS,
 	type Finding,
 	listTasks,
+	type Member,
 	memberRole,
 	parseConduct,
 	type Task,
@@ -7779,6 +7781,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				closing: false,
 				findings: [],
 				register: [],
+				silenceHours: DEFAULT_SILENCE_HOURS,
 			};
 			return { task: fresh, result: { kind: "open", task: fresh } };
 		});
@@ -7821,6 +7824,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const item: PendingItem = { kind: "lead", at: Date.now(), task: task.name, text };
 		writePrivateJson(join(PENDING_DIR, to), `lead-${Date.now()}-${randomUUID().slice(0, 8)}.json`, item);
 		if (!isLiveSession(to)) detach(() => raiseResumeCard(to), "resume card");
+	}
+
+	/** Where a session's transcript is and how many lines it holds, 0 when it has none. */
+	function transcriptLines(id: string): { path: string; lines: number } {
+		const path = transcriptPath(id);
+		let text = "";
+		try {
+			text = readFileSync(path, "utf8");
+		} catch {}
+		let lines = 0;
+		for (let at = text.indexOf("\n"); at >= 0; at = text.indexOf("\n", at + 1)) lines += 1;
+		return { path, lines };
+	}
+
+	/** A session joining a task now, its silence clock started and its transcript read on from where it stands. */
+	function newMember(session: string): Member {
+		const now = Date.now();
+		const updateLine = transcriptLines(session).lines;
+		return { session, joinedAt: now, updatedAt: now, updateLine, checkedAt: 0, silenceLed: false };
 	}
 
 	/**
@@ -7872,7 +7894,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						if (!isLiveSession(session)) {
 							return { task: { ...task, candidates: others }, result: { task, session, outcome: "gone" as const } };
 						}
-						const members = [...task.members, { session, joinedAt: Date.now() }];
+						const members = [...task.members, newMember(session)];
 						return {
 							task: { ...task, candidates: others, members, closing: false },
 							result: { task, session, outcome: "joined" as const },
@@ -8264,6 +8286,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			entry?: string;
 			outcome?: string;
 			by?: string;
+			text?: string;
 		};
 		const reply = (text: string): ToolReply => ({ content: [{ type: "text", text }], details: {} });
 		const mine = listTasks(TASKS_DIR).filter((task) => task.members.some((member) => member.session === sessionId));
@@ -8297,6 +8320,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					? `No entry of the task "${task.name}" matches.`
 					: `The register of "${task.name}":\n${shown.map(line).join("\n")}`,
 			);
+		}
+		if (q.action === "update") {
+			const text = (q.text ?? "").trim();
+			if (text === "") return refuse("Say in `text` what changed, since your conductor reads it.");
+			const { lines } = transcriptLines(sessionId);
+			const now = Date.now();
+			await updateTask(TASKS_DIR, task.slug, (current) => ({
+				task: {
+					...current,
+					members: current.members.map((m) =>
+						m.session === sessionId ? { ...m, updatedAt: now, updateLine: lines, silenceLed: false } : m,
+					),
+				},
+				result: null,
+			}));
+			sendLead(task, `${titleOf(sessionId)} (session ${sessionId}) sends an update: ${text}`);
+			return reply(`Sent your update to the conductor of "${task.name}".`);
 		}
 		if (q.action === "claim" || q.action === "propose") {
 			const title = (q.title ?? "").trim();
@@ -8391,11 +8431,55 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Members of a live task silent past its limit lead to its conductor once, with their transcript since their last
+	 * update, until the conductor calls `checked` or they update. A member waiting on the user only has its clock restarted.
+	 */
+	async function checkSilence(): Promise<void> {
+		const now = Date.now();
+		for (const listed of listTasks(TASKS_DIR)) {
+			if (listed.state !== "live") continue;
+			const limit = listed.silenceHours * 3_600_000;
+			const due = listed.members.filter((m) => !m.silenceLed && now - Math.max(m.updatedAt, m.checkedAt) >= limit);
+			if (due.length === 0) continue;
+			// A native ask, a buttonless turn-end question or a standing one leaves the member waiting on the user.
+			const waiting = new Set(
+				due
+					.filter((m) => {
+						const record = readSessionRecord(m.session);
+						return (
+							record !== null && (record.question !== null || record.replyQuestion !== null || record.standing !== null)
+						);
+					})
+					.map((m) => m.session),
+			);
+			const leads = due
+				.filter((m) => !waiting.has(m.session))
+				.map((m) => {
+					const { path, lines } = transcriptLines(m.session);
+					const range =
+						lines > m.updateLine
+							? `Read what it did since then in \`${path}:${m.updateLine + 1}-${lines}\`.`
+							: "Its transcript holds nothing since then.";
+					const text = `${titleOf(m.session)} (session ${m.session}) sent no update for ${listed.silenceHours} hours. ${range} Message it only if it did work worth an update or looks stuck, then call the conductor tool with \`action\` \`checked\` and \`session\` ${m.session}.`;
+					return { session: m.session, text };
+				});
+			const silent = new Set(leads.map((lead) => lead.session));
+			await updateTask(TASKS_DIR, listed.slug, (current) => {
+				const members = current.members.map((m) =>
+					waiting.has(m.session) ? { ...m, checkedAt: now } : silent.has(m.session) ? { ...m, silenceLed: true } : m,
+				);
+				return { task: { ...current, members }, result: null };
+			});
+			for (const lead of leads) sendLead(listed, lead.text);
+		}
+	}
+
 	registerTool({
 		name: "conductor",
 		label: "Conductor",
 		description:
-			"Coordinate the sessions of a task opened with `/conduct`. A member records its work in the task register before starting it: `action` `register` lists the entries, filtered by `filter` text; `claim` records a claim on a piece of work and `propose` a decision, each with a `title` and a `body`, and the answer lists the open entries first; `close` settles one of your own `entry` ids with `outcome` done or abandoned for a claim, or superseded with the replacing decision's id in `by`. An entry the conductor does not object to within ten minutes stands accepted. A member of several tasks names one in `task`. The conductor's actions: `accept` a proposed `entry`, or `object` to it with a `reason`, which tells its author to hold off and sends the user a card to uphold or overrule the objection. `invite` proposes the live session named in `session`, by its badge emoji or tag, for the task this session conducts, and `reason` tells the user why it belongs. The user answers Join or Skip on a Telegram card, and the answer arrives as an aside written by no one. A session conducting a task, a member and a session the user skipped cannot be invited. `finding` sends the user one card about members named in `sessions`: `kind` is one of overlap, stacked-parent, dead-wait, duplicate, contradiction, lesson or completed, `text` says what you found, and `subject` is a short key such as `overlap:src/lease.ts`. A subject is raised once, and one the user settled is never raised again, so name a new subject when the situation changes. An optional `message` is what you propose to tell the sessions: the card offers to send it, or `tell` sends it at once, as a message from you. A `completed` finding names the one member that finished, and its card carries that member's close buttons.",
+			"Coordinate the sessions of a task opened with `/conduct`. A member records its work in the task register before starting it: `action` `register` lists the entries, filtered by `filter` text; `claim` records a claim on a piece of work and `propose` a decision, each with a `title` and a `body`, and the answer lists the open entries first; `close` settles one of your own `entry` ids with `outcome` done or abandoned for a claim, or superseded with the replacing decision's id in `by`. An entry the conductor does not object to within ten minutes stands accepted. `update` tells the conductor in `text` what changed, such as a merged pull request, a changed plan or a blocker. A member of several tasks names one in `task`. The conductor's actions: `accept` a proposed `entry`, or `object` to it with a `reason`, which tells its author to hold off and sends the user a card to uphold or overrule the objection. A member silent past the task's limit reaches the conductor with its transcript lines since its last update, `checked` with that member's session id in `session` starts its silence clock again, and `silence` sets the limit in `hours`, 4 until set. `invite` proposes the live session named in `session`, by its badge emoji or tag, for the task this session conducts, and `reason` tells the user why it belongs. The user answers Join or Skip on a Telegram card, and the answer arrives as an aside written by no one. A session conducting a task, a member and a session the user skipped cannot be invited. `finding` sends the user one card about members named in `sessions`: `kind` is one of overlap, stacked-parent, dead-wait, duplicate, contradiction, lesson or completed, `text` says what you found, and `subject` is a short key such as `overlap:src/lease.ts`. A subject is raised once, and one the user settled is never raised again, so name a new subject when the situation changes. An optional `message` is what you propose to tell the sessions: the card offers to send it, or `tell` sends it at once, as a message from you. A `completed` finding names the one member that finished, and its card carries that member's close buttons.",
 		approval: "read",
 		parameters: z.object({
 			action: z.string(),
@@ -8414,6 +8498,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			entry: z.string().optional(),
 			outcome: z.string().optional(),
 			by: z.string().optional(),
+			hours: z.number().optional(),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const refuse = (text: string) => ({
@@ -8431,22 +8516,54 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const p = params as Record<string, unknown>;
 			const session = typeof p.session === "string" ? p.session.trim() : "";
 			const reason = typeof p.reason === "string" ? p.reason.trim() : "";
-			if (typeof p.action === "string" && ["register", "claim", "propose", "close"].includes(p.action)) {
+			if (typeof p.action === "string" && ["register", "claim", "propose", "close", "update"].includes(p.action)) {
 				return memberAction(p, refuse);
 			}
-			if (!["invite", "finding", "accept", "object"].includes(String(p.action))) {
+			if (!["invite", "finding", "accept", "object", "silence", "checked"].includes(String(p.action))) {
 				return refuse(
-					"`action` is one of `register`, `claim`, `propose`, `close`, `invite`, `finding`, `accept` or `object`.",
+					"`action` is one of `register`, `claim`, `propose`, `close`, `update`, `invite`, `finding`, `accept`, `object`, `silence` or `checked`.",
 				);
 			}
 			const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId && task.state === "live");
 			if (conducted === undefined) {
 				return refuse(
-					"This session conducts no live task, so it cannot invite, raise findings or judge entries. `/conduct` in Telegram opens a conductor.",
+					"This session conducts no live task, so it cannot invite, raise findings, judge entries or check on members. `/conduct` in Telegram opens a conductor.",
 				);
 			}
 			if (p.action === "finding") return raiseFinding(ctx, conducted, p, refuse);
 			if (p.action === "accept" || p.action === "object") return conductorVerdict(ctx, conducted, p, refuse);
+			if (p.action === "silence") {
+				const hours = Number(p.hours);
+				if (!(hours > 0)) return refuse("Give `hours`, a positive number of hours a member may go without an update.");
+				await updateTask(TASKS_DIR, conducted.slug, (task) => ({
+					task: { ...task, silenceHours: hours },
+					result: null,
+				}));
+				return {
+					content: [{ type: "text" as const, text: `Members silent for ${hours} hours are now checked on.` }],
+					details: {},
+				};
+			}
+			if (p.action === "checked") {
+				const id = resolveSession(session) ?? session;
+				if (!conducted.members.some((m) => m.session === id)) {
+					return refuse(
+						`${session} is not a member of the task "${conducted.name}". Name it by the session id its silence lead gave.`,
+					);
+				}
+				const now = Date.now();
+				await updateTask(TASKS_DIR, conducted.slug, (task) => ({
+					task: {
+						...task,
+						members: task.members.map((m) => (m.session === id ? { ...m, checkedAt: now, silenceLed: false } : m)),
+					},
+					result: null,
+				}));
+				return {
+					content: [{ type: "text" as const, text: `Checked ${titleOf(id)}. Its silence clock starts again.` }],
+					details: {},
+				};
+			}
 			if (reason.length === 0)
 				return refuse("Say in `reason` why the session belongs to the task, since the user reads it on the card.");
 			if ((badgeEmoji.length > 0 && session === badgeEmoji) || session === sessionTag) {
@@ -9493,7 +9610,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (!listed.members.some((member) => member.session === parent)) continue;
 			const joined = await updateTask(TASKS_DIR, listed.slug, (task) => {
 				if (task.members.some((member) => member.session === self)) return { task: null, result: null };
-				const members = [...task.members, { session: self, joinedAt: Date.now() }];
+				const members = [...task.members, newMember(self)];
 				return { task: { ...task, members, closing: false }, result: task };
 			});
 			if (joined !== null) sendLead(joined, text);
@@ -10920,6 +11037,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					priorityTick();
 					detach(() => sweepMembers(), "member sweep");
 					detach(() => acceptStale(), "register acceptance");
+					detach(() => checkSilence(), "silence check");
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
 					detachBackground(() => redrawCrashCards(), "crash cards");
