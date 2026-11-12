@@ -21130,6 +21130,57 @@ heading("leads wait out the conductor's step and arrive merged per member");
 	await update(b, "Docs done.");
 	const idle = (await leads()).slice(before + merged.length);
 	check("an idle conductor gets a lead at once", idle.length === 1 && idle[0].includes("Docs done."));
+	writeFileSync(
+		join(tasksDir, "docs.json"),
+		JSON.stringify({
+			...JSON.parse(readFileSync(join(tasksDir, "api.json"), "utf8")),
+			name: "docs",
+			slug: "docs",
+			conductor: ids.b,
+			members: [{ session: ids.a, joinedAt: Date.now() }],
+		}),
+	);
+	const memberLeads = () => a.customs.filter((c) => c.message.details?.kind === "lead");
+	const memberBefore = memberLeads().length;
+	await a.fire("agent_start");
+	await a.fire("turn_start", { turnIndex: 0, timestamp: Date.now() });
+	const pending = join(stateDir, "graph/pending", ids.a);
+	mkdirSync(pending, { recursive: true });
+	for (const task of ["api", "docs"]) {
+		for (const entry of ["first", "second"]) {
+			writeFileSync(
+				join(pending, `lead-${task}-${entry}.json`),
+				JSON.stringify({
+					kind: "lead",
+					at: Date.now(),
+					task,
+					text: `The conductor accepted your ${entry} ${task} entry.`,
+				}),
+			);
+		}
+	}
+	await a.pump(300);
+	check("a member holds both tasks' leads during its step", memberLeads().length === memberBefore);
+	await a.fire("turn_end", { turnIndex: 0, message: {}, toolResults: [] });
+	const separate = memberLeads().slice(memberBefore);
+	check(
+		"a member of two tasks receives each task's leads under its own name in one drain",
+		separate.length === 2 &&
+			["api", "docs"].every((task) => {
+				const messages = separate.filter((c) =>
+					String(c.message.content).startsWith(`Automatic conductor update for the task "${task}"`),
+				);
+				return (
+					messages.length === 1 &&
+					messages[0].message.details.leads.length === 2 &&
+					messages[0].message.details.leads.every((lead) => lead.task === task) &&
+					["first", "second"].every((entry) =>
+						String(messages[0].message.content).includes(`accepted your ${entry} ${task} entry.`),
+					)
+				);
+			}),
+	);
+	await a.fire("agent_end");
 	rmSync(join(stateDir, "ballots"), { recursive: true, force: true });
 	clockSkew = 0;
 }

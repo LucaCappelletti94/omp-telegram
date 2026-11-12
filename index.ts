@@ -7379,7 +7379,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			rmSync(file, { force: true });
 			pi.logger.warn("notify-telegram: discarded a malformed pending item", { file });
 		}
-		// Leads wait out a running step and then arrive together, one aside per session they concern.
+		// Leads wait out a running step and then arrive together, one aside per task and session they concern.
 		const due = stepRunning ? items.filter(({ item }) => item.kind !== "lead") : items;
 		const leads: Array<Extract<PendingItem, { kind: "lead" }>> = [];
 		for (const { file, item } of due) {
@@ -7435,18 +7435,21 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		const grouped = new Map<string, typeof leads>();
 		for (const lead of leads) {
-			const about = lead.about ?? "";
-			const group = grouped.get(about);
-			if (group === undefined) grouped.set(about, [lead]);
+			const key = `${lead.about ?? ""}\u0000${lead.task}`;
+			const group = grouped.get(key);
+			if (group === undefined) grouped.set(key, [lead]);
 			else group.push(lead);
 		}
-		// News about the task as a whole comes first, then each session's in focus order.
+		// News about tasks as a whole comes first, then each session's in focus order.
 		const { points, marked } =
 			leads.length > 0 ? readTally("points") : { points: new Map<string, number>(), marked: new Set<string>() };
 		const focus = byPriority(points, marked, () => 0);
-		const abouts = [...grouped.keys()].sort((x, y) => Number(x !== "") - Number(y !== "") || focus(x, y));
-		for (const about of abouts) {
-			const group = grouped.get(about) as typeof leads;
+		const groups = [...grouped.values()].map((group) => ({
+			about: (group[0] as (typeof leads)[number]).about ?? "",
+			group,
+		}));
+		groups.sort((x, y) => Number(x.about !== "") - Number(y.about !== "") || focus(x.about, y.about));
+		for (const { about, group } of groups) {
 			const { task } = group[0] as (typeof leads)[number];
 			pi.sendMessage(
 				{
