@@ -95,6 +95,8 @@ import {
 import {
 	changeTask,
 	conductorRole,
+	FINDING_KINDS,
+	type Finding,
 	listTasks,
 	memberRole,
 	parseConduct,
@@ -5359,6 +5361,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await answerJoinCallback(cfg, callback.id, callback.data, callback.message.message_id);
 				return;
 			}
+			if (callback.data.startsWith("f:")) {
+				await answerFindingCallback(cfg, callback.id, callback.data, callback.message.message_id);
+				return;
+			}
 			if (/^[rln]:/u.test(callback.data)) {
 				await answerResumeCallback(cfg, callback);
 				return;
@@ -7754,6 +7760,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				candidates: [],
 				led: [],
 				closing: false,
+				findings: [],
 			};
 			return { task: fresh, result: { kind: "open", task: fresh } };
 		});
@@ -7891,16 +7898,230 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callbackId, text: wording.toast }, 10_000);
 	}
 
+	type ToolReply = { content: { type: "text"; text: string }[]; details: Record<string, unknown>; isError?: boolean };
+
+	/** A session as a finding card names it: its badge, tag and tab, or its graph title once its record is gone. */
+	function sessionLine(id: string): string {
+		const record = readSessionRecord(id);
+		if (record === null) return titleOf(id);
+		return `${badgeOf(record)} (tag ${record.tag})${inTab(tabOf({ tmuxSession: record.tmux, tmuxWindow: record.tmuxWindow }))}`;
+	}
+
+	function findingButtons(finding: Finding): InlineButton[][] {
+		const tell: InlineButton[] =
+			finding.state === "open" && finding.suggested !== ""
+				? [{ text: "Tell the sessions", callback_data: `f:${finding.id}:t`, style: "primary" }]
+				: [];
+		return [
+			[
+				...tell,
+				{ text: "Resolved", callback_data: `f:${finding.id}:r`, style: "success" },
+				{ text: "Not a problem", callback_data: `f:${finding.id}:n` },
+			],
+		];
+	}
+
+	/** Sends `text` to each session as a message from `from`, held behind a resume card for a session that has ended. */
+	function sendAsConductor(from: AgentSender, sessions: string[], text: string): void {
+		for (const target of sessions) {
+			const id = randomUUID().replaceAll("-", "").slice(0, 12);
+			if (isLiveSession(target)) {
+				const entry: InboxEntry = { kind: "agent", value: text, id, hop: 1, from };
+				writePrivateJson(join(INBOX_DIR, target), `${Date.now()}-${id}.json`, entry);
+				continue;
+			}
+			const message: AgentMessage = { id, text, hop: 1, from };
+			writePrivateJson(join(PENDING_DIR, target), `m-${Date.now()}-${id}.json`, {
+				kind: "message",
+				at: Date.now(),
+				message,
+			});
+			detach(() => raiseResumeCard(target), "resume card");
+		}
+	}
+
+	/** The conductor tool's `finding`: one card to Luca about members of the task this session conducts. */
+	async function raiseFinding(
+		ctx: ExtensionContext,
+		conducted: Task,
+		params: Record<string, unknown>,
+		refuse: (text: string) => ToolReply,
+	): Promise<ToolReply> {
+		// omp validated the parameters against the tool's schema, so each is its declared type or absent.
+		const p = params as {
+			kind?: string;
+			sessions?: string[];
+			text?: string;
+			subject?: string;
+			message?: string;
+			tell?: boolean;
+		};
+		const kind = (p.kind ?? "").trim();
+		const text = (p.text ?? "").trim();
+		const subject = (p.subject ?? "").trim();
+		const suggested = (p.message ?? "").trim();
+		if (!(FINDING_KINDS as readonly string[]).includes(kind))
+			return refuse(`\`kind\` is one of ${FINDING_KINDS.join(", ")}.`);
+		if (text.length === 0) return refuse("Say in `text` what you found, since the user reads it on the card.");
+		if (subject.length === 0) {
+			return refuse(
+				"Name the finding's `subject`, a short key the user settles it by, such as `overlap:src/lease.ts`.",
+			);
+		}
+		const sessions: string[] = [];
+		for (const name of p.sessions ?? []) {
+			// A member whose record is gone, as after a crash, is still named by its session id.
+			const id = conducted.members.find((member) => member.session === name)?.session ?? resolveSession(name.trim());
+			if (id === null || !conducted.members.some((member) => member.session === id)) {
+				return refuse(`${name} is not a member of the task "${conducted.name}".`);
+			}
+			sessions.push(id);
+		}
+		if (sessions.length === 0) return refuse("Name in `sessions` the members the finding is about.");
+		const finding: Finding = {
+			id: randomUUID().replaceAll("-", "").slice(0, 8),
+			kind: kind as Finding["kind"],
+			sessions,
+			subject,
+			text,
+			suggested,
+			messageId: null,
+			state: p.tell === true && suggested !== "" ? "told" : "open",
+		};
+		const prior = await updateTask(TASKS_DIR, conducted.slug, (task) => {
+			const known = task.findings.find((f) => f.subject === subject);
+			if (known !== undefined) return { task: null, result: known.state };
+			return { task: { ...task, findings: [...task.findings, finding] }, result: "new" as const };
+		});
+		if (prior === null) return refuse(`The task "${conducted.name}" no longer reads.`);
+		if (prior !== "new") {
+			return refuse(
+				prior === "resolved" || prior === "rejected"
+					? `The user settled the subject ${subject} as ${prior}, so it is not raised again. Name a new subject if the situation changed.`
+					: `The subject ${subject} is already raised and its card is open.`,
+			);
+		}
+		const body = [
+			`**${kind}** in the task **${conducted.name}**, about:`,
+			...sessions.map((id) => `- ${sessionLine(id)}`),
+			"",
+			text,
+			...(suggested === "" ? [] : ["", `Suggested message: ${suggested}`]),
+		].join("\n");
+		const sent = await notify(ctx, "notice", "\u{1F50E} Finding", body, {
+			reply_markup: { inline_keyboard: findingButtons(finding) },
+		});
+		const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
+		await updateTask(TASKS_DIR, conducted.slug, (task) => ({
+			task: {
+				...task,
+				findings:
+					messageId === null
+						? task.findings.filter((f) => f.id !== finding.id)
+						: task.findings.map((f) => (f.id === finding.id ? { ...f, messageId } : f)),
+			},
+			result: null,
+		}));
+		if (messageId === null) return refuse("The finding's card could not be sent, so nothing was raised. Try again.");
+		if (finding.state === "told") {
+			const from = { session: sessionId, emoji: badgeEmoji, label: taskName(ctx), cwd: ctx.cwd, tag: sessionTag };
+			sendAsConductor(from, sessions, suggested);
+		}
+		return {
+			content: [
+				{
+					type: "text" as const,
+					text: `Raised finding ${finding.id} on ${subject}.${finding.state === "told" ? " The suggested message went to the sessions." : ""} The user's answer arrives as an aside written by no one, and a reply to the card as a message.`,
+				},
+			],
+			details: { raised: true, finding: finding.id },
+		};
+	}
+
+	/** Luca's tap on a finding card: `t` tells the sessions, `r` resolves it, `n` rejects it. */
+	async function answerFindingCallback(
+		cfg: Config,
+		callbackId: string,
+		data: string,
+		messageId: number,
+	): Promise<void> {
+		const [, id, action] = data.split(":");
+		const owner = listTasks(TASKS_DIR).find((task) => task.findings.some((f) => f.id === id));
+		const conductor = owner === undefined ? null : readSessionRecord(owner.conductor);
+		const settled =
+			owner === undefined || (action === "t" && conductor === null)
+				? null
+				: await updateTask(TASKS_DIR, owner.slug, (task) => {
+						const current = task.findings.find((f) => f.id === id);
+						const answerable =
+							action === "t" ? current?.state === "open" : current?.state === "open" || current?.state === "told";
+						if (current === undefined || !answerable) return { task: null, result: null };
+						const state = action === "t" ? "told" : action === "r" ? "resolved" : "rejected";
+						const finding = { ...current, state } as Finding;
+						const findings = task.findings.map((f) => (f.id === id ? finding : f));
+						return { task: { ...task, findings }, result: { task, finding } };
+					});
+		let toast = "That finding is no longer open.";
+		if (settled !== null) {
+			const { task, finding } = settled;
+			if (finding.state === "told" && conductor !== null) {
+				const from = {
+					session: task.conductor,
+					emoji: conductor.emoji,
+					label: conductor.label,
+					cwd: conductor.cwd,
+					tag: conductor.tag,
+				};
+				sendAsConductor(from, finding.sessions, finding.suggested);
+				toast = "Sent to the sessions.";
+			} else {
+				const chosen = finding.state === "resolved" ? "Resolved" : "Not a problem";
+				if (finding.state === "rejected") {
+					sendLead(
+						task,
+						`The user marked the finding on ${finding.subject} as not a problem. A reply the user writes to its card reaches you as a message.`,
+					);
+				}
+				toast = finding.state === "resolved" ? "Resolved." : "Marked as not a problem.";
+				await callTelegram(
+					cfg,
+					"editMessageReplyMarkup",
+					{
+						chat_id: cfg.chatId,
+						message_id: messageId,
+						reply_markup: { inline_keyboard: settledKeyboard(["Resolved", "Not a problem"], new Set([chosen])) },
+					},
+					15_000,
+				);
+			}
+			if (finding.state === "told") {
+				await callTelegram(
+					cfg,
+					"editMessageReplyMarkup",
+					{ chat_id: cfg.chatId, message_id: messageId, reply_markup: { inline_keyboard: findingButtons(finding) } },
+					15_000,
+				);
+			}
+		}
+		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callbackId, text: toast }, 10_000);
+	}
+
 	registerTool({
 		name: "conductor",
 		label: "Conductor",
 		description:
-			"Act as the conductor of a task opened with `/conduct`. `action` `invite` proposes the live session named in `session`, by its badge emoji or tag, for the task this session conducts, and `reason` tells the user why it belongs. The user answers Join or Skip on a Telegram card, and the answer arrives as an aside written by no one. A session conducting a task, a member and a session the user skipped cannot be invited.",
+			"Act as the conductor of a task opened with `/conduct`. `action` `invite` proposes the live session named in `session`, by its badge emoji or tag, for the task this session conducts, and `reason` tells the user why it belongs. The user answers Join or Skip on a Telegram card, and the answer arrives as an aside written by no one. A session conducting a task, a member and a session the user skipped cannot be invited. `action` `finding` sends the user one card about members named in `sessions`: `kind` is one of overlap, stacked-parent, dead-wait, duplicate, contradiction or lesson, `text` says what you found, and `subject` is a short key such as `overlap:src/lease.ts`. A subject is raised once, and one the user settled is never raised again, so name a new subject when the situation changes. An optional `message` is what you propose to tell the sessions: the card offers to send it, or `tell` sends it at once, as a message from you.",
 		approval: "read",
 		parameters: z.object({
 			action: z.string(),
 			session: z.string().optional(),
 			reason: z.string().optional(),
+			kind: z.string().optional(),
+			sessions: z.array(z.string()).optional(),
+			text: z.string().optional(),
+			subject: z.string().optional(),
+			message: z.string().optional(),
+			tell: z.boolean().optional(),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const refuse = (text: string) => ({
@@ -7915,16 +8136,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			}
 			const cfg = config;
 			await followSession(ctx);
-			const p = params as { action?: unknown; session?: unknown; reason?: unknown };
+			const p = params as Record<string, unknown>;
 			const session = typeof p.session === "string" ? p.session.trim() : "";
 			const reason = typeof p.reason === "string" ? p.reason.trim() : "";
-			if (p.action !== "invite") return refuse("`action` must be `invite`.");
+			if (p.action !== "invite" && p.action !== "finding") return refuse("`action` is `invite` or `finding`.");
 			const conducted = listTasks(TASKS_DIR).find((task) => task.conductor === sessionId && task.state === "live");
 			if (conducted === undefined) {
 				return refuse(
-					"This session conducts no live task, so it cannot invite. `/conduct` in Telegram opens a conductor.",
+					"This session conducts no live task, so it cannot invite or raise findings. `/conduct` in Telegram opens a conductor.",
 				);
 			}
+			if (p.action === "finding") return raiseFinding(ctx, conducted, p, refuse);
 			if (reason.length === 0)
 				return refuse("Say in `reason` why the session belongs to the task, since the user reads it on the card.");
 			if ((badgeEmoji.length > 0 && session === badgeEmoji) || session === sessionTag) {

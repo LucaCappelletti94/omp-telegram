@@ -68,6 +68,18 @@ heading("task files");
 		candidates: [{ session: "c", card: "0a1b2c3d", state: "skipped" }],
 		led: ["s"],
 		closing: true,
+		findings: [
+			{
+				id: "0f1e2d3c",
+				kind: "overlap",
+				sessions: ["m"],
+				subject: "overlap:a",
+				text: "t",
+				suggested: "",
+				messageId: null,
+				state: "open",
+			},
+		],
 	};
 	const made = await changeTask(dir, "docs-pass", (task) => ({ task: task === null ? fresh : task, result: task }));
 	check("an absent task reads as null inside the change", made === null);
@@ -110,12 +122,16 @@ heading("task files");
 		"an update of a slug outside the pattern gives null",
 		(await updateTask(dir, "../escape", () => ({ task: fresh, result: "seen" }))) === null,
 	);
-	const { members, candidates, led, closing, ...older } = fresh;
+	const { members, candidates, led, closing, findings, ...older } = fresh;
 	writeFileSync(join(dir, "older.json"), JSON.stringify({ ...older, slug: "older" }));
 	const plain = readTask(dir, "older");
 	check(
-		"a task written before membership reads with no members, candidates or leads",
-		plain.members.length === 0 && plain.candidates.length === 0 && plain.led.length === 0 && plain.closing === false,
+		"a task written before membership reads with no members, candidates, leads or findings",
+		plain.members.length === 0 &&
+			plain.candidates.length === 0 &&
+			plain.led.length === 0 &&
+			plain.closing === false &&
+			plain.findings.length === 0,
 	);
 	writeFileSync(
 		join(dir, "mixed.json"),
@@ -129,14 +145,27 @@ heading("task files");
 				...candidates,
 			],
 			led: [4, ...led],
+			findings: [
+				{ ...findings[0], id: 5 },
+				{ ...findings[0], kind: "gossip" },
+				{ ...findings[0], sessions: "m" },
+				{ ...findings[0], sessions: [1] },
+				{ ...findings[0], subject: null },
+				{ ...findings[0], text: 1 },
+				{ ...findings[0], suggested: 1 },
+				{ ...findings[0], messageId: "7" },
+				{ ...findings[0], state: "lost" },
+				{ ...findings[0], messageId: 42 },
+			],
 		}),
 	);
 	const mixed = readTask(dir, "mixed");
 	check(
-		"malformed members, candidates and leads are dropped, well-formed ones kept",
+		"malformed members, candidates, leads and findings are dropped, well-formed ones kept",
 		JSON.stringify(mixed.members) === JSON.stringify(members) &&
 			JSON.stringify(mixed.candidates) === JSON.stringify(candidates) &&
-			JSON.stringify(mixed.led) === JSON.stringify(led),
+			JSON.stringify(mixed.led) === JSON.stringify(led) &&
+			JSON.stringify(mixed.findings) === JSON.stringify([{ ...findings[0], messageId: 42 }]),
 	);
 	rmSync(dir, { recursive: true, force: true });
 }

@@ -19869,6 +19869,257 @@ heading("an upstream launch of a member joins its requester's tasks");
 	);
 }
 
+heading("conductor findings reach Luca as cards");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "m1", "m2", "outsider"].map((name, i) => [
+			name,
+			`0d0e0700-0000-7000-8000-00000000000${i + 1}`,
+		]),
+	);
+	const taskFile = join(tasksDir, "docs.json");
+	writeFileSync(
+		taskFile,
+		JSON.stringify({
+			name: "Docs",
+			slug: "docs",
+			brief: "b",
+			conductor: ids.conductor,
+			state: "live",
+			launchedAt: 0,
+			members: [ids.m1, ids.m2].map((session) => ({ session, joinedAt: 1 })),
+			candidates: [],
+			led: [],
+			closing: false,
+		}),
+	);
+	const task = () => JSON.parse(readFileSync(taskFile, "utf8"));
+	const poller = spawn(ids.poller, "/home/dev/work/findings");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "docs"));
+	await conductor.fire("session_start");
+	const m1 = spawn(ids.m1, "/home/dev/work/m1");
+	await m1.fire("session_start");
+	const m2 = spawn(ids.m2, "/home/dev/work/m2");
+	await m2.fire("session_start");
+	const outsider = spawn(ids.outsider, "/home/dev/work/outsider");
+	await outsider.fire("session_start");
+	const tag = (s) => record(s.id).tag;
+	const raise = (params, from = conductor) =>
+		from.tools.get("conductor").execute("f", { action: "finding", ...params }, undefined, undefined, from.ctx);
+	const base = {
+		kind: "overlap",
+		sessions: [tag(m1), tag(m2)],
+		text: "Both edit src/lease.ts.",
+		subject: "overlap:src/lease.ts",
+	};
+	const refused = async (params, from) => {
+		const result = await raise(params, from);
+		return result.isError === true ? result.content[0].text : "";
+	};
+	const tap = async (data, update, messageId) => {
+		api.queued = [
+			{
+				update_id: update,
+				callback_query: {
+					id: `find${update}`,
+					data,
+					from: { id: CHAT },
+					message: { message_id: messageId, chat: { id: CHAT } },
+				},
+			},
+		];
+		await poller.pump(400);
+		return lastCall("answerCallbackQuery").body.text;
+	};
+	const fromConductor = (s) => s.customs.filter((c) => String(c.message.content).includes(record(ids.conductor).tag));
+
+	check(
+		"a session conducting no live task cannot raise a finding",
+		(await refused(base, outsider)).includes("conducts no live task"),
+	);
+	const without = (key) => Object.fromEntries(Object.entries(base).filter(([k]) => k !== key));
+	check("a finding without a known kind is refused", (await refused({ ...base, kind: "gossip" })).includes("kind"));
+	check("a finding with no kind is refused", (await refused(without("kind"))).includes("kind"));
+	check("a finding without text is refused", (await refused(without("text"))).includes("text"));
+	check("a finding without a subject is refused", (await refused(without("subject"))).includes("subject"));
+	check("a finding about no session is refused", (await refused(without("sessions"))).includes("`sessions`"));
+	check(
+		"a finding naming a session outside the task is refused",
+		(await refused({ ...base, sessions: [tag(m1), tag(outsider)] })).includes("not a member"),
+	);
+
+	const raised = await raise(base);
+	const card = lastCall("sendMessage").body;
+	const buttons = () => card.reply_markup.inline_keyboard.flat().map((b) => b.text);
+	const first = task().findings[0];
+	check(
+		"a finding sends one card naming its sessions, with Resolved and Not a problem",
+		raised.isError !== true &&
+			card.text.includes("Both edit src/lease.ts.") &&
+			card.text.includes(record(ids.m1).tag) &&
+			card.text.includes(record(ids.m2).tag) &&
+			buttons().join() === "Resolved,Not a problem" &&
+			first.state === "open" &&
+			first.subject === "overlap:src/lease.ts",
+	);
+	check("the same subject cannot be raised twice", (await refused(base)).includes("already"));
+
+	await tap(`f:${first.id}:r`, 9991, first.messageId);
+	check(
+		"Resolved settles the finding and its card",
+		task().findings[0].state === "resolved" &&
+			lastCall("editMessageReplyMarkup")
+				.body.reply_markup.inline_keyboard.flat()
+				.some((b) => b.text === "\u2713 Resolved"),
+	);
+	check("a resolved subject is refused for good", (await refused({ ...base, text: "Again." })).includes("resolved"));
+
+	await raise({ ...base, subject: "overlap:docs/", text: "Both edit docs/.", message: "Split docs/ between you." });
+	const second = task().findings.at(-1);
+	const secondCard = lastCall("sendMessage").body;
+	check(
+		"a finding with a suggested message offers Tell the sessions",
+		secondCard.reply_markup.inline_keyboard.flat()[0].text === "Tell the sessions" &&
+			secondCard.text.includes("Split docs/ between you."),
+	);
+	await tap(`f:${second.id}:t`, 9992, second.messageId);
+	await m1.pump(150);
+	await m2.pump(150);
+	check(
+		"Tell the sessions sends the suggested message to each as a message from the conductor",
+		fromConductor(m1).some((c) => String(c.message.content).includes("Split docs/ between you.")) &&
+			fromConductor(m2).some((c) => String(c.message.content).includes("Split docs/ between you.")) &&
+			task().findings.at(-1).state === "told",
+	);
+	check(
+		"the card then drops the Tell button",
+		!lastCall("editMessageReplyMarkup")
+			.body.reply_markup.inline_keyboard.flat()
+			.some((b) => b.text === "Tell the sessions"),
+	);
+	await tap(`f:${second.id}:n`, 9993, second.messageId);
+	await conductor.pump(150);
+	check(
+		"Not a problem rejects the finding and tells the conductor",
+		task().findings.at(-1).state === "rejected" &&
+			conductor.customs.some((c) => String(c.message.content).includes("not a problem")),
+	);
+	check(
+		"a rejected subject is refused for good too",
+		(await refused({ ...base, subject: "overlap:docs/", text: "Still both." })).includes("rejected"),
+	);
+
+	api.queued = [
+		{
+			update_id: 9994,
+			message: {
+				message_id: 9994,
+				date: 1,
+				chat: { id: CHAT },
+				text: "They agreed on it already.",
+				reply_to_message: { message_id: second.messageId },
+			},
+		},
+	];
+	await poller.pump(300);
+	await conductor.pump(200);
+	check(
+		"Luca's reply to a card reaches the conductor",
+		conductor.steers.some((s) => steerText(s).includes("They agreed on it already.")),
+	);
+
+	// m2 crashed: its record is gone while it stays a member, so the card names it by its graph title and its
+	// message waits for its resume.
+	rmSync(join(sessionsDir, `${ids.m2}.json`));
+	await raise({
+		...base,
+		sessions: [tag(m1), ids.m2],
+		subject: "lesson:pins",
+		kind: "lesson",
+		text: "Pin the toolchain.",
+		message: "Pin it.",
+		tell: true,
+	});
+	await m1.pump(150);
+	check(
+		"a finding told at once reaches the sessions without a Tell button",
+		task().findings.at(-1).state === "told" &&
+			fromConductor(m1).some((c) => String(c.message.content).includes("Pin it.")) &&
+			!lastCall("sendMessage")
+				.body.reply_markup.inline_keyboard.flat()
+				.some((b) => b.text === "Tell the sessions"),
+	);
+	check(
+		"a member that has ended gets the message held for its resume",
+		readdirSync(join(stateDir, "graph/pending", ids.m2)).some((f) => f.startsWith("m-")),
+	);
+
+	await raise({
+		...base,
+		sessions: [tag(m1)],
+		subject: "dup:x",
+		kind: "duplicate",
+		text: "Twice.",
+		message: "Stop one.",
+	});
+	const orphaned = task().findings.at(-1);
+	rmSync(join(sessionsDir, `${ids.conductor}.json`));
+	check(
+		"Tell the sessions with the conductor gone sends nothing",
+		(await tap(`f:${orphaned.id}:t`, 9996, orphaned.messageId)).includes("no longer") &&
+			task().findings.at(-1).state === "open",
+	);
+	conductor.heartbeat();
+
+	api.failMethods = ["sendMessage"];
+	const unsent = await refused({ ...base, sessions: [tag(m1)], subject: "unsent" });
+	api.failMethods = [];
+	check(
+		"a finding whose card cannot be sent is not kept",
+		unsent.includes("could not be sent") && !task().findings.some((f) => f.subject === "unsent"),
+	);
+
+	const taskLock = join(tasksDir, "tasks.lock");
+	const intact = readFileSync(taskFile, "utf8");
+	writeFileSync(taskLock, "");
+	const waiting = refused({ ...base, sessions: [tag(m1)], subject: "racing" });
+	await settle(60);
+	writeFileSync(taskFile, "{");
+	rmSync(taskLock);
+	check("a finding whose task stopped reading while it waited is refused", (await waiting).includes("no longer reads"));
+	writeFileSync(taskFile, intact);
+	check("a tap on a finding nobody knows says so", (await tap("f:0000ffff:r", 9995, 1)).includes("no longer"));
+	const pending = task().findings.find((f) => f.subject === "dup:x");
+	writeFileSync(taskLock, "");
+	api.queued = [
+		{
+			update_id: 9997,
+			callback_query: {
+				id: "find9997",
+				data: `f:${pending.id}:r`,
+				from: { id: CHAT },
+				message: { message_id: pending.messageId, chat: { id: CHAT } },
+			},
+		},
+	];
+	await poller.pump(60);
+	writeFileSync(taskFile, JSON.stringify({ ...task(), findings: task().findings.filter((f) => f.id !== pending.id) }));
+	rmSync(taskLock);
+	await settle(400);
+	check(
+		"a tap whose finding vanished while it waited changes nothing",
+		lastCall("answerCallbackQuery").body.text.includes("no longer"),
+	);
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
