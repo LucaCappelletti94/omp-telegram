@@ -19610,7 +19610,7 @@ heading("members leaving a task and its conductor closing");
 				conductor,
 				state: "live",
 				launchedAt: 0,
-				members: members.map((session) => ({ session, joinedAt: 1 })),
+				members: members.map((session) => ({ session, joinedAt: Date.now() })),
 				candidates: [],
 				led: [],
 			}),
@@ -20585,6 +20585,177 @@ heading("conductor verdicts on the register");
 		unsent.includes("could not be sent") && entry("Split the module").status === "proposed",
 	);
 	check("a tap on an objection nobody knows says so", (await tap("v:0000ffff:u", 10013, 1)).includes("no longer"));
+}
+
+heading("member updates and the conductor's silence check");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "author", "waiter", "crashed"].map((name, i) => [
+			name,
+			`0d0e0b00-0000-7000-8000-00000000000${i + 1}`,
+		]),
+	);
+	const transcripts = join(root, "sessions", "silence");
+	mkdirSync(transcripts, { recursive: true });
+	const authorTranscript = join(transcripts, `2026-01-01T00-00-00Z_${ids.author}.jsonl`);
+	writeFileSync(authorTranscript, "{}\n{}\n{}\n");
+	const taskFile = join(tasksDir, "api.json");
+	writeFileSync(
+		taskFile,
+		JSON.stringify({
+			name: "API",
+			slug: "api",
+			brief: "b",
+			conductor: ids.conductor,
+			state: "live",
+			launchedAt: 0,
+			members: [
+				{ session: ids.author, joinedAt: Date.now() },
+				{ session: ids.waiter, joinedAt: Date.now() },
+				{ session: ids.crashed, joinedAt: Date.now() },
+			],
+			candidates: [],
+			led: [],
+			closing: false,
+			findings: [],
+			register: [],
+		}),
+	);
+	const dormantFile = join(tasksDir, "old.json");
+	writeFileSync(
+		dormantFile,
+		JSON.stringify({
+			...JSON.parse(readFileSync(taskFile, "utf8")),
+			name: "Old",
+			slug: "old",
+			conductor: "0d0e0b00-0000-7000-8000-0000000000ff",
+			state: "dormant",
+			members: [{ session: ids.crashed, joinedAt: Date.now() }],
+		}),
+	);
+	const task = () => JSON.parse(readFileSync(taskFile, "utf8"));
+	const member = (id) => task().members.find((m) => m.session === id);
+	const poller = spawn(ids.poller, "/home/dev/work/silence");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "api"));
+	await conductor.fire("session_start");
+	const author = spawn(ids.author, "/home/dev/work/author");
+	await author.fire("session_start");
+	const crashDir = join(stateDir, "crashed");
+	mkdirSync(crashDir, { recursive: true });
+	writeFileSync(
+		join(crashDir, `${ids.crashed}.json`),
+		JSON.stringify({
+			record: { ...record(ids.author), tag: "crshd" },
+			batch: "0d0e0b00-batch",
+			machine: false,
+			restoringAt: 0,
+			error: "",
+			dismissed: false,
+		}),
+	);
+	const writeWaiter = () =>
+		writeFileSync(
+			join(sessionsDir, `${ids.waiter}.json`),
+			JSON.stringify({ ...record(ids.author), tag: "waitr", question: 77, heartbeat: Date.now() }),
+		);
+	writeWaiter();
+	const tool = (s, params) => s.tools.get("conductor").execute("s", params, undefined, undefined, s.ctx);
+	const text = async (s, params) => (await tool(s, params)).content[0].text;
+	const leadsTo = async (s) => {
+		await s.pump(150);
+		return s.customs.map((c) => String(c.message.content)).filter((t) => t.startsWith("Automatic conductor update"));
+	};
+	const silenceTick = async (ms) => {
+		jump(ms);
+		writeWaiter();
+		author.heartbeat();
+		conductor.heartbeat();
+		poller.heartbeat();
+		await settle(300);
+	};
+
+	check("an update needs text", (await text(author, { action: "update" })).includes("`text`"));
+	await tool(author, { action: "update", text: "The parser is done, the lexer is next." });
+	check(
+		"a member's update reaches its conductor and marks where its transcript stood",
+		(await leadsTo(conductor)).some((t) => t.includes("The parser is done, the lexer is next.")) &&
+			member(ids.author).updateLine === 3 &&
+			member(ids.author).updatedAt >= Date.now() - 1_000,
+	);
+
+	check(
+		"only a conductor sets the silence limit",
+		(await text(author, { action: "silence", hours: 2 })).includes("conducts no live task"),
+	);
+	check(
+		"a silence limit is a positive number of hours",
+		(await text(conductor, { action: "silence", hours: 0 })).includes("hours") && task().silenceHours === 4,
+	);
+	check(
+		"the conductor sets the task's silence limit",
+		(await text(conductor, { action: "silence", hours: 2 })).includes("2 hours") && task().silenceHours === 2,
+	);
+
+	writeFileSync(authorTranscript, "{}\n{}\n{}\n{}\n{}\n");
+	const before = (await leadsTo(conductor)).length;
+	await silenceTick(60 * 60_000);
+	check("a member inside the limit is not checked on", (await leadsTo(conductor)).length === before);
+	await silenceTick(60 * 60_000 + 1_000);
+	const silent = (await leadsTo(conductor)).slice(before);
+	const aboutAuthor = (leads) => leads.filter((t) => t.includes(ids.author));
+	check(
+		"past the limit the conductor gets the member's transcript lines since its update",
+		aboutAuthor(silent).length === 1 &&
+			aboutAuthor(silent)[0].includes(`${authorTranscript}:4-5`) &&
+			member(ids.author).silenceLed,
+	);
+	check(
+		"a silent member without a transcript, such as a crashed one, is checked on with nothing to read",
+		silent.some((t) => t.includes(ids.crashed) && t.includes("nothing")) && member(ids.crashed).silenceLed,
+	);
+	check(
+		"a member waiting on the user is left alone and its silence clock starts again",
+		!silent.some((t) => t.includes(ids.waiter)) && member(ids.waiter).checkedAt >= Date.now() - 1_000,
+	);
+	await silenceTick(2 * 60 * 60_000 + 1_000);
+	check(
+		"a silence check reaches the conductor once",
+		(await leadsTo(conductor)).slice(before).length === silent.length,
+	);
+	check(
+		"a dormant task's members are not checked on, even past its limit",
+		!JSON.parse(readFileSync(dormantFile, "utf8")).members[0].silenceLed,
+	);
+
+	check(
+		"`checked` names a member of the task",
+		(await text(conductor, { action: "checked", session: "nobody" })).includes("not a member"),
+	);
+	await tool(conductor, { action: "checked", session: ids.author });
+	check(
+		"`checked` starts the member's silence clock again",
+		!member(ids.author).silenceLed && member(ids.author).checkedAt >= Date.now() - 1_000,
+	);
+	await silenceTick(2 * 60 * 60_000 + 1_000);
+	const again = aboutAuthor((await leadsTo(conductor)).slice(before + silent.length));
+	check(
+		"the next silence check still reads from the last update",
+		again.length === 1 && again[0].includes(`${authorTranscript}:4-5`),
+	);
+	await tool(author, { action: "update", text: "Lexer done." });
+	check(
+		"an update clears a pending silence check",
+		!member(ids.author).silenceLed && member(ids.author).updateLine === 5,
+	);
+	clockSkew = 0;
 }
 
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
