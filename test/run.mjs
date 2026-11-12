@@ -19783,6 +19783,92 @@ heading("members leaving a task and its conductor closing");
 	);
 }
 
+heading("an upstream launch of a member joins its requester's tasks");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["conductor", "parent", "child", "loner", "orphan"].map((name, i) => [
+			name,
+			`0d0e0600-0000-7000-8000-00000000000${i + 1}`,
+		]),
+	);
+	const writeTask = (slug, members) =>
+		writeFileSync(
+			join(tasksDir, `${slug}.json`),
+			JSON.stringify({
+				name: slug,
+				slug,
+				brief: "b",
+				conductor: ids.conductor,
+				state: "live",
+				launchedAt: 0,
+				members: members.map((session) => ({ session, joinedAt: 1 })),
+				candidates: [],
+				led: [],
+				closing: true,
+			}),
+		);
+	const taskOf = (slug) => JSON.parse(readFileSync(join(tasksDir, `${slug}.json`), "utf8"));
+	writeTask("joined", [ids.parent]);
+	writeTask("apart", [ids.loner]);
+	writeTask("already", [ids.parent, ids.child]);
+	const conductor = spawn(ids.conductor, join(tasksDir, "joined"));
+	await conductor.fire("session_start");
+	const launch = (id, parent) => {
+		const launchesDir = join(stateDir, "graph/launches");
+		mkdirSync(launchesDir, { recursive: true });
+		writeFileSync(
+			join(launchesDir, `${id}.json`),
+			JSON.stringify({
+				id,
+				parent,
+				repo: "someorg/widget",
+				branch: "upstream/fix",
+				problem: "Widget breaks.",
+				worktree: "/home/dev/widget.upstreams/fix",
+				at: Date.now(),
+			}),
+		);
+		process.env.OMP_TELEGRAM_LAUNCH = id;
+	};
+	launch("0d0e0600-launch-0001", ids.parent);
+	const child = spawn(ids.child, "/home/dev/widget.upstreams/fix");
+	await child.fire("session_start");
+	await settle(200);
+	check(
+		"a member's launched child joins every task of its requester and nothing else",
+		taskOf("joined").members.some((m) => m.session === ids.child) &&
+			!taskOf("apart").members.some((m) => m.session === ids.child),
+	);
+	check("a child joining a closing task keeps its conductor open", taskOf("joined").closing === false);
+	check(
+		"a child already in one of those tasks is not added twice",
+		taskOf("already").members.filter((m) => m.session === ids.child).length === 1,
+	);
+	await conductor.pump(150);
+	check(
+		"the conductor hears that the child joined",
+		conductor.customs.some(
+			(c) => String(c.message.content).includes("joined") && String(c.message.content).includes("upstream launch"),
+		),
+	);
+	launch("0d0e0600-launch-0002", ids.orphan);
+	const stray = spawn("0d0e0600-0000-7000-8000-000000000009", "/home/dev/widget.upstreams/other");
+	await stray.fire("session_start");
+	await settle(200);
+	check(
+		"a child of a session in no task joins nothing",
+		!taskOf("joined").members.some((m) => m.session === stray.id) &&
+			!taskOf("apart").members.some((m) => m.session === stray.id),
+	);
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
