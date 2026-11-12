@@ -21505,14 +21505,26 @@ heading("a member waiting on a session that closed");
 	mkdirSync(tasksDir, { recursive: true });
 	const nodesDir = join(stateDir, "graph/nodes");
 	mkdirSync(nodesDir, { recursive: true });
+	const prDir = join(stateDir, "graph/pr");
+	mkdirSync(prDir, { recursive: true });
 	const crashDir = join(stateDir, "crashed");
 	mkdirSync(crashDir, { recursive: true });
 	const ids = Object.fromEntries(
-		["poller", "conductor", "member", "closed", "live", "crashed", "finished", "nodeless", "dismissed"].map(
-			(name, i) => [name, `0d0e1000-0000-7000-8000-00000000000${i + 1}`],
-		),
+		[
+			"poller",
+			"conductor",
+			"member",
+			"closed",
+			"live",
+			"crashed",
+			"finished",
+			"nodeless",
+			"dismissed",
+			"prrecord",
+			"prnode",
+		].map((name, i) => [name, `0d0e1000-0000-7000-8000-00000000000${(i + 1).toString(16)}`]),
 	);
-	const node = (session, status, edges = []) =>
+	const node = (session, status, edges = [], pr) =>
 		writeFileSync(
 			join(nodesDir, `${session}.json`),
 			JSON.stringify({
@@ -21523,6 +21535,7 @@ heading("a member waiting on a session that closed");
 				cwd: "/nowhere",
 				status,
 				note: "",
+				pr,
 				edges,
 				createdAt: Date.now(),
 				updatedAt: Date.now(),
@@ -21582,7 +21595,9 @@ heading("a member waiting on a session that closed");
 	crash(ids.dismissed, true);
 	const waitsOn = (to) => ({ from: ids.member, to, type: "waits-on", at: Date.now() });
 	node(ids.member, "waiting", [
-		...["closed", "live", "crashed", "finished", "nodeless", "dismissed"].map((name) => waitsOn(ids[name])),
+		...["closed", "live", "crashed", "finished", "nodeless", "dismissed", "prrecord", "prnode"].map((name) =>
+			waitsOn(ids[name]),
+		),
 		{ from: ids.member, to: ids.closed, type: "related", at: Date.now() },
 	]);
 	node(ids.closed, "working");
@@ -21590,6 +21605,19 @@ heading("a member waiting on a session that closed");
 	node(ids.crashed, "working");
 	node(ids.finished, "done");
 	node(ids.dismissed, "working");
+	node(ids.prrecord, "pushed");
+	node(ids.prnode, "pushed", [], "https://github.com/someorg/widget/pull/32");
+	writeFileSync(
+		join(prDir, `${ids.prrecord}.json`),
+		JSON.stringify({
+			url: "https://github.com/someorg/widget/pull/31",
+			number: 31,
+			state: "open",
+			checkedAt: Date.now(),
+			changedAt: Date.now(),
+			emitted: [],
+		}),
+	);
 	const check10 = async () => {
 		jump(10 * 60_000 + 1_000);
 		for (const s of [conductor, member, live]) s.heartbeat();
@@ -21608,6 +21636,8 @@ heading("a member waiting on a session that closed");
 
 	await check10();
 	const first = (await deadWaits()).join("\n");
+	check("a wait on a closed session with a PR record does not lead its conductor", !first.includes(ids.prrecord));
+	check("a wait on a closed session with a node PR does not lead its conductor", !first.includes(ids.prnode));
 	check(
 		"a wait on a session that closed unfinished or whose crash card was dismissed leads its conductor, and one on a session with no node too",
 		(await deadWaits()).length === 3 &&
