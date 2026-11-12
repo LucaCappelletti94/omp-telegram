@@ -15312,6 +15312,7 @@ const vsTranscript = (id) => {
 	return path;
 };
 const vsMarker = (id) => join(root, "notify-telegram/restart-pending", `${id}.json`);
+const vsHold = (id) => join(root, "notify-telegram/restart-held", `${id}.json`);
 const vsMarkerRead = (id) => {
 	try {
 		return JSON.parse(readFileSync(vsMarker(id), "utf8"));
@@ -15351,6 +15352,9 @@ const vsRetire = (id) =>
 	const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
 	const stale = spawn("01a1f110-0000-7000-8000-000000000010", folder, "Stale one");
 	await stale.fire("session_start");
+	await stale.tools
+		.get("session_badge")
+		.execute("vs-badge", { emoji: "🛟", code: "HOLD", label: "Restart identity" }, undefined, undefined, stale.ctx);
 	// Plain green opens the close offer; the green choice becomes the standing question; the red light gets pinned.
 	await stale.tools
 		.get("notify_status")
@@ -15404,6 +15408,7 @@ const vsRetire = (id) =>
 		"the wave wrote the restart marker before the kill",
 		marker !== null && marker.pid === old.pid && typeof marker.at === "number",
 	);
+	check("the wave holds the record before the restart", existsSync(vsHold(stale.id)));
 	const log = vsLog();
 	check(
 		"the pane is held open while the process is gone and respawned with the transcript",
@@ -15427,6 +15432,19 @@ const vsRetire = (id) =>
 	check("a restart shutdown keeps the close offer", after.closeOffer === before.closeOffer);
 	check("a restart shutdown keeps the red pin", after.pinned === redMessage && api.pinned.has(redMessage));
 	check("the marker is consumed by the shutdown", !existsSync(vsMarker(stale.id)));
+	check("the restart hold survives shutdown", existsSync(vsHold(stale.id)));
+	const other = spawn("01a1f110-0000-7000-8000-000000000042", folder, "Concurrent registration");
+	await other.fire("session_start");
+	const kept = existsSync(join(sessionsDir, `${stale.id}.json`)) ? record(stale.id) : null;
+	check(
+		"another registration preserves the restarting session's identity",
+		kept !== null &&
+			kept.tag === before.tag &&
+			kept.emoji === before.emoji &&
+			kept.label === before.label &&
+			kept.code === before.code,
+	);
+	check("registration leaves the restart hold intact", existsSync(vsHold(stale.id)));
 	const back = spawn(stale.id, folder, "Stale one");
 	await back.fire("session_start");
 	await settle(100);
@@ -15435,6 +15453,14 @@ const vsRetire = (id) =>
 	check(
 		"the wave confirms the resume by the record, the new pid and the current stamp",
 		record(stale.id).pid !== old.pid,
+	);
+	check("confirmation removes the restart hold", !existsSync(vsHold(stale.id)));
+	check("the resumed process adopts the held tag", record(stale.id).tag === before.tag);
+	check(
+		"the resumed process adopts the held badge",
+		record(stale.id).emoji === before.emoji &&
+			record(stale.id).label === before.label &&
+			record(stale.id).code === before.code,
 	);
 	check("the resumed process adopts the standing question", record(stale.id).standing?.id === before.standing.id);
 	check("the resumed process adopts the close offer", record(stale.id).closeOffer === before.closeOffer);
@@ -15450,6 +15476,7 @@ const vsRetire = (id) =>
 	);
 	check("a fully restarted wave sends no notice", vsWaveNotices() === 0);
 	await back.fire("session_shutdown");
+	await other.fire("session_shutdown");
 	vsRetire(stale.id);
 }
 
@@ -15653,6 +15680,7 @@ const vsRetire = (id) =>
 	await settle(100);
 	jump(31_000);
 	await settle(1500);
+	vsCandidate(stale, folder, { state: "working" });
 	vsPoller.heartbeat();
 	await settle(400);
 	check(
@@ -15660,7 +15688,8 @@ const vsRetire = (id) =>
 		stubborn.exitCode === null && vsWaveNotices() === 3 && lastVsNotice().includes("did not exit"),
 	);
 	check("the wave that reported it did not respawn a pane", !vsLog().includes("respawn-pane"));
-	writeFileSync(join(sessionsDir, `${stale.id}.json`), JSON.stringify({ ...record(stale.id), heartbeat: Date.now() }));
+	check("a failed exit releases the restart hold", !existsSync(vsHold(stale.id)));
+	vsCandidate(stale, folder, {});
 	vsLogReset();
 	vsPoller.heartbeat();
 	// The retry's kill takes real milliseconds through the fake tmux.
@@ -16058,7 +16087,7 @@ const vsRetire = (id) =>
 	old.kill("SIGKILL");
 }
 
-// The reaper leaves a record alone while its restart marker is live, and takes it up once the marker ages out.
+// The reaper leaves a held record alone until its hold expires.
 {
 	const id = "01a1f141-0000-7000-8000-000000000041";
 	const rec = {
@@ -16096,22 +16125,35 @@ const vsRetire = (id) =>
 		codeStamp: "stale-stamp",
 	};
 	writeFileSync(join(sessionsDir, `${id}.json`), JSON.stringify(rec));
-	mkdirSync(join(root, "notify-telegram/restart-pending"), { recursive: true });
-	writeFileSync(vsMarker(id), JSON.stringify({ at: Date.now(), pid: deadPid }), { mode: 0o600 });
+	mkdirSync(join(root, "notify-telegram/restart-held"), { recursive: true });
+	writeFileSync(vsHold(id), JSON.stringify({ at: Date.now() }), { mode: 0o600 });
 	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 	vsPoller.heartbeat();
 	await settle(150);
 	check(
-		"the reaper leaves a marked record alone while its restart marker is live",
+		"the crash reaper leaves a record alone while its restart hold is live",
 		existsSync(join(sessionsDir, `${id}.json`)) && !existsSync(join(root, "notify-telegram/crashed", `${id}.json`)),
 	);
 	jump(6 * 60_000);
 	vsPoller.heartbeat();
 	await settle(200);
 	check(
-		"the reaper takes up a marked record once its marker is gone",
+		"the crash reaper takes up a record once its restart hold expires",
 		!existsSync(join(sessionsDir, `${id}.json`)) && existsSync(join(root, "notify-telegram/crashed", `${id}.json`)),
 	);
+	for (const [name, hold] of [
+		["expired", { at: Date.now() - 5 * 60_000 }],
+		["missing timestamp", {}],
+		["invalid timestamp", { at: "now" }],
+		["null", null],
+	]) {
+		writeFileSync(join(sessionsDir, `${id}.json`), JSON.stringify({ ...rec, heartbeat: 0 }));
+		writeFileSync(vsHold(id), JSON.stringify(hold));
+		const other = spawn(`hold-${name.replaceAll(" ", "-")}`, rec.cwd, "Hold expiry registration");
+		await other.fire("session_start");
+		check(`registration reaps a closed record with ${name} hold data`, !existsSync(join(sessionsDir, `${id}.json`)));
+		await other.fire("session_shutdown");
+	}
 }
 
 restoreStamp();
