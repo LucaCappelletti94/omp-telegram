@@ -25,6 +25,7 @@ import {
 	blockingPath,
 	buildWatchQuery,
 	classifyPr,
+	type DisplayStatus,
 	dependentsOf,
 	diffWatch,
 	displayedStatus,
@@ -919,6 +920,8 @@ const CLOSE_NOTICE_WAIT_MS = 30_000;
 const REGISTER_WAIT_MS = 10 * 60_000;
 /** How often the poller compares the files members of one repository change. */
 const OVERLAP_CHECK_MS = 10 * 60_000;
+/** How long a green close offer stands before its member looks finished to the conductor. */
+const FINISHED_IDLE_MS = 30 * 60_000;
 /** What a tap gets when its window is already opening. */
 const ALREADY_STARTING = "That session is already starting.";
 /** A pending or failed launch request is answered by expiry seven days after it was made. */
@@ -7814,6 +7817,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				followed: "",
 				overlaps: [],
 				deadWaits: [],
+				finished: [],
 			};
 			return { task: fresh, result: { kind: "open", task: fresh } };
 		});
@@ -8542,6 +8546,53 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		]);
 		const files = [...new Set(`${changed.stdout}\n${untracked.stdout}`.split("\n").filter((f) => f !== ""))].sort();
 		return { repo: origin.stdout, branch: branch.stdout, files };
+	}
+
+	/**
+	 * Leads each live task's conductor once per state in which a member looks finished: its graph status done,
+	 * not-needed or abandoned, its pull request merged, or a green close offer from its last turn left standing for half
+	 * an hour. A member waiting on the user, or one without a session record, is left alone.
+	 */
+	async function checkFinished(): Promise<void> {
+		const { nodes, prs } = graphSnapshot();
+		const byId = new Map(nodes.map((node) => [node.session, node]));
+		const statusReasons: Partial<Record<DisplayStatus, string>> = {
+			done: "its `session_graph` status is done",
+			merged: "its pull request merged",
+			"not-needed": "its `session_graph` status is not-needed",
+			abandoned: "its `session_graph` status is abandoned",
+		};
+		const idleReason = "its last turn ended green with a close offer, and it has stayed idle for half an hour";
+		const now = Date.now();
+		for (const listed of listTasks(TASKS_DIR)) {
+			if (listed.state !== "live") continue;
+			const looks = listed.members.flatMap(({ session }) => {
+				const record = readSessionRecord(session);
+				if (record === null || record.question !== null || record.replyQuestion !== null || record.standing !== null) {
+					return [];
+				}
+				const node = byId.get(session);
+				const status = node === undefined ? undefined : displayedStatus(node, prs.get(session));
+				const reason = status === undefined ? undefined : statusReasons[status];
+				if (reason !== undefined) return [{ session, state: status as string, reason }];
+				return record.closeOffer !== null && now - record.summaryAt >= FINISHED_IDLE_MS
+					? [{ session, state: "idle", reason: idleReason }]
+					: [];
+			});
+			if (looks.length === 0) continue;
+			await updateTask(TASKS_DIR, listed.slug, (task) => {
+				const fresh = looks.filter(({ session, state }) => !task.finished.includes(`${session} ${state}`));
+				for (const { session, reason } of fresh) {
+					sendLead(
+						task,
+						`${titleOf(session)} (session ${session}) looks finished: ${reason}. If its part of the task is done, raise a \`completed\` finding naming it, so the user can close it.`,
+						{ about: session },
+					);
+				}
+				const finished = [...task.finished, ...fresh.map(({ session, state }) => `${session} ${state}`)];
+				return { task: { ...task, finished }, result: null };
+			});
+		}
 	}
 
 	/**
@@ -11264,6 +11315,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						lastOverlapCheck = Date.now();
 						detach(() => checkOverlaps(""), "overlap check");
 						detach(() => checkDeadWaits(), "dead wait check");
+						detach(() => checkFinished(), "finished check");
 					}
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");

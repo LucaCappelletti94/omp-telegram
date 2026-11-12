@@ -21412,6 +21412,164 @@ heading("a member waiting on a session that closed");
 	clockSkew = 0;
 }
 
+heading("a member that looks finished");
+{
+	clockSkew = 0;
+	writeConfig();
+	const stateDir = join(root, "notify-telegram");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	const tasksDir = join(stateDir, "tasks");
+	rmSync(tasksDir, { recursive: true, force: true });
+	mkdirSync(tasksDir, { recursive: true });
+	const nodesDir = join(stateDir, "graph/nodes");
+	const prDir = join(stateDir, "graph/pr");
+	mkdirSync(nodesDir, { recursive: true });
+	mkdirSync(prDir, { recursive: true });
+	const ids = Object.fromEntries(
+		["poller", "conductor", "done", "merged", "waiting", "idle", "recent", "busy", "nodeless"].map((name, i) => [
+			name,
+			`0d0e1100-0000-7000-8000-00000000000${i + 1}`,
+		]),
+	);
+	const members = ["done", "merged", "waiting", "idle", "recent", "busy", "nodeless"];
+	const node = (name, status) =>
+		writeFileSync(
+			join(nodesDir, `${ids[name]}.json`),
+			JSON.stringify({
+				session: ids[name],
+				label: name,
+				emoji: "",
+				tag: `f${name}`,
+				cwd: "/nowhere",
+				status,
+				note: "",
+				edges: [],
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			}),
+		);
+	writeFileSync(
+		join(tasksDir, "api.json"),
+		JSON.stringify({
+			name: "api",
+			slug: "api",
+			brief: "b",
+			conductor: ids.conductor,
+			state: "live",
+			launchedAt: 0,
+			members: members.map((name) => ({ session: ids[name], joinedAt: Date.now() })),
+			candidates: [],
+			led: [],
+			closing: false,
+			findings: [],
+			register: [],
+		}),
+	);
+	writeFileSync(
+		join(tasksDir, "old.json"),
+		JSON.stringify({
+			...JSON.parse(readFileSync(join(tasksDir, "api.json"), "utf8")),
+			name: "old",
+			slug: "old",
+			conductor: "0d0e1100-0000-7000-8000-0000000000ff",
+			state: "dormant",
+		}),
+	);
+	const poller = spawn(ids.poller, "/home/dev/work/finished");
+	await poller.fire("session_start");
+	const conductor = spawn(ids.conductor, join(tasksDir, "api"));
+	await conductor.fire("session_start");
+	const summaryAt = Date.now();
+	// Each member's record as its own omp would leave it, rewritten before every check so it stays fresh.
+	const records = () => {
+		const base = { ...record(ids.conductor), closeOffer: null, question: null, replyQuestion: null, standing: null };
+		const extra = {
+			waiting: { question: 77 },
+			idle: { closeOffer: 7, summaryAt },
+			recent: { closeOffer: 8, summaryAt: Date.now() },
+		};
+		for (const name of members.filter((name) => name !== "busy")) {
+			writeFileSync(
+				join(sessionsDir, `${ids[name]}.json`),
+				JSON.stringify({ ...base, tag: `f${name}`, heartbeat: Date.now(), ...(extra[name] ?? {}) }),
+			);
+		}
+	};
+	node("done", "done");
+	node("merged", "pushed");
+	writeFileSync(
+		join(prDir, `${ids.merged}.json`),
+		JSON.stringify({
+			url: "https://github.com/someorg/widget/pull/30",
+			number: 30,
+			state: "merged",
+			checkedAt: Date.now(),
+			changedAt: Date.now(),
+			emitted: [],
+		}),
+	);
+	node("waiting", "done");
+	node("idle", "working");
+	node("recent", "working");
+	// The crashed member has no session record, only the crash record that keeps it in the task.
+	node("busy", "done");
+	mkdirSync(join(stateDir, "crashed"), { recursive: true });
+	writeFileSync(
+		join(stateDir, "crashed", `${ids.busy}.json`),
+		JSON.stringify({
+			record: { ...record(ids.conductor), tag: "fbusy" },
+			batch: "0d0e1100-batch",
+			machine: false,
+			restoringAt: 0,
+			error: "",
+			dismissed: false,
+		}),
+	);
+	const check10 = async () => {
+		jump(10 * 60_000 + 1_000);
+		records();
+		conductor.heartbeat();
+		poller.heartbeat();
+		await settle(500);
+	};
+	const finished = async () => {
+		await conductor.pump(300);
+		return conductor.customs
+			.map((c) => String(c.message.content))
+			.join("\n")
+			.split("looks finished")
+			.slice(0, -1);
+	};
+
+	records();
+	await check10();
+	await check10();
+	await check10();
+	const leads = await finished();
+	const text = leads.join("\n");
+	check(
+		"a member whose graph status is done, whose pull request merged, or that sat idle on a green close offer for half an hour leads its conductor",
+		leads.length === 3 &&
+			text.includes(ids.done) &&
+			text.includes(ids.merged) &&
+			text.includes(ids.idle) &&
+			!text.includes(ids.recent) &&
+			!text.includes(ids.busy),
+	);
+	check("a member waiting on the user is not led about", !text.includes(ids.waiting));
+	await check10();
+	check("each state leads once", (await finished()).length === 3);
+	node("idle", "abandoned");
+	await check10();
+	const later = (await finished()).slice(3);
+	check("a new state of the same member leads again", later.length === 1 && later[0].includes(ids.idle));
+	check(
+		"a dormant task's file is never rewritten for it",
+		!("finished" in JSON.parse(readFileSync(join(tasksDir, "old.json"), "utf8"))),
+	);
+	clockSkew = 0;
+}
+
 console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
 process.exit(fails === 0 ? 0 : 1);
 rmSync(root, { recursive: true, force: true });
