@@ -7782,6 +7782,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				findings: [],
 				register: [],
 				silenceHours: DEFAULT_SILENCE_HOURS,
+				followed: "",
 			};
 			return { task: fresh, result: { kind: "open", task: fresh } };
 		});
@@ -7841,8 +7842,67 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** A session joining a task now, its silence clock started and its transcript read on from where it stands. */
 	function newMember(session: string): Member {
 		const now = Date.now();
-		const updateLine = transcriptLines(session).lines;
-		return { session, joinedAt: now, updatedAt: now, updateLine, checkedAt: 0, silenceLed: false };
+		const line = transcriptLines(session).lines;
+		return {
+			session,
+			joinedAt: now,
+			updatedAt: now,
+			updateLine: line,
+			checkedAt: 0,
+			silenceLed: false,
+			reviewLine: line,
+		};
+	}
+
+	/**
+	 * Each live task follows the member with the most focus points, members joined earlier and then by id winning
+	 * ties. A member newly on top is followed from its transcript's current end, so its next turn is what gets reviewed.
+	 */
+	async function followFocus(points: ReadonlyMap<string, number>, marked: ReadonlySet<string>): Promise<void> {
+		for (const listed of listTasks(TASKS_DIR)) {
+			if (listed.state !== "live") continue;
+			const joined = new Map(listed.members.map((m) => [m.session, m.joinedAt]));
+			const order = byPriority(
+				points,
+				marked,
+				(x, y) => (joined.get(x) as number) - (joined.get(y) as number) || x.localeCompare(y),
+			);
+			const top = [...joined.keys()].sort(order)[0] ?? "";
+			if (top === listed.followed) continue;
+			const line = transcriptLines(top).lines;
+			await updateTask(TASKS_DIR, listed.slug, (task) => ({
+				task: {
+					...task,
+					followed: top,
+					members: task.members.map((m) => (m.session === top ? { ...m, reviewLine: line } : m)),
+				},
+				result: null,
+			}));
+		}
+	}
+
+	/** The followed member's turn end leads each live task following it with the transcript lines the turn wrote. */
+	async function reviewTurn(headline: string): Promise<void> {
+		const { path, lines } = transcriptLines(sessionId);
+		for (const listed of listTasks(TASKS_DIR)) {
+			if (listed.state !== "live") continue;
+			const reviewed = listed.members.filter(
+				(m) => m.session === sessionId && listed.followed === sessionId && lines > m.reviewLine,
+			);
+			for (const me of reviewed) {
+				await updateTask(TASKS_DIR, listed.slug, (task) => ({
+					task: {
+						...task,
+						members: task.members.map((m) => (m.session === sessionId ? { ...m, reviewLine: lines } : m)),
+					},
+					result: null,
+				}));
+				sendLead(
+					listed,
+					`${titleOf(sessionId)} (session ${sessionId}), the member you follow, ended a turn: ${headline} Review it in \`${path}:${me.reviewLine + 1}-${lines}\`.`,
+				);
+			}
+		}
 	}
 
 	/**
@@ -9289,6 +9349,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			0o600,
 		);
 		await markFocusWinner(live, focus.points, panes);
+		await followFocus(focus.points, marked);
 		await weightScopes(live, resources, marked);
 		await capScopes(live, resources, marked, policy);
 	}
@@ -11689,6 +11750,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (turnSummary !== null) {
 			const headline = turnSummary.text.replace(/\n[\s\S]*$/u, "").trim();
 			detach(() => leadConductors(ctx, headline), "conductor leads");
+			// A turn that ends asking the user something waits on the user, and its lines are reviewed with the next turn.
+			if (turnSummary.urgency === "green" && turnSummary.options === undefined) {
+				detach(() => reviewTurn(headline), "focus review");
+			}
 		}
 		if (config === null || !config.notifyOnTurnEnd) return;
 		const quiet = Date.now() - lastLocalInput < config.quietSeconds * 1000;
