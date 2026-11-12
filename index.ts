@@ -8583,7 +8583,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return { repo: origin.stdout, top: top.stdout, branch: branch.stdout, files };
 	}
 
-	/** Leads live conductors once per finished status or idle turn end, leaving members waiting on the user alone. */
+	/** Prunes obsolete finished keys and leads conductors about finished members not waiting on the user. */
 	async function checkFinished(): Promise<void> {
 		const { nodes, prs } = graphSnapshot();
 		const byId = new Map(nodes.map((node) => [node.session, node]));
@@ -8600,15 +8600,14 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const states = new Map<string, string>();
 			const looks = listed.members.flatMap(({ session }) => {
 				const record = readSessionRecord(session);
-				if (record === null || record.question !== null || record.replyQuestion !== null || record.standing !== null) {
-					return [];
-				}
+				if (record === null) return [];
 				const node = byId.get(session);
 				const status = node === undefined ? undefined : displayedStatus(node, prs.get(session));
 				const reason = status === undefined ? undefined : statusReasons[status];
 				const idle = reason === undefined && record.closeOffer !== null && now - record.summaryAt >= FINISHED_IDLE_MS;
 				const state = reason === undefined ? (idle ? `idle ${record.summaryAt}` : "") : (status as string);
 				states.set(session, `${session} ${state}`);
+				if (record.question !== null || record.replyQuestion !== null || record.standing !== null) return [];
 				return reason !== undefined || idle ? [{ session, state, reason: reason ?? idleReason }] : [];
 			});
 			const keep = (key: string): boolean => {
