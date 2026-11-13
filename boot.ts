@@ -93,7 +93,6 @@ async function restoreBoot(
 		const record = readJsonFile(join(sessions, file)) as BootRecord | null;
 		if (
 			record === null ||
-			record.heartbeat !== 0 ||
 			typeof record.pid !== "number" ||
 			typeof record.boot !== "string" ||
 			record.boot.length === 0 ||
@@ -113,7 +112,8 @@ async function restoreBoot(
 			typeof hold?.at === "number" &&
 			typeof plan?.startedAt === "number" &&
 			hold.at >= plan.startedAt;
-		if (!(record.systemShutdownAt > 0) && !straggler) continue;
+		// A straggler the poller signalled is selected even when its process died before writing heartbeat 0.
+		if (!((record.heartbeat === 0 && record.systemShutdownAt > 0) || straggler)) continue;
 		entries.push({
 			id,
 			record: { ...record, systemShutdownAt: record.systemShutdownAt || hold?.at || 0 },
