@@ -1,26 +1,72 @@
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import filesystem from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 const PAIRING_WINDOW_MS = 5 * 60_000;
 const RETRY_MS = 3_000;
 
-/**
- * The wizard with its network, its prompts and its output injected, so the suite can drive it.
- * Returns the process exit code rather than calling `process.exit`.
- */
+/** Pairs Telegram and installs the boot unit using injectable host services. */
 export async function runSetup({
 	fetch,
 	ask,
 	log,
 	agentDir,
 	checkout,
+	bootUnitOnly = false,
+	fs = filesystem,
+	exec = execFileSync,
+	configHome = process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"),
 	pairingWindowMs = PAIRING_WINDOW_MS,
 	retryMs = RETRY_MS,
 }) {
+	const { existsSync, mkdirSync, renameSync, writeFileSync } = fs;
 	const configPath = join(agentDir, "notify-telegram.json");
+	/** Installs the boot unit for this checkout and agent directory. */
+	function installBootUnit() {
+		try {
+			const omp = exec("which", ["omp"], { encoding: "utf8", timeout: 5_000 }).trim();
+			if (!isAbsolute(omp)) throw new Error("omp must resolve to an absolute path.");
+			const unitDir = join(configHome, "systemd", "user");
+			const unitPath = join(unitDir, "omp-telegram-boot.service");
+			const quote = (value) => JSON.stringify(value.replaceAll("%", "%%"));
+			const unit = [
+				"[Unit]",
+				"Description=Restore wound-down omp sessions at boot",
+				"",
+				"[Service]",
+				"Type=oneshot",
+				`ExecStart=${quote(process.execPath.replaceAll("$", "$$$$"))} ${quote(join(checkout, "boot.ts").replaceAll("$", "$$$$"))}`,
+				`Environment=${quote(`PATH=${dirname(process.execPath)}:${dirname(omp)}:/usr/local/bin:/usr/bin:/bin`)}`,
+				`Environment=${quote(`PI_CODING_AGENT_DIR=${agentDir}`)}`,
+				"TimeoutStartSec=240",
+				"",
+				"[Install]",
+				"WantedBy=default.target",
+				"",
+			].join("\n");
+			mkdirSync(unitDir, { recursive: true });
+			writeFileSync(`${unitPath}.tmp`, unit, { mode: 0o600 });
+			renameSync(`${unitPath}.tmp`, unitPath);
+			exec("systemctl", ["--user", "daemon-reload"], { timeout: 10_000 });
+			exec("systemctl", ["--user", "enable", "omp-telegram-boot.service"], { timeout: 10_000 });
+			log(`Installed and enabled ${unitPath}.`);
+			log("Boot restoration requires lingering. Enable it with loginctl enable-linger.");
+			return 0;
+		} catch (error) {
+			log(`Could not install the boot unit. ${error.message}`);
+			return 1;
+		}
+	}
+	if (bootUnitOnly) {
+		if (!existsSync(configPath)) {
+			log(`No Telegram configuration at ${configPath}. Run node setup.mjs to pair the bot first.`);
+			return 1;
+		}
+		return installBootUnit();
+	}
 	const call = async (token, method, body) => {
 		const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
 			method: "POST",
@@ -113,6 +159,7 @@ export async function runSetup({
 		{ mode: 0o600 },
 	);
 	renameSync(temp, configPath);
+	if (installBootUnit() !== 0) return 1;
 	await call(token, "sendMessage", {
 		chat_id: chatId,
 		text: "omp-telegram is configured. Notifications will arrive here.",
@@ -133,7 +180,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 		ask: (prompt) => rl.question(prompt),
 		log: console.log,
 		agentDir: process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent"),
-		checkout: new URL(".", import.meta.url).pathname.replace(/\/$/, ""),
+		checkout: fileURLToPath(new URL(".", import.meta.url)).replace(/\/$/, ""),
+		bootUnitOnly: process.argv.includes("--boot-unit"),
 	});
 	rl.close();
 	process.exit(code);

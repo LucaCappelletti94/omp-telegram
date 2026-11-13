@@ -17,7 +17,7 @@ import fs, {
 	writeFileSync,
 } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { tmpdir } from "node:os";
+import os, { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const EXTENSION = new URL("../index.ts", import.meta.url).pathname;
@@ -18130,9 +18130,333 @@ heading("boot restoration after a machine shutdown");
 		rmSync(oldPlan, { force: true });
 		await peer.fire("session_shutdown");
 	}
+	const signalled = spawn("boot-signalled", root);
+	await signalled.fire("session_start");
+	const pending = join(root, `notify-telegram/restart-pending/${signalled.id}.json`);
+	const held = join(root, `notify-telegram/restart-held/${signalled.id}.json`);
+	for (const path of [pending, held]) {
+		mkdirSync(join(path, ".."), { recursive: true });
+		writeFileSync(path, JSON.stringify({ plan: "wind-down", pid: process.pid, at: Date.now() }));
+	}
+	await signalled.fire("session_shutdown");
+	check(
+		"a signalled shutdown consumes pending but preserves its identifiable hold",
+		!existsSync(pending) &&
+			existsSync(held) &&
+			record(signalled.id).systemShutdownAt === 0 &&
+			record(signalled.id).heartbeat === 0,
+	);
 	await bootOwner.fire("session_shutdown");
 	for (const file of readdirSync(sessionsDir)) rmSync(join(sessionsDir, file), { force: true });
 	process.env.PATH = planPath;
+	const bootModule = new URL("../boot.ts", import.meta.url);
+	check("the standalone boot entry point exists", existsSync(bootModule));
+	if (existsSync(bootModule)) {
+		const { runBoot } = await import(bootModule.href);
+		const bootRoot = join(root, "boot-suite");
+		const bootAgent = join(bootRoot, "agent");
+		const state = join(bootAgent, "notify-telegram");
+		const bin = join(bootRoot, "bin");
+		const log = join(bootRoot, "commands.jsonl");
+		const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+		const put = (path, value) => {
+			mkdirSync(join(path, ".."), { recursive: true });
+			writeFileSync(path, JSON.stringify(value));
+		};
+		const get = (path) => JSON.parse(readFileSync(path, "utf8"));
+		mkdirSync(bin, { recursive: true });
+		put(join(bootAgent, "notify-telegram.json"), { token: `12345:${"A".repeat(30)}`, chatId: CHAT });
+		put(join(state, "shutdown/plan.json"), {
+			id: "wind-down",
+			boot: "earlier-boot",
+			startedAt: 0,
+			state: "powering-off",
+		});
+		const records = {
+			halted: { systemShutdownAt: 1, tmuxWindow: 7 },
+			straggler: { systemShutdownAt: 0, tmuxWindow: 2 },
+			missing: { cwd: join(bootRoot, "missing") },
+			transcriptless: {},
+			unconfirmed: {},
+			named: { label: "", name: "Fallback name", emoji: "🌅" },
+			unnamed: { label: "", name: "" },
+			zero: { systemShutdownAt: 0 },
+			closed: { systemShutdownAt: 0 },
+			crashed: { heartbeat: 1, systemShutdownAt: 0 },
+			current: { boot },
+			unrelated: { systemShutdownAt: 0 },
+		};
+		const selected = ["halted", "straggler", "missing", "transcriptless", "unconfirmed", "named", "unnamed", "zero"];
+		for (const [id, extra] of Object.entries(records)) {
+			put(join(state, `sessions/${id}.json`), {
+				pid: 123,
+				heartbeat: 0,
+				systemShutdownAt: 1,
+				boot: "earlier-boot",
+				cwd: bootRoot,
+				tmux: "work",
+				tmuxWindow: 9,
+				argv: ["--model", "test"],
+				label: id,
+				name: id,
+				tag: id,
+				emoji: "",
+				state: "working",
+				...extra,
+			});
+			if (id !== "transcriptless") put(join(bootAgent, `sessions/project/date_${id}.jsonl`), {});
+		}
+		put(join(state, "restart-held/straggler.json"), { plan: "wind-down", pid: 123, at: 1 });
+		put(join(state, "restart-held/unrelated.json"), { plan: "other-plan", pid: 123, at: 1 });
+		put(join(state, "restart-held/zero.json"), { plan: "wind-down", pid: 123, at: 0 });
+		put(join(state, "sessions/not-json.txt"), {});
+		put(join(state, "sessions/_invalid.json"), {});
+		put(join(state, "sessions/broken.json"), null);
+		const stub = `#!${process.execPath}
+const fs = require("node:fs"), path = require("node:path");
+const args = process.argv.slice(2), tool = path.basename(process.argv[1]);
+const state = ${JSON.stringify(state)}, log = ${JSON.stringify(log)};
+fs.appendFileSync(log, JSON.stringify({tool, args}) + "\\n");
+if (tool === "systemd-run") {
+	const at = args.indexOf("tmux");
+	const result = require("node:child_process").spawnSync("tmux", args.slice(at + 1), {encoding:"utf8"});
+	process.stdout.write(result.stdout || "");
+	process.exit(result.status || 0);
+}
+if (tool !== "tmux") process.exit(0);
+if (args[0] === "has-session") process.exit(fs.existsSync(path.join(state, "server")) ? 0 : 1);
+if (args[0] === "new-window" && args.includes("work:2")) process.exit(1);
+if (args[0] === "new-session" || args[0] === "new-window") {
+	const ids = ${JSON.stringify(selected)};
+	const held = ids.every(id => fs.existsSync(path.join(state, "restart-held", id + ".json")));
+	if (!fs.existsSync(path.join(state, "started"))) fs.writeFileSync(path.join(state, "started"), JSON.stringify({held, planGone:!fs.existsSync(path.join(state, "shutdown/plan.json"))}));
+	fs.writeFileSync(path.join(state, "server"), "");
+	const id = args[args.indexOf("--resume") + 1];
+	if (id !== "unconfirmed") {
+		const kept = JSON.parse(fs.readFileSync(path.join(state, "crashed", id + ".json")));
+		fs.writeFileSync(path.join(state, "sessions", id + ".json"), JSON.stringify({...kept.record, boot:${JSON.stringify(boot)}, pid:456, heartbeat:${Date.now()}}));
+	}
+	console.log(args[0] === "new-session" ? "0" : "work:10");
+}
+`;
+		for (const tool of ["tmux", "systemd-run", "systemctl"]) writeFileSync(join(bin, tool), stub, { mode: 0o755 });
+		const savedPath = process.env.PATH;
+		const savedAgent = process.env.PI_CODING_AGENT_DIR;
+		process.env.PATH = `${bin}:${savedPath}`;
+		process.env.PI_CODING_AGENT_DIR = bootAgent;
+		check("boot subprocess stubs lead PATH", process.env.PATH.split(":")[0] === bin);
+		const before = api.calls.length;
+		try {
+			check("partial boot restoration exits zero", (await runBoot({ confirmMs: 200 })) === 0);
+			const calls = readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
+			const started = get(join(state, "started"));
+			check("every selected session is held before any omp starts", started.held);
+			check("the old shutdown plan is retired before opening omp", started.planGone);
+			check("the old shutdown plan is archived", get(join(state, "shutdown/wind-down.json")).id === "wind-down");
+			check(
+				"tmux creation runs in a separate user scope",
+				calls.some(
+					(c) =>
+						c.tool === "systemd-run" &&
+						c.args.includes("--user") &&
+						c.args.includes("--scope") &&
+						c.args.includes("tmux"),
+				),
+			);
+			check(
+				"boot restoration keeps the recorded window index",
+				calls.some((c) => c.args.join(" ") === "move-window -d -s work:0 -t work:7"),
+			);
+			check(
+				"an occupied boot window appends",
+				calls.some((c) => c.args.includes("work:2")) && calls.some((c) => c.args.includes("work:")),
+			);
+			check(
+				"confirmed and failed boot holds are removed",
+				selected.every((id) => !existsSync(join(state, `restart-held/${id}.json`))),
+			);
+			check(
+				"hand-closed crashed and current-boot records are left alone",
+				["closed", "crashed", "current", "unrelated"].every((id) => existsSync(join(state, `sessions/${id}.json`))),
+			);
+			check(
+				"the straggler is selected after its pending marker was consumed",
+				calls.some((c) => c.args.includes("--resume") && c.args.includes("straggler")),
+			);
+			check(
+				"boot restoration preserves the resume flags",
+				calls.some((c) => c.args.join(" ").includes("omp --model test --resume halted")),
+			);
+			const batches = readdirSync(join(state, "crashed/batches"));
+			const batch = get(join(state, "crashed/batches", batches[0]));
+			check(
+				"boot failures share one crash batch",
+				batches.length === 1 && selected.every((id) => batch.ids.includes(id)),
+			);
+			check(
+				"a missing folder has a Restore failure",
+				get(join(state, "crashed/missing.json")).error.includes("folder"),
+			);
+			check(
+				"a missing transcript has a Restore failure",
+				get(join(state, "crashed/transcriptless.json")).error.includes("transcript"),
+			);
+			check(
+				"an unconfirmed boot has a bounded failure",
+				get(join(state, "crashed/unconfirmed.json")).error.includes("confirm"),
+			);
+			const cards = api.calls.slice(before).filter((c) => c.method === "sendMessage");
+			check(
+				"boot sends exactly one summary card",
+				cards.length === 1 && cards[0].body.text.includes("halted") && cards[0].body.text.includes("missing"),
+			);
+			check(
+				"boot failures use existing Restore callbacks",
+				cards[0]?.body.reply_markup.inline_keyboard.flat().some((b) => b.callback_data === "kr:missing"),
+			);
+			check("the poller receives the boot card message id", typeof batch.messageId === "number" && batch.boot === true);
+			const commandsBefore = readFileSync(log, "utf8");
+			check("a second boot invocation exits zero", (await runBoot({ confirmMs: 1 })) === 0);
+			check(
+				"a second boot invocation opens and sends nothing",
+				readFileSync(log, "utf8") === commandsBefore &&
+					api.calls.slice(before).filter((c) => c.method === "sendMessage").length === 1,
+			);
+			const rootCrash = join(root, "notify-telegram/crashed");
+			for (const id of selected) put(join(rootCrash, `${id}.json`), get(join(state, `crashed/${id}.json`)));
+			put(join(rootCrash, "batches", batches[0]), batch);
+			const adopted = spawn("halted", bootRoot);
+			await adopted.fire("session_start");
+			await adopted.pump(100);
+			adopted.heartbeat();
+			await settle(200);
+			check(
+				"a boot resume adopts retained state and receives its interrupted-turn note",
+				record("halted").label === "halted" && /was shut down/.test(adopted.customs.at(-1)?.message.content ?? ""),
+			);
+			check(
+				"the first poller edits the existing boot card with Restore failures",
+				api.calls
+					.slice(before)
+					.some(
+						(c) =>
+							c.method === "editMessageText" &&
+							c.body.message_id === batch.messageId &&
+							c.body.text.includes("restored after boot") &&
+							c.body.reply_markup.inline_keyboard.flat().some((b) => b.callback_data === "kr:missing"),
+					),
+			);
+			check(
+				"the poller does not send a second boot summary",
+				api.calls.slice(before).filter((c) => c.method === "sendMessage" && c.body.text.includes("restored after boot"))
+					.length === 1,
+			);
+			await adopted.fire("session_shutdown");
+			rmSync(join(rootCrash, "batches", batches[0]));
+			for (const id of selected) {
+				rmSync(join(rootCrash, `${id}.json`), { force: true });
+				rmSync(join(rootCrash, `${id}.restored`), { force: true });
+				rmSync(join(sessionsDir, `${id}.json`), { force: true });
+			}
+			rmSync(join(state, `shutdown/boots/${boot}.json`));
+			rmSync(join(state, "sessions"), { recursive: true });
+			put(join(state, "shutdown/plan.json"), { id: "current-plan", boot, startedAt: Date.now(), state: "winding" });
+			check("a boot run with no halted records exits zero", (await runBoot({ confirmMs: 1 })) === 0);
+			check(
+				"boot leaves the current-boot plan untouched",
+				get(join(state, "shutdown/plan.json")).id === "current-plan",
+			);
+			check(
+				"an empty boot sends no boot card",
+				api.calls.slice(before).filter((c) => c.method === "sendMessage" && c.body.text.includes("restored after boot"))
+					.length === 1,
+			);
+			for (const value of [
+				null,
+				{},
+				{ token: "bad", chatId: CHAT },
+				{ token: `12345:${"A".repeat(30)}`, chatId: "bad" },
+			]) {
+				put(join(bootAgent, "notify-telegram.json"), value);
+				check("a broken boot configuration exits nonzero", (await runBoot()) === 1);
+			}
+			put(join(bootAgent, "notify-telegram.json"), { token: `12345:${"A".repeat(30)}`, chatId: CHAT });
+			for (const failure of ["refused", "network"]) {
+				rmSync(join(state, `shutdown/boots/${boot}.json`));
+				put(join(state, "sessions/missing.json"), get(join(state, "crashed/missing.json")).record);
+				if (failure === "refused") api.failMethods = ["sendMessage"];
+				else api.fetchThrows = ["sendMessage"];
+				check(`a boot card ${failure} does not fail the unit`, (await runBoot({ confirmMs: 1 })) === 0);
+				check(
+					`a boot card ${failure} stays queued for the poller`,
+					get(join(state, "crashed/batches", batches[0])).messageId === null,
+				);
+				api.failMethods = [];
+				api.fetchThrows = [];
+			}
+			rmSync(join(state, `shutdown/boots/${boot}.json`));
+			put(join(state, "sessions/halted.json"), get(join(state, "crashed/halted.json")).record);
+			check(
+				"the total boot deadline bounds subprocess startup",
+				(await runBoot({ timeoutMs: 0 })) === 0 && get(join(state, "crashed/halted.json")).error.includes("timed out"),
+			);
+			check("a startup failure releases its boot hold", !existsSync(join(state, "restart-held/halted.json")));
+			check(
+				"the standalone boot command exits zero on a completed boot",
+				execFileSync(process.execPath, ["--disable-warning=ExperimentalWarning", bootModule.pathname], {
+					timeout: 5_000,
+					encoding: "utf8",
+				}) === "",
+			);
+			put(join(bootAgent, "notify-telegram.json"), {});
+			let invalidExit = 0;
+			try {
+				execFileSync(process.execPath, ["--disable-warning=ExperimentalWarning", bootModule.pathname], {
+					timeout: 5_000,
+					stdio: "pipe",
+				});
+			} catch (error) {
+				invalidExit = error.status;
+			}
+			check("the standalone boot command rejects a broken config", invalidExit === 1);
+			put(join(bootAgent, "notify-telegram.json"), { token: `12345:${"A".repeat(30)}`, chatId: CHAT });
+			const originalRead = fs.readFileSync;
+			const originalWrite = fs.writeFileSync;
+			const originalHome = os.homedir;
+			try {
+				fs.readFileSync = (path, ...args) =>
+					String(path) === "/proc/sys/kernel/random/boot_id" ? "" : originalRead(path, ...args);
+				syncBuiltinESMExports();
+				check("an unavailable boot id does not fail the unit", (await runBoot()) === 0);
+				fs.readFileSync = originalRead;
+				fs.writeFileSync = (path, ...args) => {
+					if (String(path).includes("/shutdown/boots/")) throw new Error("marker denied");
+					return originalWrite(path, ...args);
+				};
+				syncBuiltinESMExports();
+				check("a marker write failure does not fail the unit", (await runBoot()) === 0);
+				fs.writeFileSync = originalWrite;
+				os.homedir = () => bootRoot;
+				delete process.env.PI_CODING_AGENT_DIR;
+				syncBuiltinESMExports();
+				put(join(bootRoot, ".omp/agent/notify-telegram.json"), { token: `12345:${"A".repeat(30)}`, chatId: CHAT });
+				check(
+					"boot uses the default agent directory when no override is set",
+					(await runBoot()) === 0 &&
+						existsSync(join(bootRoot, `.omp/agent/notify-telegram/shutdown/boots/${boot}.json`)),
+				);
+			} finally {
+				fs.readFileSync = originalRead;
+				fs.writeFileSync = originalWrite;
+				os.homedir = originalHome;
+				process.env.PI_CODING_AGENT_DIR = bootAgent;
+				syncBuiltinESMExports();
+			}
+		} finally {
+			process.env.PATH = savedPath;
+			process.env.PI_CODING_AGENT_DIR = savedAgent;
+		}
+	}
 }
 
 heading("PR watch");

@@ -12,5 +12,5 @@
 		"skipLibCheck": true,
 		"noUncheckedIndexedAccess": true
 	},
-	"include": ["index.ts", "render.ts", "graph.ts", "priority.ts", "lease.ts", "lock.ts"]
+	"include": ["index.ts", "render.ts", "graph.ts", "priority.ts", "lease.ts", "lock.ts", "boot.ts", "restore.ts"]
 }
