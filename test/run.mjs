@@ -345,6 +345,8 @@ const spawn = (id, cwd, title = "") => {
 		},
 	};
 	let aborts = 0;
+	let shutdowns = 0;
+	let idle = true;
 	const ctx = {
 		hasUI: false,
 		cwd,
@@ -355,6 +357,11 @@ const spawn = (id, cwd, title = "") => {
 		setInterval: (fn) => timers.push(fn) - 1,
 		setTimeout: (fn) => timers.push(fn) - 1,
 		clearTimer: () => {},
+		isIdle: () => idle,
+		shutdown: async () => {
+			shutdowns += 1;
+			for (const fn of handlers.get("session_shutdown") ?? []) await fn({}, ctx);
+		},
 		abort: () => {
 			aborts += 1;
 		},
@@ -379,6 +386,12 @@ const spawn = (id, cwd, title = "") => {
 		},
 		get aborts() {
 			return aborts;
+		},
+		get shutdowns() {
+			return shutdowns;
+		},
+		setIdle: (value) => {
+			idle = value;
 		},
 		setTitle: (value) => {
 			name = value;
@@ -15182,6 +15195,7 @@ writeFileSync(
 	`#!/bin/sh
 echo "$*" >> "$VS_TMUX_LOG"
 S="$VS_STATE"
+if [ "$1" = "$VS_SHUTDOWN_EVENT" ]; then cp "$S/shutdown_during_gate" "$VS_SHUTDOWN_PLAN"; fi
 case "$1" in
   capture-pane) cat "$S/capture" ;;
   display-message)
@@ -16153,6 +16167,544 @@ const vsRetire = (id) =>
 		await other.fire("session_start");
 		check(`registration reaps a closed record with ${name} hold data`, !existsSync(join(sessionsDir, `${id}.json`)));
 		await other.fire("session_shutdown");
+	}
+}
+
+heading("sessions wind down for a machine shutdown");
+{
+	const stateDir = join(root, "notify-telegram");
+	const planDir = join(stateDir, "shutdown");
+	const planFile = join(planDir, "plan.json");
+	mkdirSync(planDir, { recursive: true });
+	const plan = (fields = {}) => ({
+		id: "shutdown-test",
+		kind: "poweroff",
+		startedAt: Date.now(),
+		deadline: Date.now() + 600_000,
+		by: "command",
+		messageId: null,
+		state: "winding",
+		error: "",
+		...fields,
+	});
+	const writePlan = (fields = {}) => writeFileSync(planFile, JSON.stringify(plan(fields)));
+	const clearPlan = () => rmSync(planFile, { force: true });
+	const sessions = [];
+	const start = async (name) => {
+		const session = spawn(`shutdown-${name}`, vsFolder(`shutdown-${name}`));
+		sessions.push(session);
+		await session.fire("session_start");
+		return session;
+	};
+	const status = async (session, fields) => {
+		await session.tools.get("notify_status").execute("shutdown-status", fields, undefined, undefined, session.ctx);
+		await session.fire("session_stop");
+		await settle(120);
+	};
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	vsPoller.heartbeat();
+	await settle(120);
+	const idle = await start("idle");
+	await idle.tools
+		.get("session_badge")
+		.execute(
+			"shutdown-badge",
+			{ emoji: "🛑", code: "HALT", label: "Retained identity" },
+			undefined,
+			undefined,
+			idle.ctx,
+		);
+	await status(idle, { summary: "Ready.", urgency: "green", effect: "none" });
+	await status(idle, { summary: "Choose.", urgency: "orange", options: opts("Continue", "Stop") });
+	const before = record(idle.id);
+	const ballot = join(stateDir, "ballots", `${idle.id}.json`);
+	const ballotBefore = readFileSync(ballot, "utf8");
+	const inbox = join(inboxOf(idle.id), "999999.json");
+	writeFileSync(inbox, JSON.stringify({ kind: "text", value: "Keep this instruction." }));
+	const redoInbox = join(inboxOf(idle.id), "1000000.json");
+	writeFileSync(redoInbox, JSON.stringify({ kind: "redo", value: "Keep this redo." }));
+	const tasksDir = join(stateDir, "tasks");
+	mkdirSync(tasksDir, { recursive: true });
+	const member = await start("member");
+	const taskFile = join(tasksDir, "shutdown-test.json");
+	writeFileSync(
+		taskFile,
+		JSON.stringify({
+			name: "Shutdown task",
+			slug: "shutdown-test",
+			brief: "Keep membership.",
+			conductor: idle.id,
+			state: "live",
+			launchedAt: 0,
+			members: [{ session: member.id, joinedAt: Date.now() }],
+			candidates: [],
+		}),
+	);
+	writePlan();
+	await idle.pump(150);
+	await member.pump(150);
+	await idle.pump(100);
+	const after = record(idle.id);
+	check("an idle shutdown stops once without aborting", idle.shutdowns === 1 && idle.aborts === 0);
+	check("wind-down marks the stopped record for restore", after.heartbeat === 0 && after.systemShutdownAt > 0);
+	check(
+		"wind-down writes a private restart hold",
+		existsSync(vsHold(idle.id)) && (statSync(vsHold(idle.id)).mode & 0o777) === 0o600,
+	);
+	check(
+		"wind-down keeps tag badge label and code",
+		["tag", "emoji", "label", "code"].every((key) => after[key] === before[key]),
+	);
+	check(
+		"wind-down keeps the close offer and standing question",
+		before.closeOffer !== null &&
+			before.standing !== null &&
+			after.closeOffer === before.closeOffer &&
+			after.standing?.id === before.standing.id,
+	);
+	check(
+		"wind-down keeps the ballot and undrained inbox",
+		existsSync(ballot) &&
+			readFileSync(ballot, "utf8") === ballotBefore &&
+			existsSync(inbox) &&
+			existsSync(redoInbox) &&
+			idle.steers.length === 0,
+	);
+	const keptTask = JSON.parse(readFileSync(taskFile, "utf8"));
+	check(
+		"wind-down keeps the conductor live and its members joined",
+		keptTask.state === "live" &&
+			keptTask.members.some((entry) => entry.session === member.id) &&
+			member.shutdowns === 1,
+	);
+	vsPoller.heartbeat();
+	await settle(120);
+	check(
+		"the reaper keeps a wound-down record with its hold",
+		existsSync(join(sessionsDir, `${idle.id}.json`)) && !existsSync(join(stateDir, "crashed", `${idle.id}.json`)),
+	);
+	writeFileSync(vsHold(idle.id), JSON.stringify({ at: Date.now() - 360_000 }));
+	vsPoller.heartbeat();
+	await settle(120);
+	check(
+		"the same-boot shutdown mark outlives the restart hold",
+		existsSync(join(sessionsDir, `${idle.id}.json`)) && !existsSync(join(stateDir, "crashed", `${idle.id}.json`)),
+	);
+	clearPlan();
+	rmSync(taskFile);
+
+	const busy = await start("busy");
+	await busy.fire("agent_start");
+	writePlan();
+	await busy.pump(100);
+	check("an active turn stays up before the shutdown deadline", busy.shutdowns === 0 && busy.aborts === 0);
+	const verdict = await busy.fire("session_stop");
+	await settle(120);
+	check(
+		"a busy turn stops at session_stop without a status block",
+		busy.shutdowns === 1 && busy.aborts === 0 && verdict.every((entry) => entry?.decision !== "block"),
+	);
+	clearPlan();
+
+	for (const choice of [false, true]) {
+		const reported = await start(choice ? "reported-choice" : "reported");
+		await reported.fire("agent_start");
+		const summary = choice ? "Shutdown choice report." : "Shutdown final report.";
+		await reported.tools
+			.get("notify_status")
+			.execute(
+				"shutdown-final-report",
+				{ summary, urgency: "green", effect: "none", ...(choice ? { options: opts("Continue", "Stop") } : {}) },
+				undefined,
+				undefined,
+				reported.ctx,
+			);
+		writeFileSync(
+			taskFile,
+			JSON.stringify({
+				name: "Shutdown task",
+				slug: "shutdown-test",
+				brief: "Keep the final lead.",
+				conductor: vsPoller.id,
+				state: "live",
+				launchedAt: 0,
+				members: [],
+				candidates: [],
+			}),
+		);
+		const gate = Promise.withResolvers();
+		api.sendMessageGate = gate.promise;
+		writePlan();
+		await reported.fire("session_stop");
+		await reported.pump(100);
+		check(`shutdown waits for the final ${choice ? "choice" : "plain"} report`, reported.shutdowns === 0);
+		gate.resolve();
+		api.sendMessageGate = null;
+		await settle(150);
+		check(
+			`the final ${choice ? "choice" : "plain"} report reaches Telegram before shutdown`,
+			reported.shutdowns === 1 &&
+				record(reported.id).summary === summary &&
+				record(reported.id).lastNotified > 0 &&
+				record(reported.id).closeOffer !== null &&
+				(!choice || record(reported.id).standing !== null),
+		);
+		check(
+			`the final ${choice ? "choice" : "plain"} report leads its conductor`,
+			JSON.parse(readFileSync(taskFile, "utf8")).led.includes(reported.id),
+		);
+		clearPlan();
+		rmSync(taskFile);
+	}
+
+	for (const outcome of ["cancelled", "removed", "failed", "new-turn", "poller", "timeout", "later-plan"]) {
+		const reported = await start(`report-${outcome}`);
+		await reported.fire("agent_start");
+		await reported.tools
+			.get("notify_status")
+			.execute(
+				"shutdown-report-outcome",
+				{ summary: `Final report ${outcome}.`, urgency: "green", effect: "none" },
+				undefined,
+				undefined,
+				reported.ctx,
+			);
+		const gate = Promise.withResolvers();
+		api.sendMessageGate = gate.promise;
+		if (outcome !== "later-plan") writePlan();
+		await reported.fire("session_stop");
+		if (outcome === "later-plan") {
+			writePlan();
+			await reported.pump(80);
+		}
+		check(`the ${outcome} final report holds shutdown open`, reported.shutdowns === 0);
+		if (outcome === "removed") clearPlan();
+		if (outcome === "cancelled" || outcome === "failed") writePlan({ state: outcome });
+		if (outcome === "new-turn") await reported.fire("agent_start");
+		if (outcome === "poller") {
+			writeFileSync(
+				join(stateDir, "poller.lock"),
+				JSON.stringify({
+					...record(reported.id),
+					sessionId: reported.id,
+					code: record(reported.id).codeStamp,
+				}),
+			);
+		}
+		if (outcome === "timeout") {
+			const started = performance.now();
+			for (let i = 0; i < 60 && reported.shutdowns === 0; i++) await settle(100);
+			check(
+				"a stalled final report cannot hold shutdown beyond its bounded wait",
+				reported.shutdowns === 1 && performance.now() - started < 6_500,
+			);
+		}
+		gate.resolve();
+		api.sendMessageGate = null;
+		await settle(150);
+		if (outcome === "later-plan") {
+			check(
+				"a plan arriving during final delivery waits for that delivery",
+				reported.shutdowns === 1 && record(reported.id).closeOffer !== null,
+			);
+		} else if (outcome !== "timeout") {
+			check(
+				`${outcome} during final delivery leaves the session running`,
+				reported.shutdowns === 0 && record(reported.id).systemShutdownAt === 0 && !existsSync(vsHold(reported.id)),
+			);
+		}
+		clearPlan();
+		if (outcome === "poller") {
+			rmSync(join(stateDir, "poller.lock"));
+			vsPoller.heartbeat();
+			await settle(80);
+		}
+	}
+
+	const hostBusy = await start("host-busy");
+	hostBusy.setIdle(false);
+	writePlan();
+	await hostBusy.pump(80);
+	check("a non-idle host without an active turn stays up", hostBusy.shutdowns === 0);
+	hostBusy.setIdle(true);
+	await hostBusy.pump(120);
+	check("the host stops when it becomes idle", hostBusy.shutdowns === 1);
+	clearPlan();
+
+	const overdueHost = await start("overdue-host");
+	overdueHost.setIdle(false);
+	writePlan({ deadline: Date.now() });
+	await overdueHost.pump(120);
+	check(
+		"an overdue non-idle host is aborted and recorded as working",
+		overdueHost.aborts === 1 && overdueHost.shutdowns === 1 && record(overdueHost.id).state === "working",
+	);
+	clearPlan();
+
+	const job = await start("job");
+	await job.fire("agent_start");
+	await job.fire("agent_end", { awaitingAsyncWork: true });
+	writePlan();
+	await job.pump(80);
+	check("a session waiting on a background job stays up before the deadline", job.shutdowns === 0 && job.aborts === 0);
+	writePlan({ deadline: Date.now(), kind: "reboot", by: "inhibitor", messageId: 123 });
+	await job.pump(150);
+	await job.pump(80);
+	check("the deadline aborts a background job then stops once", job.aborts === 1 && job.shutdowns === 1);
+	check("the halted record remembers the background job", /background job/.test(record(job.id).state));
+	clearPlan();
+
+	const endingJob = await start("ending-job");
+	await endingJob.fire("agent_start");
+	writePlan();
+	await endingJob.fire("agent_end", { awaitingAsyncWork: true });
+	await settle(120);
+	check("a background-job turn ending while winding stops", endingJob.shutdowns === 1 && endingJob.aborts === 0);
+	clearPlan();
+
+	const expired = await start("expired");
+	expired.setIdle(false);
+	await expired.fire("agent_start");
+	const order = [];
+	const abort = expired.ctx.abort;
+	const shutdown = expired.ctx.shutdown;
+	expired.ctx.abort = async () => {
+		order.push("abort");
+		abort();
+		await expired.fire("agent_end");
+	};
+	expired.ctx.shutdown = async () => {
+		order.push("shutdown");
+		await shutdown();
+	};
+	writePlan({ state: "powering-off", deadline: Date.now() - 1 });
+	await expired.pump(150);
+	check("an overdue active turn aborts before shutdown", order.join() === "abort,shutdown");
+	check("an aborted turn keeps its working state for the crash note", record(expired.id).state === "working");
+	clearPlan();
+
+	for (const session of [expired, job]) {
+		writeFileSync(
+			join(sessionsDir, `${session.id}.json`),
+			JSON.stringify({
+				...record(session.id),
+				boot: "boot-before-shutdown",
+			}),
+		);
+		writeFileSync(vsHold(session.id), JSON.stringify({ at: Date.now() - 360_000 }));
+	}
+	vsPoller.heartbeat();
+	await settle(150);
+	for (const [session, state] of [
+		[expired, "working"],
+		[job, "waiting on a background job"],
+	]) {
+		const restored = spawn(session.id, session.ctx.cwd);
+		await restored.fire("session_start");
+		await restored.pump(100);
+		check(
+			`a restored shutdown session reports it was ${state}`,
+			restored.customs.some((entry) => String(entry.message.content).includes(`It was ${state} at that moment`)),
+		);
+		await restored.fire("session_shutdown");
+	}
+
+	const reply = await start("reply");
+	await status(reply, { summary: "Choose a branch.", urgency: "orange", question: "Which branch?" });
+	reply.setIdle(false);
+	const replyId = record(reply.id).replyQuestion;
+	writePlan();
+	await reply.pump(120);
+	check("a reply question stops even when the host is not idle", reply.shutdowns === 1 && reply.aborts === 0);
+	check("a reply question survives wind-down", replyId !== null && record(reply.id).replyQuestion === replyId);
+	clearPlan();
+
+	const asking = await start("asking");
+	await asking.fire("agent_start");
+	asking.setIdle(false);
+	const askState = {};
+	const askRun = asking.tools
+		.get("ask")
+		.execute("shutdown-ask", singleQuestion, undefined, undefined, stubbornCtx(asking.ctx, askState));
+	await settle(120);
+	writePlan();
+	await asking.pump(150);
+	check("a native question winds down without waiting for the deadline", asking.shutdowns === 1 && asking.aborts === 0);
+	clearPlan();
+	await asking.fire("session_shutdown");
+	void askRun;
+
+	for (const cancel of ["cancelled", "removed", "failed"]) {
+		const session = await start(cancel);
+		await session.fire("agent_start");
+		writePlan();
+		await session.pump(60);
+		if (cancel === "removed") clearPlan();
+		else writePlan({ state: cancel });
+		await session.fire("session_stop");
+		await session.pump(80);
+		check(
+			`${cancel} shutdown leaves a previously busy session running`,
+			session.shutdowns === 0 && session.aborts === 0,
+		);
+		clearPlan();
+	}
+	const invalid = await start("invalid");
+	const badPlans = [
+		null,
+		[],
+		"shutdown",
+		{},
+		...[
+			["id", ""],
+			["id", 3],
+			["kind", "halt"],
+			["startedAt", "now"],
+			["startedAt", -1],
+			["deadline", "later"],
+			["deadline", -1],
+			["by", "other"],
+			["state", "unknown"],
+			["messageId", "card"],
+			["error", false],
+		].map(([key, value]) => plan({ [key]: value })),
+	];
+	for (const [index, value] of badPlans.entries()) {
+		writeFileSync(planFile, JSON.stringify(value));
+		await invalid.pump(30);
+		check(`invalid shutdown plan ${index} leaves the session running`, invalid.shutdowns === 0);
+	}
+	writeFileSync(planFile, "{");
+	await invalid.pump(30);
+	check("an unreadable shutdown plan leaves the session running", invalid.shutdowns === 0);
+	for (const key of ["startedAt", "deadline"]) {
+		writeFileSync(planFile, JSON.stringify(plan({ [key]: "infinite" })).replace('"infinite"', "1e999"));
+		await invalid.pump(30);
+		check(`an infinite shutdown ${key} leaves the session running`, invalid.shutdowns === 0);
+	}
+	clearPlan();
+
+	for (const state of ["winding", "powering-off"]) {
+		writePlan({ state, deadline: Date.now() - 1 });
+		await vsPoller.pump(100);
+		await vsPoller.fire("session_stop");
+		check(`the poller stays up while ${state}`, vsPoller.shutdowns === 0 && vsPoller.aborts === 0);
+		clearPlan();
+	}
+
+	const stale = await start("wave");
+	const old = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	vsTranscript(stale.id);
+	vsCandidate(stale, stale.ctx.cwd, { codeStamp: "old-shutdown-code", pid: old.pid });
+	vsSet("pane_pid", String(old.pid));
+	vsSet("pane_dead", "1");
+	vsSet("capture", "idle\n");
+	for (const state of ["winding", "powering-off"]) {
+		writePlan({ state });
+		vsLogReset();
+		vsPoller.heartbeat();
+		await settle(250);
+		check(
+			`the restart wave starts nothing while ${state}`,
+			!existsSync(vsMarker(stale.id)) && !vsLog().includes("respawn-pane") && old.exitCode === null,
+		);
+	}
+	clearPlan();
+	vsSet("shutdown_during_gate", JSON.stringify(plan()));
+	process.env.VS_SHUTDOWN_PLAN = planFile;
+	process.env.VS_SHUTDOWN_EVENT = "capture-pane";
+	vsPoller.heartbeat();
+	await settle(250);
+	check(
+		"a shutdown arriving during the restart gate prevents the restart",
+		existsSync(planFile) && !existsSync(vsMarker(stale.id)) && old.exitCode === null,
+	);
+	process.env.VS_SHUTDOWN_EVENT = "respawn-pane";
+	writePlan({ state: "cancelled" });
+	vsPoller.heartbeat();
+	for (let i = 0; i < 40 && !vsLog().includes("respawn-pane"); i++) await settle(100);
+	check("cancelling shutdown lets the restart wave resume", vsLog().includes("respawn-pane"));
+	check(
+		"a restart in flight finishes when its respawn begins shutdown",
+		JSON.parse(readFileSync(planFile, "utf8")).state === "winding",
+	);
+	delete process.env.VS_SHUTDOWN_EVENT;
+	await stale.fire("session_shutdown");
+	const resumed = spawn(stale.id, stale.ctx.cwd);
+	await resumed.fire("session_start");
+	vsPoller.heartbeat();
+	await settle(150);
+	check("a restart already in flight confirms during shutdown", !existsSync(vsHold(stale.id)));
+	await resumed.pump(150);
+	check("the resumed session winds down on its next tick", resumed.shutdowns === 1);
+	clearPlan();
+
+	const crashDir = join(stateDir, "crashed");
+	const batchDir = join(crashDir, "batches");
+	mkdirSync(batchDir, { recursive: true });
+	const crashId = "shutdown-crashed";
+	const batch = "shutdown-batch";
+	writeFileSync(
+		join(crashDir, `${crashId}.json`),
+		JSON.stringify({
+			record: { ...before, cwd: idle.ctx.cwd, heartbeat: Date.now() - 60_000, pid: deadPid },
+			batch,
+			machine: false,
+			restoringAt: 0,
+			error: "",
+			dismissed: false,
+		}),
+	);
+	writeFileSync(
+		join(batchDir, `${batch}.json`),
+		JSON.stringify({ at: Date.now(), ids: [crashId], messageId: 9999, shown: "" }),
+	);
+	for (const state of ["winding", "powering-off"]) {
+		writePlan({ state });
+		for (const data of [`kr:${crashId}`, `ka:${batch}`]) {
+			vsLogReset();
+			const callbackId = `${state}-${data}`;
+			api.queued.push({
+				update_id: 19999,
+				callback_query: {
+					id: callbackId,
+					from: { id: CHAT },
+					data,
+					message: { message_id: 9999, chat: { id: CHAT } },
+				},
+			});
+			await vsPoller.pump(150);
+			const toast = called("answerCallbackQuery").find((call) => call.body.callback_query_id === callbackId);
+			check(
+				`${data.startsWith("kr:") ? "Restore" : "Restore all"} refuses while ${state}`,
+				/shutdown.*progress/i.test(toast?.body.text ?? "") && !vsLog().includes("new-window"),
+			);
+		}
+	}
+	clearPlan();
+	process.env.VS_SHUTDOWN_EVENT = "new-window";
+	api.queued.push({
+		update_id: 20000,
+		callback_query: {
+			id: "shutdown-restore-inflight",
+			from: { id: CHAT },
+			data: `kr:${crashId}`,
+			message: { message_id: 9999, chat: { id: CHAT } },
+		},
+	});
+	await vsPoller.pump(250);
+	const inFlight = JSON.parse(readFileSync(join(crashDir, `${crashId}.json`), "utf8"));
+	check(
+		"a crash restore in flight finishes during shutdown",
+		existsSync(planFile) && inFlight.restoringAt > 0 && inFlight.error === "",
+	);
+	delete process.env.VS_SHUTDOWN_EVENT;
+	delete process.env.VS_SHUTDOWN_PLAN;
+	clearPlan();
+	rmSync(join(crashDir, `${crashId}.json`));
+	rmSync(join(batchDir, `${batch}.json`));
+	for (const session of sessions) {
+		if (session.shutdowns === 0) await session.fire("session_shutdown");
 	}
 }
 
