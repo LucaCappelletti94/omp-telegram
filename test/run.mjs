@@ -7010,6 +7010,156 @@ heading("uncovered event handlers");
 	await ev.fire("agent_end");
 }
 
+heading("poller command registration");
+{
+	const stateDir = join(root, "notify-telegram");
+	const commandsFile = join(stateDir, "commands.json");
+	const throttleFile = join(stateDir, "throttle.json");
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	rmSync(commandsFile, { force: true });
+	const before = called("setMyCommands").length;
+	const menuBefore = called("setChatMenuButton").length;
+	const peers = [0, 1, 2].map((n) => spawn(`01a07031-0000-0000-0000-00000000000${n}`, `/home/dev/work/commands-${n}`));
+	await Promise.all(peers.map((peer) => peer.fire("session_start")));
+	await settle(150);
+	const holderId = JSON.parse(readFileSync(join(stateDir, "poller.lock"), "utf8")).sessionId;
+	const holder = peers.find((peer) => peer.id === holderId);
+	check("concurrent startup registers commands once", called("setMyCommands").length === before + 1);
+	check("concurrent startup sets the menu button once", called("setChatMenuButton").length === menuBefore + 1);
+	const accepted = existsSync(commandsFile) ? readFileSync(commandsFile, "utf8") : null;
+	check(
+		"accepted commands have a private persistent receipt",
+		accepted !== null && (statSync(commandsFile).mode & 0o777) === 0o600,
+	);
+	check(
+		"the receipt hashes both the commands and the menu button",
+		accepted !== null &&
+			JSON.parse(accepted) ===
+				createHash("sha256")
+					.update(
+						JSON.stringify({
+							commands: lastCall("setMyCommands").body.commands,
+							menu_button: lastCall("setChatMenuButton").body.menu_button,
+						}),
+					)
+					.digest("hex"),
+	);
+	writeFileSync(commandsFile, JSON.stringify("an older command list"));
+	for (const peer of peers.filter((peer) => peer !== holder)) peer.heartbeat();
+	await settle(150);
+	check("non-pollers never register changed commands", called("setMyCommands").length === before + 1);
+	holder.heartbeat();
+	await settle(150);
+	holder.heartbeat();
+	await settle(150);
+	check("the poller registers a changed command list once", called("setMyCommands").length === before + 2);
+	check(
+		"the accepted receipt identifies the current command list",
+		accepted !== null && readFileSync(commandsFile, "utf8") === accepted,
+	);
+	await Promise.all(peers.map((peer) => peer.fire("session_shutdown")));
+	const resumed = spawn(holderId, "/home/dev/work/commands-resumed");
+	const restartBefore = called("setMyCommands").length;
+	const menuRestartBefore = called("setChatMenuButton").length;
+	await resumed.fire("session_start");
+	resumed.heartbeat();
+	await settle(150);
+	check("a restart does not register an unchanged command list", called("setMyCommands").length === restartBefore);
+	check("a restart does not set an unchanged menu button", called("setChatMenuButton").length === menuRestartBefore);
+
+	const fetchBefore = globalThis.fetch;
+	let releaseCommands;
+	const commandsGate = new Promise((resolve) => {
+		releaseCommands = resolve;
+	});
+	let gatedCalls = 0;
+	globalThis.fetch = async (url, init) => {
+		if (String(url).endsWith("/setMyCommands")) {
+			gatedCalls++;
+			await commandsGate;
+		}
+		return fetchBefore(url, init);
+	};
+	writeFileSync(commandsFile, JSON.stringify("another command list"));
+	resumed.heartbeat();
+	resumed.heartbeat();
+	await settle(150);
+	check("poller ticks do not overlap command registration", gatedCalls === 1);
+	releaseCommands();
+	await settle(150);
+	globalThis.fetch = fetchBefore;
+
+	for (const method of ["setMyCommands", "setChatMenuButton"]) {
+		for (const failure of ["refused", "disconnected", "throttled"]) {
+			writeFileSync(commandsFile, JSON.stringify("unaccepted command list"));
+			const previous = readFileSync(commandsFile, "utf8");
+			const triesBefore = called(method).length;
+			api.failMethods = failure === "disconnected" ? [] : [method];
+			api.fetchThrows = failure === "disconnected" ? [method] : [];
+			api.failStatus = failure === "throttled" ? 429 : 400;
+			api.failRetryAfter = failure === "throttled" ? 793 : undefined;
+			resumed.heartbeat();
+			await settle(150);
+			check(
+				`${failure} ${method} registration is attempted on the poller tick`,
+				called(method).length === triesBefore + 1,
+			);
+			check(
+				`${failure} ${method} does not replace the accepted receipt`,
+				readFileSync(commandsFile, "utf8") === previous,
+			);
+			if (failure === "throttled") {
+				check(`a ${method} 429 leaves the chat throttle absent`, !existsSync(throttleFile));
+				const sent = await resumed.tools
+					.get("notify_snippet")
+					.execute(
+						"commands-after-429",
+						{ purpose: "command throttle probe", text: "pwd" },
+						undefined,
+						undefined,
+						resumed.ctx,
+					);
+				check(
+					`a message sends after a ${method} 429`,
+					sent.isError !== true && lastCall("sendMessage")?.body.text.includes("pwd"),
+				);
+				rmSync(throttleFile, { force: true });
+			}
+			api.failMethods = [];
+			api.fetchThrows = [];
+			api.failStatus = undefined;
+			api.failRetryAfter = undefined;
+			resumed.heartbeat();
+			await settle(150);
+			check(
+				`${failure} ${method} registration retries on a later poller tick`,
+				called(method).length === triesBefore + 2 &&
+					accepted !== null &&
+					readFileSync(commandsFile, "utf8") === accepted,
+			);
+		}
+	}
+	const previousThrottle = JSON.stringify({ until: Date.now() + 60_000, paceUntil: 0, next: 0 });
+	writeFileSync(throttleFile, previousThrottle);
+	writeFileSync(commandsFile, JSON.stringify("commands during a chat throttle"));
+	resumed.heartbeat();
+	await settle(150);
+	check(
+		"command registration bypasses the chat throttle",
+		accepted !== null && readFileSync(commandsFile, "utf8") === accepted,
+	);
+	api.failMethods = ["getUpdates"];
+	api.failStatus = 429;
+	api.failRetryAfter = 793;
+	await resumed.pump(200);
+	check("a polling 429 leaves the chat throttle untouched", readFileSync(throttleFile, "utf8") === previousThrottle);
+	api.failMethods = [];
+	api.failStatus = undefined;
+	api.failRetryAfter = undefined;
+	rmSync(throttleFile, { force: true });
+	await resumed.fire("session_shutdown");
+}
+
 heading("shared Telegram throttle");
 {
 	const throttleFile = join(root, "notify-telegram/throttle.json");
