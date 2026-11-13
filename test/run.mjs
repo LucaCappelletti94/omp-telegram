@@ -18175,6 +18175,7 @@ heading("boot restoration after a machine shutdown");
 		const records = {
 			halted: { systemShutdownAt: 1, tmuxWindow: 7 },
 			straggler: { systemShutdownAt: 0, tmuxWindow: 2 },
+			hung: { heartbeat: 5, systemShutdownAt: 0 },
 			missing: { cwd: join(bootRoot, "missing") },
 			transcriptless: {},
 			unconfirmed: {},
@@ -18186,7 +18187,17 @@ heading("boot restoration after a machine shutdown");
 			current: { boot },
 			unrelated: { systemShutdownAt: 0 },
 		};
-		const selected = ["halted", "straggler", "missing", "transcriptless", "unconfirmed", "named", "unnamed", "zero"];
+		const selected = [
+			"halted",
+			"straggler",
+			"hung",
+			"missing",
+			"transcriptless",
+			"unconfirmed",
+			"named",
+			"unnamed",
+			"zero",
+		];
 		for (const [id, extra] of Object.entries(records)) {
 			put(join(state, `sessions/${id}.json`), {
 				pid: 123,
@@ -18207,6 +18218,7 @@ heading("boot restoration after a machine shutdown");
 			if (id !== "transcriptless") put(join(bootAgent, `sessions/project/date_${id}.jsonl`), {});
 		}
 		put(join(state, "restart-held/straggler.json"), { plan: "wind-down", pid: 123, at: 1 });
+		put(join(state, "restart-held/hung.json"), { plan: "wind-down", pid: 123, at: 1 });
 		put(join(state, "restart-held/unrelated.json"), { plan: "other-plan", pid: 123, at: 1 });
 		put(join(state, "restart-held/zero.json"), { plan: "wind-down", pid: 123, at: 0 });
 		put(join(state, "sessions/not-json.txt"), {});
@@ -18282,6 +18294,10 @@ if (args[0] === "new-session" || args[0] === "new-window") {
 			check(
 				"the straggler is selected after its pending marker was consumed",
 				calls.some((c) => c.args.includes("--resume") && c.args.includes("straggler")),
+			);
+			check(
+				"a signalled straggler whose shutdown never ran is selected",
+				calls.some((c) => c.args.includes("--resume") && c.args.includes("hung")),
 			);
 			check(
 				"boot restoration preserves the resume flags",
