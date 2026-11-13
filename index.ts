@@ -124,6 +124,8 @@ const OMP_SESSIONS_DIR = join(AGENT_DIR, "sessions");
 const RESTART_MARKER_DIR = join(STATE_DIR, "restart-pending");
 /** Protects a restarting session's record until the wave confirms or fails. */
 const RESTART_HOLD_DIR = join(STATE_DIR, "restart-held");
+const SHUTDOWN_PLAN_FILE = join(STATE_DIR, "shutdown", "plan.json");
+const SHUTDOWN_REPORT_WAIT_MS = 5_000;
 /** Bounds restart retention if the wave cannot finish. */
 const RESTART_MARKER_MS = 5 * 60_000;
 /** How long a process has to exit after its SIGTERM before the wave gives up on it. */
@@ -525,6 +527,17 @@ interface SessionRecord {
 	lastInputAt: number;
 	/** The hash of the extension code the process loaded, so stale code yields the fleet locks. */
 	codeStamp: string;
+}
+
+interface ShutdownPlan {
+	id: string;
+	kind: "poweroff" | "reboot";
+	startedAt: number;
+	deadline: number;
+	by: "command" | "inhibitor";
+	messageId: number | null;
+	state: "winding" | "powering-off" | "cancelled" | "failed";
+	error: string;
 }
 
 /** How a restart wave reopens a session once its old process is gone. */
@@ -2462,11 +2475,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Every session a restart wave touched, and what it ended up as. */
 	const restartEntries = new Map<string, RestartEntry>();
 	let turnActive = false;
+	let waitingOnJob = false;
 	/** Set from a step's start to its end, while leads wait so the step's news arrives together at its boundary. */
 	let stepRunning = false;
 	let sessionAlive = true;
 	/** Set by a session_shutdown that a reboot or poweroff caused, so the record stays restorable. */
 	let systemShutdownAt = 0;
+	/** The state retained before aborting a turn for the machine shutdown. */
+	let shutdownState: string | null = null;
+	let shutdownPending = false;
+	const turnEndDeliveries = new Set<Promise<unknown>>();
 	/** What a session restored after a crash is told on its first drain, when it died with work in hand. */
 	let crashNote: string | null = null;
 	/** The turn that note started: it reaches Telegram only if the agent asks to continue. */
@@ -2518,6 +2536,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				error: config === null ? raw : raw.split(config.token).join("<token>"),
 			});
 		});
+	}
+
+	/** Keeps turn-end delivery and registration alive through a machine shutdown. */
+	function detachTurnEnd(start: () => Promise<unknown>, label: string): void {
+		const work = agentWaiting.exit(start);
+		turnEndDeliveries.add(work);
+		detach(async () => {
+			try {
+				await work;
+			} finally {
+				turnEndDeliveries.delete(work);
+			}
+		}, label);
 	}
 
 	/** `detach` for work nobody waits on, which takes a paced slot only when no other send has one booked. */
@@ -2795,6 +2826,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function sessionState(): string {
 		if (pendingAsk !== null) return WAITING_ON_QUESTION;
 		if (approvalWaiting) return "waiting on a tool approval";
+		if (waitingOnJob) return "waiting on a background job";
 		if (!turnActive) return "idle";
 		return currentTool.length > 0 ? `working (${currentTool})` : "working";
 	}
@@ -2802,7 +2834,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	function writeSessionRecord(ctx: ExtensionContext): void {
 		releaseLostId(ctx);
 		if (!registered) return;
-		lastState = sessionState();
+		lastState = shutdownState ?? sessionState();
 		lastHealth = turnHealth;
 		const record: SessionRecord = {
 			instance,
@@ -2923,6 +2955,70 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			lastInputAt: count(raw.lastInputAt),
 			codeStamp: text(raw.codeStamp),
 		};
+	}
+
+	/** Reads a complete machine-shutdown plan. */
+	function readShutdownPlan(): ShutdownPlan | null {
+		const raw = readJsonFile(SHUTDOWN_PLAN_FILE) as Partial<Record<keyof ShutdownPlan, unknown>> | null;
+		if (
+			raw === null ||
+			typeof raw.id !== "string" ||
+			!isStateToken(raw.id) ||
+			(raw.kind !== "poweroff" && raw.kind !== "reboot") ||
+			typeof raw.startedAt !== "number" ||
+			!Number.isFinite(raw.startedAt) ||
+			raw.startedAt < 0 ||
+			typeof raw.deadline !== "number" ||
+			!Number.isFinite(raw.deadline) ||
+			raw.deadline < 0 ||
+			(raw.by !== "command" && raw.by !== "inhibitor") ||
+			(raw.messageId !== null && !isTelegramMessageId(raw.messageId)) ||
+			(raw.state !== "winding" &&
+				raw.state !== "powering-off" &&
+				raw.state !== "cancelled" &&
+				raw.state !== "failed") ||
+			typeof raw.error !== "string"
+		)
+			return null;
+		return raw as ShutdownPlan;
+	}
+
+	/** Returns the plan while sessions must wind down. */
+	function activeShutdownPlan(): ShutdownPlan | null {
+		const plan = readShutdownPlan();
+		return plan?.state === "winding" || plan?.state === "powering-off" ? plan : null;
+	}
+
+	/** Stops this session once it can leave its state for restore. */
+	function windDown(ctx: ExtensionContext, turnEnded = false): boolean {
+		if (shutdownState !== null || shutdownPending) return true;
+		if (!registered || !sessionAlive || ownsLock()) return false;
+		const plan = activeShutdownPlan();
+		if (plan === null) return false;
+		const waitingOnUser =
+			pendingAsk !== null || approvalWaiting || standingQuestion !== null || replyQuestionMessageId !== null;
+		const busy = !turnEnded && !waitingOnUser && (turnActive || waitingOnJob || !ctx.isIdle());
+		if (busy && Date.now() < plan.deadline) return false;
+		shutdownPending = true;
+		detach(async () => {
+			try {
+				if (turnEndDeliveries.size > 0) {
+					await Promise.race([Promise.allSettled(turnEndDeliveries), sleepMs(SHUTDOWN_REPORT_WAIT_MS)]);
+					if (activeShutdownPlan() === null || ownsLock() || (!busy && turnActive)) return;
+				}
+				shutdownState = turnEnded && !waitingOnJob ? "idle" : sessionState();
+				if (busy && shutdownState === "idle") shutdownState = "working";
+				systemShutdownAt = Date.now();
+				closing = true;
+				writePrivateJson(RESTART_HOLD_DIR, `${sessionId}.json`, { at: systemShutdownAt });
+				writeSessionRecord(ctx);
+				if (busy) await ctx.abort();
+				ctx.shutdown();
+			} finally {
+				shutdownPending = false;
+			}
+		}, "machine shutdown");
+		return true;
 	}
 
 	function readCrash(id: string): CrashRecord | null {
@@ -4517,7 +4613,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	 */
 	async function runRestartWave(stampNow: string): Promise<void> {
 		try {
-			if (codeStamp !== stampNow) return;
+			if (codeStamp !== stampNow || activeShutdownPlan() !== null) return;
 			for (const [id, entry] of restartEntries) if (entry.outcome !== "") restartEntries.delete(id);
 			const candidates: Array<{ id: string; record: SessionRecord }> = [];
 			for (const { id, record } of allRecords()) {
@@ -4561,6 +4657,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					reason: "",
 					failNote: "",
 				};
+				if (activeShutdownPlan() !== null) break;
 				restartEntries.set(id, entry);
 				await startRestart(entry);
 			}
@@ -6080,7 +6177,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		advance(ask);
 	}
 
-	async function closeReactionRouteForShutdown(): Promise<number> {
+	async function closeReactionRouteForShutdown(keepForRestore: boolean): Promise<number> {
 		// A waiting instance never opened the route of the id it reports, which belongs to the holder.
 		if (!registered) return 0;
 		mkdirSync(REACTION_ROUTE_LOCK_DIR, { recursive: true, mode: 0o700 });
@@ -6100,7 +6197,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				if (token === null) throw new Error("Could not fence the reaction inbox route");
 			}
 			try {
-				const queuedRedos = discardQueuedRedos(sessionId);
+				const queuedRedos = keepForRestore ? 0 : discardQueuedRedos(sessionId);
 				sessionAlive = false;
 				if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 				return queuedRedos;
@@ -9145,7 +9242,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const data = callback.data ?? "";
 		const arg = data.slice(3);
 		let toast: string | null;
-		if (data.startsWith("kr:")) {
+		if ((data.startsWith("kr:") || data.startsWith("ka:")) && activeShutdownPlan() !== null) {
+			toast = "A machine shutdown is in progress.";
+		} else if (data.startsWith("kr:")) {
 			toast = restoreCrashed(arg);
 		} else {
 			const batch = readCrashBatch(arg);
@@ -11423,6 +11522,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				// Every heartbeat aged through the sleep, and routing skips a session whose record looks stale.
 				if (noteWake()) writeSessionRecord(ctx);
 				detach(() => followSession(ctx), "session follow");
+				if (windDown(ctx)) return;
 				detach(() => drainInbox(), "inbox drain");
 				drainPending();
 				closeWhenNoticed();
@@ -11716,6 +11816,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		clearPaneState();
 		if (sessionCtx !== null) await followSession(ctx);
 		turnActive = true;
+		waitingOnJob = false;
 		statusBlockUsed = false;
 		detach(() => unpinRed(ctx), "new-work unpin");
 		retireCloseOffer(true);
@@ -11759,6 +11860,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	pi.on("agent_end", async (event, ctx) => {
 		turnActive = false;
+		waitingOnJob = event.awaitingAsyncWork === true;
 		stepRunning = false;
 		replyOwedAt = 0;
 		turnEndedAt = Date.now();
@@ -12053,11 +12155,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return waitsOnJob || waitsOnUnfinishedSession() ? "sleeping" : "done";
 	}
 
+	/** Queues the final report before allowing a machine shutdown. */
+	async function endTurn(ctx: ExtensionContext, waitsOnJob: boolean) {
+		const verdict = await reportTurn(ctx, waitsOnJob);
+		if (verdict === undefined) windDown(ctx, true);
+		return verdict;
+	}
+
 	/**
 	 * Reports a finished turn to Telegram. A turn that waits on a background job cannot be held back for a
 	 * status, offers no Close buttons, since closing would end the job, and says the session waits on it.
 	 */
-	async function endTurn(ctx: ExtensionContext, waitsOnJob: boolean) {
+	async function reportTurn(ctx: ExtensionContext, waitsOnJob: boolean) {
+		waitingOnJob = waitsOnJob;
 		turnActive = false;
 		replyOwedAt = 0;
 		approvalWaiting = false;
@@ -12078,7 +12188,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		// Conductors hear of a session at its turn end whether or not turn ends reach Telegram.
 		if (turnSummary !== null) {
 			const headline = turnSummary.text.replace(/\n[\s\S]*$/u, "").trim();
-			detach(() => leadConductors(ctx, headline), "conductor leads");
+			detachTurnEnd(() => leadConductors(ctx, headline), "conductor leads");
 			detach(() => checkOverlaps(sessionId), "overlap check");
 			// A turn that ends asking the user something waits on the user, and its lines are reviewed with the next turn.
 			if (turnSummary.urgency === "green" && turnSummary.options === undefined && turnSummary.question === undefined) {
@@ -12140,10 +12250,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					if (recorded.urgency === "red") return pinRed(ctx, sent, pinGeneration);
 					return undefined;
 				});
-				detach(() => work, "turn-end notice");
+				detachTurnEnd(() => work, "turn-end notice");
 				return;
 			}
-			detach(
+			detachTurnEnd(
 				() =>
 					sendStandingQuestion(
 						ctx,
@@ -12159,7 +12269,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			return;
 		}
 
-		if (!statusBlockUsed && !waitsOnJob) {
+		if (!statusBlockUsed && !waitsOnJob && activeShutdownPlan() === null) {
 			statusBlockUsed = true;
 			if (pendingAsk === null && /\?\s*$/.test(lastAssistantTail(ctx))) {
 				return { decision: "block" as const, reason: QUESTION_STOP_REASON };
@@ -12185,7 +12295,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						: `${clip(tail, 600)}...`;
 		const body = waitsOnJob ? `${tailBody}\n\n${JOB_WAIT_LINE}` : tailBody;
 		const generation = redPinGeneration;
-		detach(
+		detachTurnEnd(
 			() =>
 				deliverUntilTaken(
 					(onRefused) =>
@@ -12263,13 +12373,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			marker !== null && typeof marker.at === "number" && Date.now() - marker.at < RESTART_MARKER_MS;
 		if (restartMarked) removeStatePath(RESTART_MARKER_DIR, `${sessionId}.json`);
 		const keepForRestore = systemShutdownAt > 0 || restartMarked;
-		const queuedRedos = await closeReactionRouteForShutdown();
+		const queuedRedos = await closeReactionRouteForShutdown(keepForRestore);
 		if (queuedRedos > 0) {
 			await serviceNotice("Grade kept, but this session ended before its queued redo could reach the agent.", false);
 		}
 		unsubscribeInput?.();
 		unsubscribeInput = null;
-		if (!restartMarked) retireCloseOffer(true);
+		if (!keepForRestore) retireCloseOffer(true);
 		const ask = pendingAsk;
 		if (ask !== null) {
 			pendingAsk = null;
@@ -12294,7 +12404,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const closingCtx = sessionCtx;
 		if (closingCtx !== null && !keepForRestore) detach(() => unpinRed(closingCtx), "shutdown unpin");
 		await Promise.allSettled(redPinOperations);
-		closeReplyQuestion();
+		if (!keepForRestore) closeReplyQuestion();
 		sessionAlive = false;
 		// A process that only waited on an id another process holds owns no ballot under it.
 		if (registered && !keepForRestore) {
