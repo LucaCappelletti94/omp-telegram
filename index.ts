@@ -16,6 +16,7 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
+import type { Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -3125,6 +3126,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				{ stdio: ["ignore", "pipe", "ignore"] },
 			);
 			inhibitor = child;
+			// The lock lives exactly as long as this process, which exits on its own schedule and kills the child then.
+			child.unref();
+			// A piped stdout is a net.Socket at runtime, whose unref the Readable type leaves out.
+			const stdout = child.stdout as unknown as Socket;
+			stdout.unref();
 			process.once("exit", stopInhibitor);
 			const lines = createInterface({ input: child.stdout });
 			inhibitorClosed = new Promise((resolve) => {
