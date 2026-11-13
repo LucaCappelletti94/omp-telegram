@@ -91,6 +91,8 @@ A session that dies without shutting down, whether its omp process was killed or
 
 `/shutdown` and `/reboot` wind sessions down with a ten-minute deadline, or a duration such as `/shutdown 30m`, `/reboot 90s` or `/shutdown 1h`, then power off or reboot the machine once every other session is down. The progress card offers Stop now and Cancel until power-off begins. If cancelled or refused, the machine stays up and Restore or Restore all on the restore card reopens stopped sessions.
 
+A power-off or reboot started outside Telegram also winds sessions down within logind's delay limit. Busy sessions are aborted at once, with five seconds reserved for the machine to finish shutting down.
+
 ### Power-off permissions
 
 An administrator installs this [polkit rule](https://polkit.pages.freedesktop.org/polkit/polkit.8.html) once in `/etc/polkit-1/rules.d/49-omp-telegram-power.rules`, replacing `YOUR_USER` with the account running omp. It permits noninteractive [logind power-off and reboot](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html) without granting the `-ignore-inhibit` actions.

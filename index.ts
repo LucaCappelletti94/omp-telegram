@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { type ChildProcess, execFile, execFileSync, spawn } from "node:child_process";
 import { createHash, randomInt, randomUUID } from "node:crypto";
 import {
 	appendFileSync,
@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
+import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -3023,7 +3024,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const waitingOnUser =
 			pendingAsk !== null || approvalWaiting || standingQuestion !== null || replyQuestionMessageId !== null;
 		const busy = !turnEnded && !waitingOnUser && (turnActive || waitingOnJob || !ctx.isIdle());
-		if (busy && Date.now() < plan.deadline) return false;
+		if (busy && plan.by !== "inhibitor" && Date.now() < plan.deadline) return false;
 		shutdownPending = true;
 		detach(async () => {
 			try {
@@ -3049,6 +3050,116 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Persists the poller's machine-shutdown decision. */
 	function writeShutdownPlan(plan: ShutdownPlan): void {
 		if (ownsLock()) writePrivateJson(join(STATE_DIR, "shutdown"), "plan.json", plan);
+	}
+
+	let inhibitor: ChildProcess | null = null;
+	let inhibitorStarting = false;
+	let inhibitorClosed: Promise<void> = Promise.resolve();
+	let warnedSetpriv = false;
+
+	/** Releases the delay lock without waiting on the monitor. */
+	function stopInhibitor(): void {
+		if (inhibitor !== null && !inhibitor.killed) inhibitor.kill("SIGKILL");
+	}
+
+	lifetime.signal.addEventListener("abort", stopInhibitor, { once: true });
+
+	/** Releases an inhibitor whose owner or shutdown window has ended. */
+	function releaseInhibitor(): void {
+		if (inhibitor === null) return;
+		const plan = activeShutdownPlan();
+		if (
+			!ownsLock() ||
+			lifetime.signal.aborted ||
+			plan?.state === "powering-off" ||
+			(plan?.by === "inhibitor" && (Date.now() >= plan.deadline || shutdownSessions().length === 0))
+		)
+			stopInhibitor();
+	}
+
+	/** Starts at most one inhibitor per heartbeat while no wind-down is active. */
+	async function startInhibitor(): Promise<void> {
+		releaseInhibitor();
+		const eligible = (): boolean => ownsLock() && !lifetime.signal.aborted && activeShutdownPlan() === null;
+		if (inhibitor !== null || inhibitorStarting || !eligible()) return;
+		inhibitorStarting = true;
+		try {
+			const limit = await run(
+				"busctl",
+				[
+					"get-property",
+					"org.freedesktop.login1",
+					"/org/freedesktop/login1",
+					"org.freedesktop.login1.Manager",
+					"InhibitDelayMaxUSec",
+				],
+				1_000,
+			);
+			if (!eligible()) return;
+			const micros = Number(/^t (\d+)$/u.exec(limit.stdout)?.[1]);
+			if (!limit.ok || !Number.isSafeInteger(micros)) {
+				pi.logger.warn("notify-telegram shutdown delay limit unavailable", { error: limit.stderr || limit.stdout });
+				return;
+			}
+			const args = [
+				"--what=shutdown",
+				"--mode=delay",
+				"--who=omp-telegram",
+				"--why=wind omp sessions down",
+				process.env.OMP_TELEGRAM_GDBUS ?? "/usr/bin/gdbus",
+				"monitor",
+				"--system",
+				"--dest",
+				"org.freedesktop.login1",
+				"--object-path",
+				"/org/freedesktop/login1",
+			];
+			const setpriv = existsSync("/usr/bin/setpriv");
+			if (!setpriv && !warnedSetpriv) {
+				warnedSetpriv = true;
+				pi.logger.warn("notify-telegram setpriv unavailable, inhibitor cleanup requires a graceful exit");
+			}
+			const child = spawn(
+				setpriv ? "/usr/bin/setpriv" : "systemd-inhibit",
+				setpriv ? ["--pdeathsig", "TERM", "systemd-inhibit", ...args] : args,
+				{ stdio: ["ignore", "pipe", "ignore"] },
+			);
+			inhibitor = child;
+			process.once("exit", stopInhibitor);
+			const lines = createInterface({ input: child.stdout });
+			inhibitorClosed = new Promise((resolve) => {
+				child.once("close", () => {
+					lines.close();
+					process.removeListener("exit", stopInhibitor);
+					inhibitor = null;
+					resolve();
+				});
+			});
+			child.once("error", (error) => {
+				pi.logger.warn("notify-telegram shutdown inhibitor failed", { error: error.message });
+			});
+			lines.on("line", (line) => {
+				if (!/\.PrepareForShutdown(WithMetadata)? \(true\b/u.test(line)) return;
+				detach(async () => {
+					if (inhibitor !== child || child.killed || !eligible()) return;
+					const startedAt = Date.now();
+					writeShutdownPlan({
+						id: randomUUID(),
+						kind: "poweroff",
+						startedAt,
+						deadline: startedAt + Math.max(0, micros / 1000 - SHUTDOWN_REPORT_WAIT_MS),
+						by: "inhibitor",
+						messageId: null,
+						state: "winding",
+						error: "",
+					});
+					releaseInhibitor();
+					await shutdownTick();
+				}, "external machine shutdown");
+			});
+		} finally {
+			inhibitorStarting = false;
+		}
 	}
 
 	/** Identifies a process the poller signalled for a wind-down. */
@@ -3175,13 +3286,16 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!ownsPlan()) return;
 		const method = plan.kind === "poweroff" ? "PowerOff" : "Reboot";
 		const args = ["call", "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager"];
-		const allowed = await run("busctl", [...args, `Can${method}`], 5_000);
-		if (!ownsPlan()) return;
-		let error = allowed.ok
-			? allowed.stdout === 's "yes"'
-				? ""
-				: `logind Can${method} answered ${allowed.stdout}`
-			: `logind Can${method} failed (${allowed.stderr})`;
+		let error = "";
+		if (plan.by !== "inhibitor") {
+			const allowed = await run("busctl", [...args, `Can${method}`], 5_000);
+			if (!ownsPlan()) return;
+			error = allowed.ok
+				? allowed.stdout === 's "yes"'
+					? ""
+					: `logind Can${method} answered ${allowed.stdout}`
+				: `logind Can${method} failed (${allowed.stderr})`;
+		}
 		if (error === "" && shutdownSessions().length > 0) error = "Another session is still running";
 		if (error === "") {
 			shutdownState = sessionState();
@@ -3189,6 +3303,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			closing = true;
 			writePrivateJson(RESTART_HOLD_DIR, `${sessionId}.json`, { at: systemShutdownAt });
 			writeSessionRecord(ctx);
+			if (plan.by === "inhibitor") {
+				ctx.shutdown();
+				return;
+			}
 			const result = await run("busctl", [...args, method, "b", "false"], 5_000);
 			if (result.ok) {
 				ctx.shutdown();
@@ -3209,6 +3327,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** Drives the deadline and publishes the current shutdown card. */
 	async function updateShutdown(): Promise<void> {
+		releaseInhibitor();
 		if (!ownsLock() || config === null || sessionCtx === null) return;
 		const cfg = config;
 		const ctx = sessionCtx;
@@ -3222,15 +3341,26 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (plan.state === "winding" && up.length === 0) {
 			plan = { ...plan, state: "powering-off" };
 			writeShutdownPlan(plan);
+			stopInhibitor();
 		}
 		offerShutdownSessions(plan);
 		const busy = (record: SessionRecord): number =>
 			Number(/^(working|waiting on a background job)/u.test(record.state));
 		up.sort((a, b) => busy(b.record) - busy(a.record) || badgeOf(a.record).localeCompare(badgeOf(b.record)));
-		const lines = [plan.kind === "poweroff" ? "Power off requested." : "Reboot requested."];
+		const lines = [
+			plan.by === "inhibitor"
+				? "Shutdown started outside Telegram."
+				: plan.kind === "poweroff"
+					? "Power off requested."
+					: "Reboot requested.",
+		];
 		const rows: InlineButton[][] = [];
 		if (plan.state === "winding") {
-			lines.push(`Deadline ${relativeTime(plan.deadline)}.`);
+			lines.push(
+				plan.by === "inhibitor"
+					? `Sessions get at most ${Math.max(0, Math.ceil((plan.deadline - Date.now()) / 1000))} seconds.`
+					: `Deadline ${relativeTime(plan.deadline)}.`,
+			);
 			for (const { record } of up)
 				lines.push(
 					`${badgeOf(record)} · ${record.state || "idle"}${Date.now() - record.heartbeat > LOCK_STALE_MS ? " · unresponsive" : ""}`,
@@ -3240,7 +3370,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				{ text: "Cancel", callback_data: `sc:${plan.id}` },
 			]);
 		} else if (plan.state === "powering-off") {
-			lines.push(plan.kind === "poweroff" ? "The machine is powering off." : "The machine is rebooting.");
+			lines.push(
+				plan.by === "inhibitor"
+					? "Sessions are down."
+					: plan.kind === "poweroff"
+						? "The machine is powering off."
+						: "The machine is rebooting.",
+			);
 		} else {
 			const stopped = readCrashBatch(plan.id)?.ids.length ?? 0;
 			lines.push(plan.state === "cancelled" ? "Cancelled." : "The machine stayed up.");
@@ -3270,7 +3406,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const sent =
 				plan.state === "powering-off"
 					? await Promise.race([
-							Promise.all([sending.catch(() => null), Promise.allSettled(turnEndDeliveries)]).then(
+							Promise.all([sending.catch(() => null), Promise.allSettled(turnEndDeliveries), inhibitorClosed]).then(
 								([message]) => message,
 							),
 							sleepMs(SHUTDOWN_REPORT_WAIT_MS).then(() => null),
@@ -4747,6 +4883,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	function releaseLock(file: string = LOCK_FILE): void {
+		if (file === LOCK_FILE) stopInhibitor();
 		if (!ownsLock(file)) return;
 		const path = resolve(file);
 		if (!path.startsWith(`${resolve(STATE_DIR)}${sep}`)) return;
@@ -11770,6 +11907,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		removeStatePath(STATE_DIR, basename(LEGACY_LOCK_DIR));
 		const cfg = config;
 		if (acquireLock()) detach(() => registerCommands(cfg), "command menu");
+		detach(() => startInhibitor(), "shutdown inhibitor");
 
 		if (ctx.hasUI) {
 			unsubscribeInput = ctx.ui.onTerminalInput(() => {
@@ -11804,6 +11942,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					releaseLock();
 					releaseLock(DASHBOARD_LOCK_FILE);
 				}
+				detach(() => startInhibitor(), "shutdown inhibitor");
 				if (ownsLock()) {
 					detach(() => registerCommands(cfg), "command menu");
 					graphTick();
@@ -11851,6 +11990,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				// Every heartbeat aged through the sleep, and routing skips a session whose record looks stale.
 				if (noteWake()) writeSessionRecord(ctx);
 				detach(() => followSession(ctx), "session follow");
+				releaseInhibitor();
 				if (windDown(ctx)) return;
 				detach(() => drainInbox(), "inbox drain");
 				drainPending();

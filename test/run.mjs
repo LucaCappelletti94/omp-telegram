@@ -78,6 +78,14 @@ writeFileSync(
 	`#!/bin/sh
 echo "$*" >> "${busctlLog}"
 [ -f "${busctlState}/slow-$5" ] && sleep 6
+if [ "$1" = get-property ]; then
+	[ -f "${busctlState}/property-error" ] && exit 1
+	if [ -f "${busctlState}/property-target" ]; then
+		cp "${busctlState}/replacement" "$(cat "${busctlState}/property-target")"
+	fi
+	if [ -f "${busctlState}/delay" ]; then cat "${busctlState}/delay"; else echo 't 30000000'; fi
+	exit 0
+fi
 case "$5" in
 CanPowerOff|CanReboot)
 	if [ -f "${busctlState}/target" ]; then
@@ -96,6 +104,47 @@ esac
 	{ mode: 0o755 },
 );
 process.env.PATH = `${systemdBin}:${process.env.PATH}`;
+const inhibitLog = join(root, "inhibit.log");
+const inhibitState = join(root, "inhibit-state");
+mkdirSync(inhibitState);
+writeFileSync(inhibitLog, "");
+writeFileSync(
+	join(systemdBin, "systemd-inhibit"),
+	`#!/bin/sh
+echo "$$ $*" >> "${inhibitLog}"
+shift 4
+exec "$@"
+`,
+	{ mode: 0o755 },
+);
+const fakeGdbus = join(systemdBin, "gdbus");
+writeFileSync(
+	fakeGdbus,
+	`#!/usr/bin/env node
+if (process.env.OMP_TELEGRAM_TEST_INHIBITOR !== "1") process.exit(0);
+const fs = require("node:fs");
+const path = require("node:path");
+const dir = ${JSON.stringify(inhibitState)};
+const inbox = path.join(dir, String(process.pid));
+fs.writeFileSync(inbox, "");
+let offset = 0;
+const timer = setInterval(() => {
+	if (!fs.existsSync(inbox)) process.exit(0);
+	const text = fs.readFileSync(inbox, "utf8");
+	if (text.length > offset) {
+		process.stdout.write(text.substring(offset));
+		offset = text.length;
+	}
+}, 20);
+process.on("SIGTERM", () => {
+	fs.rmSync(inbox, { force: true });
+	clearInterval(timer);
+	process.exit(0);
+});
+`,
+	{ mode: 0o755 },
+);
+process.env.OMP_TELEGRAM_GDBUS = fakeGdbus;
 const writeConfig = (extra = {}) =>
 	writeFileSync(
 		join(root, "notify-telegram.json"),
@@ -17400,7 +17449,11 @@ heading("logind power-off and reboot");
 		rmSync(join(sessionsDir, file));
 	}
 	const readPlan = () => (existsSync(planFile) ? JSON.parse(readFileSync(planFile, "utf8")) : null);
-	const calls = () => readFileSync(busctlLog, "utf8").trim().split("\n").filter(Boolean);
+	const calls = () =>
+		readFileSync(busctlLog, "utf8")
+			.trim()
+			.split("\n")
+			.filter((line) => line.startsWith("call "));
 	let seq = 22000;
 	const start = async (name) => {
 		const session = spawn(`power-${name}`, vsFolder(`power-${name}`), name);
@@ -17683,6 +17736,341 @@ heading("logind power-off and reboot");
 	}
 	resetBus('s "challenge"\n');
 	for (const [file, bytes] of parked) writeFileSync(join(sessionsDir, file), bytes);
+}
+
+heading("shutdown delay inhibitor");
+{
+	process.env.OMP_TELEGRAM_TEST_INHIBITOR = "1";
+	const stateDir = join(root, "notify-telegram");
+	const planFile = join(stateDir, "shutdown/plan.json");
+	const lockFile = join(stateDir, "poller.lock");
+	const parked = new Map();
+	for (const file of readdirSync(sessionsDir)) {
+		parked.set(file, readFileSync(join(sessionsDir, file)));
+		rmSync(join(sessionsDir, file));
+	}
+	const readPlan = () => (existsSync(planFile) ? JSON.parse(readFileSync(planFile, "utf8")) : null);
+	const starts = () => readFileSync(inhibitLog, "utf8").trim().split("\n").filter(Boolean);
+	const lastPid = () => Number(starts().at(-1)?.split(" ")[0]);
+	const running = (pid) => {
+		if (!Number.isInteger(pid) || pid <= 0) return false;
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	const signal = async (
+		pid,
+		text = "/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForShutdown (true,)\n",
+	) => {
+		if (running(pid)) fs.appendFileSync(join(inhibitState, String(pid)), text);
+		await settle(200);
+	};
+	const tick = async (session) => {
+		session.heartbeat();
+		await settle(200);
+	};
+	const start = async (name) => {
+		const session = spawn(`inhibit-${name}`, vsFolder(`inhibit-${name}`), name);
+		vsTranscript(session.id);
+		await session.fire("session_start");
+		await tick(session);
+		return session;
+	};
+	const cleanup = async (...sessions) => {
+		rmSync(planFile, { force: true });
+		for (const session of sessions) {
+			if (session.shutdowns === 0) await session.fire("session_shutdown");
+			rmSync(join(sessionsDir, `${session.id}.json`), { force: true });
+			rmSync(vsHold(session.id), { force: true });
+		}
+		rmSync(lockFile, { force: true });
+		await settle(100);
+	};
+	rmSync(lockFile, { force: true });
+	const before = starts().length;
+	const poller = await start("owner");
+	const pid = lastPid();
+	const peer = await start("peer");
+	check("only the poller takes one shutdown delay inhibitor", starts().length === before + 1 && running(pid));
+	check(
+		"the inhibitor runs the injected gdbus monitor with shutdown delay arguments",
+		starts()
+			.at(-1)
+			?.includes(
+				`--what=shutdown --mode=delay --who=omp-telegram --why=wind omp sessions down ${fakeGdbus} monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1`,
+			) === true,
+	);
+	const owner = record(peer.id);
+	writeFileSync(lockFile, JSON.stringify({ ...owner, sessionId: peer.id, code: owner.codeStamp }));
+	await poller.pump(150);
+	check("losing the poller lock ends its inhibitor on the next drain", !running(pid));
+	await tick(peer);
+	const replacement = lastPid();
+	check("the new poller takes its own inhibitor", replacement !== pid && running(replacement));
+	if (running(replacement)) process.kill(replacement, "SIGKILL");
+	await settle(150);
+	const exitedStarts = starts().length;
+	await peer.pump(250);
+	check("an unexpectedly exited inhibitor is not restarted by drain ticks", starts().length === exitedStarts);
+	await tick(peer);
+	const restarted = lastPid();
+	check(
+		"an unexpectedly exited inhibitor restarts on the next heartbeat",
+		starts().length === exitedStarts + 1 && running(restarted),
+	);
+	await peer.fire("session_shutdown");
+	await settle(150);
+	check("lifetime abort ends the inhibitor", !running(restarted));
+	await cleanup(poller, peer);
+
+	for (const delay of [30_000_000, 3_000_000]) {
+		writeFileSync(join(busctlState, "delay"), `t ${delay}\n`);
+		const holder = await start(`signal-${delay}`);
+		const child = lastPid();
+		const busy = await start(`busy-${delay}`);
+		await busy.fire("agent_start");
+		busy.setIdle(false);
+		await signal(child, "/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForShutdown (false,)\n");
+		check(`a false PrepareForShutdown signal leaves no plan for delay ${delay}`, readPlan() === null);
+		await signal(child, "/org/freedesktop/login1: org.freedesktop.login1.Manager.SessionNew ('7',)\n");
+		check(`an unrelated logind signal leaves no plan for delay ${delay}`, readPlan() === null);
+		await signal(child, "sender :1.3 /org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareFor");
+		check(`a partial PrepareForShutdown line leaves no plan for delay ${delay}`, readPlan() === null);
+		const at = Date.now();
+		await signal(
+			child,
+			delay === 3_000_000 ? "ShutdownWithMetadata (true, {'type': <'reboot'>}) \t\n" : "Shutdown (true,) \t\n",
+		);
+		const plan = readPlan();
+		check(
+			`${delay === 3_000_000 ? "PrepareForShutdownWithMetadata" : "PrepareForShutdown with prefix and trailing whitespace"} creates an inhibitor plan with delay ${delay}`,
+			plan?.by === "inhibitor" &&
+				plan.kind === "poweroff" &&
+				plan.startedAt >= at &&
+				plan.deadline - plan.startedAt === Math.max(0, delay / 1000 - 5000),
+		);
+		const message = api.calls.findLast(
+			(call) =>
+				call.method === "sendMessage" &&
+				call.body.message_id === undefined &&
+				/outside Telegram/.test(call.body.text ?? ""),
+		);
+		check(
+			`the inhibitor card names the external shutdown and remaining seconds for delay ${delay}`,
+			/at most \d+ seconds/.test(message?.body.text ?? ""),
+		);
+		await busy.pump(200);
+		check(
+			`an inhibitor plan aborts busy sessions immediately for delay ${delay}`,
+			busy.aborts === 1 && busy.shutdowns === 1,
+		);
+		const callsBefore = readFileSync(busctlLog, "utf8");
+		await tick(holder);
+		check(`the inhibitor releases when all peers are down for delay ${delay}`, !running(child));
+		check(
+			`the inhibitor poller stops with its state kept and no logind call for delay ${delay}`,
+			holder.shutdowns === 1 &&
+				record(holder.id)?.heartbeat === 0 &&
+				record(holder.id)?.systemShutdownAt > 0 &&
+				existsSync(vsHold(holder.id)) &&
+				readFileSync(busctlLog, "utf8") === callsBefore,
+		);
+		await cleanup(holder, busy);
+	}
+	rmSync(join(busctlState, "delay"), { force: true });
+	const deadlinePoller = await start("deadline");
+	const deadlinePid = lastPid();
+	const late = await start("late");
+	await late.fire("agent_start");
+	const deadlineGate = Promise.withResolvers();
+	api.sendMessageGate = deadlineGate.promise;
+	await signal(deadlinePid);
+	const deadlinePlan = readPlan();
+	check("a plain PrepareForShutdown line creates an inhibitor plan", deadlinePlan?.by === "inhibitor");
+	const deadlineClock = clockSkew;
+	if (deadlinePlan !== null) jump(Math.max(0, deadlinePlan.deadline - Date.now()) + 1);
+	await deadlinePoller.pump(200);
+	check(
+		"the inhibitor releases at its deadline even while another session remains up",
+		!running(deadlinePid) && late.shutdowns === 0,
+	);
+	deadlineGate.resolve();
+	api.sendMessageGate = null;
+	await settle(200);
+	clockSkew = deadlineClock;
+	await cleanup(deadlinePoller, late);
+
+	const commandPoller = await start("command");
+	const commandPid = lastPid();
+	const commandPeer = await start("command-peer");
+	const commandPlan = {
+		id: "inhibit-command",
+		kind: "poweroff",
+		startedAt: Date.now(),
+		deadline: Date.now() + 60_000,
+		by: "command",
+		messageId: null,
+		state: "winding",
+		error: "",
+	};
+	writeFileSync(planFile, JSON.stringify(commandPlan));
+	await signal(commandPid);
+	check(
+		"a command plan ignores PrepareForShutdown and retains its inhibitor",
+		JSON.stringify(readPlan()) === JSON.stringify(commandPlan) && running(commandPid),
+	);
+	writeFileSync(join(busctlState, "answer"), 's "yes"\n');
+	const logBefore = readFileSync(busctlLog, "utf8");
+	await commandPeer.pump(150);
+	const gate = Promise.withResolvers();
+	api.sendMessageGate = gate.promise;
+	await tick(commandPoller);
+	check(
+		"powering-off releases its inhibitor before waiting for the final card",
+		readPlan()?.state === "powering-off" && !running(commandPid) && readFileSync(busctlLog, "utf8") === logBefore,
+	);
+	gate.resolve();
+	api.sendMessageGate = null;
+	await settle(250);
+	check(
+		"a command plan calls logind after releasing its inhibitor",
+		commandPoller.shutdowns === 1 && readFileSync(busctlLog, "utf8").includes("PowerOff b false"),
+	);
+	await cleanup(commandPoller, commandPeer);
+
+	for (const response of ["t invalid", "t 1e100", "t 999999999999999999999", 's "30000000"', "error"]) {
+		const propertyBefore = starts().length;
+		writeFileSync(join(busctlState, "delay"), `${response}\n`);
+		if (response === "error") writeFileSync(join(busctlState, "property-error"), "");
+		const refused = await start(`property-${response.replace(/\W/g, "")}`);
+		check(`an unusable delay limit ${response} does not start an inhibitor`, starts().length === propertyBefore);
+		check(
+			`an unusable delay limit ${response} is reported`,
+			refused.warns.some((entry) => /delay limit/.test(entry.m)),
+		);
+		rmSync(join(busctlState, "property-error"), { force: true });
+		writeFileSync(join(busctlState, "delay"), "t 30000000\n");
+		await tick(refused);
+		check(`a later heartbeat recovers from delay limit ${response}`, starts().length === propertyBefore + 1);
+		await cleanup(refused);
+	}
+	rmSync(join(busctlState, "delay"), { force: true });
+	const racedStarts = starts().length;
+	writeFileSync(join(busctlState, "property-target"), lockFile);
+	writeFileSync(
+		join(busctlState, "replacement"),
+		JSON.stringify({
+			instance: "foreign-inhibitor",
+			sessionId: "foreign",
+			pid: process.pid,
+			heartbeat: Date.now(),
+		}),
+	);
+	const raced = await start("property-race");
+	check("losing the poller lock during the property read starts no inhibitor", starts().length === racedStarts);
+	rmSync(join(busctlState, "property-target"));
+	await cleanup(raced);
+	const realExists = fs.existsSync;
+	fs.existsSync = (path) => path !== "/usr/bin/setpriv" && realExists(path);
+	syncBuiltinESMExports();
+	const fallback = await start("fallback");
+	const fallbackPid = lastPid();
+	check("a missing setpriv still starts the inhibitor directly", running(fallbackPid));
+	if (running(fallbackPid)) process.kill(fallbackPid, "SIGKILL");
+	await settle(100);
+	await tick(fallback);
+	check(
+		"a missing setpriv warns only once per process",
+		fallback.warns.filter((entry) => /setpriv/.test(entry.m)).length === 1,
+	);
+	renameSync(join(systemdBin, "systemd-inhibit"), join(systemdBin, "inhibit-saved"));
+	const missingPath = process.env.PATH;
+	process.env.PATH = systemdBin;
+	const missingPid = lastPid();
+	if (running(missingPid)) process.kill(missingPid, "SIGKILL");
+	await settle(100);
+	await tick(fallback);
+	check(
+		"an inhibitor spawn error is reported without an unhandled event",
+		fallback.warns.some((entry) => /inhibitor.*failed/.test(entry.m)),
+	);
+	renameSync(join(systemdBin, "inhibit-saved"), join(systemdBin, "systemd-inhibit"));
+	process.env.PATH = missingPath;
+	await tick(fallback);
+	check("an inhibitor spawn error recovers on a later heartbeat", running(lastPid()));
+	await cleanup(fallback);
+	fs.existsSync = realExists;
+	syncBuiltinESMExports();
+
+	const parentRequest = "inhibitor-parent-death";
+	const parent = startProcess(
+		process.execPath,
+		[
+			"--disable-warning=ExperimentalWarning",
+			"--input-type=module",
+			"-e",
+			`
+			import childProcess from "node:child_process";
+			import { syncBuiltinESMExports } from "node:module";
+			const realSpawn = childProcess.spawn;
+			let defaultMonitor = false;
+			childProcess.spawn = (command, args, ...rest) => {
+				defaultMonitor ||= args.includes("/usr/bin/gdbus");
+				return realSpawn(command, args.map((arg) => arg === "/usr/bin/gdbus" ? ${JSON.stringify(fakeGdbus)} : arg), ...rest);
+			};
+			syncBuiltinESMExports();
+			delete process.env.OMP_TELEGRAM_GDBUS;
+			const { default: extension } = await import(${JSON.stringify(EXTENSION)});
+			const chain = new Proxy(() => chain, { get: () => chain, apply: () => chain });
+			const handlers = new Map();
+			const timers = [];
+			globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, result: true }) });
+			extension({
+				zod: chain, logger: { debug() {}, info() {}, warn() {}, error() {} },
+				on: (event, fn) => handlers.set(event, fn), registerTool() {},
+				sendUserMessage() {}, sendMessage() {}, setSessionName() {},
+			});
+			const ctx = {
+				hasUI: false, cwd: ${JSON.stringify(root)},
+				sessionManager: { getSessionId: () => "inhibit-parent", getSessionName: () => "parent" },
+				setInterval: (fn) => timers.push(fn), setTimeout: () => {}, clearTimer() {},
+				isIdle: () => true,
+			};
+			await handlers.get("session_start")({}, ctx);
+			timers[0]();
+			const { takeCoverage } = await import("node:v8");
+			setTimeout(() => {
+				takeCoverage();
+				process.send({ id: ${JSON.stringify(parentRequest)}, defaultMonitor });
+			}, 500);
+			setInterval(() => {}, 1000);
+		`,
+		],
+		{ stdio: ["ignore", "ignore", "pipe", "ipc"] },
+	);
+	const parentReady = await Promise.race([
+		new Promise((resolve) =>
+			parent.on("message", (reply) => {
+				if (reply.id === parentRequest) resolve(reply.defaultMonitor);
+			}),
+		),
+		settle(2500).then(() => false),
+	]);
+	const orphan = lastPid();
+	check("the parent-death fixture starts a real inhibitor child", parentReady && running(orphan));
+	check("the default monitor uses the absolute system gdbus path", parentReady);
+	parent.kill("SIGKILL");
+	await settle(300);
+	check("SIGKILL of the parent ends its inhibitor child", !existsSync(join(inhibitState, String(orphan))));
+	if (running(orphan)) process.kill(orphan, "SIGKILL");
+	rmSync(join(sessionsDir, "inhibit-parent.json"), { force: true });
+	rmSync(lockFile, { force: true });
+	writeFileSync(join(busctlState, "answer"), 's "challenge"\n');
+	for (const [file, bytes] of parked) writeFileSync(join(sessionsDir, file), bytes);
+	delete process.env.OMP_TELEGRAM_TEST_INHIBITOR;
 }
 
 restoreStamp();
