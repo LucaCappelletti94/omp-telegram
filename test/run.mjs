@@ -68,6 +68,33 @@ esac
 `,
 	{ mode: 0o755 },
 );
+const busctlLog = join(root, "busctl.log");
+const busctlState = join(root, "busctl-state");
+mkdirSync(busctlState);
+writeFileSync(join(busctlState, "answer"), 's "challenge"\n');
+writeFileSync(busctlLog, "");
+writeFileSync(
+	join(systemdBin, "busctl"),
+	`#!/bin/sh
+echo "$*" >> "${busctlLog}"
+[ -f "${busctlState}/slow-$5" ] && sleep 6
+case "$5" in
+CanPowerOff|CanReboot)
+	if [ -f "${busctlState}/target" ]; then
+		cp "${busctlState}/replacement" "$(cat "${busctlState}/target")"
+	fi
+	cat "${busctlState}/answer"
+	if [ -f "${busctlState}/check-error" ]; then cat "${busctlState}/check-error" >&2; exit 1; fi ;;
+PowerOff|Reboot)
+	if [ -f "${busctlState}/call-target" ]; then
+		cp "${busctlState}/replacement" "$(cat "${busctlState}/call-target")"
+	fi
+	if [ -f "${busctlState}/call-error" ]; then cat "${busctlState}/call-error" >&2; exit 1; fi ;;
+*) exit 2 ;;
+esac
+`,
+	{ mode: 0o755 },
+);
 process.env.PATH = `${systemdBin}:${process.env.PATH}`;
 const writeConfig = (extra = {}) =>
 	writeFileSync(
@@ -320,6 +347,8 @@ const killProcessOf = (id) =>
 	writeFileSync(join(sessionsDir, `${id}.json`), JSON.stringify({ ...record(id), pid: deadPid }));
 
 const spawn = (id, cwd, title = "") => {
+	if (process.env.PATH.split(":").find((dir) => existsSync(join(dir, "busctl"))) !== systemdBin)
+		throw new Error("Every fixture must resolve busctl to the suite stub");
 	const handlers = new Map();
 	const timers = [];
 	const tools = new Map();
@@ -17336,14 +17365,12 @@ heading("shutdown commands and progress cards");
 		freshChild.signalCode === "SIGTERM" && existsSync(join(crashDir, `${fresh.id}.json`)),
 	);
 	check(
-		"the last session ends the wind-down without powering off",
-		readPlan()?.state === "failed" &&
-			readPlan()?.error === "power-off comes with the next release" &&
-			vsPoller.shutdowns === 0,
+		"a refused logind check keeps the poller up",
+		readPlan()?.state === "failed" && /challenge/.test(readPlan()?.error ?? "") && vsPoller.shutdowns === 0,
 	);
 	check(
-		"the terminal card reports all sessions down and offers restoration",
-		/all sessions are down/i.test(card()?.text ?? "") &&
+		"the terminal card reports the machine stayed up and offers restoration",
+		/machine stayed up/i.test(card()?.text ?? "") &&
 			/2 sessions.*stopped/i.test(card()?.text ?? "") &&
 			/Restore/.test(card()?.text ?? "") &&
 			card()?.reply_markup.inline_keyboard.length === 0,
@@ -17359,6 +17386,302 @@ heading("shutdown commands and progress cards");
 	for (const session of [busy, idle, restored, staleSession, noPane, last, fresh]) {
 		rmSync(join(sessionsDir, `${session.id}.json`), { force: true });
 	}
+	for (const [file, bytes] of parked) writeFileSync(join(sessionsDir, file), bytes);
+}
+
+heading("logind power-off and reboot");
+{
+	const stateDir = join(root, "notify-telegram");
+	const planFile = join(stateDir, "shutdown/plan.json");
+	const lockFile = join(stateDir, "poller.lock");
+	const parked = new Map();
+	for (const file of readdirSync(sessionsDir)) {
+		parked.set(file, readFileSync(join(sessionsDir, file)));
+		rmSync(join(sessionsDir, file));
+	}
+	const readPlan = () => (existsSync(planFile) ? JSON.parse(readFileSync(planFile, "utf8")) : null);
+	const calls = () => readFileSync(busctlLog, "utf8").trim().split("\n").filter(Boolean);
+	let seq = 22000;
+	const start = async (name) => {
+		const session = spawn(`power-${name}`, vsFolder(`power-${name}`), name);
+		vsTranscript(session.id);
+		await session.fire("session_start");
+		return session;
+	};
+	const tick = async (poller, ms = 250) => {
+		poller.heartbeat();
+		await settle(ms);
+	};
+	const command = async (poller, text) => {
+		api.queued.push({
+			update_id: ++seq,
+			message: { message_id: seq, date: 1, chat: { id: CHAT }, text },
+		});
+		await poller.pump(200);
+	};
+	const card = () =>
+		api.calls.findLast((call) => call.method === "editMessageText" && call.body.message_id === readPlan()?.messageId)
+			?.body;
+	const resetBus = (answer = 's "yes"\n') => {
+		for (const file of readdirSync(busctlState)) rmSync(join(busctlState, file));
+		writeFileSync(join(busctlState, "answer"), answer);
+		writeFileSync(busctlLog, "");
+	};
+	const cleanup = async (...sessions) => {
+		rmSync(planFile, { force: true });
+		for (const session of sessions) {
+			if (session.shutdowns === 0) await session.fire("session_shutdown");
+			rmSync(join(sessionsDir, `${session.id}.json`), { force: true });
+			rmSync(vsHold(session.id), { force: true });
+		}
+		rmSync(lockFile, { force: true });
+	};
+	for (const [text, method] of [
+		["/shutdown", "PowerOff"],
+		["/reboot", "Reboot"],
+	]) {
+		resetBus();
+		rmSync(lockFile, { force: true });
+		const poller = await start(method);
+		const other = await start(`${method}-other`);
+		await command(poller, text);
+		const original = readPlan();
+		const gate = Promise.withResolvers();
+		api.editMessageGate = gate.promise;
+		await other.pump(150);
+		await tick(poller);
+		check(`${method} persists powering-off before the final card finishes`, readPlan()?.state === "powering-off");
+		check(
+			`${method} waits for its final card before calling logind or stopping`,
+			!calls().some((line) => line.endsWith(`${method} b false`)) && poller.shutdowns === 0,
+		);
+		check(
+			`${method} removes all buttons while powering off`,
+			card()?.reply_markup.inline_keyboard.length === 0 &&
+				(method === "PowerOff" ? /powering off/i : /rebooting/i).test(card()?.text ?? ""),
+		);
+		api.queued.push({
+			update_id: ++seq,
+			callback_query: {
+				id: `power-cancel-${seq}`,
+				data: `sc:${original?.id}`,
+				from: { id: CHAT },
+				message: { message_id: original?.messageId, chat: { id: CHAT } },
+			},
+		});
+		await poller.pump(200);
+		check(`${method} ignores Cancel after powering-off`, readPlan()?.state === "powering-off");
+		let atShutdown = null;
+		const shutdown = poller.ctx.shutdown;
+		poller.ctx.shutdown = () => {
+			atShutdown = { calls: calls(), record: record(poller.id), hold: existsSync(vsHold(poller.id)) };
+			return shutdown();
+		};
+		gate.resolve();
+		api.editMessageGate = null;
+		await settle(350);
+		check(
+			`${method} checks logind then calls its noninteractive system-bus method before stopping`,
+			atShutdown?.calls.join("\n") ===
+				`call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager Can${method}\n` +
+					`call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager ${method} b false` &&
+				poller.shutdowns === 1,
+		);
+		check(
+			`${method} retains the poller and stopped sessions for restore`,
+			atShutdown?.hold &&
+				atShutdown.record.systemShutdownAt > 0 &&
+				record(poller.id)?.heartbeat === 0 &&
+				existsSync(vsHold(other.id)),
+		);
+		await tick(poller);
+		check(`${method} runs only once`, calls().length === 2);
+		await cleanup(poller, other);
+	}
+	for (const answer of ["challenge", "no", "na", "yes-inhibited", "challenge-inhibited", "unexpected", ""]) {
+		resetBus(`s "${answer}"\n`);
+		const poller = await start(`refused-${answer || "empty"}`);
+		const other = await start(`refused-${answer || "empty"}-other`);
+		await command(poller, "/shutdown");
+		await other.pump(150);
+		await tick(poller);
+		check(
+			`logind answer ${JSON.stringify(answer)} fails without stopping the poller`,
+			readPlan()?.state === "failed" &&
+				readPlan()?.error.includes(`"${answer}"`) &&
+				poller.shutdowns === 0 &&
+				calls().length === 1 &&
+				record(poller.id).systemShutdownAt === 0 &&
+				!existsSync(vsHold(poller.id)),
+		);
+		check(
+			`logind answer ${JSON.stringify(answer)} offers stopped sessions in the restore batch`,
+			existsSync(join(stateDir, `crashed/${other.id}.json`)) &&
+				!existsSync(vsHold(other.id)) &&
+				/machine stayed up/i.test(card()?.text ?? "") &&
+				/README.*polkit/i.test(card()?.text ?? "") &&
+				/Restore/.test(card()?.text ?? ""),
+		);
+		await cleanup(poller, other);
+	}
+	for (const stage of ["check", "call"]) {
+		resetBus();
+		writeFileSync(join(busctlState, `${stage}-error`), `${stage} access denied`);
+		const poller = await start(`error-${stage}`);
+		await command(poller, "/reboot");
+		check(
+			`a logind ${stage} failure keeps the poller running and reports stderr`,
+			readPlan()?.state === "failed" &&
+				readPlan()?.error.includes(`${stage} access denied`) &&
+				poller.shutdowns === 0 &&
+				record(poller.id).systemShutdownAt === 0 &&
+				!existsSync(vsHold(poller.id)),
+		);
+		await cleanup(poller);
+	}
+	for (const change of ["session-up", "plan-replaced", "plan-removed", "plan-cancelled", "lock-lost"]) {
+		resetBus();
+		const poller = await start(`race-${change}`);
+		const other = await start(`race-${change}-other`);
+		const otherRecord = record(other.id);
+		await command(poller, "/shutdown");
+		let target = planFile;
+		let replacement = { ...readPlan(), state: "cancelled" };
+		if (change === "session-up") {
+			target = join(sessionsDir, `${other.id}.json`);
+			replacement = otherRecord;
+		} else if (change === "plan-replaced") replacement = { ...readPlan(), id: "replacement", state: "winding" };
+		else if (change === "plan-removed") replacement = {};
+		else if (change === "lock-lost") {
+			target = lockFile;
+			replacement = { ...otherRecord, sessionId: other.id, code: otherRecord.codeStamp };
+		}
+		writeFileSync(join(busctlState, "target"), target);
+		writeFileSync(join(busctlState, "replacement"), JSON.stringify(replacement));
+		await other.pump(150);
+		await tick(poller);
+		check(
+			`a ${change} during CanPowerOff prevents the power-off call`,
+			calls().length === 1 &&
+				poller.shutdowns === 0 &&
+				record(poller.id).systemShutdownAt === 0 &&
+				!existsSync(vsHold(poller.id)),
+		);
+		check(
+			`a ${change} preserves the replacement or reports sessions still up`,
+			change === "session-up"
+				? readPlan()?.state === "failed" && /session/i.test(readPlan()?.error ?? "")
+				: JSON.stringify(JSON.parse(readFileSync(target, "utf8"))) === JSON.stringify(replacement),
+		);
+		await cleanup(poller, other);
+	}
+	for (const phase of ["card", "call"]) {
+		resetBus();
+		const poller = await start(`removed-during-${phase}`);
+		const other = await start(`removed-during-${phase}-other`);
+		await command(poller, "/shutdown");
+		const gate = Promise.withResolvers();
+		if (phase === "card") api.editMessageGate = gate.promise;
+		else {
+			writeFileSync(join(busctlState, "call-error"), "access denied");
+			writeFileSync(join(busctlState, "call-target"), planFile);
+			writeFileSync(join(busctlState, "replacement"), "{}");
+		}
+		await other.pump(150);
+		await tick(poller);
+		if (phase === "card") writeFileSync(planFile, "{}");
+		gate.resolve();
+		api.editMessageGate = null;
+		await settle(200);
+		check(
+			`a plan removed during the ${phase} is not overwritten`,
+			readFileSync(planFile, "utf8") === "{}" &&
+				poller.shutdowns === 0 &&
+				calls().length === (phase === "card" ? 0 : 2) &&
+				record(poller.id).systemShutdownAt === 0 &&
+				!existsSync(vsHold(poller.id)),
+		);
+		await cleanup(poller, other);
+	}
+	for (const method of ["CanPowerOff", "PowerOff"]) {
+		resetBus();
+		writeFileSync(join(busctlState, `slow-${method}`), "");
+		const poller = await start(`timeout-${method}`);
+		const before = performance.now();
+		await command(poller, "/shutdown");
+		await settle(6_300);
+		check(
+			`a stalled logind ${method} fails within its bounded timeout`,
+			readPlan()?.state === "failed" &&
+				readPlan()?.error.includes(`logind ${method} failed`) &&
+				poller.shutdowns === 0 &&
+				performance.now() - before < 7_000 &&
+				record(poller.id).systemShutdownAt === 0 &&
+				!existsSync(vsHold(poller.id)),
+		);
+		await cleanup(poller);
+	}
+	for (const report of ["delivered", "refused"]) {
+		resetBus();
+		const poller = await start(`report-${report}`);
+		const other = await start(`report-${report}-other`);
+		await command(poller, "/shutdown");
+		await poller.fire("agent_start");
+		await poller.tools
+			.get("notify_status")
+			.execute(
+				"poweroff-final-report",
+				{ summary: "Power-off report.", urgency: "green", effect: "none" },
+				undefined,
+				undefined,
+				poller.ctx,
+			);
+		const gate = Promise.withResolvers();
+		api.sendMessageGate = gate.promise;
+		await poller.fire("session_stop");
+		await other.pump(150);
+		await tick(poller);
+		check(`the poller waits for its ${report} final report`, poller.shutdowns === 0 && calls().length === 0);
+		if (report === "refused") {
+			api.failMethods = ["sendMessage"];
+			gate.reject(new TypeError("final report unavailable"));
+		} else gate.resolve();
+		api.sendMessageGate = null;
+		await settle(report === "refused" ? 2_500 : 400);
+		api.failMethods = [];
+		check(`the ${report} final report permits power-off`, poller.shutdowns === 1);
+		if (report === "delivered")
+			check("the poller retains its delivered close offer for restore", record(poller.id).closeOffer !== null);
+		await cleanup(poller, other);
+	}
+	resetBus();
+	const bounded = await start("bounded-card");
+	const other = await start("bounded-card-other");
+	await command(bounded, "/shutdown");
+	const gate = Promise.withResolvers();
+	api.editMessageGate = gate.promise;
+	await other.pump(150);
+	await tick(bounded, 5_300);
+	check("an unresponsive final card cannot hold power-off beyond five seconds", bounded.shutdowns === 1);
+	gate.resolve();
+	api.editMessageGate = null;
+	await settle(100);
+	await cleanup(bounded, other);
+	for (const failure of ["network-error", "refused"]) {
+		resetBus();
+		const poller = await start(`card-${failure}`);
+		const other = await start(`card-${failure}-other`);
+		await command(poller, "/shutdown");
+		if (failure === "network-error") api.fetchThrows = ["editMessageText"];
+		else api.failMethods = ["editMessageText"];
+		await other.pump(150);
+		await tick(poller);
+		check(`a ${failure} final card still permits power-off`, poller.shutdowns === 1 && calls().length === 2);
+		api.fetchThrows = [];
+		api.failMethods = [];
+		await cleanup(poller, other);
+	}
+	resetBus('s "challenge"\n');
 	for (const [file, bytes] of parked) writeFileSync(join(sessionsDir, file), bytes);
 }
 
