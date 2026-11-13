@@ -16406,6 +16406,7 @@ heading("sessions wind down for a machine shutdown");
 	mkdirSync(planDir, { recursive: true });
 	const plan = (fields = {}) => ({
 		id: "shutdown-test",
+		boot: readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
 		kind: "poweroff",
 		startedAt: Date.now(),
 		deadline: Date.now() + 600_000,
@@ -16786,6 +16787,9 @@ heading("sessions wind down for a machine shutdown");
 		...[
 			["id", ""],
 			["id", 3],
+			["boot", undefined],
+			["boot", ""],
+			["boot", 3],
 			["kind", "halt"],
 			["startedAt", "now"],
 			["startedAt", -1],
@@ -17908,6 +17912,7 @@ heading("shutdown delay inhibitor");
 	const commandPeer = await start("command-peer");
 	const commandPlan = {
 		id: "inhibit-command",
+		boot: readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
 		kind: "poweroff",
 		startedAt: Date.now(),
 		deadline: Date.now() + 60_000,
@@ -18091,6 +18096,44 @@ check(
 	"the extension files are left as they were",
 	readFileSync(stampFiles()[1], "utf8") === renderBytes.toString("utf8"),
 );
+
+heading("boot restoration after a machine shutdown");
+{
+	const oldPlan = join(root, "notify-telegram/shutdown/plan.json");
+	mkdirSync(join(oldPlan, ".."), { recursive: true });
+	const planPath = process.env.PATH;
+	const planBin = join(root, "boot-plan-bin");
+	mkdirSync(planBin, { recursive: true });
+	writeFileSync(join(planBin, "tmux"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+	process.env.PATH = `${planBin}:${planPath}`;
+	const bootOwner = spawn("boot-plan-owner", root);
+	await bootOwner.fire("session_start");
+	for (const state of ["winding", "powering-off"]) {
+		writeFileSync(
+			oldPlan,
+			JSON.stringify({
+				id: "old-boot-plan",
+				boot: "earlier-boot",
+				kind: "poweroff",
+				startedAt: 1,
+				deadline: 1,
+				by: "command",
+				messageId: null,
+				state,
+				error: "",
+			}),
+		);
+		const peer = spawn(`boot-plan-${state}`, root);
+		await peer.fire("session_start");
+		await peer.pump(100);
+		check(`a new boot ignores the retained ${state} plan`, peer.shutdowns === 0);
+		rmSync(oldPlan, { force: true });
+		await peer.fire("session_shutdown");
+	}
+	await bootOwner.fire("session_shutdown");
+	for (const file of readdirSync(sessionsDir)) rmSync(join(sessionsDir, file), { force: true });
+	process.env.PATH = planPath;
+}
 
 heading("PR watch");
 {
