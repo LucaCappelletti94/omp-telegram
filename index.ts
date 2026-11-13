@@ -116,6 +116,22 @@ const STATE_DIR = join(AGENT_DIR, "notify-telegram");
 const PENDING_MESSAGES_DIR = join(STATE_DIR, "pending-messages");
 const PENDING_UNPINS_DIR = join(STATE_DIR, "pending-unpins");
 const LOCK_FILE = join(STATE_DIR, "poller.lock");
+const COMMANDS_FILE = join(STATE_DIR, "commands.json");
+const BOT_COMMANDS = [
+	{ command: "status", description: "Show what each session is doing" },
+	{ command: "fleet", description: "List every tmux omp window and its state" },
+	{ command: "hidequestions", description: "Hide open question buttons" },
+	{ command: "stop", description: "Abort the running turn, reply to pick the session" },
+	{ command: "deps", description: "Draw the dependencies between sessions" },
+	{ command: "resume", description: "Resume an ended session that has updates waiting" },
+	{ command: "conduct", description: "Open or resume the conductor of a task" },
+	{ command: "shutdown", description: "Wind sessions down for power off, optionally with a duration" },
+	{ command: "reboot", description: "Wind sessions down for reboot, optionally with a duration" },
+];
+const BOT_MENU_BUTTON = { type: "commands" };
+const BOT_COMMANDS_HASH = createHash("sha256")
+	.update(JSON.stringify({ commands: BOT_COMMANDS, menu_button: BOT_MENU_BUTTON }))
+	.digest("hex");
 const LEGACY_LOCK_DIR = join(STATE_DIR, "poller.lock.d");
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
 /** Where omp keeps transcripts, one project subdirectory per working tree. */
@@ -1676,15 +1692,14 @@ const THROTTLE_FILE = join(STATE_DIR, "throttle.json");
 const THROTTLE_LOCK_FILE = join(STATE_DIR, "throttle.lock");
 /** The lock is held for a synchronous read and write, so one this old belongs to a process that died holding it. */
 const THROTTLE_LOCK_STALE_MS = 2_000;
-/**
- * A toast has its own short deadline, polling must never stop, a typing action is not a message, and `getFile`
- * only reads a file the user sent, which the poller fetches before the updates queued behind it.
- */
+/** Methods that neither wait on nor write the chat-wide throttle. */
 const THROTTLE_EXEMPT: Record<string, true> = {
 	answerCallbackQuery: true,
 	getFile: true,
 	getUpdates: true,
 	sendChatAction: true,
+	setMyCommands: true,
+	setChatMenuButton: true,
 };
 /** The longest a tool the agent is blocked on waits out the shared throttle before its call is refused. */
 const AGENT_THROTTLE_WAIT_MS = 30_000;
@@ -1775,14 +1790,7 @@ async function admit(lifetime?: AbortSignal): Promise<number | null> {
 	}
 }
 
-/**
- * Telegram throttles a bot to roughly one message per second per chat, and its `retry_after` is the time left
- * before the request can be repeated, for every sender of the chat. So a 429 is written down for every omp
- * process, and each send or edit first passes `admit`. A tool the agent is blocked on waits at most
- * `AGENT_THROTTLE_WAIT_MS`, and a process shutting down not at all. Both get the throttle as a refusal instead.
- * A short retry-after is still honoured once, through `admit` like any other send. `send` is re-invoked rather
- * than reused, since a request body is spent by its first attempt.
- */
+/** Retries a short throttle once by re-invoking `send`, whose request body is spent by its first attempt. */
 async function sendWithRetry(
 	method: string,
 	send: () => Promise<Response>,
@@ -1806,7 +1814,7 @@ async function sendWithRetry(
 		const payload: unknown = await response.json().catch(() => null);
 		const envelope = payload !== null && typeof payload === "object" ? (payload as TelegramEnvelope) : null;
 		const retryAfter = envelope?.parameters?.retry_after;
-		if (response.status === 429 && typeof retryAfter === "number") {
+		if (!exempt && response.status === 429 && typeof retryAfter === "number") {
 			const until = Date.now() + retryAfter * 1000;
 			await changeThrottle((current) => ({
 				state:
@@ -2437,6 +2445,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let silenceInFlight = false;
 	let lastLocalInput = Date.now();
 	let pollInFlight = false;
+	let commandsInFlight = false;
 	let drainInFlight = false;
 	/** External question keys already answered this session, so the first press on one wins. */
 	const externalAnswered = new Set<string>();
@@ -2565,6 +2574,22 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return callTelegramRaw<T>(cfg, method, body, timeoutMs, (failure) =>
 			pi.logger.warn("telegram call failed", { ...failure }),
 		);
+	}
+
+	/** Records the menu settings only after Telegram accepts both requests. */
+	async function registerCommands(cfg: Config): Promise<void> {
+		if (commandsInFlight || readJsonFile(COMMANDS_FILE) === BOT_COMMANDS_HASH) return;
+		commandsInFlight = true;
+		try {
+			if (
+				(await callTelegram<boolean>(cfg, "setMyCommands", { commands: BOT_COMMANDS }, 15_000)) &&
+				(await callTelegram<boolean>(cfg, "setChatMenuButton", { menu_button: BOT_MENU_BUTTON }, 15_000))
+			) {
+				writePrivateJson(STATE_DIR, basename(COMMANDS_FILE), BOT_COMMANDS_HASH);
+			}
+		} finally {
+			commandsInFlight = false;
+		}
 	}
 
 	function parseSentRecord(parsed: unknown, id: number): SentRecord | null {
@@ -11679,32 +11704,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			removeStatePath(STATE_DIR, basename(LOCK_FILE));
 		}
 		removeStatePath(STATE_DIR, basename(LEGACY_LOCK_DIR));
-		acquireLock();
-
 		const cfg = config;
-		detach(
-			() =>
-				callTelegram(
-					cfg,
-					"setMyCommands",
-					{
-						commands: [
-							{ command: "status", description: "Show what each session is doing" },
-							{ command: "fleet", description: "List every tmux omp window and its state" },
-							{ command: "hidequestions", description: "Hide open question buttons" },
-							{ command: "stop", description: "Abort the running turn, reply to pick the session" },
-							{ command: "deps", description: "Draw the dependencies between sessions" },
-							{ command: "resume", description: "Resume an ended session that has updates waiting" },
-							{ command: "conduct", description: "Open or resume the conductor of a task" },
-							{ command: "shutdown", description: "Wind sessions down for power off, optionally with a duration" },
-							{ command: "reboot", description: "Wind sessions down for reboot, optionally with a duration" },
-						],
-					},
-					15_000,
-				),
-			"command menu",
-		);
-		detach(() => callTelegram(cfg, "setChatMenuButton", { menu_button: { type: "commands" } }, 15_000), "menu button");
+		if (acquireLock()) detach(() => registerCommands(cfg), "command menu");
 
 		if (ctx.hasUI) {
 			unsubscribeInput = ctx.ui.onTerminalInput(() => {
@@ -11740,6 +11741,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					releaseLock(DASHBOARD_LOCK_FILE);
 				}
 				if (ownsLock()) {
+					detach(() => registerCommands(cfg), "command menu");
 					graphTick();
 					watchTick();
 					launchRequestTick();
@@ -11799,7 +11801,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				} else {
 					// A holder whose process is gone frees the lock now, before its heartbeat goes stale.
 					const held = readLock();
-					if (held !== null && held.pid > 0 && !processRuns(held.pid)) acquireLock();
+					if (held !== null && held.pid > 0 && !processRuns(held.pid) && acquireLock()) {
+						detach(() => registerCommands(cfg), "command menu");
+					}
 				}
 			} catch (error) {
 				pi.logger.warn("notify-telegram: drain failed", {
