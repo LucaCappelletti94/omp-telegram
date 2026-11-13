@@ -549,6 +549,7 @@ interface SessionRecord {
 
 interface ShutdownPlan {
 	id: string;
+	boot: string;
 	kind: "poweroff" | "reboot";
 	startedAt: number;
 	deadline: number;
@@ -2991,6 +2992,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			raw === null ||
 			typeof raw.id !== "string" ||
 			!isStateToken(raw.id) ||
+			!isStateToken(raw.boot) ||
 			(raw.kind !== "poweroff" && raw.kind !== "reboot") ||
 			typeof raw.startedAt !== "number" ||
 			!Number.isFinite(raw.startedAt) ||
@@ -3013,7 +3015,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Returns the plan while sessions must wind down. */
 	function activeShutdownPlan(): ShutdownPlan | null {
 		const plan = readShutdownPlan();
-		return plan?.state === "winding" || plan?.state === "powering-off" ? plan : null;
+		return plan?.boot === BOOT_ID && (plan.state === "winding" || plan.state === "powering-off") ? plan : null;
 	}
 
 	/** Stops this session once it can leave its state for restore. */
@@ -3151,6 +3153,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					const startedAt = Date.now();
 					writeShutdownPlan({
 						id: randomUUID(),
+						boot: BOOT_ID,
 						kind: "poweroff",
 						startedAt,
 						deadline: startedAt + Math.max(0, micros / 1000 - SHUTDOWN_REPORT_WAIT_MS),
@@ -3243,7 +3246,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const pane = await paneOf(record);
 			if (pane === "") continue;
 			await run("tmux", ["set-option", "-p", "-t", pane, "remain-on-exit", "on"], 2_000);
-			const current = readShutdownPlan();
+			const current = activeShutdownPlan();
 			if (!ownsLock() || current?.id !== plan.id || current.state !== "winding") return;
 			const latest = readSessionRecord(id);
 			if (latest?.pid !== record.pid || latest.heartbeat === 0 || !processRuns(record.pid)) continue;
@@ -3286,7 +3289,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	/** Checks authority and live sessions immediately before requesting logind shutdown. */
 	async function powerOff(plan: ShutdownPlan, ctx: ExtensionContext): Promise<void> {
 		const ownsPlan = (): boolean => {
-			const current = readShutdownPlan();
+			const current = activeShutdownPlan();
 			return ownsLock() && current?.id === plan.id && current.state === "powering-off";
 		};
 		if (!ownsPlan()) return;
@@ -3338,11 +3341,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const cfg = config;
 		const ctx = sessionCtx;
 		let plan = readShutdownPlan();
-		if (plan === null || plan.state === "powering-off") return;
+		if (plan === null || plan.boot !== BOOT_ID || plan.state === "powering-off") return;
 		if (plan.state === "winding" && Date.now() >= plan.deadline) await stopShutdownStragglers(plan);
 		if (!ownsLock()) return;
 		plan = readShutdownPlan();
-		if (plan === null || plan.state === "powering-off") return;
+		if (plan === null || plan.boot !== BOOT_ID || plan.state === "powering-off") return;
 		const up = shutdownSessions();
 		if (plan.state === "winding" && up.length === 0) {
 			plan = { ...plan, state: "powering-off" };
@@ -3469,6 +3472,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 		writeShutdownPlan({
 			id: randomUUID(),
+			boot: BOOT_ID,
 			kind,
 			startedAt,
 			deadline: startedAt + duration,
@@ -3484,7 +3488,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	async function answerShutdownCallback(cfg: Config, callback: TelegramCallbackQuery, data: string): Promise<void> {
 		if (!ownsLock()) return;
 		const match = /^s([nc]):(.+)$/u.exec(data);
-		const plan = readShutdownPlan();
+		const plan = activeShutdownPlan();
 		let toast = "That wind-down is no longer active.";
 		if (match !== null && plan?.state === "winding" && plan.id === match[2]) {
 			if (match[1] === "c") {
