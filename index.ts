@@ -3021,6 +3021,253 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return true;
 	}
 
+	/** Persists the poller's machine-shutdown decision. */
+	function writeShutdownPlan(plan: ShutdownPlan): void {
+		if (ownsLock()) writePrivateJson(join(STATE_DIR, "shutdown"), "plan.json", plan);
+	}
+
+	/** Identifies a process the poller signalled for a wind-down. */
+	function shutdownHold(id: string): { plan: string; pid: number; at: number } | null {
+		const raw = readJsonFile(join(RESTART_HOLD_DIR, `${id}.json`)) as {
+			plan?: unknown;
+			pid?: unknown;
+			at?: unknown;
+		} | null;
+		return raw !== null && isStateToken(raw.plan) && typeof raw.pid === "number" && typeof raw.at === "number"
+			? { plan: raw.plan, pid: raw.pid, at: raw.at }
+			: null;
+	}
+
+	/** Lists processes still participating in a machine wind-down. */
+	function shutdownSessions(): Array<{ id: string; record: SessionRecord }> {
+		return allRecords().filter(
+			({ id, record }) =>
+				id !== sessionId &&
+				isStateToken(id) &&
+				(record.heartbeat > 0 || shutdownHold(id)?.pid === record.pid) &&
+				processRuns(record.pid),
+		);
+	}
+
+	/** Moves stopped sessions into their wind-down's restore batch. */
+	function offerShutdownSessions(plan: ShutdownPlan): void {
+		const terminal = plan.state === "cancelled" || plan.state === "failed";
+		for (const { id, record } of allRecords()) {
+			if (id === sessionId || !isStateToken(id)) continue;
+			const hold = shutdownHold(id);
+			let batchId: string;
+			if (hold !== null && hold.pid === record.pid) {
+				if ((hold.plan === plan.id && !terminal) || processRuns(record.pid)) continue;
+				batchId = hold.plan;
+			} else {
+				if (
+					!terminal ||
+					record.heartbeat !== 0 ||
+					record.systemShutdownAt <= 0 ||
+					record.systemShutdownAt < plan.startedAt ||
+					record.boot !== BOOT_ID
+				)
+					continue;
+				batchId = plan.id;
+			}
+			const kept: CrashRecord = {
+				record: { ...record, heartbeat: 0, systemShutdownAt: record.systemShutdownAt || hold?.at || plan.startedAt },
+				batch: batchId,
+				machine: false,
+				restoringAt: 0,
+				error: "",
+				dismissed: false,
+			};
+			writePrivateJson(CRASH_DIR, `${id}.json`, kept);
+			const batch = readCrashBatch(batchId) ?? { at: Date.now(), ids: [], machine: false, messageId: null, shown: "" };
+			if (!batch.ids.includes(id)) batch.ids.push(id);
+			writePrivateJson(CRASH_BATCH_DIR, `${batchId}.json`, batch);
+			removeStatePath(SESSIONS_DIR, `${id}.json`);
+			removeStatePath(RESTART_MARKER_DIR, `${id}.json`);
+			removeStatePath(RESTART_HOLD_DIR, `${id}.json`);
+			markCrashedPane(record.tmuxPane);
+		}
+	}
+
+	/** Signals overdue processes only while this poller still owns the active plan. */
+	async function stopShutdownStragglers(plan: ShutdownPlan): Promise<void> {
+		for (const { id, record } of shutdownSessions()) {
+			if (record.pid === process.pid || shutdownHold(id)?.pid === record.pid) continue;
+			if (
+				Date.now() - record.heartbeat <= LOCK_STALE_MS &&
+				Date.now() < plan.deadline + SHUTDOWN_REPORT_WAIT_MS + DRAIN_MS
+			)
+				continue;
+			const pane = await paneOf(record);
+			if (pane === "") continue;
+			await run("tmux", ["set-option", "-p", "-t", pane, "remain-on-exit", "on"], 2_000);
+			const current = readShutdownPlan();
+			if (!ownsLock() || current?.id !== plan.id || current.state !== "winding") return;
+			const latest = readSessionRecord(id);
+			if (latest?.pid !== record.pid || latest.heartbeat === 0 || !processRuns(record.pid)) continue;
+			const marker = { at: Date.now(), pid: record.pid, plan: plan.id };
+			writePrivateJson(RESTART_MARKER_DIR, `${id}.json`, marker);
+			writePrivateJson(RESTART_HOLD_DIR, `${id}.json`, marker);
+			try {
+				process.kill(record.pid, "SIGTERM");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+					removeStatePath(RESTART_MARKER_DIR, `${id}.json`);
+					removeStatePath(RESTART_HOLD_DIR, `${id}.json`);
+					throw error;
+				}
+			}
+		}
+	}
+
+	let shutdownShown = "";
+	let shutdownRender: Promise<void> | null = null;
+	let shutdownRenderOwed = false;
+
+	/** Serializes progress updates across commands, callbacks and heartbeats. */
+	function shutdownTick(): Promise<void> {
+		shutdownRenderOwed = true;
+		if (shutdownRender !== null) return shutdownRender;
+		shutdownRender = (async () => {
+			try {
+				do {
+					shutdownRenderOwed = false;
+					await updateShutdown();
+				} while (shutdownRenderOwed);
+			} finally {
+				shutdownRender = null;
+			}
+		})();
+		return shutdownRender;
+	}
+
+	/** Drives the deadline and publishes the current shutdown card. */
+	async function updateShutdown(): Promise<void> {
+		if (!ownsLock() || config === null) return;
+		const cfg = config;
+		let plan = readShutdownPlan();
+		if (plan === null || plan.state === "powering-off") return;
+		if (plan.state === "winding" && Date.now() >= plan.deadline) await stopShutdownStragglers(plan);
+		if (!ownsLock()) return;
+		plan = readShutdownPlan();
+		if (plan === null || plan.state === "powering-off") return;
+		const up = shutdownSessions();
+		if (plan.state === "winding" && up.length === 0) {
+			plan = { ...plan, state: "failed", error: "power-off comes with the next release" };
+			writeShutdownPlan(plan);
+		}
+		offerShutdownSessions(plan);
+		const busy = (record: SessionRecord): number =>
+			Number(/^(working|waiting on a background job)/u.test(record.state));
+		up.sort((a, b) => busy(b.record) - busy(a.record) || badgeOf(a.record).localeCompare(badgeOf(b.record)));
+		const lines = [plan.kind === "poweroff" ? "Power off requested." : "Reboot requested."];
+		const rows: InlineButton[][] = [];
+		if (plan.state === "winding") {
+			lines.push(`Deadline ${relativeTime(plan.deadline)}.`);
+			for (const { record } of up)
+				lines.push(
+					`${badgeOf(record)} · ${record.state || "idle"}${Date.now() - record.heartbeat > LOCK_STALE_MS ? " · unresponsive" : ""}`,
+				);
+			rows.push([
+				{ text: "Stop now", callback_data: `sn:${plan.id}` },
+				{ text: "Cancel", callback_data: `sc:${plan.id}` },
+			]);
+		} else {
+			const stopped = readCrashBatch(plan.id)?.ids.length ?? 0;
+			lines.push(plan.state === "cancelled" ? "Cancelled." : "All sessions are down. The poller stays up.");
+			lines.push(`${stopped} ${stopped === 1 ? "session" : "sessions"} stopped.`);
+			if (plan.error !== "") lines.push(`${plan.error}.`);
+			if (stopped > 0) lines.push("Restore or Restore all on the 🚑 card reopens stopped sessions.");
+			for (const { id, record } of up) {
+				if (shutdownHold(id)?.plan === plan.id) lines.push(`${badgeOf(record)} · stopping`);
+			}
+		}
+		const body = {
+			chat_id: cfg.chatId,
+			text: toTelegramHtml(fitToTelegram(lines.join("\n"), "")),
+			parse_mode: "HTML",
+			reply_markup: { inline_keyboard: rows },
+		};
+		const shown = JSON.stringify({ id: plan.id, body });
+		if (shown !== shutdownShown) {
+			const sent =
+				plan.messageId === null
+					? await callTelegram<TelegramMessage>(cfg, "sendMessage", body, 15_000)
+					: await callTelegram(cfg, "editMessageText", { ...body, message_id: plan.messageId }, 15_000);
+			if (sent !== null && ownsLock()) {
+				const current = readShutdownPlan();
+				if (current?.id === plan.id) {
+					if (current.messageId === null)
+						writeShutdownPlan({ ...current, messageId: (sent as TelegramMessage).message_id });
+					shutdownShown = shown;
+				}
+			}
+		}
+		if (ownsLock()) await redrawCrashCards();
+	}
+
+	/** Starts a wind-down or points at the one already in progress. */
+	async function commandShutdown(cfg: Config, typed: string, kind: ShutdownPlan["kind"]): Promise<void> {
+		if (!ownsLock()) return;
+		const existing = activeShutdownPlan();
+		if (existing !== null) {
+			await callTelegram(
+				cfg,
+				"sendMessage",
+				{
+					chat_id: cfg.chatId,
+					text: "A machine wind-down is already in progress. Use its Stop now or Cancel buttons.",
+					...(existing.messageId === null ? {} : { reply_parameters: { message_id: existing.messageId } }),
+				},
+				15_000,
+			);
+			return;
+		}
+		const argument = typed
+			.trim()
+			.replace(/^\/(shutdown|reboot)(@\w+)?\b/u, "")
+			.trim();
+		const match = /^(\d+)(s|m|h)$/u.exec(argument);
+		const unit = match?.[2];
+		const duration =
+			argument === "" ? 600_000 : Number(match?.[1]) * (unit === "h" ? 3_600_000 : unit === "m" ? 60_000 : 1_000);
+		const startedAt = Date.now();
+		if (!Number.isSafeInteger(duration) || duration <= 0 || !Number.isSafeInteger(startedAt + duration)) {
+			pollerNotice("Use a positive whole duration such as 90s, 30m or 1h.");
+			return;
+		}
+		writeShutdownPlan({
+			id: randomUUID(),
+			kind,
+			startedAt,
+			deadline: startedAt + duration,
+			by: "command",
+			messageId: null,
+			state: "winding",
+			error: "",
+		});
+		await shutdownTick();
+	}
+
+	/** Applies a progress-card press only to its still-active plan. */
+	async function answerShutdownCallback(cfg: Config, callback: TelegramCallbackQuery, data: string): Promise<void> {
+		if (!ownsLock()) return;
+		const match = /^s([nc]):(.+)$/u.exec(data);
+		const plan = readShutdownPlan();
+		let toast = "That wind-down is no longer active.";
+		if (match !== null && plan?.state === "winding" && plan.id === match[2]) {
+			if (match[1] === "c") {
+				writeShutdownPlan({ ...plan, state: "cancelled" });
+				toast = "Wind-down cancelled. Stopped sessions stay down.";
+			} else {
+				writeShutdownPlan({ ...plan, deadline: Date.now() });
+				toast = "Stopping the remaining sessions.";
+			}
+		}
+		await callTelegram(cfg, "answerCallbackQuery", { callback_query_id: callback.id, text: toast }, 10_000);
+		detach(() => shutdownTick(), "shutdown card");
+	}
+
 	function readCrash(id: string): CrashRecord | null {
 		if (!isStateToken(id)) return null;
 		const raw = readJsonFile(join(CRASH_DIR, `${id}.json`)) as Partial<Record<keyof CrashRecord, unknown>> | null;
@@ -3278,6 +3525,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (record !== null && Date.now() - record.heartbeat <= LOCK_STALE_MS) continue;
 			const hold = readJsonFile(join(RESTART_HOLD_DIR, `${id}.json`)) as { at?: unknown } | null;
 			if (hold !== null && typeof hold.at === "number" && Date.now() - hold.at < RESTART_MARKER_MS) continue;
+			if (record?.boot === BOOT_ID && shutdownHold(id) !== null) continue;
 			const bootKnown = record !== null && record.boot.length > 0 && BOOT_ID.length > 0;
 			const restarted = bootKnown && record.boot !== BOOT_ID;
 			const halted = record !== null && record.heartbeat === 0 && record.systemShutdownAt > 0;
@@ -5477,6 +5725,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				await answerExternalQuestion(cfg, callback);
 				return;
 			}
+			if (/^s[nc]:/u.test(callback.data)) {
+				await answerShutdownCallback(cfg, callback, callback.data);
+				return;
+			}
 			if (/^k[rad]:/u.test(callback.data)) {
 				await answerCrashCallback(cfg, callback);
 				return;
@@ -5572,7 +5824,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		};
 
 		const typed = typeof text === "string" ? text : "";
-		const command = /^\/(hidequestions|status|fleet|stop|deps|resume|conduct)\b/u.exec(typed.trim())?.[1];
+		const command = /^\/(hidequestions|status|fleet|stop|deps|resume|conduct|shutdown|reboot)\b/u.exec(
+			typed.trim(),
+		)?.[1];
+		if (command === "shutdown" || command === "reboot") {
+			await commandShutdown(cfg, typed, command === "shutdown" ? "poweroff" : "reboot");
+			return;
+		}
 		if (command === "deps") {
 			// Rendering starts a browser, which must not hold up the updates queued behind this one.
 			detach(
@@ -9154,7 +9412,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const died = batch.ids.length - shut;
 			const head =
 				shut > 0
-					? `\u{1F691} **The machine restarted.** ${sessions(shut)} shut down with it${died > 0 ? `, and ${sessions(died)} died without shutting down` : ""}.`
+					? batch.machine
+						? `\u{1F691} **The machine restarted.** ${sessions(shut)} shut down with it${died > 0 ? `, and ${sessions(died)} died without shutting down` : ""}.`
+						: `\u{1F691} ${sessions(shut)} stopped during a machine wind-down.`
 					: batch.machine
 						? `\u{1F691} **The machine restarted**, and ${sessions(died)} died without shutting down.`
 						: `\u{1F691} ${sessions(died)} died without shutting down.`;
@@ -11436,6 +11696,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 							{ command: "deps", description: "Draw the dependencies between sessions" },
 							{ command: "resume", description: "Resume an ended session that has updates waiting" },
 							{ command: "conduct", description: "Open or resume the conductor of a task" },
+							{ command: "shutdown", description: "Wind sessions down for power off, optionally with a duration" },
+							{ command: "reboot", description: "Wind sessions down for reboot, optionally with a duration" },
 						],
 					},
 					15_000,
@@ -11500,6 +11762,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						detach(() => checkDeadWaits(), "dead wait check");
 						detach(() => checkFinished(), "finished check");
 					}
+					detach(() => shutdownTick(), "machine wind-down");
 					reapDeadSessions(true);
 					detachBackground(() => retryPendingUnpins(), "pending pin cleanup");
 					detachBackground(() => redrawCrashCards(), "crash cards");
@@ -11639,7 +11902,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				const wrote = listPending(sessionId).items.some(({ item }) => item.kind === "inbox");
 				crashNote = [
 					shutAt > 0
-						? `This session was shut down around ${when}, because the machine restarted.`
+						? `This session was shut down around ${when}, because ${crash.machine ? "the machine restarted" : "a machine wind-down stopped it"}.`
 						: `This session died without shutting down around ${when}, because ${crash.machine ? "the machine restarted" : "its omp process ended unexpectedly"}.`,
 					...(!wrote
 						? [
