@@ -16708,6 +16708,510 @@ heading("sessions wind down for a machine shutdown");
 	}
 }
 
+heading("shutdown commands and progress cards");
+{
+	const stateDir = join(root, "notify-telegram");
+	const planFile = join(stateDir, "shutdown/plan.json");
+	const crashDir = join(stateDir, "crashed");
+	const batchDir = join(crashDir, "batches");
+	const parked = new Map();
+	for (const file of readdirSync(sessionsDir)) {
+		if (file === `${vsPoller.id}.json`) continue;
+		parked.set(file, readFileSync(join(sessionsDir, file)));
+		rmSync(join(sessionsDir, file));
+	}
+	const readPlan = () => (existsSync(planFile) ? JSON.parse(readFileSync(planFile, "utf8")) : null);
+	let seq = 21000;
+	const command = async (text, who = vsPoller) => {
+		api.queued.push({
+			update_id: ++seq,
+			message: { message_id: seq, date: 1, chat: { id: CHAT }, text },
+		});
+		await who.pump(200);
+	};
+	const tap = async (data, messageId = readPlan()?.messageId ?? 9999) => {
+		const id = `shutdown-command-${++seq}`;
+		api.queued.push({
+			update_id: seq,
+			callback_query: { id, data, from: { id: CHAT }, message: { message_id: messageId, chat: { id: CHAT } } },
+		});
+		await vsPoller.pump(250);
+		return called("answerCallbackQuery").find((call) => call.body.callback_query_id === id)?.body.text ?? "";
+	};
+	const card = () => {
+		const id = readPlan()?.messageId;
+		return api.calls.findLast(
+			(call) =>
+				(call.method === "editMessageText" && call.body.message_id === id) ||
+				(call.method === "sendMessage" &&
+					call.body.reply_markup?.inline_keyboard
+						?.flat()
+						.some((button) => button.callback_data === `sn:${readPlan()?.id}`)),
+		)?.body;
+	};
+	const tick = async () => {
+		vsPoller.heartbeat();
+		await settle(250);
+	};
+	const start = async (name) => {
+		const session = spawn(`shutdown-command-${name}`, vsFolder(`shutdown-command-${name}`), name);
+		vsTranscript(session.id);
+		await session.fire("session_start");
+		return session;
+	};
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	vsSet("pane_ok", "%9\n");
+	vsSet("list_panes", "");
+	await tick();
+	const busy = await start("busy");
+	await busy.fire("agent_start");
+	await command("/shutdown 30m", busy);
+	check("a non-poller leaves a shutdown command for the poller", readPlan() === null && api.queued.length === 1);
+	api.queued = [];
+	for (const text of [
+		"/shutdown tomorrow",
+		"/shutdown 0s",
+		"/reboot -1h",
+		"/shutdown 1.5h",
+		"/shutdown 1m extra",
+		"/shutdown 999999999999999999999h",
+		"/shutdown 9007199254740s",
+	]) {
+		const calls = called("sendMessage").length;
+		await command(text);
+		check(`an invalid duration starts nothing for ${text}`, readPlan() === null);
+		check(
+			`an invalid duration gets a notice for ${text}`,
+			called("sendMessage")
+				.slice(calls)
+				.some((call) => /duration/i.test(call.body.text)),
+		);
+	}
+	for (const [text, kind, duration] of [
+		["/shutdown", "poweroff", 600_000],
+		["/shutdown 30m", "poweroff", 1_800_000],
+		["/reboot 90s", "reboot", 90_000],
+		["/reboot@my_bot 1h", "reboot", 3_600_000],
+	]) {
+		await command(text);
+		const plan = readPlan();
+		check(
+			`the command writes its kind and deadline for ${text}`,
+			plan?.kind === kind && plan.deadline - plan.startedAt === duration,
+		);
+		check(
+			`the command writes a private winding plan for ${text}`,
+			plan?.by === "command" &&
+				plan.state === "winding" &&
+				plan.error === "" &&
+				typeof plan.messageId === "number" &&
+				(statSync(planFile).mode & 0o777) === 0o600,
+		);
+		check(
+			`the progress card has a relative deadline and controls for ${text}`,
+			/tg-time unix="\d+" format="r"/.test(card()?.text ?? "") &&
+				card()
+					?.reply_markup.inline_keyboard.flat()
+					.some((button) => button.callback_data === `sc:${plan?.id}`),
+		);
+		await tap(`sc:${plan?.id}`);
+		check(
+			"cancelling an empty wind-down keeps the busy session up",
+			readPlan()?.state === "cancelled" && busy.shutdowns === 0,
+		);
+		rmSync(planFile, { force: true });
+	}
+	check(
+		"the command menu offers shutdown and reboot",
+		called("setMyCommands").some((call) =>
+			["shutdown", "reboot"].every((name) => call.body.commands.some((entry) => entry.command === name)),
+		),
+	);
+	api.failMethods = ["sendMessage"];
+	await command("/shutdown");
+	check(
+		"a refused shutdown card retains its plan for retry",
+		readPlan()?.state === "winding" && readPlan()?.messageId === null,
+	);
+	api.failMethods = [];
+	await command("/reboot");
+	check(
+		"a second command keeps a plan whose card send failed",
+		readPlan()?.kind === "poweroff" && readPlan()?.messageId === null,
+	);
+	await tick();
+	check("the heartbeat retries a refused shutdown card", typeof readPlan()?.messageId === "number");
+	busy.setTitle("busy changed");
+	busy.heartbeat();
+	const editGate = Promise.withResolvers();
+	api.editMessageGate = editGate.promise;
+	await tick();
+	await tap(`sc:${readPlan()?.id}`);
+	check("Cancel takes effect while an earlier progress edit is pending", readPlan()?.state === "cancelled");
+	editGate.resolve();
+	api.editMessageGate = null;
+	await settle(200);
+	check(
+		"a pending progress edit cannot overwrite cancellation",
+		readPlan()?.state === "cancelled" &&
+			/cancelled/i.test(card()?.text ?? "") &&
+			card()?.reply_markup.inline_keyboard.length === 0,
+	);
+	busy.setTitle("busy");
+	busy.heartbeat();
+	rmSync(planFile, { force: true });
+	for (const outcome of [
+		"cancelled",
+		"removed",
+		"powering-off",
+		"lock-lost",
+		"record-stopped",
+		"record-replaced",
+		"record-missing",
+	]) {
+		const subject = await start(`race-${outcome}`);
+		const process = dummy(globalThis.process.execPath, "-e", "setInterval(() => {}, 600000)");
+		const snapshot = vsCandidate(subject, subject.ctx.cwd, { pid: process.pid, heartbeat: Date.now() - 60_000 });
+		await command("/shutdown");
+		const active = readPlan();
+		let target = planFile;
+		let value = { ...active, state: outcome };
+		if (outcome === "removed") value = {};
+		if (outcome === "lock-lost") {
+			target = join(stateDir, "poller.lock");
+			value = { ...record(busy.id), sessionId: busy.id, code: record(busy.id).codeStamp };
+		}
+		if (outcome.startsWith("record-")) {
+			target = join(sessionsDir, `${subject.id}.json`);
+			value = { ...snapshot, ...(outcome === "record-stopped" ? { heartbeat: 0 } : { pid: globalThis.process.pid }) };
+			if (outcome === "record-missing") value = null;
+		}
+		writeFileSync(join(vsState, "shutdown_during_gate"), JSON.stringify(value));
+		globalThis.process.env.VS_SHUTDOWN_EVENT = "set-option";
+		globalThis.process.env.VS_SHUTDOWN_PLAN = target;
+		await tap(`sn:${active?.id}`);
+		delete globalThis.process.env.VS_SHUTDOWN_EVENT;
+		delete globalThis.process.env.VS_SHUTDOWN_PLAN;
+		check(
+			`the poller rechecks ${outcome} after finding the pane`,
+			process.exitCode === null && !existsSync(vsMarker(subject.id)),
+		);
+		rmSync(planFile, { force: true });
+		if (outcome === "lock-lost") {
+			rmSync(join(stateDir, "poller.lock"), { force: true });
+			await tick();
+		}
+		process.kill("SIGTERM");
+		await subject.fire("session_shutdown");
+		rmSync(join(sessionsDir, `${subject.id}.json`), { force: true });
+	}
+	for (const code of ["ESRCH", "EPERM"]) {
+		const subject = await start(`signal-${code}`);
+		const child = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+		vsCandidate(subject, subject.ctx.cwd, { pid: child.pid, heartbeat: Date.now() - 60_000 });
+		await command("/shutdown");
+		const kill = process.kill;
+		process.kill = (pid, signal) => {
+			if (pid === child.pid && signal === "SIGTERM") {
+				if (code === "ESRCH") kill(pid, signal);
+				throw Object.assign(new Error("shutdown signal refused"), { code });
+			}
+			return kill(pid, signal);
+		};
+		await tap(`sn:${readPlan()?.id}`);
+		process.kill = kill;
+		if (code === "EPERM") {
+			check(
+				"a refused SIGTERM releases markers instead of claiming a stopped process",
+				!existsSync(vsMarker(subject.id)) && !existsSync(vsHold(subject.id)),
+			);
+			await tick();
+		}
+		for (let i = 0; i < 100 && child.exitCode === null; i++) await settle(20);
+		await tap(`sc:${readPlan()?.id}`);
+		check(`the ${code} signal outcome leaves a restorable session`, existsSync(join(crashDir, `${subject.id}.json`)));
+		child.kill("SIGTERM");
+		rmSync(planFile, { force: true });
+		rmSync(join(sessionsDir, `${subject.id}.json`), { force: true });
+		rmSync(vsMarker(subject.id), { force: true });
+		rmSync(vsHold(subject.id), { force: true });
+	}
+	const sendGate = Promise.withResolvers();
+	api.sendMessageGate = sendGate.promise;
+	api.queued.push(
+		{ update_id: ++seq, message: { message_id: seq, date: 1, chat: { id: CHAT }, text: "/shutdown" } },
+		{ update_id: ++seq, message: { message_id: seq, date: 1, chat: { id: CHAT }, text: "/reboot" } },
+		{
+			update_id: ++seq,
+			callback_query: {
+				id: "shutdown-lost-poller",
+				data: "sn:missing",
+				from: { id: CHAT },
+				message: { message_id: 9999, chat: { id: CHAT } },
+			},
+		},
+	);
+	await vsPoller.pump(200);
+	await tick();
+	busy.heartbeat();
+	writeFileSync(
+		join(stateDir, "poller.lock"),
+		JSON.stringify({ ...record(busy.id), sessionId: busy.id, code: record(busy.id).codeStamp }),
+	);
+	sendGate.resolve();
+	api.sendMessageGate = null;
+	await settle(200);
+	check(
+		"a lost poller ignores remaining commands and callbacks in its fetched batch",
+		readPlan()?.kind === "poweroff" &&
+			!called("answerCallbackQuery").some((call) => call.body.callback_query_id === "shutdown-lost-poller"),
+	);
+	rmSync(planFile, { force: true });
+	rmSync(join(stateDir, "poller.lock"), { force: true });
+	await tick();
+	check("an empty shutdown callback gets a stale-press toast", /no longer/.test(await tap("sn:")));
+	const idle = await start("idle");
+	await idle.tools
+		.get("session_badge")
+		.execute(
+			"shutdown-command-badge",
+			{ emoji: "🛑", code: "HALT", label: "Kept identity" },
+			undefined,
+			undefined,
+			idle.ctx,
+		);
+	for (const fields of [
+		{ summary: "Ready.", urgency: "green", effect: "none" },
+		{ summary: "Choose.", urgency: "orange", options: opts("Continue", "Stop") },
+	]) {
+		await idle.tools.get("notify_status").execute("shutdown-command-status", fields, undefined, undefined, idle.ctx);
+		await idle.fire("session_stop");
+		await settle(120);
+	}
+	const before = record(idle.id);
+	await command("/shutdown 30m");
+	const original = readPlan();
+	check(
+		"the progress card lists busy sessions before idle sessions",
+		(card()?.text ?? "").indexOf("busy") < (card()?.text ?? "").indexOf("Kept identity"),
+	);
+	const edits = called("editMessageText").filter((call) => call.body.message_id === original?.messageId).length;
+	await tick();
+	check(
+		"an unchanged shutdown card is not edited",
+		called("editMessageText").filter((call) => call.body.message_id === original?.messageId).length === edits,
+	);
+	const notices = called("sendMessage").length;
+	await command("/reboot 1h");
+	check("a second shutdown command keeps the active plan", JSON.stringify(readPlan()) === JSON.stringify(original));
+	check(
+		"a second command points at the existing card",
+		called("sendMessage")
+			.slice(notices)
+			.some((call) => call.body.reply_parameters?.message_id === original?.messageId),
+	);
+	const stale = await tap("sc:shutdown-expired");
+	check(
+		"a stale shutdown press has a toast and changes nothing",
+		/no longer|expired/i.test(stale) && readPlan()?.state === "winding",
+	);
+	await idle.pump(150);
+	await tick();
+	check(
+		"the progress card is edited as sessions stop",
+		!(card()?.text ?? "").includes("Kept identity") &&
+			called("editMessageText").some((call) => call.body.message_id === original?.messageId),
+	);
+	await tap(`sc:${original?.id}`);
+	check(
+		"Cancel settles the progress card without controls",
+		readPlan()?.state === "cancelled" &&
+			/cancelled/i.test(card()?.text ?? "") &&
+			card()?.reply_markup.inline_keyboard.length === 0,
+	);
+	check(
+		"Cancel reports its stopped count and the restore card",
+		/1 session.*stopped/i.test(card()?.text ?? "") && /Restore/.test(card()?.text ?? ""),
+	);
+	const keptFile = join(crashDir, `${idle.id}.json`);
+	const kept = existsSync(keptFile) ? JSON.parse(readFileSync(keptFile, "utf8")) : null;
+	check(
+		"Cancel moves the stopped session into a non-machine crash batch",
+		kept?.machine === false && kept.batch === original?.id && !existsSync(join(sessionsDir, `${idle.id}.json`)),
+	);
+	check(
+		"Cancel releases restart markers once the crash store owns the record",
+		!existsSync(vsHold(idle.id)) && !existsSync(vsMarker(idle.id)),
+	);
+	check(
+		"same-boot restore card does not claim the machine restarted",
+		called("sendMessage").some(
+			(call) =>
+				/session.*stopped/i.test(call.body.text) &&
+				call.body.reply_markup?.inline_keyboard?.flat().some((button) => button.callback_data === `kr:${idle.id}`) &&
+				!/machine restarted/i.test(call.body.text),
+		),
+	);
+	await tick();
+	check(
+		"the reaper does not create a second shutdown crash batch",
+		readdirSync(batchDir).filter((file) => JSON.parse(readFileSync(join(batchDir, file), "utf8")).ids.includes(idle.id))
+			.length === 1,
+	);
+	await tap(`kr:${idle.id}`);
+	check("Restore opens the cancelled shutdown session", vsLog().includes(`--resume ${idle.id}`));
+	const restored = spawn(idle.id, idle.ctx.cwd);
+	await restored.fire("session_start");
+	vsPoller.heartbeat();
+	const adopted = record(idle.id);
+	check(
+		"Restore adopts the shutdown identity and questions",
+		["tag", "emoji", "code", "label", "closeOffer"].every((key) => adopted[key] === before[key]) &&
+			adopted.standing?.id === before.standing?.id &&
+			adopted.systemShutdownAt === 0,
+	);
+	await restored.fire("session_shutdown");
+	rmSync(planFile, { force: true });
+
+	const staleSession = await start("unresponsive");
+	const signalFile = join(root, "shutdown-signals.json");
+	const readyFile = join(root, "shutdown-signal-ready");
+	const releaseFile = join(root, "shutdown-signal-release");
+	const child = dummy(
+		process.execPath,
+		"-e",
+		`
+		const fs = require("node:fs");
+		process.on("SIGTERM", () => {
+			fs.writeFileSync(${JSON.stringify(signalFile)}, JSON.stringify({
+				pending: fs.existsSync(${JSON.stringify(vsMarker(staleSession.id))}),
+				held: fs.existsSync(${JSON.stringify(vsHold(staleSession.id))})
+			}));
+			const timer = setInterval(() => {
+				if (fs.existsSync(${JSON.stringify(releaseFile)})) { clearInterval(timer); process.exit(0); }
+			}, 10);
+		});
+		fs.writeFileSync(${JSON.stringify(readyFile)}, "");
+		setInterval(() => {}, 600000);
+	`,
+	);
+	for (let i = 0; i < 100 && !existsSync(readyFile); i++) await settle(20);
+	vsCandidate(staleSession, staleSession.ctx.cwd, { pid: child.pid, heartbeat: Date.now() - 60_000, state: "" });
+	const noPane = await start("no-pane");
+	const noPaneChild = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	vsCandidate(noPane, noPane.ctx.cwd, { pid: noPaneChild.pid, tmuxPane: "%404" });
+	await command("/reboot 90s");
+	const reboot = readPlan();
+	check(
+		"the progress card marks stale sessions unresponsive and lists fresh sessions normally",
+		/unresponsive/.test(card()?.text ?? "") &&
+			/no-pane[^\n]*idle/.test(card()?.text ?? "") &&
+			!/no-pane[^\n]*unresponsive/.test(card()?.text ?? ""),
+	);
+	await tap(`sn:${reboot?.id}`);
+	check(
+		"Stop now sets the current plan deadline to now",
+		readPlan()?.id === reboot?.id && readPlan()?.deadline <= Date.now(),
+	);
+	await settle(200);
+	const signalled = existsSync(signalFile) ? JSON.parse(readFileSync(signalFile, "utf8")) : null;
+	check("a straggler receives SIGTERM only after both restart markers exist", signalled?.pending && signalled?.held);
+	jump(6_001);
+	await tick();
+	check(
+		"a straggler without a pane is left alive without markers",
+		noPaneChild.exitCode === null && !existsSync(vsMarker(noPane.id)) && !existsSync(vsHold(noPane.id)),
+	);
+	await busy.pump(150);
+	check("Stop now still lets a responsive session abort and wind down", busy.aborts === 1 && busy.shutdowns === 1);
+	vsCandidate(staleSession, staleSession.ctx.cwd, { pid: child.pid, heartbeat: 0 });
+	writeFileSync(vsHold(staleSession.id), JSON.stringify({ plan: reboot?.id, pid: child.pid, at: 0 }));
+	await tick();
+	check(
+		"the reaper keeps a signalled process with an expired hold until it exits",
+		existsSync(join(sessionsDir, `${staleSession.id}.json`)) && !existsSync(join(crashDir, `${staleSession.id}.json`)),
+	);
+	await tap(`sc:${reboot?.id}`);
+	check(
+		"Cancel leaves an unresponsive session running until its SIGTERM finishes",
+		child.exitCode === null && readPlan()?.state === "cancelled",
+	);
+	writeFileSync(releaseFile, "");
+	for (let i = 0; i < 100 && child.exitCode === null; i++) await settle(20);
+	await tick();
+	check(
+		"a late straggler joins the same cancelled crash batch",
+		existsSync(join(crashDir, `${staleSession.id}.json`)) &&
+			JSON.parse(readFileSync(join(crashDir, `${staleSession.id}.json`), "utf8")).batch === reboot?.id,
+	);
+	check(
+		"a late straggler releases its markers and updates the stopped count",
+		!existsSync(vsHold(staleSession.id)) &&
+			!existsSync(vsMarker(staleSession.id)) &&
+			/2 sessions.*stopped/i.test(card()?.text ?? ""),
+	);
+	noPaneChild.kill("SIGTERM");
+	await noPane.fire("session_shutdown");
+	rmSync(planFile, { force: true });
+	const busyBack = spawn(busy.id, busy.ctx.cwd);
+	await busyBack.fire("session_start");
+	await busyBack.pump(100);
+	check(
+		"same-boot restoration explains a cut turn without claiming a reboot",
+		busyBack.customs.some(
+			(entry) =>
+				/wind-down/.test(String(entry.message.content)) && !/machine restarted/.test(String(entry.message.content)),
+		),
+	);
+	await busyBack.fire("session_shutdown");
+
+	const last = await start("last");
+	const fresh = await start("fresh-old-code");
+	const freshChild = dummy(process.execPath, "-e", "setInterval(() => {}, 600000)");
+	vsCandidate(fresh, fresh.ctx.cwd, { pid: freshChild.pid, state: "working" });
+	await command("/shutdown");
+	await last.pump(150);
+	await tick();
+	await tap(`sn:${readPlan()?.id}`);
+	check(
+		"a fresh process gets time for the drain and final-report wait",
+		freshChild.exitCode === null && !existsSync(vsMarker(fresh.id)),
+	);
+	jump(6_001);
+	await tick();
+	for (let i = 0; i < 100 && freshChild.exitCode === null; i++) await settle(20);
+	await tick();
+	check(
+		"the poller SIGTERMs fresh old code after the final-report grace",
+		freshChild.signalCode === "SIGTERM" && existsSync(join(crashDir, `${fresh.id}.json`)),
+	);
+	check(
+		"the last session ends the wind-down without powering off",
+		readPlan()?.state === "failed" &&
+			readPlan()?.error === "power-off comes with the next release" &&
+			vsPoller.shutdowns === 0,
+	);
+	check(
+		"the terminal card reports all sessions down and offers restoration",
+		/all sessions are down/i.test(card()?.text ?? "") &&
+			/2 sessions.*stopped/i.test(card()?.text ?? "") &&
+			/Restore/.test(card()?.text ?? "") &&
+			card()?.reply_markup.inline_keyboard.length === 0,
+	);
+	check(
+		"terminal wind-down moves stopped sessions into its restore batch",
+		existsSync(join(crashDir, `${last.id}.json`)) && !existsSync(vsHold(last.id)),
+	);
+	const finished = readPlan();
+	await tap(`sn:${finished?.id}`);
+	check("a terminal shutdown card refuses a late Stop now", JSON.stringify(readPlan()) === JSON.stringify(finished));
+	rmSync(planFile, { force: true });
+	for (const session of [busy, idle, restored, staleSession, noPane, last, fresh]) {
+		rmSync(join(sessionsDir, `${session.id}.json`), { force: true });
+	}
+	for (const [file, bytes] of parked) writeFileSync(join(sessionsDir, file), bytes);
+}
+
 restoreStamp();
 process.env.PATH = savedVsPath;
 delete process.env.VS_STATE;
