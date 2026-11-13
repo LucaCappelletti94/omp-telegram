@@ -3141,10 +3141,52 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return shutdownRender;
 	}
 
+	/** Checks authority and live sessions immediately before requesting logind shutdown. */
+	async function powerOff(plan: ShutdownPlan, ctx: ExtensionContext): Promise<void> {
+		const ownsPlan = (): boolean => {
+			const current = readShutdownPlan();
+			return ownsLock() && current?.id === plan.id && current.state === "powering-off";
+		};
+		if (!ownsPlan()) return;
+		const method = plan.kind === "poweroff" ? "PowerOff" : "Reboot";
+		const args = ["call", "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager"];
+		const allowed = await run("busctl", [...args, `Can${method}`], 5_000);
+		if (!ownsPlan()) return;
+		let error = allowed.ok
+			? allowed.stdout === 's "yes"'
+				? ""
+				: `logind Can${method} answered ${allowed.stdout}`
+			: `logind Can${method} failed (${allowed.stderr})`;
+		if (error === "" && shutdownSessions().length > 0) error = "Another session is still running";
+		if (error === "") {
+			shutdownState = sessionState();
+			systemShutdownAt = Date.now();
+			closing = true;
+			writePrivateJson(RESTART_HOLD_DIR, `${sessionId}.json`, { at: systemShutdownAt });
+			writeSessionRecord(ctx);
+			const result = await run("busctl", [...args, method, "b", "false"], 5_000);
+			if (result.ok) {
+				ctx.shutdown();
+				return;
+			}
+			error = `logind ${method} failed (${result.stderr})`;
+			shutdownState = null;
+			systemShutdownAt = 0;
+			closing = false;
+			removeStatePath(RESTART_HOLD_DIR, `${sessionId}.json`);
+			writeSessionRecord(ctx);
+		}
+		if (ownsPlan()) {
+			writeShutdownPlan({ ...plan, state: "failed", error });
+			shutdownRenderOwed = true;
+		}
+	}
+
 	/** Drives the deadline and publishes the current shutdown card. */
 	async function updateShutdown(): Promise<void> {
-		if (!ownsLock() || config === null) return;
+		if (!ownsLock() || config === null || sessionCtx === null) return;
 		const cfg = config;
+		const ctx = sessionCtx;
 		let plan = readShutdownPlan();
 		if (plan === null || plan.state === "powering-off") return;
 		if (plan.state === "winding" && Date.now() >= plan.deadline) await stopShutdownStragglers(plan);
@@ -3153,7 +3195,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (plan === null || plan.state === "powering-off") return;
 		const up = shutdownSessions();
 		if (plan.state === "winding" && up.length === 0) {
-			plan = { ...plan, state: "failed", error: "power-off comes with the next release" };
+			plan = { ...plan, state: "powering-off" };
 			writeShutdownPlan(plan);
 		}
 		offerShutdownSessions(plan);
@@ -3172,11 +3214,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				{ text: "Stop now", callback_data: `sn:${plan.id}` },
 				{ text: "Cancel", callback_data: `sc:${plan.id}` },
 			]);
+		} else if (plan.state === "powering-off") {
+			lines.push(plan.kind === "poweroff" ? "The machine is powering off." : "The machine is rebooting.");
 		} else {
 			const stopped = readCrashBatch(plan.id)?.ids.length ?? 0;
-			lines.push(plan.state === "cancelled" ? "Cancelled." : "All sessions are down. The poller stays up.");
+			lines.push(plan.state === "cancelled" ? "Cancelled." : "The machine stayed up.");
 			lines.push(`${stopped} ${stopped === 1 ? "session" : "sessions"} stopped.`);
 			if (plan.error !== "") lines.push(`${plan.error}.`);
+			if (plan.state === "failed")
+				lines.push(
+					"See the [README polkit rule](https://github.com/LucaCappelletti94/omp-telegram#power-off-permissions).",
+				);
 			if (stopped > 0) lines.push("Restore or Restore all on the 🚑 card reopens stopped sessions.");
 			for (const { id, record } of up) {
 				if (shutdownHold(id)?.plan === plan.id) lines.push(`${badgeOf(record)} · stopping`);
@@ -3190,18 +3238,34 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		};
 		const shown = JSON.stringify({ id: plan.id, body });
 		if (shown !== shutdownShown) {
-			const sent =
+			const sending =
 				plan.messageId === null
-					? await callTelegram<TelegramMessage>(cfg, "sendMessage", body, 15_000)
-					: await callTelegram(cfg, "editMessageText", { ...body, message_id: plan.messageId }, 15_000);
+					? callTelegram<TelegramMessage>(cfg, "sendMessage", body, 15_000)
+					: callTelegram(cfg, "editMessageText", { ...body, message_id: plan.messageId }, 15_000);
+			const sent =
+				plan.state === "powering-off"
+					? await Promise.race([
+							Promise.all([sending.catch(() => null), Promise.allSettled(turnEndDeliveries)]).then(
+								([message]) => message,
+							),
+							sleepMs(SHUTDOWN_REPORT_WAIT_MS).then(() => null),
+						])
+					: await sending;
 			if (sent !== null && ownsLock()) {
 				const current = readShutdownPlan();
 				if (current?.id === plan.id) {
-					if (current.messageId === null)
-						writeShutdownPlan({ ...current, messageId: (sent as TelegramMessage).message_id });
+					if (current.messageId === null) {
+						current.messageId = (sent as TelegramMessage).message_id;
+						writeShutdownPlan(current);
+						plan.messageId = current.messageId;
+					}
 					shutdownShown = shown;
 				}
 			}
+		}
+		if (plan.state === "powering-off") {
+			await powerOff(plan, ctx);
+			return;
 		}
 		if (ownsLock()) await redrawCrashCards();
 	}

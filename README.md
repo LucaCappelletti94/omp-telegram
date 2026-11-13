@@ -89,7 +89,27 @@ The card names the tmux tab the session ran in. Resume reopens the session at th
 
 A session that dies without shutting down, whether its omp process was killed or the whole machine went down, is kept aside with its folder, flags, tmux session, tab number and open questions. So is a session that a reboot or poweroff shut down, which systemd reports while it stops the machine, and its red pin stays up. The first omp to start afterwards, or the one holding the Telegram connection within fifteen seconds of a lone death, posts one card listing every session that ended together and the state each was in. A tap on Restore reopens it with `omp --resume` at its old tab number in its tmux session, creating that session detached when a reboot took it and appending the window when another one holds that number. The reopened session takes back its badge, reply routing and standing question. One cut off mid-turn is told what happened, and asks on Telegram whether to continue only when work remains. Dismiss clears the card's buttons and leaves the transcripts for a manual `omp --resume`. A session closed by hand is never offered, nor is a process still running on the same boot, as after a suspend, and the records expire after a week.
 
-`/shutdown` and `/reboot` wind sessions down with a ten-minute deadline, or a duration such as `/shutdown 30m`, `/reboot 90s` or `/shutdown 1h`. The progress card offers Stop now and Cancel, and the poller stays up without powering off or rebooting the machine. Sessions stopped by a cancelled or completed wind-down appear on the restore card, where Restore or Restore all reopens them.
+`/shutdown` and `/reboot` wind sessions down with a ten-minute deadline, or a duration such as `/shutdown 30m`, `/reboot 90s` or `/shutdown 1h`, then power off or reboot the machine once every other session is down. The progress card offers Stop now and Cancel until power-off begins. If cancelled or refused, the machine stays up and Restore or Restore all on the restore card reopens stopped sessions.
+
+### Power-off permissions
+
+An administrator installs this [polkit rule](https://polkit.pages.freedesktop.org/polkit/polkit.8.html) once in `/etc/polkit-1/rules.d/49-omp-telegram-power.rules`, replacing `YOUR_USER` with the account running omp. It permits noninteractive [logind power-off and reboot](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html) without granting the `-ignore-inhibit` actions.
+
+```js
+polkit.addRule(function (action, subject) {
+	if (
+		subject.user === "YOUR_USER" &&
+		[
+			"org.freedesktop.login1.power-off",
+			"org.freedesktop.login1.power-off-multiple-sessions",
+			"org.freedesktop.login1.reboot",
+			"org.freedesktop.login1.reboot-multiple-sessions",
+		].indexOf(action.id) >= 0
+	) {
+		return polkit.Result.YES;
+	}
+});
+```
 
 ## Upstream fixes
 
