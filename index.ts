@@ -97,6 +97,15 @@ import {
 	toTelegramHtml,
 } from "./render.ts";
 import {
+	transcriptPath as findTranscript,
+	isStateToken,
+	openOmp as openWindow,
+	type RunResult,
+	readJsonFile,
+	removeStatePath as removePrivateStatePath,
+	writePrivateJson,
+} from "./restore.ts";
+import {
 	changeTask,
 	conductorRole,
 	DEFAULT_SILENCE_HOURS,
@@ -345,9 +354,6 @@ interface TelegramReaction {
 
 function isTelegramMessageId(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-function isStateToken(value: unknown): value is string {
-	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value);
 }
 
 type TelegramReactionType =
@@ -1020,6 +1026,7 @@ interface CrashBatch {
 	messageId: number | null;
 	/** Text and buttons the card last showed, so an unchanged card is not edited. */
 	shown: string;
+	boot?: boolean;
 }
 
 interface LaunchRecord {
@@ -1166,19 +1173,6 @@ type PendingItem =
 			verdict: string;
 			body: string;
 	  };
-
-function readJsonFile(path: string): unknown {
-	try {
-		return JSON.parse(readFileSync(path, "utf8"));
-	} catch {
-		return null;
-	}
-}
-
-function writePrivateJson(dir: string, name: string, value: unknown): void {
-	mkdirSync(dir, { recursive: true, mode: 0o700 });
-	writeFileAtomic(join(dir, name), JSON.stringify(value), 0o600);
-}
 
 function isEdge(value: unknown): value is GraphNode["edges"][number] {
 	if (value === null || typeof value !== "object") return false;
@@ -1898,13 +1892,6 @@ function settledKeyboard(labels: string[], chosen: Set<string>): InlineButton[][
 			callback_data: SETTLED_CALLBACK,
 		})),
 	);
-}
-
-/** One subprocess, captured. `ok` is the exit status; stderr carries the reason a step can report. */
-interface RunResult {
-	ok: boolean;
-	stdout: string;
-	stderr: string;
 }
 
 const execFileAsync = promisify(execFile);
@@ -3830,8 +3817,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/** Removes `name` under `dir` only when it resolves inside the private state directory, since session ids name it. */
 	function removeStatePath(dir: string, name: string): void {
-		const path = resolve(dir, name);
-		if (path.startsWith(`${resolve(STATE_DIR)}${sep}`)) rmSync(path, { recursive: true, force: true });
+		removePrivateStatePath(STATE_DIR, dir, name);
 	}
 
 	/** Downloaded files are working input, and sent messages are grading records. Neither is an archive. */
@@ -4902,23 +4888,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} catch {}
 	}
 
-	/** The transcript a resume reopens: one `*_<id>.jsonl` under the project directories, first match. */
+	/** Finds the transcript for a retained session. */
 	function transcriptPath(id: string): string {
-		if (!existsSync(OMP_SESSIONS_DIR)) return "";
-		for (const dir of readdirSync(OMP_SESSIONS_DIR, { withFileTypes: true })) {
-			if (!dir.isDirectory()) continue;
-			const base = join(OMP_SESSIONS_DIR, dir.name);
-			let entries: string[];
-			try {
-				entries = readdirSync(base);
-			} catch {
-				continue;
-			}
-			for (const entry of entries) {
-				if (new RegExp(`^.+_${id}\\.jsonl$`, "u").test(entry)) return join(base, entry);
-			}
-		}
-		return "";
+		return findTranscript(OMP_SESSIONS_DIR, id);
 	}
 
 	/**
@@ -8191,13 +8163,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return openOmp(node.cwd, ["omp", ...argv, "--resume", id], [], tmuxSession, tmuxWindow, nodePlace(node));
 	}
 
-	/**
-	 * Opens `command` in a detached window of the named tmux session, or in a new detached tmux session of that
-	 * name when a reboot took it, so the poller needs no tmux of its own. Detached, because a tap on the phone must
-	 * not pull the terminal away from whoever sits at it. `env` holds the window's `-e NAME=value` pairs. A known
-	 * `windowIndex` reopens the old tab number, or appends when another window holds it. `tab` is where the window
-	 * opened, as `session:window`.
-	 */
+	/** Opens an omp window using the recorded or launching tmux session. */
 	async function openOmp(
 		cwd: string,
 		command: string[],
@@ -8206,36 +8172,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		windowIndex: number | null,
 		name: string,
 	): Promise<{ ok: true; tab: string } | { ok: false; error: string }> {
-		if (!existsSync(cwd)) {
-			return { ok: false, error: `Its folder ${cwd} no longer exists, so omp would resume it somewhere else.` };
-		}
-		const target = tmuxSession || launchSpec.tmuxSession || "omp";
-		const named = ["-n", clip(name, 30), "-c", cwd, ...env];
-		const window = [...named, ...command];
-		if (!(await run("tmux", ["has-session", "-t", `=${target}`])).ok) {
-			const created = await run("tmux", ["new-session", "-d", "-s", target, "-P", "-F", "#{window_index}", ...window]);
-			if (!created.ok) return { ok: false, error: `tmux new-session failed: ${clip(created.stderr, 150)}` };
-			if (windowIndex === null || created.stdout === String(windowIndex)) {
-				return { ok: true, tab: `${target}:${created.stdout}` };
-			}
-			const moved = await run("tmux", [
-				"move-window",
-				"-d",
-				"-s",
-				`${target}:${created.stdout}`,
-				"-t",
-				`${target}:${windowIndex}`,
-			]);
-			return { ok: true, tab: `${target}:${moved.ok ? windowIndex : created.stdout}` };
-		}
-		const placed = [...named, "-P", "-F", "#{session_name}:#{window_index}", ...command];
-		if (windowIndex !== null) {
-			const reopened = await run("tmux", ["new-window", "-d", "-t", `${target}:${windowIndex}`, ...placed]);
-			if (reopened.ok) return { ok: true, tab: reopened.stdout };
-		}
-		const opened = await run("tmux", ["new-window", "-d", "-t", `${target}:`, ...placed]);
-		if (opened.ok) return { ok: true, tab: opened.stdout };
-		return { ok: false, error: `tmux new-window failed: ${clip(opened.stderr, 150)}` };
+		return openWindow(cwd, command, env, tmuxSession || launchSpec.tmuxSession, windowIndex, name, run);
 	}
 
 	async function answerResumeCallback(cfg: Config, callback: TelegramCallbackQuery): Promise<void> {
@@ -9556,6 +9493,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			machine: raw.machine === true,
 			messageId: typeof raw.messageId === "number" ? raw.messageId : null,
 			shown: typeof raw.shown === "string" ? raw.shown : "",
+			boot: raw.boot === true,
 		};
 	}
 
@@ -9647,13 +9585,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (rows.length > 0) rows.push([{ text: "Dismiss", callback_data: `kd:${batchId}` }]);
 			const died = batch.ids.length - shut;
 			const head =
-				shut > 0
-					? batch.machine
-						? `\u{1F691} **The machine restarted.** ${sessions(shut)} shut down with it${died > 0 ? `, and ${sessions(died)} died without shutting down` : ""}.`
-						: `\u{1F691} ${sessions(shut)} stopped during a machine wind-down.`
-					: batch.machine
-						? `\u{1F691} **The machine restarted**, and ${sessions(died)} died without shutting down.`
-						: `\u{1F691} ${sessions(died)} died without shutting down.`;
+				batch.boot === true
+					? "Sessions restored after boot."
+					: shut > 0
+						? batch.machine
+							? `\u{1F691} **The machine restarted.** ${sessions(shut)} shut down with it${died > 0 ? `, and ${sessions(died)} died without shutting down` : ""}.`
+							: `\u{1F691} ${sessions(shut)} stopped during a machine wind-down.`
+						: batch.machine
+							? `\u{1F691} **The machine restarted**, and ${sessions(died)} died without shutting down.`
+							: `\u{1F691} ${sessions(died)} died without shutting down.`;
 			const foot = rows.length > 0 ? "\n\nRestore reopens a session with `omp --resume` in its tmux tab." : "";
 			const text = `${head} Last seen ${relativeTime(lastSeen)}.\n${lines.join("\n")}${foot}`;
 			const shown = JSON.stringify({ text, rows });
