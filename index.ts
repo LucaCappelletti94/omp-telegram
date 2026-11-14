@@ -1143,7 +1143,7 @@ type PendingItem =
 	| { kind: "message"; at: number; message: AgentMessage }
 	/** What the user sent a session that died before reading it, delivered as if it had just arrived. */
 	| { kind: "inbox"; at: number; updateId: number; summary: string; entry: InboxEntry }
-	/** A launch request's outcome, delivered to its requester as an aside, written by no one. */
+	/** A launch request's outcome, delivered to its requester as news written by no one, which starts no turn. */
 	| { kind: "launch"; at: number; requestId: string; state: LaunchRequestState; text: string; summary: string }
 	/** A queued heavy command's lease, granted and reserved for the session, delivered as an aside written by no one. */
 	| { kind: "lease"; at: number; lease: string; command: string }
@@ -1152,7 +1152,7 @@ type PendingItem =
 	 * `about` names the session the news concerns, so leads about one session arrive together.
 	 */
 	| { kind: "lead"; at: number; task: string; text: string; about?: string }
-	/** A watched pull request's news, delivered to its watcher as an aside, written by no one. */
+	/** A watched pull request's news, written by no one. Only its merge, close or disappearance starts a turn. */
 	| {
 			kind: "pr";
 			at: number;
@@ -7957,6 +7957,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			rmSync(file, { force: true });
 			pi.logger.warn("notify-telegram: discarded a malformed pending item", { file });
 		}
+		const wake = { deliverAs: "aside", triggerTurn: true } as const;
+		// News nobody waits on joins a running turn or waits for the next one, unless the user resumed the
+		// session from its card to have what was held read.
+		const news =
+			!sessionCtx.isIdle() || existsSync(join(PENDING_DIR, id, "resuming.json"))
+				? wake
+				: ({ deliverAs: "nextTurn", triggerTurn: false } as const);
 		// Leads wait out a running step and then arrive together, one aside per task and session they concern.
 		const due = stepRunning ? items.filter(({ item }) => item.kind !== "lead") : items;
 		const leads: Array<Extract<PendingItem, { kind: "lead" }>> = [];
@@ -7975,7 +7982,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			if (item.kind === "launch") {
 				pi.sendMessage(
 					{ customType: DEPENDENCY_MESSAGE_TYPE, content: launchText(item), display: true, details: item },
-					{ deliverAs: "aside", triggerTurn: true },
+					news,
 				);
 				continue;
 			}
@@ -7990,7 +7997,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						display: true,
 						details: item,
 					},
-					{ deliverAs: "aside", triggerTurn: true },
+					wake,
 				);
 				continue;
 			}
@@ -7998,17 +8005,19 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				leads.push(item);
 				continue;
 			}
-			// A PR-watch event is a status update, so it is written by no one and answers to no one.
+			// A PR-watch event is a status update, so it is written by no one and answers to no one. Only the end of the
+			// pull request is waited on.
 			if (item.kind === "pr") {
+				const ended = item.event === "merged" || item.event === "closed" || item.event === "gone";
 				pi.sendMessage(
 					{ customType: DEPENDENCY_MESSAGE_TYPE, content: prText(item), display: true, details: item },
-					{ deliverAs: "aside", triggerTurn: true },
+					ended ? wake : news,
 				);
 				continue;
 			}
 			pi.sendMessage(
 				{ customType: DEPENDENCY_MESSAGE_TYPE, content: outcomeText(item), display: true, details: item },
-				{ deliverAs: "aside", triggerTurn: true },
+				wake,
 			);
 		}
 		const grouped = new Map<string, typeof leads>();
@@ -10571,8 +10580,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/**
 	 * What a request's requester hears when it reaches an outcome. The word is a status update written
-	 * by no one. A live requester's own drain delivers it as an aside, and an ended one holds it until
-	 * its resume card delivers it, where it gets its own line. A `quiet` word for an ended requester drops.
+	 * by no one. A live requester's own drain delivers it as news that starts no turn, and an ended one holds it
+	 * until its resume card delivers it, where it gets its own line. A `quiet` word for an ended requester drops.
 	 */
 	function tellRequester(request: LaunchRequest, text: string, quiet = false): void {
 		const requester = request.requester;
@@ -10974,7 +10983,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	registerTool({
 		name: "pr_watch",
 		label: "PR Watch",
-		description: `Watch pull requests so their news reaches you without polling GitHub. \`action\` \`add\` takes a GitHub pull request URL in \`url\` and answers with the pull request's current state, so you never wait for news you already have. \`remove\` stops watching one you added, and \`list\` shows what this session watches. Every watched pull request wakes you with an aside written by no one when it is merged or closed, when any review lands, bots and comment-only ones included, and when the head commit's CI turns red or fully green. Your own pull requests are watched without asking, so only other people's need \`add\`.`,
+		description: `Watch pull requests so their news reaches you without polling GitHub. \`action\` \`add\` takes a GitHub pull request URL in \`url\` and answers with the pull request's current state, so you never wait for news you already have. \`remove\` stops watching one you added, and \`list\` shows what this session watches. Every watched pull request sends an update written by no one when it is merged or closed, when any review lands, bots and comment-only ones included, and when the head commit's CI turns red or fully green. A merge or close wakes you when idle. A review or a CI change joins your running turn, or waits for your next turn once you have ended it. Your own pull requests are watched without asking, so only other people's need \`add\`.`,
 		approval: "read",
 		parameters: z.object({
 			action: z.string().optional(),
@@ -11090,7 +11099,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						: "CI still running";
 			const seen = watchCount === 1 ? "1 review" : `${watchCount} reviews`;
 			return reply(
-				`Watching ${key.owner}/${key.name}#${key.number} (${url}).\nCurrent state: ${state}, ${ci}, ${seen} already seen.\nA merge or close, a new review, or the CI turning red or green on a new head wakes you with an aside written by no one.`,
+				`Watching ${key.owner}/${key.name}#${key.number} (${url}).\nCurrent state: ${state}, ${ci}, ${seen} already seen.\nA merge or close wakes you with an update written by no one. A new review, or the CI turning red or green on a new head, joins your running turn or waits for your next one.`,
 				{ url, state },
 			);
 		},
@@ -11665,7 +11674,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		name: "upstream_launch",
 		label: "Upstream Launch",
 		description:
-			"Request, list and retract upstream fixes through a Telegram card that the poller answers, so this call never blocks. `action` `request` (the default) validates the request, records it and sends the card offering Launch, Cancel and Upstreaming has already started. It returns the request's id at once with nothing launched yet, the decision and the launch's result arrive as messages, so end or continue the turn. Call `list` for the repository before requesting, and when another session has already started or requested the same upstream fix, retract your own request with `retract`. `action` `list` reports every request and every started upstream session for `repo`, or for all repositories when it is omitted. `action` `retract` withdraws this session's own request by `id`, which deletes its card. A failed launch keeps Launch and Cancel on its card, so a retry is one tap, and a pending or failed request expires after seven days. Launch uses the target repository when the user can push there, otherwise finds or creates the user's fork by its parent. It preserves existing remotes in `~/github/<name>`, creates a worktree on `upstream/<slug>` from the target's default branch, carries the request document and opens an `omp` session in a `tmux` tab of the requesting session's tmux session with the push remote. It operates under `~/github` and leaves this repository untouched. `repo` names the upstream repository as `owner/name`, `document` is the request path relative to this session's working directory, `problem` is the one-sentence defect shown on the card, and optional `slug` names the branch and worktree, defaulting from `problem`.",
+			"Request, list and retract upstream fixes through a Telegram card that the poller answers, so this call never blocks. `action` `request` (the default) validates the request, records it and sends the card offering Launch, Cancel and Upstreaming has already started. It returns the request's id at once with nothing launched yet. The decision and the launch's result join your running turn, or wait for your next turn once you have ended it, so end or continue the turn. Call `list` for the repository before requesting, and when another session has already started or requested the same upstream fix, retract your own request with `retract`. `action` `list` reports every request and every started upstream session for `repo`, or for all repositories when it is omitted. `action` `retract` withdraws this session's own request by `id`, which deletes its card. A failed launch keeps Launch and Cancel on its card, so a retry is one tap, and a pending or failed request expires after seven days. Launch uses the target repository when the user can push there, otherwise finds or creates the user's fork by its parent. It preserves existing remotes in `~/github/<name>`, creates a worktree on `upstream/<slug>` from the target's default branch, carries the request document and opens an `omp` session in a `tmux` tab of the requesting session's tmux session with the push remote. It operates under `~/github` and leaves this repository untouched. `repo` names the upstream repository as `owner/name`, `document` is the request path relative to this session's working directory, `problem` is the one-sentence defect shown on the card, and optional `slug` names the branch and worktree, defaulting from `problem`.",
 		approval: "read",
 		strict: true,
 		parameters: z.object({
@@ -11815,7 +11824,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				content: [
 					{
 						type: "text",
-						text: `Nothing launched yet. Request ${id} is pending on its Telegram card, which offers Launch, Cancel and Upstreaming has already started. The decision and the launch's result arrive as messages, so end or continue the turn. Call \`list\` for the repository to see other requests and started upstream sessions, and retract this one with \`retract\` when another session covers the same fix.`,
+						text: `Nothing launched yet. Request ${id} is pending on its Telegram card, which offers Launch, Cancel and Upstreaming has already started. The decision and the launch's result join your running turn, or wait for your next turn once you have ended it, so end or continue the turn. Call \`list\` for the repository to see other requests and started upstream sessions, and retract this one with \`retract\` when another session covers the same fix.`,
 					},
 				],
 				details: { requested: true, id, state: "pending", card: card.message_id },

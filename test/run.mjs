@@ -11679,8 +11679,8 @@ esac
 		own.content[0].text,
 	);
 	check(
-		"a request tells the model the decision arrives as a message",
-		own.content[0].text.includes("Nothing launched yet") && own.content[0].text.includes("arrive as messages"),
+		"a request tells the model the decision reaches its running or next turn",
+		own.content[0].text.includes("Nothing launched yet") && own.content[0].text.includes("wait for your next turn"),
 	);
 	const ownReq = requestOf(ownId);
 	check("the request file names the requester", ownReq.requester === upId);
@@ -11744,6 +11744,10 @@ esac
 	check(
 		"the launch outcome is not attributed to the poller",
 		launchOutcome !== undefined && !String(launchOutcome.message.content).includes("from the agent of the omp session"),
+	);
+	check(
+		"an upstream-launch outcome reaches an idle requester with its next turn, starting none",
+		launchOutcome?.options.deliverAs === "nextTurn" && launchOutcome?.options.triggerTurn === false,
 	);
 	check(
 		"the launch carries the request into the worktree",
@@ -18701,8 +18705,8 @@ echo done >> ${wghLog}
 	);
 	check("fully green CI reaches the watcher", news[1].message.content.includes("CI green on its head commit"));
 	check(
-		"the event is an aside written by no one that wakes the session",
-		news[0].options.deliverAs === "aside" && news[0].options.triggerTurn === true,
+		"a review and CI turning green reach an idle watcher with its next turn, starting none",
+		news.every((n) => n.options.deliverAs === "nextTurn" && n.options.triggerTurn === false),
 	);
 	const afterReview = w1.customs.length;
 	check(
@@ -18746,7 +18750,9 @@ echo done >> ${wghLog}
 		}),
 	});
 	const sendsBefore = called("sendMessage").length;
+	w1.setIdle(false);
 	await tick(w1, [w1], [w1]);
+	w1.setIdle(true);
 	const w1News = w1.customs.slice(afterReview);
 	check(
 		"each watcher of the same pull request gets its own review event",
@@ -18754,6 +18760,7 @@ echo done >> ${wghLog}
 			w1News[0].message.content.includes("review from bob") &&
 			w1News[0].message.content.includes("CHANGES_REQUESTED"),
 	);
+	check("a review reaching a watcher mid-turn joins that turn as an aside", w1News[0]?.options.deliverAs === "aside");
 	check("the ended watcher's review is held for it", pendingFiles(w2Id).length === 1);
 	check(
 		"the ended watcher's held review raises a resume card",
@@ -18767,6 +18774,10 @@ echo done >> ${wghLog}
 	const editsBefore = called("editMessageText").length;
 	await tick(w1, [w1], [w1]);
 	check("the merge reaches the live watcher", w1.customs.at(-1).message.content.includes("was merged"));
+	check(
+		"a merge wakes the idle watcher",
+		w1.customs.at(-1).options.deliverAs === "aside" && w1.customs.at(-1).options.triggerTurn === true,
+	);
 	check("the merge is held for the ended watcher", pendingFiles(w2Id).length === 2);
 	check(
 		"the merged pull request ends every watch of it",
@@ -19274,6 +19285,20 @@ echo done >> ${wghLog}
 			watchOf(w5Id, "someorg", "widget", 16).head === "z2" &&
 			watchOf(w5Id, "someorg", "widget", 16).redSent === true,
 	);
+	// The user resumed the session from its card to read the held news, so the news wakes it.
+	writeFileSync(join(root, "notify-telegram/graph/pending", w5Id, "resuming.json"), JSON.stringify({ at: Date.now() }));
+	const w5Back = spawn(w5Id, "/home/dev/work/w5");
+	await w5Back.fire("session_start");
+	w3.heartbeat();
+	w5Back.heartbeat();
+	await w5Back.pump(200);
+	const heldReviews = w5Back.customs.filter((c) => String(c.message.content).includes("Automatic PR-watch update"));
+	check(
+		"held reviews wake a session resumed from its card",
+		heldReviews.length === 2 &&
+			heldReviews.every((c) => c.options.deliverAs === "aside" && c.options.triggerTurn === true),
+	);
+	await w5Back.fire("session_shutdown");
 
 	// A pr pending item the drain cannot validate is discarded.
 	const pdir = join(root, "notify-telegram/graph/pending", w3Id);
