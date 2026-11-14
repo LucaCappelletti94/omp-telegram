@@ -13570,17 +13570,22 @@ heading("dependency graph across sessions");
 	for (const s of [parent, waiter, follower]) await s.pump(150);
 	const pushed = parent.customs.at(-1);
 	check(
-		"an outcome reaches the upstream parent as an aside that wakes it",
+		"an upstream child's push reaches its idle parent with its next turn, starting none",
 		parent.customs.length === 1 &&
-			pushed.options.deliverAs === "aside" &&
-			pushed.options.triggerTurn === true &&
+			pushed.options.deliverAs === "nextTurn" &&
+			pushed.options.triggerTurn === false &&
 			pushed.message.customType === "omp-telegram.dependency",
 	);
 	check(
 		"the outcome names the dependency and what happened",
 		pushed.message.content.includes("Widget mis-encodes Y") && pushed.message.content.includes("pushed"),
 	);
-	check("a waits-on dependent is woken too", waiter.customs.length === 1);
+	check(
+		"a waits-on dependent is woken by the push",
+		waiter.customs.length === 1 &&
+			waiter.customs[0].options.deliverAs === "aside" &&
+			waiter.customs[0].options.triggerTurn === true,
+	);
 	check("a follow-up session is not woken", follower.customs.length === 0);
 	check("a delivered outcome leaves nothing pending", pendingOf(parentId).length === 0);
 	await graph(child, { action: "status", status: "pushed" });
@@ -13616,6 +13621,13 @@ heading("dependency graph across sessions");
 	check(
 		"a PR first seen open wakes the dependents with its link",
 		parent.customs.at(-1).message.content.includes("pull/5") && waiter.customs.length === 2,
+	);
+	check(
+		"an opened pull request reaches the idle upstream parent with its next turn and wakes the waiter",
+		parent.customs.at(-1).options.deliverAs === "nextTurn" &&
+			parent.customs.at(-1).options.triggerTurn === false &&
+			waiter.customs.at(-1).options.deliverAs === "aside" &&
+			waiter.customs.at(-1).options.triggerTurn === true,
 	);
 
 	writeFileSync(
@@ -14052,6 +14064,28 @@ heading("dependency graph across sessions");
 	check(
 		"the card says the items were delivered, and where",
 		/Delivered .*<code>work:4<\/code>/u.test(lastCall("editMessageText").body.text),
+	);
+
+	// The end of an upstream fix is what its parent waits for, so it wakes the idle parent.
+	writeFileSync(
+		join(graphDir, "pending", parentId, `o-${childId}-done.json`),
+		JSON.stringify({
+			kind: "outcome",
+			at: Date.now(),
+			outcome: "done",
+			source: childId,
+			title: "Widget mis-encodes Y",
+			place: "/home/dev/widget.upstreams/fix-y",
+			edge: "upstream",
+		}),
+	);
+	await back.pump(200);
+	check(
+		"an upstream child's done wakes its idle parent",
+		back.customs.length === 3 &&
+			back.customs[2].message.content.includes("reported its work done") &&
+			back.customs[2].options.deliverAs === "aside" &&
+			back.customs[2].options.triggerTurn === true,
 	);
 
 	// A launch nobody claimed shows as never started.

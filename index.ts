@@ -8015,9 +8015,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				);
 				continue;
 			}
+			// An upstream parent waits for its child's fix to end, so the push and the opened pull request on the way
+			// are news to it. A waits-on dependent acts on every outcome.
+			const progress = item.edge === "upstream" && (item.outcome === "pushed" || item.outcome === "pr-opened");
 			pi.sendMessage(
 				{ customType: DEPENDENCY_MESSAGE_TYPE, content: outcomeText(item), display: true, details: item },
-				wake,
+				progress ? news : wake,
 			);
 		}
 		const grouped = new Map<string, typeof leads>();
@@ -10811,7 +10814,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	registerTool({
 		name: "session_graph",
 		label: "Session Graph",
-		description: `Record and read the dependencies between omp sessions, kept for a year across restarts. \`action\` \`show\` (the default) lists what this session waits on and who waits on it, each with its status and pull request. \`status\` sets this session's \`status\` to one of ${AGENT_STATUSES.join(", ")}, with an optional \`note\` and an optional GitHub pull request URL in \`pr\` whose state is then polled. \`pushed\`, \`done\`, \`not-needed\` and \`abandoned\` are outcomes that wake every session waiting on this one, and so are a PR opening, merging or closing. \`link\` declares an edge from this session of \`type\` \`waits-on\` (this session needs \`to\` to reach an outcome first, and is woken by its outcomes), \`follows-up\` (this session continues the work of \`to\`) or \`related\`. \`unlink\` removes an edge this session declared. \`to\` is a live session's badge emoji or tag, or a session id prefix of at least 8 characters, which also reaches ended sessions. \`find\` lists the sessions whose label, repository or folder contains \`query\`, with their ids. Upstream edges come only from upstream_launch.`,
+		description: `Record and read the dependencies between omp sessions, kept for a year across restarts. \`action\` \`show\` (the default) lists what this session waits on and who waits on it, each with its status and pull request. \`status\` sets this session's \`status\` to one of ${AGENT_STATUSES.join(", ")}, with an optional \`note\` and an optional GitHub pull request URL in \`pr\` whose state is then polled. \`pushed\`, \`done\`, \`not-needed\` and \`abandoned\` are outcomes that wake every session waiting on this one, and so are a PR opening, merging or closing. The one exception is the session that launched this one through upstream_launch: a push or an opened PR joins its running turn or waits for its next one. \`link\` declares an edge from this session of \`type\` \`waits-on\` (this session needs \`to\` to reach an outcome first, and is woken by its outcomes), \`follows-up\` (this session continues the work of \`to\`) or \`related\`. \`unlink\` removes an edge this session declared. \`to\` is a live session's badge emoji or tag, or a session id prefix of at least 8 characters, which also reaches ended sessions. \`find\` lists the sessions whose label, repository or folder contains \`query\`, with their ids. Upstream edges come only from upstream_launch.`,
 		approval: "read",
 		parameters: z.object({
 			action: z.string().optional(),
