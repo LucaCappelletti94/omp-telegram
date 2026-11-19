@@ -217,6 +217,10 @@ globalThis.fetch = async (url, init) => {
 	}
 	const body = JSON.parse(init.body);
 	api.calls.push({ method, body, at: Date.now() });
+	// An outage of the Bot API answers every method with 502, as on 2026-11-19.
+	if (api.down === true) {
+		return { ok: false, status: 502, json: async () => ({ ok: false, error_code: 502, description: "Bad Gateway" }) };
+	}
 	// A broken connection rejects the fetch, so no status line is ever read.
 	if ((api.fetchThrows ?? []).includes(method)) throw new TypeError("fetch failed");
 	if ((api.failMethods ?? []).includes(method)) {
@@ -7359,6 +7363,70 @@ heading("shared Telegram throttle");
 	);
 	rmSync(throttleFile, { force: true });
 	await tb.fire("session_shutdown");
+}
+
+heading("Telegram outage");
+{
+	const textOf = (result) => result.content.map((part) => part.text).join(" ");
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const oa = spawn("01a06026-0000-0000-0000-000000000000", "/home/dev/work/outage-a");
+	await oa.fire("session_start");
+	const ob = spawn("01a06027-0000-0000-0000-000000000000", "/home/dev/work/outage-b");
+	await ob.fire("session_start");
+	const snippetOf = async (session, id) => {
+		try {
+			return await session.tools
+				.get("notify_snippet")
+				.execute(id, { purpose: "a command", text: "ls" }, undefined, undefined, session.ctx);
+		} catch (error) {
+			return { content: [{ type: "text", text: String(error) }], isError: true };
+		}
+	};
+	const statusOf = (session, id) =>
+		session.tools
+			.get("notify_status")
+			.execute(id, { summary: `Status ${id}.`, urgency: "green", effect: "none" }, undefined, undefined, session.ctx);
+
+	// A Bot API answering 502 is down, and every process tells its agent so.
+	api.down = true;
+	const downSnippet = await snippetOf(oa, "out-snippet");
+	check(
+		"a send failing in an outage tells the agent Telegram is down",
+		downSnippet.isError === true && textOf(downSnippet).includes("Telegram has been down"),
+	);
+	const downStatus = textOf(await statusOf(ob, "out-status"));
+	check(
+		"a status recorded in an outage another process saw says it goes out once Telegram answers",
+		downStatus.includes("Telegram has been down") && downStatus.includes("goes out once"),
+	);
+	api.down = false;
+	await snippetOf(ob, "out-back");
+	check(
+		"one answer from Telegram ends the outage for every process",
+		!textOf(await statusOf(oa, "out-after")).includes("Telegram has been down"),
+	);
+
+	// A refusal comes from Telegram, so it is no outage.
+	api.failMethods = ["sendMessage"];
+	api.failDescription = "Bad Request: chat not found";
+	const refused = await snippetOf(oa, "out-refused");
+	api.failMethods = [];
+	api.failDescription = undefined;
+	check(
+		"a refusal from Telegram is no outage",
+		refused.isError === true && !textOf(refused).includes("Telegram has been down"),
+	);
+
+	// A connection that never reaches Telegram is an outage too.
+	api.fetchThrows = ["sendMessage"];
+	await snippetOf(oa, "out-lost");
+	api.fetchThrows = [];
+	check(
+		"a lost connection counts as an outage",
+		textOf(await statusOf(ob, "out-lost")).includes("Telegram has been down"),
+	);
+	await snippetOf(ob, "out-recovered");
+	for (const s of [oa, ob]) await s.fire("session_shutdown");
 }
 
 heading("paced release after a throttle");
