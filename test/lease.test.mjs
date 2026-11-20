@@ -59,6 +59,16 @@ check("a word that only contains make is light", !isHeavy("cmake --version && ec
 check("git status is light", !isHeavy("git status --short"));
 check("grep for cargo test in a log is light", !isHeavy("grep 'cargo test' log.txt"));
 check("a cargo test inside a brace group is heavy", isHeavy("{ cargo test; } 2>&1 | tail"));
+check(
+	"a quoted environment value holding a space before cargo is looked through",
+	isHeavy('RUSTDOCFLAGS="-D warnings" nice cargo doc --no-deps') && isHeavy("RUSTFLAGS='-D warnings' cargo check"),
+);
+check("cargo run through eval is heavy", isHeavy('P=x; eval "nice cargo $P clippy --all-targets"'));
+check("cargo run through sh -c is heavy", isHeavy("bash -c 'cd x && cargo test -p x'"));
+check(
+	"cargo named inside a quoted argument is light",
+	!isHeavy(`echo "cargo build; make" && node -e 'run("cargo test")'`),
+);
 
 heading("leased command wrapper");
 {
@@ -92,6 +102,10 @@ heading("leased command wrapper");
 	check(
 		"an invented lease id in a written-out wrapper unwraps all the same",
 		unwrapLeased(wrapped.replaceAll("l-0123456789ab", "l-bd13d16f8bfc"), module, dir) === "cargo test -p x",
+	);
+	check(
+		"a written-out wrapper with an id of any other shape unwraps all the same",
+		unwrapLeased(wrapped.replaceAll("l-0123456789ab", "l-pre397b"), module, dir) === "cargo test -p x",
 	);
 	const quoted = `printf '%s\\n' "${wrapped}"; cargo check`;
 	check("wrapper text inside double quotes is data and stays as it is", unwrapLeased(quoted, module, dir) === quoted);

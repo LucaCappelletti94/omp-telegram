@@ -112,30 +112,81 @@ const CARGO_HEAVY: Record<string, true> = {
 };
 
 /**
- * Whether `command` starts a build, a test suite or another job that loads the whole machine. Each pipeline
- * segment is judged by the program it runs, so `grep 'cargo test' log` stays light.
+ * Whether `command` starts a build, a test suite or another job that loads the whole machine. Each command in it
+ * is judged by the program it runs, so `grep 'cargo test' log` stays light, while a command string `eval` or
+ * `sh -c` runs is judged as a command of its own.
  */
 export function isHeavy(command: string): boolean {
-	for (const segment of command.split(/&&|\|\||[;|\n()]/u)) {
-		const words = segment.trim().split(/\s+/u);
-		let at = 0;
-		while (at < words.length) {
-			const word = words[at] as string;
-			// A brace group's opening word runs nothing itself, so the program follows it.
-			if (word === "{" || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) at++;
-			else if (RUNNERS[word] === true) {
-				at++;
-				while (at < words.length && /^(-|[\d.:,-]+[smhd]?$|[A-Za-z_][A-Za-z0-9_]*=)/u.test(words[at] as string)) at++;
-			} else break;
-		}
-		const [program, ...rest] = words.slice(at);
-		const args = rest.filter((word) => !word.startsWith("+") && !word.startsWith("-"));
-		if (program === "cargo" && CARGO_HEAVY[args[0] ?? ""] === true) return true;
-		if (program === "npm" && (args[0] === "test" || (args[0] === "run" && args[1] === "test"))) return true;
-		if (program === "make") return true;
-		if (program === "docker" && args[0] === "build") return true;
+	return commandStarts(command).some((start) => runsHeavy(wordsAt(command, start)));
+}
+
+/** Whether the simple command made of `words` runs a heavy program. */
+function runsHeavy(words: string[]): boolean {
+	let at = 0;
+	while (at < words.length) {
+		const word = words[at] as string;
+		// A brace group's opening word runs nothing itself, so the program follows it.
+		if (word === "{" || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) at++;
+		else if (RUNNERS[word] === true) {
+			at++;
+			while (at < words.length && /^(-|[\d.:,-]+[smhd]?$|[A-Za-z_][A-Za-z0-9_]*=)/u.test(words[at] as string)) at++;
+		} else break;
 	}
-	return false;
+	const [program, ...rest] = words.slice(at);
+	if (program === "eval") return isHeavy(rest.join(" "));
+	if (program === "bash" || program === "sh") {
+		const flag = rest.findIndex((word) => /^-[a-z]*c[a-z]*$/u.test(word));
+		const script = rest[flag + 1];
+		return flag !== -1 && script !== undefined && isHeavy(script);
+	}
+	// A variable before the subcommand holds options, so the subcommand is the first literal word.
+	const args = rest.filter((word) => !/^[-+$]/u.test(word));
+	if (program === "cargo" && CARGO_HEAVY[args[0] ?? ""] === true) return true;
+	if (program === "npm" && (args[0] === "test" || (args[0] === "run" && args[1] === "test"))) return true;
+	if (program === "make") return true;
+	return program === "docker" && args[0] === "build";
+}
+
+/**
+ * The words of the simple command starting at offset `from` of `text`, with their quotes and escapes resolved, up
+ * to the first unquoted `;`, `&`, `|`, parenthesis or line end.
+ */
+function wordsAt(text: string, from: number): string[] {
+	const words: string[] = [];
+	let word: string | null = null;
+	let at = from;
+	while (at < text.length) {
+		const ch = text[at] as string;
+		if (ch === "'") {
+			const end = text.indexOf("'", at + 1);
+			const stop = end === -1 ? text.length : end;
+			word = (word ?? "") + text.slice(at + 1, stop);
+			at = stop + 1;
+		} else if (ch === '"') {
+			at++;
+			let body = "";
+			while (at < text.length && text[at] !== '"') {
+				const escaped = text[at] === "\\" && at + 1 < text.length;
+				body += escaped ? text.charAt(at + 1) : text.charAt(at);
+				at += escaped ? 2 : 1;
+			}
+			word = (word ?? "") + body;
+			at++;
+		} else if (ch === "\\") {
+			word = (word ?? "") + text.charAt(at + 1);
+			at += 2;
+		} else if (/[\s;&|()]/u.test(ch)) {
+			if (word !== null) words.push(word);
+			word = null;
+			if (ch !== " " && ch !== "\t") break;
+			at++;
+		} else {
+			word = (word ?? "") + ch;
+			at++;
+		}
+	}
+	if (word !== null) words.push(word);
+	return words;
 }
 
 /** What keeps another heavy command from starting anywhere on the machine, empty when a slot is free and calm. */
@@ -337,7 +388,7 @@ export function unwrapLeased(command: string, module: string, stateDir: string):
 	const runner = literal(`node --disable-warning=ExperimentalWarning ${shellWord(module)}`);
 	const dir = literal(shellWord(stateDir));
 	const wrapper = new RegExp(
-		`${runner} take ${dir} (l-[0-9a-f]{12}) && \\{ ([\\s\\S]*?)\\n\\} 9> >\\(exec ${runner} hold ${dir} \\1\\)`,
+		`${runner} take ${dir} (l-[A-Za-z0-9_-]+) && \\{ ([\\s\\S]*?)\\n\\} 9> >\\(exec ${runner} hold ${dir} \\1\\)`,
 		"uy",
 	);
 	let inner = command;
