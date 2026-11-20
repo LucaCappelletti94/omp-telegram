@@ -21022,6 +21022,11 @@ heading("resource leases for heavy commands");
 		"wrapper text a command only prints stays as written while the command is leased",
 		printed?.input?.command.includes(`&& { ${data}\n}`) === true,
 	);
+	const pasted = await call("mid", first.input.command.replace("&& { cargo doc\n}", "&& { git status\n}"));
+	check(
+		"a rewritten wrapper written around a light command runs that command without the wrapper",
+		pasted?.input?.command === "git status",
+	);
 
 	// A session started without a readable config file has the extension disabled and no poller to schedule it.
 	rmSync(join(root, "notify-telegram.json"));

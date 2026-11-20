@@ -12417,9 +12417,11 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const cfg = config;
 		if (cfg === null) return undefined;
 		const input = event.input as Record<string, unknown>;
-		// An agent that runs a rewritten command again from its transcript gets its plain command leased afresh.
+		// An agent that runs a rewritten command again from its transcript gets its plain command leased afresh, or
+		// run as it is when it is light, since the written-out take of a lease it does not hold would refuse to run it.
 		const command = typeof input.command === "string" ? unwrapLeased(input.command, LEASE_MODULE, STATE_DIR) : null;
-		if (event.toolName !== "bash" || command === null || !isHeavy(command)) return undefined;
+		if (event.toolName !== "bash" || command === null) return undefined;
+		if (!isHeavy(command)) return command === input.command ? undefined : { input: { ...input, command } };
 		const cwd = typeof input.cwd === "string" ? resolve(ctx.cwd, input.cwd) : ctx.cwd;
 		const { points, marked } = readTally("resources");
 		const leaseCtx = {
