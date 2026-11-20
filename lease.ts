@@ -9,6 +9,10 @@ const LEASE_LOCK_STALE_MS = 2_000;
 export interface LeasePolicy {
 	/** Heavy commands running at once, a grant still waiting for its holder included. */
 	limit: number;
+	/** Leases out from which a further grant waits `paceMs` after the newest, so pressure decides past this count. */
+	paceFrom: number;
+	/** How long a command's load takes to show in the 10-second pressure average. */
+	paceMs: number;
 	cpuPressure: number;
 	memoryPressure: number;
 	ioPressure: number;
@@ -19,7 +23,9 @@ export interface LeasePolicy {
 }
 
 export const DEFAULT_LEASE_POLICY: LeasePolicy = {
-	limit: 4,
+	limit: 16,
+	paceFrom: 4,
+	paceMs: 15_000,
 	cpuPressure: 20,
 	memoryPressure: 10,
 	ioPressure: 20,
@@ -143,6 +149,14 @@ function machineBlockers(state: Leases, ctx: LeaseContext): string[] {
 	const { machine, policy } = ctx;
 	const blockers: string[] = [];
 	if (state.granted.length >= policy.limit) blockers.push(`all ${policy.limit} slots are taken`);
+	else if (state.granted.length >= policy.paceFrom) {
+		const age = ctx.now - Math.max(...state.granted.map((grant) => grant.grantedAt));
+		if (age < policy.paceMs) {
+			blockers.push(
+				`the newest lease is ${Math.round(age / 1000)} s old, under the ${Math.round(policy.paceMs / 1000)} s its load takes to show in the pressure reading`,
+			);
+		}
+	}
 	if (machine.cpu >= policy.cpuPressure) blockers.push(`CPU pressure is ${machine.cpu}%`);
 	if (machine.memory >= policy.memoryPressure) blockers.push(`memory pressure is ${machine.memory}%`);
 	if (machine.io >= policy.ioPressure) blockers.push(`I/O pressure is ${machine.io}%`);
@@ -211,8 +225,8 @@ export function admit(
  * The poller's pass. A grant whose holder died, or that waited past its expiry without one, is reclaimed, and so
  * is a holderless grant of a session that ended. A running holder keeps its slot even after its session ends,
  * because its command still loads the machine. Queued requests of ended sessions drop. Free slots then go to the
- * queue in rank order as reservations. Machine pressure or a full slot count stops the pass, while a request held
- * back only by its own filesystem's floor lets the next one through.
+ * queue in rank order as reservations. Machine pressure, a full slot count or a pace interval still running stops
+ * the pass, while a request held back only by its own filesystem's floor lets the next one through.
  */
 export function settle(
 	state: Leases,

@@ -193,6 +193,82 @@ heading("machine pressure and disk");
 	check("the queued answer gives the free share", full.outcome.blockers.join() === "its filesystem has 1% free");
 }
 
+heading("pressure leads past the pace threshold");
+{
+	const paced = { ...DEFAULT_LEASE_POLICY, limit: 4, paceFrom: 2, paceMs: 15_000 };
+	const out = (...grantedAts) => ({
+		granted: grantedAts.map((grantedAt, at) => ({
+			id: `g${at}`,
+			session: `s${at}`,
+			command: "cargo test",
+			grantedAt,
+			holder: 100 + at,
+			bound: true,
+			expires: 999_000,
+		})),
+		queue: [],
+	});
+	const at = (now) => ({ ...base(now), policy: paced });
+	check(
+		"under the threshold a burst of starts is admitted on the count alone",
+		admit(out(999), ask("a", "l1"), at(1_000)).outcome.kind === "grant",
+	);
+	check(
+		"past the threshold a calm machine admits once the newest lease is a pace interval old",
+		admit(out(1_000, 2_000), ask("a", "l1"), at(17_000)).outcome.kind === "grant",
+	);
+	const early = admit(out(1_000, 2_000), ask("a", "l1"), at(10_000));
+	check(
+		"past the threshold a lease younger than the pace interval holds the next back",
+		early.outcome.kind === "queued",
+	);
+	check(
+		"the held answer gives the newest lease's age and the interval",
+		early.outcome.blockers.join() ===
+			"the newest lease is 8 s old, under the 15 s its load takes to show in the pressure reading",
+	);
+	check(
+		"the cap still holds a calm machine",
+		admit(out(1_000, 1_000, 1_000, 1_000), ask("a", "l1"), at(60_000)).outcome.blockers.join() ===
+			"all 4 slots are taken",
+	);
+	check(
+		"pressure still holds back a paced admission",
+		admit(out(1_000, 2_000), ask("a", "l1"), { ...at(60_000), machine: { ...calm, cpu: 50 } }).outcome.kind ===
+			"queued",
+	);
+
+	const queue = ["a", "b", "c", "d"].map((session, n) => ({
+		id: `q${n}`,
+		session,
+		command: "cargo test",
+		cwd: "/w",
+		requestedAt: 100 + n,
+	}));
+	const live = { live: new Set(["a", "b", "c", "d"]), alive: () => true };
+	const burst = settle({ granted: [], queue }, { ...at(1_000), ...live });
+	check(
+		"a tick grants up to the threshold and the pace interval then runs from those grants",
+		burst.granted.map((g) => g.session).join() === "a,b",
+	);
+	const later = settle({ granted: out(1_000, 2_000).granted, queue }, { ...at(60_000), ...live });
+	check("past the threshold a tick grants one and ends its pass", later.granted.map((g) => g.session).join() === "a");
+
+	let state = empty();
+	for (const [session, id] of [
+		["a", "l1"],
+		["b", "l2"],
+		["c", "l3"],
+		["d", "l4"],
+	]) {
+		state = admit(state, ask(session, id), { ...base(0), policy: DEFAULT_LEASE_POLICY }).state;
+	}
+	check(
+		"by default a calm machine admits a fifth heavy command once the others are a minute old",
+		admit(state, ask("e", "l5"), { ...base(60_000), policy: DEFAULT_LEASE_POLICY }).outcome.kind === "grant",
+	);
+}
+
 heading("settling the queue");
 {
 	const queue = [
