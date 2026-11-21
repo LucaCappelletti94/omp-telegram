@@ -274,8 +274,14 @@ const SPINNER_FRAMES = new Set([
 	"\u280F",
 ]);
 const STATUS_SUMMARY_MAX = 160;
-/** Closes a turn-end message whose turn ended while one of the session's background jobs still runs. */
-const JOB_WAIT_LINE = "\u23F3 This session waits on a background job and wakes when it finishes.";
+/** The lines closing a turn-end message whose session still waits on a background job or on the named waits. */
+function waitLines(waitsOnJob: boolean, waits: readonly string[]): string[] {
+	const lines = waitsOnJob ? ["\u23F3 This session waits on a background job and wakes when it finishes."] : [];
+	if (waits.length === 0) return lines;
+	const named = waits.length === 1 ? waits[0] : `${waits.slice(0, -1).join(", ")} and ${waits.at(-1)}`;
+	return [...lines, `\u23F3 Still waiting on ${named}.`];
+}
+
 const CAPTION_MAX = 1024;
 /** A snippet's purpose is one line above the block, not a second summary. */
 const SNIPPET_PURPOSE_MAX = 120;
@@ -1062,6 +1068,9 @@ const LAUNCH_REQUEST_STATES: readonly LaunchRequestState[] = [
 	"retracted",
 	"expired",
 ];
+
+/** The states whose card still waits on a Launch, Retry or Cancel tap, or on the launch it started. */
+const WAITED_LAUNCH_STATES: readonly LaunchRequestState[] = ["pending", "launching", "failed"];
 
 /**
  * A launch request the card answers. The requesting tool writes it, and the poller owns the card,
@@ -7861,17 +7870,35 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		return { nodes, prs };
 	}
 
-	/** True while the session's own node has an upstream or waits-on edge to a node that is not finished. */
-	function waitsOnUnfinishedSession(): boolean {
+	/**
+	 * What wakes this session later besides a background job, each named for its turn-end line: unfinished
+	 * sessions its node waits on, pull requests it watches, and its launch cards still open to a tap.
+	 */
+	function pendingWaits(): string[] {
+		const waits: string[] = [];
 		const { nodes, prs } = graphSnapshot();
 		const own = nodes.find((node) => node.session === sessionId);
-		if (own === undefined) return false;
-		const byId = new Map(nodes.map((node) => [node.session, node]));
-		return own.edges.some((edge) => {
-			if (edge.type !== "upstream" && edge.type !== "waits-on") return false;
-			const target = byId.get(edge.to);
-			return target !== undefined && !isFinished(displayedStatus(target, prs.get(edge.to)));
-		});
+		if (own !== undefined) {
+			const byId = new Map(nodes.map((node) => [node.session, node]));
+			for (const edge of own.edges) {
+				if (edge.type !== "upstream" && edge.type !== "waits-on") continue;
+				const target = byId.get(edge.to);
+				if (target !== undefined && !isFinished(displayedStatus(target, prs.get(edge.to)))) {
+					waits.push(nodeTitle(target));
+				}
+			}
+		}
+		const watches = join(WATCH_DIR, sessionId);
+		for (const entry of listJson(watches)) {
+			const watch = prWatchOf(readJsonFile(join(watches, entry)));
+			if (watch !== null && !watch.ended) waits.push(`${watch.owner}/${watch.name}#${watch.number}`);
+		}
+		for (const request of allLaunchRequests()) {
+			if (request.requester === sessionId && WAITED_LAUNCH_STATES.includes(request.state)) {
+				waits.push(`the launch card for ${request.owner}/${request.name}`);
+			}
+		}
+		return [...new Set(waits)];
 	}
 
 	/** A badge or tag of a live session, or an id prefix of any live session or graph node, when unambiguous. */
@@ -12582,12 +12609,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		urgency: "green" | "orange" | "red" | null,
 		offersChoice: boolean,
 		asksReply: boolean,
-		waitsOnJob: boolean,
+		waits: boolean,
 	): "urgent" | "reply" | "sleeping" | "done" {
 		if (urgency === "red") return "urgent";
 		if (urgency === "orange") return "reply";
 		if (offersChoice || asksReply) return "reply";
-		return waitsOnJob || waitsOnUnfinishedSession() ? "sleeping" : "done";
+		return waits ? "sleeping" : "done";
 	}
 
 	/** Queues the final report before allowing a machine shutdown. */
@@ -12599,7 +12626,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 	/**
 	 * Reports a finished turn to Telegram. A turn that waits on a background job cannot be held back for a
-	 * status, offers no Close buttons, since closing would end the job, and says the session waits on it.
+	 * status and says the session waits on it. Close is offered only on a green end that waits on nothing,
+	 * so a session paused on a job, a session, a pull request, a launch card or a question keeps running.
 	 */
 	async function reportTurn(ctx: ExtensionContext, waitsOnJob: boolean) {
 		waitingOnJob = waitsOnJob;
@@ -12639,14 +12667,23 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				orange: "\u{1F7E0} Reply wanted",
 				red: "\u{1F534} Action required",
 			};
-			const recorded = waitsOnJob ? { ...turnSummary, text: `${turnSummary.text}\n\n${JOB_WAIT_LINE}` } : turnSummary;
-			if (!waitsOnJob) setPaneState(endTurnPaneState(recorded.urgency, recorded.options !== undefined, false, false));
+			const waits = pendingWaits();
+			// A green question without choices waits on the reply as surely as a choice does.
+			const asksQuestion = turnSummary.options === undefined && turnSummary.question !== undefined;
+			const lines = waitLines(waitsOnJob, waits);
+			const recorded =
+				lines.length > 0 ? { ...turnSummary, text: [turnSummary.text, ...lines].join("\n\n") } : turnSummary;
+			if (!waitsOnJob) {
+				setPaneState(
+					endTurnPaneState(recorded.urgency, recorded.options !== undefined, asksQuestion, waits.length > 0),
+				);
+			}
 			detach(() => unpinRed(ctx), "status unpin");
 			const pinGeneration = redPinGeneration;
 			turnSummary = null;
 			// The record keeps the headline only: `/status` lists it beside every other session.
 			lastSummary = clip(recorded.text.split("\n")[0]?.trim() ?? "", STATUS_SUMMARY_MAX);
-			const offersClose = recorded.urgency === "green" && !waitsOnJob;
+			const offersClose = recorded.urgency === "green" && !waitsOnJob && waits.length === 0 && !asksQuestion;
 			lastSummaryAt = Date.now();
 			if (recorded.options === undefined) {
 				const closeGeneration = closeOfferGeneration;
@@ -12697,7 +12734,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						quiet,
 						pinGeneration,
 						usageFooter(),
-						!waitsOnJob,
+						!waitsOnJob && waits.length === 0,
 					),
 				"turn-end question",
 			);
@@ -12718,7 +12755,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 
 		const tail = lastAssistantTail(ctx);
 		const wantsReply = /\?\s*$/.test(tail);
-		if (!waitsOnJob) setPaneState(endTurnPaneState(null, false, wantsReply, false));
+		const waits = pendingWaits();
+		if (!waitsOnJob) setPaneState(endTurnPaneState(null, false, wantsReply, waits.length > 0));
 		const title = wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished";
 		const tailBody =
 			tail.length === 0
@@ -12728,7 +12766,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					: wantsReply
 						? `...${clipEnd(tail, 600)}`
 						: `${clip(tail, 600)}...`;
-		const body = waitsOnJob ? `${tailBody}\n\n${JOB_WAIT_LINE}` : tailBody;
+		const lines = waitLines(waitsOnJob, waits);
+		const body = [tailBody, ...lines].join("\n\n");
 		const generation = redPinGeneration;
 		detachTurnEnd(
 			() =>

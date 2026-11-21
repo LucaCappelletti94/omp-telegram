@@ -20058,6 +20058,59 @@ esac
 		paneLogText().includes("set-option -p -t %78 @omp_state reply") && paneValue("%78") === "reply",
 	);
 
+	const lastStatus = () => lastCall("sendMessage").body;
+	const closeButtons = (body) =>
+		(body.reply_markup?.inline_keyboard ?? []).flat().filter((b) => /^[kx]:/u.test(b.callback_data));
+	const psWatches = join(root, "notify-telegram/graph/watches", psId);
+	const watchPr = (number, ended) => {
+		mkdirSync(psWatches, { recursive: true });
+		writeFileSync(
+			join(psWatches, `acme+widget+${number}.json`),
+			JSON.stringify({
+				url: `https://github.com/acme/widget/pull/${number}`,
+				owner: "acme",
+				name: "widget",
+				number,
+				by: psId,
+				at: Date.now(),
+				seeded: true,
+				ended,
+				head: "h1",
+				redSent: false,
+				greenSent: false,
+				reviews: [],
+			}),
+		);
+	};
+	const psRequest = join(root, "notify-telegram/graph/requests", "0c2c0b0b-0000-7000-8000-00000000000b.json");
+	const launchCard = (state) => {
+		mkdirSync(join(root, "notify-telegram/graph/requests"), { recursive: true });
+		writeFileSync(
+			psRequest,
+			JSON.stringify({
+				id: "0c2c0b0b-0000-7000-8000-00000000000b",
+				requester: psId,
+				owner: "acme",
+				name: "lib",
+				slug: "fix-lib",
+				problem: "x",
+				doc: "x",
+				docPath: "/nowhere/x.md",
+				tmux: "",
+				error: "",
+				branch: "",
+				tab: "",
+				state,
+				at: Date.now(),
+				stateAt: Date.now(),
+				launchPid: 0,
+				messageId: 7001,
+				tmuxWindow: null,
+				head: "",
+			}),
+		);
+	};
+
 	await freshTurn();
 	await notify("p5", { summary: "All done.", urgency: "green", effect: "none" });
 	await stopTurn();
@@ -20065,6 +20118,7 @@ esac
 		"a green turn end that waits on nothing marks the pane done",
 		paneLogText().includes("set-option -p -t %78 @omp_state done") && paneValue("%78") === "done",
 	);
+	check("a green turn end that waits on nothing offers Close", closeButtons(lastStatus()).length === 2);
 
 	gtNode("working");
 	ownNode([
@@ -20073,11 +20127,35 @@ esac
 		{ from: psId, to: gtId, type: "waits-on", at: Date.now() },
 	]);
 	await freshTurn();
+	// The agent loop retires the previous turn's close offer, as it does before every real turn end.
+	await ps.fire("agent_start");
 	await notify("p6", { summary: "The graph is green.", urgency: "green", effect: "none" });
 	await stopTurn();
 	check(
 		"a green turn end that waits on an unfinished session sleeps the pane",
 		paneLogText().includes("set-option -p -t %78 @omp_state sleeping") && paneValue("%78") === "sleeping",
+	);
+	check(
+		"a green turn end that waits on an unfinished session offers no Close and names the session",
+		lastStatus().text.includes("The graph is green") &&
+			closeButtons(lastStatus()).length === 0 &&
+			lastStatus().text.includes("Still waiting on The target"),
+	);
+	check("the session's own record holds no close offer while it waits", record(psId).closeOffer === null);
+
+	await freshTurn();
+	await notify("p6o", {
+		summary: "Pick one while waiting.",
+		urgency: "green",
+		effect: "none",
+		options: opts("A", "B"),
+	});
+	await stopTurn();
+	check(
+		"a green choice that waits on an unfinished session offers only its options",
+		lastStatus().text.includes("Pick one while waiting") &&
+			lastStatus().reply_markup.inline_keyboard.flat().length === 2 &&
+			closeButtons(lastStatus()).length === 0,
 	);
 
 	gtNode("done");
@@ -20087,6 +20165,66 @@ esac
 	check(
 		"a green turn end whose target is finished marks the pane done",
 		paneLogText().includes("set-option -p -t %78 @omp_state done") && paneValue("%78") === "done",
+	);
+	check("a green turn end whose target is finished offers Close", closeButtons(lastStatus()).length === 2);
+
+	watchPr(12, false);
+	await freshTurn();
+	await notify("p7w", { summary: "PR opened, CI running.", urgency: "green", effect: "none" });
+	await stopTurn();
+	check(
+		"a green turn end with an open watched pull request sleeps the pane",
+		paneLogText().includes("set-option -p -t %78 @omp_state sleeping") && paneValue("%78") === "sleeping",
+	);
+	check(
+		"a green turn end with an open watched pull request offers no Close and names the pull request",
+		lastStatus().text.includes("PR opened, CI running") &&
+			closeButtons(lastStatus()).length === 0 &&
+			lastStatus().text.includes("acme/widget#12"),
+	);
+
+	watchPr(12, true);
+	await freshTurn();
+	await notify("p7e", { summary: "PR merged.", urgency: "green", effect: "none" });
+	await stopTurn();
+	check(
+		"a green turn end whose watched pull request ended offers Close and marks the pane done",
+		closeButtons(lastStatus()).length === 2 && paneValue("%78") === "done",
+	);
+	rmSync(psWatches, { recursive: true, force: true });
+
+	for (const state of ["pending", "failed"]) {
+		launchCard(state);
+		await freshTurn();
+		await notify(`p7l-${state}`, { summary: "Launch requested.", urgency: "green", effect: "none" });
+		await stopTurn();
+		check(
+			`a green turn end with a ${state} launch card offers no Close, names it and sleeps the pane`,
+			closeButtons(lastStatus()).length === 0 &&
+				lastStatus().text.includes("the launch card for acme/lib") &&
+				paneValue("%78") === "sleeping",
+		);
+	}
+	launchCard("cancelled");
+	await freshTurn();
+	await notify("p7c", { summary: "Launch cancelled.", urgency: "green", effect: "none" });
+	await stopTurn();
+	check("a green turn end whose launch card is settled offers Close", closeButtons(lastStatus()).length === 2);
+	rmSync(psRequest, { force: true });
+
+	await freshTurn();
+	await notify("p7q", {
+		summary: "Built it.",
+		urgency: "green",
+		effect: "none",
+		question: "Which name should it get?",
+	});
+	await stopTurn();
+	check(
+		"a green turn end that asks a question offers no Close and asks the pane for a reply",
+		lastStatus().text.includes("Which name should it get?") &&
+			closeButtons(lastStatus()).length === 0 &&
+			paneValue("%78") === "reply",
 	);
 
 	tail = "Should I delete the legacy shim?";
