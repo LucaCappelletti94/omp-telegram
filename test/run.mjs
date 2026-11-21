@@ -3417,16 +3417,16 @@ await tq.fire("session_stop");
 await settle(150);
 const telegramQuestionId = record(tq.id).standing.messageId;
 const telegramEditsBefore = called("editMessageText").length;
-await tq.fire("agent_start");
-await settle(150);
+writeFileSync(join(inboxOf(tq.id), "997.json"), JSON.stringify({ kind: "text", value: "proceed" }));
+await tq.pump(250);
 const telegramClosures = called("editMessageText").slice(telegramEditsBefore);
 check(
-	"a Telegram-started turn retires the standing question",
+	"a Telegram message answers the standing question",
 	telegramClosures.some(
-		(c) => c.body.message_id === telegramQuestionId && c.body.text.includes("Superseded by new work"),
+		(c) => c.body.message_id === telegramQuestionId && c.body.text.includes("Answered on Telegram."),
 	),
 );
-check("the retired standing question is cleared from the record", record(tq.id).standing === null);
+check("the answered standing question is cleared from the record", record(tq.id).standing === null);
 
 // notify_status validation: a bad options list costs the buttons, never the notification.
 const badOpts = await tq.tools
@@ -3707,7 +3707,7 @@ heading("durable pin retirement");
 		const id = await red(session);
 		api.failMethods = ["unpinChatMessage"];
 		api.failDescription = "Bad Request: not enough rights to manage pinned messages in the chat";
-		await session.fire("agent_start");
+		await session.fire("input");
 		await settle();
 		const attempts = () => called("unpinChatMessage").filter((c) => c.body.message_id === id).length;
 		const afterFirst = attempts();
@@ -4206,9 +4206,9 @@ writeFileSync(join(inboxOf(ux.id), "6111.json"), JSON.stringify({ kind: "command
 await ux.pump(250);
 const pinnedStatus = lastCall("sendMessage").body.text;
 check("status retains the pinned-status alert", pinnedStatus.includes("A red status is pinned."));
-await ux.fire("agent_start");
-await settle(150);
-check("a Telegram-started turn unpins it", lastCall("unpinChatMessage").body.message_id === pinnedCall.body.message_id);
+writeFileSync(join(inboxOf(ux.id), "6112.json"), JSON.stringify({ kind: "text", value: "credentials are in place" }));
+await ux.pump(250);
+check("a Telegram answer unpins it", lastCall("unpinChatMessage").body.message_id === pinnedCall.body.message_id);
 check("the record clears", record(ux.id).pinned === null);
 
 heading("standing publication generations");
@@ -4499,7 +4499,7 @@ rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
 heading("retired status pins");
 for (const withOptions of [false, true]) {
 	for (const delay of ["send", "pin"]) {
-		for (const event of ["input", "agent_start", "session_shutdown"]) {
+		for (const event of ["input", "session_shutdown"]) {
 			const session = spawn(crypto.randomUUID(), "/home/dev/work/pin-retirement");
 			await session.fire("session_start");
 			const gate = Promise.withResolvers();
@@ -7474,6 +7474,157 @@ heading("Telegram outage");
 	check("an outage dates from its first failure, not its latest", textOf(later).includes("down for 3 minutes"));
 	await snippetOf(ob, "out-proxy-back");
 	for (const s of [oa, ob]) await s.fire("session_shutdown");
+}
+
+heading("questions survive automatic wakes");
+{
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const aw = spawn("01a06040-0000-0000-0000-000000000000", "/home/dev/work/wakes");
+	await aw.fire("session_start");
+	const status = async (id, args) => {
+		await aw.tools.get("notify_status").execute(id, args, undefined, undefined, aw.ctx);
+		await aw.fire("session_stop");
+		await settle(150);
+	};
+	const editsOf = (messageId) => called("editMessageText").filter((c) => c.body.message_id === messageId);
+	const sentWith = (text) => called("sendMessage").filter((c) => String(c.body.text).includes(text));
+
+	// A lease grant, a PR watch or another session's message starts a turn with no input from the user.
+	await aw.fire("input");
+	await status("aw-1", {
+		summary: "Pick one.",
+		urgency: "orange",
+		question: "Which path?",
+		options: opts("Left", "Right"),
+	});
+	const asked = record(aw.id).standing;
+	await aw.fire("agent_start");
+	await settle(150);
+	check(
+		"an automatic wake leaves the delivered question open with live buttons",
+		record(aw.id).standing?.id === asked.id && editsOf(asked.messageId).length === 0,
+	);
+	await status("aw-2", { summary: "Lease ran.", urgency: "green", effect: "none" });
+	check(
+		"a green turn end after an automatic wake leaves the question open",
+		record(aw.id).standing?.id === asked.id && editsOf(asked.messageId).length === 0,
+	);
+	check(
+		"no close offer while a question waits on the user",
+		sentWith("Lease ran.").every((c) => !JSON.stringify(c.body.reply_markup ?? {}).includes('"k:')),
+	);
+	writeFileSync(join(inboxOf(aw.id), "4001.json"), JSON.stringify({ kind: "callback", value: `c:${asked.id}:1` }));
+	await aw.pump(250);
+	check(
+		"a press after the automatic turn still answers the question",
+		aw.steers.some((s) => s.text === "Right") && editsOf(asked.messageId).some((c) => c.body.text.includes("Chosen:")),
+	);
+
+	// A question Telegram has not taken yet keeps retrying through an automatic turn and its green end.
+	await aw.fire("agent_start");
+	api.down = true;
+	await status("aw-3", {
+		summary: "Outage pick.",
+		urgency: "orange",
+		question: "Ship it?",
+		options: opts("Ship", "Hold"),
+	});
+	await aw.fire("agent_start");
+	await status("aw-4", { summary: "Background job done.", urgency: "green", effect: "none" });
+	api.down = false;
+	jump(5_000);
+	await settle(800);
+	const shipped = record(aw.id).standing;
+	check(
+		"an unsent question still reaches Telegram after an automatic turn",
+		shipped?.labels.includes("Ship") === true && typeof shipped.messageId === "number",
+	);
+
+	// A reply to another message is about that message, so the question stays open.
+	writeFileSync(
+		join(inboxOf(aw.id), "4002.json"),
+		JSON.stringify({ kind: "text", value: "about the earlier one", replyTo: asked.messageId, messageId: 4002 }),
+	);
+	await aw.pump(250);
+	check(
+		"a reply to another message leaves the standing question open",
+		record(aw.id).standing?.id === shipped.id && editsOf(shipped.messageId).length === 0,
+	);
+
+	// A red question stays pinned through an automatic turn, and the user's answer unpins it.
+	await aw.fire("input");
+	await status("aw-5", {
+		summary: "Blocked.",
+		urgency: "red",
+		question: "Grant access?",
+		options: opts("Grant", "Refuse"),
+	});
+	const blocked = record(aw.id).standing;
+	check("a red question is pinned", api.pinned.has(blocked.messageId));
+	await aw.fire("agent_start");
+	await status("aw-6", { summary: "Watch fired.", urgency: "green", effect: "none" });
+	check("an automatic turn keeps the red question pinned", api.pinned.has(blocked.messageId));
+	await aw.fire("input");
+	await settle(150);
+	check(
+		"the user's answer unpins and settles the red question",
+		!api.pinned.has(blocked.messageId) &&
+			editsOf(blocked.messageId).some((c) => c.body.text.includes("Answered at the terminal")),
+	);
+
+	// A close offer riding on a green question loses only its close buttons when new work starts.
+	await status("aw-7", {
+		summary: "All done.",
+		urgency: "green",
+		effect: "none",
+		question: "Anything else?",
+		options: opts("Review", "Stop"),
+	});
+	const offered = record(aw.id).standing;
+	check("a green question carries the close offer", record(aw.id).closeOffer === offered.messageId);
+	await aw.fire("agent_start");
+	await settle(150);
+	const keyboards = called("editMessageReplyMarkup")
+		.filter((c) => c.body.message_id === offered.messageId)
+		.map((c) => c.body.reply_markup.inline_keyboard.flat());
+	check(
+		"an automatic wake drops the close buttons and keeps the choices",
+		keyboards.length > 0 &&
+			keyboards.every((buttons) => buttons.every((b) => !/^[kx]:/.test(b.callback_data))) &&
+			keyboards.every((buttons) => buttons.some((b) => b.callback_data.startsWith(`c:${offered.id}:`))) &&
+			record(aw.id).standing?.id === offered.id,
+	);
+
+	// A buttonless question survives an automatic wake, and a newer question replaces either kind.
+	await aw.fire("input");
+	await status("aw-8", { summary: "Need input.", urgency: "orange", question: "Which port?" });
+	const replyQuestion = record(aw.id).replyQuestion;
+	await aw.fire("agent_start");
+	await settle(150);
+	check(
+		"an automatic wake leaves the buttonless question open",
+		replyQuestion !== null && record(aw.id).replyQuestion === replyQuestion,
+	);
+	await status("aw-9", {
+		summary: "Another.",
+		urgency: "orange",
+		question: "Which host?",
+		options: opts("Alpha", "Beta"),
+	});
+	const choice = record(aw.id).standing;
+	check(
+		"a newer question closes the buttonless one",
+		record(aw.id).replyQuestion === null && choice?.labels.includes("Alpha") === true,
+	);
+	await aw.fire("agent_start");
+	await status("aw-10", { summary: "Plainly.", urgency: "orange", question: "Which region?" });
+	check(
+		"a newer buttonless question supersedes the standing one",
+		record(aw.id).standing === null &&
+			record(aw.id).replyQuestion !== null &&
+			editsOf(choice.messageId).some((c) => c.body.text.includes("Superseded by a newer question")),
+	);
+	await aw.fire("session_shutdown");
 }
 
 heading("paced release after a throttle");
@@ -15750,7 +15901,7 @@ const vsRetire = (id) =>
 	await stale.tools
 		.get("session_badge")
 		.execute("vs-badge", { emoji: "🛟", code: "HOLD", label: "Restart identity" }, undefined, undefined, stale.ctx);
-	// Plain green opens the close offer; the green choice becomes the standing question; the red light gets pinned.
+	// Plain green opens the close offer, then a red choice becomes the standing question and gets pinned.
 	await stale.tools
 		.get("notify_status")
 		.execute(
@@ -15765,9 +15916,8 @@ const vsRetire = (id) =>
 	await stale.tools.get("notify_status").execute(
 		"vs2",
 		{
-			summary: "Green, choose.",
-			urgency: "green",
-			effect: "thumbs_up",
+			summary: "The red light.",
+			urgency: "red",
 			question: "What next for the stale one?",
 			options: opts("Go", "Stop"),
 		},
@@ -15775,11 +15925,6 @@ const vsRetire = (id) =>
 		undefined,
 		stale.ctx,
 	);
-	await stale.fire("session_stop");
-	await settle(150);
-	await stale.tools
-		.get("notify_status")
-		.execute("vs3", { summary: "The red light.", urgency: "red" }, undefined, undefined, stale.ctx);
 	await stale.fire("session_stop");
 	await settle(150);
 	const redMessage = api.nextMessage - 1;
