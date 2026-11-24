@@ -2550,6 +2550,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	let pinnedMessageId: number | null = null;
 	let pinPendingUntil = 0;
 	let redPinGeneration = 0;
+	/** The pin generation of the last turn end that asked the user something, which stays open until it moves. */
+	let askedGeneration: number | null = null;
 	const redPinOperations = new Set<Promise<unknown>>();
 	const unpinsInFlight = new Map<string, Promise<void>>();
 	let unpinSweepInFlight = false;
@@ -2946,6 +2948,25 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (replyQuestionMessageId === null) return;
 		replyQuestionMessageId = null;
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
+	}
+
+	/** Whether a question to the user is still open, delivered or still being sent. */
+	function questionOpen(): boolean {
+		return standingQuestion !== null || replyQuestionMessageId !== null || askedGeneration === redPinGeneration;
+	}
+
+	/** The user's own input answers every open question: it unpins, stops unsent ones and settles the standing one. */
+	function retireQuestions(ctx: ExtensionContext, settlement: string, settled?: InlineButton[][]): void {
+		detach(() => unpinRed(ctx), "answer unpin");
+		closeReplyQuestion();
+		const standing = standingQuestion;
+		if (standing === null) return;
+		standingQuestion = null;
+		writeSessionRecord(ctx);
+		detach(
+			() => settleQuestionMessage(standing.messageId, standing.head, settlement, settled),
+			"standing-question close",
+		);
 	}
 
 	/**
@@ -4041,6 +4062,34 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Drops a message's close buttons and keeps any choices riding on the same keyboard. `sent` is the keyboard of
+	 * a message whose record is not written yet.
+	 */
+	async function dropCloseButtons(messageId: number, sent?: InlineButton[][]): Promise<void> {
+		const cfg = config;
+		if (cfg === null) return;
+		const closes = (button: InlineButton): boolean => /^[kx]:/u.test(button.callback_data);
+		const keyboardOf = (record: SentRecord | null): InlineButton[][] | undefined =>
+			(record?.replyMarkup as { inline_keyboard?: InlineButton[][] } | undefined)?.inline_keyboard;
+		const rows = (sent ?? keyboardOf(readSentRecord(messageId)) ?? [])
+			.map((row) => row.filter((button) => !closes(button)))
+			.filter((row) => row.length > 0);
+		// The caller's own answer may settle the question in the same tick, and its dead buttons must stay dead.
+		await Promise.resolve();
+		if (rows.length > 0 && standingQuestion?.messageId !== messageId) return;
+		const dropped = await callTelegram(
+			cfg,
+			"editMessageReplyMarkup",
+			{ chat_id: cfg.chatId, message_id: messageId, reply_markup: { inline_keyboard: rows } },
+			10_000,
+		);
+		const current = readSentRecord(messageId);
+		// A settlement that landed meanwhile already recorded the keyboard it left.
+		if (dropped === null || current === null || keyboardOf(current)?.flat().some(closes) !== true) return;
+		recordSent(messageId, current.kind, current.text, current.session, current.payload, { inline_keyboard: rows });
+	}
+
 	/** The green-summary close button: strip the button, then let the ordinary shutdown path run. */
 	async function closeSessionFromTelegram(messageId: number | undefined): Promise<void> {
 		if (messageId !== undefined && closeOfferMessageId === messageId) closeOfferMessageId = null;
@@ -4129,7 +4178,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		closeOfferMessageId = null;
 		if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 		if (!withEdit) return;
-		detach(() => stripKeyboard(messageId), "close-offer retire");
+		detach(() => dropCloseButtons(messageId), "close-offer retire");
 	}
 
 	/** One line per omp pane, read from the same pane titles that drive the tmux tabs. Listing panes, not windows,
@@ -6580,7 +6629,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					closeOfferMessageId = messageId;
 					writeSessionRecord(ctx);
 				} else {
-					detach(() => stripKeyboard(messageId), "late close-offer retire");
+					detach(() => dropCloseButtons(messageId, keyboard), "late close-offer retire");
 				}
 			}
 		};
@@ -7062,20 +7111,15 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					const standing = standingQuestion;
 					if (standing !== null && standing.id === choiceId) {
 						const label = standing.labels[Number.parseInt(rawIndex ?? "", 10)];
-						standingQuestion = null;
-						if (sessionCtx !== null) writeSessionRecord(sessionCtx);
 						// Close even when the index is unreadable: state is already cleared,
 						// and a live-looking keyboard on a dead question misleads.
-						detach(
-							() =>
-								settleQuestionMessage(
-									standing.messageId,
-									standing.head,
-									label === undefined ? "This question is closed." : `**Chosen:** ${label}`,
-									label === undefined ? undefined : settledKeyboard(standing.labels, new Set([label])),
-								),
-							"chosen standing question close",
-						);
+						if (sessionCtx !== null) {
+							retireQuestions(
+								sessionCtx,
+								label === undefined ? "This question is closed." : `**Chosen:** ${label}`,
+								label === undefined ? undefined : settledKeyboard(standing.labels, new Set([label])),
+							);
+						}
 						if (label !== undefined) {
 							pi.sendUserMessage(label);
 							replyOwedAt = Date.now();
@@ -7111,6 +7155,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						// No `deliverAs`: omp steers a running turn and starts one when idle. An explicit
 						// steer only interrupts, so on a finished session it delivered nothing at all.
 						closeReplyQuestion(entry.replyTo);
+						answerFromTelegram(owner, entry.replyTo);
 						const reference = replyReference(entry);
 						pi.sendUserMessage([
 							{ type: "image", data, mimeType: entry.mime },
@@ -7120,6 +7165,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					} else {
 						const tail = caption.length > 0 ? ` Caption: ${caption}` : "";
 						closeReplyQuestion(entry.replyTo);
+						answerFromTelegram(owner, entry.replyTo);
 						const sent = `The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`;
 						const reference = replyReference(entry);
 						pi.sendUserMessage(reference === null ? sent : [reference, { type: "text", text: sent }]);
@@ -7151,6 +7197,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						continue;
 					}
 					if (entry.targetQuestion === true) closeReplyQuestion(entry.messageId);
+					answerFromTelegram(owner, entry.messageId);
 					focusTmuxWindow();
 					pi.sendUserMessage(entry.value);
 					rmSync(processing, { force: true });
@@ -7167,6 +7214,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					replyOwedAt = Date.now();
 					continue;
 				}
+				answerFromTelegram(owner, entry.replyTo);
 				const reference = replyReference(entry);
 				pi.sendUserMessage(reference === null ? entry.value : [reference, { type: "text", text: entry.value }]);
 				replyOwedAt = Date.now();
@@ -7175,6 +7223,13 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		} finally {
 			drainInFlight = false;
 		}
+	}
+
+	/** A Telegram message answers the open question when it replies to that question, to its pin or to nothing. */
+	function answerFromTelegram(ctx: ExtensionContext, target: number | undefined): void {
+		const open = [standingQuestion?.messageId, replyQuestionMessageId, pinnedMessageId];
+		if (target !== undefined && !open.includes(target)) return;
+		retireQuestions(ctx, "Answered on Telegram.");
 	}
 
 	/** Every tool's Telegram calls are made while the agent waits on it, which `sendWithRetry` reads to fail fast. */
@@ -12301,17 +12356,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		chainHop = null;
 		statusBlockUsed = false;
 		recoveryTurn = false;
-		detach(() => unpinRed(ctx), "input unpin");
-		closeReplyQuestion();
-		const standing = standingQuestion;
-		if (standing !== null) {
-			standingQuestion = null;
-			writeSessionRecord(ctx);
-			detach(
-				() => settleQuestionMessage(standing.messageId, standing.head, "Answered at the terminal."),
-				"standing-question close",
-			);
-		}
+		retireQuestions(ctx, "Answered at the terminal.");
 	});
 
 	// The agent loop is the only truthful "working" signal: `input` also fires for
@@ -12322,18 +12367,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnActive = true;
 		waitingOnJob = false;
 		statusBlockUsed = false;
-		detach(() => unpinRed(ctx), "new-work unpin");
+		// A turn started by a lease, a PR watch or another session leaves the user's open question standing.
 		retireCloseOffer(true);
-		closeReplyQuestion();
-		const standing = standingQuestion;
-		if (standing !== null) {
-			standingQuestion = null;
-			writeSessionRecord(ctx);
-			detach(
-				() => settleQuestionMessage(standing.messageId, standing.head, "Superseded by new work."),
-				"standing-question close",
-			);
-		}
 		approvalWaiting = false;
 		typingSentAt = 0;
 		draftText = "";
@@ -12678,10 +12713,12 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		turnActive = false;
 		replyOwedAt = 0;
 		approvalWaiting = false;
+		// A question an earlier turn left open still waits on the user, whatever this turn ends with.
+		const open = questionOpen();
 		// A turn that ends while a background job runs sleeps on it unless it asked for something.
 		if (waitsOnJob) {
 			const summary = turnSummary;
-			const asksReply = summary === null && /\?\s*$/.test(lastAssistantTail(ctx));
+			const asksReply = open || (summary === null && /\?\s*$/.test(lastAssistantTail(ctx)));
 			setPaneState(endTurnPaneState(summary?.urgency ?? null, summary?.options !== undefined, asksReply, waitsOnJob));
 		}
 		if (recoveryTurn) {
@@ -12714,20 +12751,33 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const waits = pendingWaits();
 			// A green question without choices waits on the reply as surely as a choice does.
 			const asksQuestion = turnSummary.options === undefined && turnSummary.question !== undefined;
+			const asks =
+				turnSummary.urgency !== "green" || turnSummary.question !== undefined || turnSummary.options !== undefined;
 			const lines = waitLines(waitsOnJob, waits);
 			const recorded =
 				lines.length > 0 ? { ...turnSummary, text: [turnSummary.text, ...lines].join("\n\n") } : turnSummary;
 			if (!waitsOnJob) {
 				setPaneState(
-					endTurnPaneState(recorded.urgency, recorded.options !== undefined, asksQuestion, waits.length > 0),
+					endTurnPaneState(recorded.urgency, recorded.options !== undefined, asksQuestion || open, waits.length > 0),
 				);
 			}
-			detach(() => unpinRed(ctx), "status unpin");
+			// Only a turn end that asks replaces the open question. One that asks nothing, as after an automatic
+			// wake, leaves it standing, its pin up and its unsent message retrying.
+			if (asks) {
+				detach(() => unpinRed(ctx), "status unpin");
+				closeReplyQuestion();
+				askedGeneration = redPinGeneration;
+			}
 			const pinGeneration = redPinGeneration;
+			const superseded = standingQuestion;
+			// Once its send ends, the question is open only as the standing or buttonless message it became.
+			const sendEnded = (): void => {
+				if (askedGeneration === pinGeneration) askedGeneration = null;
+			};
 			turnSummary = null;
 			// The record keeps the headline only: `/status` lists it beside every other session.
 			lastSummary = clip(recorded.text.split("\n")[0]?.trim() ?? "", STATUS_SUMMARY_MAX);
-			const offersClose = recorded.urgency === "green" && !waitsOnJob && waits.length === 0 && !asksQuestion;
+			const offersClose = recorded.urgency === "green" && !waitsOnJob && waits.length === 0 && !asksQuestion && !open;
 			lastSummaryAt = Date.now();
 			if (recorded.options === undefined) {
 				const closeGeneration = closeOfferGeneration;
@@ -12754,6 +12804,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						),
 					() => pinGeneration === redPinGeneration,
 				).then((sent) => {
+					sendEnded();
 					const messageId = isTelegramMessageId(sent?.message_id) ? sent.message_id : null;
 					if (offersClose) {
 						if (closeGeneration === closeOfferGeneration && !turnActive && !closing) {
@@ -12762,6 +12813,17 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						} else if (messageId !== null) {
 							detach(() => stripKeyboard(messageId), "late close-offer retire");
 						}
+					}
+					// A buttonless question replaces a standing one only once it shows.
+					const replaces =
+						asks && sent !== null && pinGeneration === redPinGeneration && standingQuestion === superseded;
+					if (replaces && superseded !== null) {
+						standingQuestion = null;
+						writeSessionRecord(ctx);
+						detach(
+							() => settleQuestionMessage(superseded.messageId, superseded.head, "Superseded by a newer question."),
+							"superseded standing question close",
+						);
 					}
 					if (recorded.urgency === "red") return pinRed(ctx, sent, pinGeneration);
 					return undefined;
@@ -12779,7 +12841,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						pinGeneration,
 						usageFooter(),
 						!waitsOnJob && waits.length === 0,
-					),
+					).finally(sendEnded),
 				"turn-end question",
 			);
 			return;
@@ -12800,7 +12862,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const tail = lastAssistantTail(ctx);
 		const wantsReply = /\?\s*$/.test(tail);
 		const waits = pendingWaits();
-		if (!waitsOnJob) setPaneState(endTurnPaneState(null, false, wantsReply, waits.length > 0));
+		if (!waitsOnJob) setPaneState(endTurnPaneState(null, false, wantsReply || open, waits.length > 0));
 		const title = wantsReply ? "\u{1F7E0} Reply wanted" : "\u{1F7E2} Turn finished";
 		const tailBody =
 			tail.length === 0
