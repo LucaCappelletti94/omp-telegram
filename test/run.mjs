@@ -208,6 +208,9 @@ globalThis.fetch = async (url, init) => {
 		}
 		api.calls.push({ method, body, files, bytes, at: Date.now() });
 		if (api.uploadGate !== null) await api.uploadGate;
+		if (api.down === true) {
+			return { ok: false, status: 502, json: async () => ({ ok: false, error_code: 502, description: "Bad Gateway" }) };
+		}
 		if ((api.failMethods ?? []).includes(method)) {
 			return { ok: false, status: 400, json: async () => ({ ok: false, description: "failed by test" }) };
 		}
@@ -217,6 +220,20 @@ globalThis.fetch = async (url, init) => {
 	}
 	const body = JSON.parse(init.body);
 	api.calls.push({ method, body, at: Date.now() });
+	// An outage of the Bot API answers every method with 502, as on 2026-11-19. A proxy in front of it may answer
+	// with an HTML page instead of JSON.
+	if (api.down === true) {
+		return { ok: false, status: 502, json: async () => ({ ok: false, error_code: 502, description: "Bad Gateway" }) };
+	}
+	if (api.down === "html") {
+		return {
+			ok: false,
+			status: 502,
+			json: async () => {
+				throw new SyntaxError("Unexpected token '<'");
+			},
+		};
+	}
 	// A broken connection rejects the fetch, so no status line is ever read.
 	if ((api.fetchThrows ?? []).includes(method)) throw new TypeError("fetch failed");
 	if ((api.failMethods ?? []).includes(method)) {
@@ -7359,6 +7376,104 @@ heading("shared Telegram throttle");
 	);
 	rmSync(throttleFile, { force: true });
 	await tb.fire("session_shutdown");
+}
+
+heading("Telegram outage");
+{
+	const textOf = (result) => result.content.map((part) => part.text).join(" ");
+	rmSync(join(root, "notify-telegram/poller.lock"), { force: true });
+	const oa = spawn("01a06026-0000-0000-0000-000000000000", "/home/dev/work/outage-a");
+	await oa.fire("session_start");
+	const ob = spawn("01a06027-0000-0000-0000-000000000000", "/home/dev/work/outage-b");
+	await ob.fire("session_start");
+	const snippetOf = async (session, id) => {
+		try {
+			return await session.tools
+				.get("notify_snippet")
+				.execute(id, { purpose: "a command", text: "ls" }, undefined, undefined, session.ctx);
+		} catch (error) {
+			return { content: [{ type: "text", text: String(error) }], isError: true };
+		}
+	};
+	const statusOf = (session, id) =>
+		session.tools
+			.get("notify_status")
+			.execute(id, { summary: `Status ${id}.`, urgency: "green", effect: "none" }, undefined, undefined, session.ctx);
+
+	// A Bot API answering 502 is down, and every process tells its agent so.
+	api.down = true;
+	const downSnippet = await snippetOf(oa, "out-snippet");
+	check(
+		"a send failing in an outage tells the agent Telegram is down",
+		downSnippet.isError === true && textOf(downSnippet).includes("Telegram has been down"),
+	);
+	const downStatus = textOf(await statusOf(ob, "out-status"));
+	check(
+		"a status recorded in an outage another process saw says it goes out once Telegram answers",
+		downStatus.includes("Telegram has been down") && downStatus.includes("goes out once"),
+	);
+	api.down = false;
+	await snippetOf(ob, "out-back");
+	check(
+		"one answer from Telegram ends the outage for every process",
+		!textOf(await statusOf(oa, "out-after")).includes("Telegram has been down"),
+	);
+
+	// A refusal comes from Telegram, so it is no outage.
+	api.failMethods = ["sendMessage"];
+	api.failDescription = "Bad Request: chat not found";
+	const refused = await snippetOf(oa, "out-refused");
+	api.failMethods = [];
+	api.failDescription = undefined;
+	check(
+		"a refusal from Telegram is no outage",
+		refused.isError === true && !textOf(refused).includes("Telegram has been down"),
+	);
+
+	// A connection that never reaches Telegram is an outage too.
+	api.fetchThrows = ["sendMessage"];
+	await snippetOf(oa, "out-lost");
+	api.fetchThrows = [];
+	check(
+		"a lost connection counts as an outage",
+		textOf(await statusOf(ob, "out-lost")).includes("Telegram has been down"),
+	);
+	await snippetOf(ob, "out-recovered");
+
+	// Files fail in an outage like any other send, and the agent hears why.
+	const shot = join(root, "outage.png");
+	writeFileSync(shot, "png-bytes");
+	const shot2 = join(root, "outage2.jpg");
+	writeFileSync(shot2, "jpg-bytes");
+	const fileOf = (id, paths) => oa.tools.get("notify_file").execute(id, { paths }, undefined, undefined, oa.ctx);
+	api.down = true;
+	const downFile = await fileOf("out-file", [shot]);
+	const downAlbum = await fileOf("out-album", [shot, shot2]);
+	api.down = false;
+	check(
+		"a file failing in an outage tells the agent Telegram is down",
+		downFile.isError === true && textOf(downFile).includes("Telegram has been down"),
+	);
+	check(
+		"an album failing in an outage tells the agent Telegram is down",
+		downAlbum.isError === true && textOf(downAlbum).includes("Telegram has been down"),
+	);
+	check("the outage names Telegram's status and description", textOf(downFile).includes("answers 502 Bad Gateway,"));
+	await snippetOf(ob, "out-files-back");
+
+	// A proxy's error page carries no description, so the status alone names the outage.
+	api.down = "html";
+	const proxied = await snippetOf(oa, "out-proxy");
+	check("a 502 that is not JSON is named by its status alone", textOf(proxied).includes("answers 502, so nothing"));
+	// Moving the clock would age every sent-record marker too, so the outage itself is made three minutes old.
+	const outageFile = join(root, "notify-telegram/outage.json");
+	const outage = JSON.parse(readFileSync(outageFile, "utf8"));
+	writeFileSync(outageFile, JSON.stringify({ ...outage, since: outage.since - 3 * 60_000 }));
+	const later = await snippetOf(oa, "out-later");
+	api.down = false;
+	check("an outage dates from its first failure, not its latest", textOf(later).includes("down for 3 minutes"));
+	await snippetOf(ob, "out-proxy-back");
+	for (const s of [oa, ob]) await s.fire("session_shutdown");
 }
 
 heading("paced release after a throttle");

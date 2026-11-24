@@ -1754,6 +1754,28 @@ function throttleNote(): string {
 	return left > 0 ? ` Telegram is throttling this bot for ${left} more ${left === 1 ? "second" : "seconds"}.` : "";
 }
 
+/** The first failure of the current Telegram outage, shared by every omp process and removed by Telegram's next answer. */
+const OUTAGE_FILE = join(STATE_DIR, "outage.json");
+
+/** Records how Telegram fails, keeping the first failure so the outage's age stays true. */
+function noteOutage(how: string): void {
+	if (readJsonFile(OUTAGE_FILE) !== null) return;
+	writeFileAtomic(OUTAGE_FILE, JSON.stringify({ since: Date.now(), how: clip(how, 120) }), 0o600);
+}
+
+/** Ends the outage, since Telegram answered. */
+function endOutage(): void {
+	if (existsSync(OUTAGE_FILE)) removePrivateStatePath(STATE_DIR, STATE_DIR, basename(OUTAGE_FILE));
+}
+
+/** How long Telegram has been down, for a tool result. Empty while it answers. */
+function outageNote(): string {
+	const raw = readJsonFile(OUTAGE_FILE) as { since?: unknown; how?: unknown } | null;
+	if (typeof raw?.since !== "number" || typeof raw.how !== "string") return "";
+	const minutes = Math.max(1, Math.round((Date.now() - raw.since) / 60_000));
+	return ` Telegram has been down for ${minutes} ${minutes === 1 ? "minute" : "minutes"} and ${raw.how}, so nothing reaches the chat until it answers again.`;
+}
+
 /**
  * Waits until a non-exempt call may go, and returns null, or returns the time that holds it back when it must be
  * refused instead. After a 429 every waiting send would fire in the same instant the deadline passes and earn the
@@ -1818,9 +1840,22 @@ async function sendWithRetry(
 				},
 			};
 		}
-		const response = await send();
+		let response: Response;
+		try {
+			response = await send();
+		} catch (error) {
+			// A shutdown aborts its own calls, which says nothing about Telegram.
+			if (lifetime?.aborted !== true) noteOutage("cannot be reached");
+			throw error;
+		}
 		const payload: unknown = await response.json().catch(() => null);
 		const envelope = payload !== null && typeof payload === "object" ? (payload as TelegramEnvelope) : null;
+		if (response.status >= 500) {
+			const description = typeof envelope?.description === "string" ? ` ${envelope.description}` : "";
+			noteOutage(`answers ${response.status}${description}`);
+		} else if (response.status !== 429) {
+			endOutage();
+		}
 		const retryAfter = envelope?.parameters?.retry_after;
 		if (!exempt && response.status === 429 && typeof retryAfter === "number") {
 			const until = Date.now() + retryAfter * 1000;
@@ -7512,6 +7547,8 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const told = [`Status recorded (${urgency}${offered.length > 0 ? ", with choices" : ""}).`];
 			if (clipped) told.push(`The summary was truncated to ${SUMMARY_MAX} characters, write a shorter one.`);
 			if (notes.length > 0) told.push(`${notes.join(", and ")}.`);
+			const outage = outageNote();
+			if (outage !== "") told.push(`${outage.trim()} This status goes out once it does.`);
 			return {
 				content: [{ type: "text", text: told.join(" ") }],
 				details: {
@@ -11438,7 +11475,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 				});
 				if (sent === null) {
 					return {
-						content: [{ type: "text", text: `Error: Telegram rejected the album upload.${throttleNote()}` }],
+						content: [
+							{ type: "text", text: `Error: Telegram rejected the album upload.${throttleNote()}${outageNote()}` },
+						],
 						isError: true,
 					};
 				}
@@ -11478,7 +11517,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					if (sent === null) {
 						return {
 							content: [
-								{ type: "text", text: `Error: Telegram rejected the upload of ${file.path}.${throttleNote()}` },
+								{
+									type: "text",
+									text: `Error: Telegram rejected the upload of ${file.path}.${throttleNote()}${outageNote()}`,
+								},
 							],
 							isError: true,
 						};
@@ -11590,7 +11632,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					}
 					return accepted === true;
 				}, messageId);
-				if (!deleted) return fail(`Telegram refused deletion. ${refusal}${throttleNote()}`);
+				if (!deleted) return fail(`Telegram refused deletion. ${refusal}${throttleNote()}${outageNote()}`);
 			} else {
 				const text = typeof p.text === "string" ? p.text.trim() : "";
 				if (text.length === 0) return fail("`text` must contain the replacement message body.");
@@ -11607,7 +11649,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					previous.kind,
 					{ text },
 				);
-				if (edited === null) return fail(`Telegram refused the edit.${throttleNote()}`);
+				if (edited === null) return fail(`Telegram refused the edit.${throttleNote()}${outageNote()}`);
 				if (standingQuestion?.messageId === messageId) {
 					standingQuestion.head = source;
 					writeSessionRecord(ctx);
@@ -11689,7 +11731,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const sent = await sendOrEdit(config, "sendMessage", { chat_id: config.chatId }, plain, "", "snippet");
 			if (sent === null) {
 				return {
-					content: [{ type: "text", text: `Error: Telegram rejected the snippet.${throttleNote()}` }],
+					content: [{ type: "text", text: `Error: Telegram rejected the snippet.${throttleNote()}${outageNote()}` }],
 					isError: true,
 				};
 			}
