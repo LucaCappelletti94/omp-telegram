@@ -175,25 +175,44 @@ check(
 );
 
 heading("selection");
+const DAY = 24 * 60 * 60 * 1000;
 const stale = node("stale", { updatedAt: NOW - GRAPH_RETENTION_MS - 1, status: "done" });
 const staleOpen = node("stale-open", { updatedAt: NOW - GRAPH_RETENTION_MS - 1, status: "working" });
 const fresh = node("fresh", { status: "done", updatedAt: NOW - GRAPH_RETENTION_MS + 60_000 });
-const kept = selectNodes([...all, stale, staleOpen, fresh], "", NOW).map((n) => n.session);
-check("a node untouched for a year drops out", !kept.includes("stale") && !kept.includes("stale-open"));
-check("a finished node within the year stays", kept.includes("fresh"));
+const yearPool = [...all, stale, staleOpen, fresh];
+const yearKept = selectNodes(yearPool, new Map(), "task", NOW).map((n) => n.session);
+check("a node untouched for a year drops out", !yearKept.includes("stale") && !yearKept.includes("stale-open"));
+check("a filter still finds a finished node within the year", yearKept.includes("fresh"));
+const recentOpen = node("recent-open", { updatedAt: NOW - 6 * DAY });
+const recentDone = node("recent-done", { status: "done", updatedAt: NOW - DAY });
+const recentMerged = node("recent-merged", { updatedAt: NOW - DAY });
+const weekOld = node("week-old", { updatedAt: NOW - 8 * DAY });
+const bare = selectNodes(
+	[recentOpen, recentDone, recentMerged, weekOld],
+	new Map([["recent-merged", pr("merged")]]),
+	"",
+	NOW,
+).map((n) => n.session);
+check("the bare view keeps unfinished work touched within a week", bare.includes("recent-open"));
+check(
+	"the bare view leaves out finished work, by its own status or its pull request's",
+	!bare.includes("recent-done") && !bare.includes("recent-merged"),
+);
+check("the bare view leaves out unfinished work untouched for over a week", !bare.includes("week-old"));
 const repoNode = node("rs", {
 	repo: "diesel-rs/diesel",
 	edges: [{ from: "rs", to: "down", type: "upstream", at: NOW }],
 });
 const down = node("down");
 const unrelated = node("unrelated");
-const filtered = selectNodes([repoNode, down, unrelated], "DIESEL", NOW).map((n) => n.session);
+const filtered = selectNodes([repoNode, down, unrelated], new Map(), "DIESEL", NOW).map((n) => n.session);
 check(
 	"a filter keeps the whole component of a matching node, case-insensitively",
 	filtered.includes("rs") && filtered.includes("down") && !filtered.includes("unrelated"),
 );
 const viaInbound = selectNodes(
 	[node("x", { edges: [{ from: "x", to: "y", type: "waits-on", at: NOW }] }), node("y", { label: "needle" })],
+	new Map(),
 	"needle",
 	NOW,
 ).map((n) => n.session);

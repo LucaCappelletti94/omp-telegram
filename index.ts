@@ -1546,8 +1546,10 @@ async function renderMermaid(text: string): Promise<{ ok: true; png: Uint8Array 
 	const settings = join(RENDER_DIR, `${stamp}.mermaid.json`);
 	try {
 		writeFileSync(input, text, { mode: 0o600 });
-		// At its natural width, since fitting a wide graph into mmdc's 800-pixel page shrinks its text.
-		writeFileSync(settings, JSON.stringify({ flowchart: { useMaxWidth: false } }), { mode: 0o600 });
+		// At its natural width, since fitting a wide graph into mmdc's 800-pixel page shrinks its text. Over its
+		// text or edge cap, Mermaid draws a notice in place of the graph and mmdc still succeeds, so neither caps.
+		const limits = { maxTextSize: Number.MAX_SAFE_INTEGER, maxEdges: Number.MAX_SAFE_INTEGER };
+		writeFileSync(settings, JSON.stringify({ ...limits, flowchart: { useMaxWidth: false } }), { mode: 0o600 });
 		const args = ["-i", input, "-o", output, "-c", settings, "-s", "2", "-b", "white"];
 		const chrome = findChrome();
 		if (chrome !== null) {
@@ -9762,7 +9764,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	async function sendDependencyGraph(cfg: Config, filter: string): Promise<void> {
 		const now = Date.now();
 		const { nodes, prs } = graphSnapshot();
-		const selected = selectNodes(nodes, filter, now);
+		const selected = selectNodes(nodes, prs, filter, now);
 		let note = "";
 		if (selected.length > 0) {
 			const rendered = await renderMermaid(toMermaid(selected, prs, now));

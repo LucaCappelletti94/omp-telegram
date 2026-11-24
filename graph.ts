@@ -5,6 +5,9 @@
 
 export const GRAPH_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
 
+/** How far back an unfiltered view reaches, since a year of sessions outgrows any one diagram. */
+export const RECENT_WORK_MS = 7 * 24 * 60 * 60 * 1000;
+
 export const EDGE_TYPES = ["upstream", "waits-on", "follows-up", "related"] as const;
 export type EdgeType = (typeof EDGE_TYPES)[number];
 
@@ -538,11 +541,23 @@ function matches(node: GraphNode, needle: string): boolean {
 	);
 }
 
-/** Nodes touched within the retention window, narrowed to the components holding a match when filtered. */
-export function selectNodes(nodes: readonly GraphNode[], filter: string, now: number): GraphNode[] {
-	const kept = nodes.filter((node) => now - node.updatedAt <= GRAPH_RETENTION_MS);
+/**
+ * Without a filter, the unfinished work touched within the last week. With one, every node of the retention window
+ * in a component holding a match, finished work included.
+ */
+export function selectNodes(
+	nodes: readonly GraphNode[],
+	prs: ReadonlyMap<string, PrRecord>,
+	filter: string,
+	now: number,
+): GraphNode[] {
 	const needle = filter.trim().toLowerCase();
-	if (needle.length === 0) return kept;
+	if (needle.length === 0) {
+		return nodes.filter(
+			(node) => now - node.updatedAt <= RECENT_WORK_MS && !isFinished(displayedStatus(node, prs.get(node.session))),
+		);
+	}
+	const kept = nodes.filter((node) => now - node.updatedAt <= GRAPH_RETENTION_MS);
 	const ids = new Set(kept.map((node) => node.session));
 	const neighbours = new Map<string, string[]>();
 	for (const edge of uniqueEdges(kept)) {

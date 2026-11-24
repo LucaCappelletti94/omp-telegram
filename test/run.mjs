@@ -14102,20 +14102,30 @@ heading("dependency graph across sessions");
 		}),
 	);
 	const photosBefore = called("sendPhoto").length;
+	writeFileSync(mmdcLog, "");
 	api.queued = [{ update_id: 9105, message: { message_id: 903, date: 1, chat: { id: CHAT }, text: "/deps" } }];
 	await waiter.pump(600);
 	check("/deps sends the rendered diagram as a photo", called("sendPhoto").length === photosBefore + 1);
+	const recent = readFileSync(mmdcLog, "utf8");
+	check(
+		"a bare /deps draws unfinished work and leaves merged work out",
+		recent.includes("Gizmo leaks") && !recent.includes("Widget mis-encodes Y"),
+	);
+	const recentListing = lastCall("sendMessage").body.text;
+	check(
+		"an unclaimed launch shows as never started",
+		recentListing.includes("Gizmo leaks") && recentListing.includes("not-started"),
+	);
+	writeFileSync(mmdcLog, "");
+	api.queued = [{ update_id: 9190, message: { message_id: 907, date: 1, chat: { id: CHAT }, text: "/deps widget" } }];
+	await waiter.pump(600);
 	const diagram = readFileSync(mmdcLog, "utf8");
 	check(
-		"the diagram holds the nodes and typed edges",
+		"a filtered diagram reaches finished work with its nodes and typed edges",
 		diagram.includes("Widget mis-encodes Y") && diagram.includes("==>|upstream|") && diagram.includes("-->|waits on|"),
 	);
 	const listing = lastCall("sendMessage").body.text;
 	check("/deps follows with the status list and PR links", listing.includes("merged") && listing.includes("pull/5"));
-	check(
-		"an unclaimed launch shows as never started",
-		listing.includes("Gizmo leaks") && listing.includes("not-started"),
-	);
 
 	// A long ledger is split across messages rather than cut.
 	const bulk = Array.from({ length: 60 }, (_, i) => `0c1ab${String(i).padStart(3, "0")}-0000-7000-8000-000000000000`);
