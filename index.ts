@@ -4068,9 +4068,9 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const cfg = config;
 		if (cfg === null) return;
 		const closes = (button: InlineButton): boolean => /^[kx]:/u.test(button.callback_data);
-		const keyboard = (): InlineButton[][] | undefined =>
-			(readSentRecord(messageId)?.replyMarkup as { inline_keyboard?: InlineButton[][] } | undefined)?.inline_keyboard;
-		const rows = (sent ?? keyboard() ?? [])
+		const keyboardOf = (record: SentRecord | null): InlineButton[][] | undefined =>
+			(record?.replyMarkup as { inline_keyboard?: InlineButton[][] } | undefined)?.inline_keyboard;
+		const rows = (sent ?? keyboardOf(readSentRecord(messageId)) ?? [])
 			.map((row) => row.filter((button) => !closes(button)))
 			.filter((row) => row.length > 0);
 		// The caller's own answer may settle the question in the same tick, and its dead buttons must stay dead.
@@ -4084,7 +4084,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		);
 		const current = readSentRecord(messageId);
 		// A settlement that landed meanwhile already recorded the keyboard it left.
-		if (dropped === null || current === null || !(keyboard() ?? []).flat().some(closes)) return;
+		if (dropped === null || current === null || keyboardOf(current)?.flat().some(closes) !== true) return;
 		recordSent(messageId, current.kind, current.text, current.session, current.payload, { inline_keyboard: rows });
 	}
 
@@ -7153,7 +7153,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						// No `deliverAs`: omp steers a running turn and starts one when idle. An explicit
 						// steer only interrupts, so on a finished session it delivered nothing at all.
 						closeReplyQuestion(entry.replyTo);
-						answerFromTelegram(entry.replyTo);
+						answerFromTelegram(owner, entry.replyTo);
 						const reference = replyReference(entry);
 						pi.sendUserMessage([
 							{ type: "image", data, mimeType: entry.mime },
@@ -7163,7 +7163,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					} else {
 						const tail = caption.length > 0 ? ` Caption: ${caption}` : "";
 						closeReplyQuestion(entry.replyTo);
-						answerFromTelegram(entry.replyTo);
+						answerFromTelegram(owner, entry.replyTo);
 						const sent = `The user sent a file from Telegram (${entry.mime ?? "unknown type"}), saved at ${entry.value}.${tail}`;
 						const reference = replyReference(entry);
 						pi.sendUserMessage(reference === null ? sent : [reference, { type: "text", text: sent }]);
@@ -7195,7 +7195,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 						continue;
 					}
 					if (entry.targetQuestion === true) closeReplyQuestion(entry.messageId);
-					answerFromTelegram(entry.messageId);
+					answerFromTelegram(owner, entry.messageId);
 					focusTmuxWindow();
 					pi.sendUserMessage(entry.value);
 					rmSync(processing, { force: true });
@@ -7212,7 +7212,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					replyOwedAt = Date.now();
 					continue;
 				}
-				answerFromTelegram(entry.replyTo);
+				answerFromTelegram(owner, entry.replyTo);
 				const reference = replyReference(entry);
 				pi.sendUserMessage(reference === null ? entry.value : [reference, { type: "text", text: entry.value }]);
 				replyOwedAt = Date.now();
@@ -7224,9 +7224,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 	}
 
 	/** A Telegram message answers the open question when it replies to that question, to its pin or to nothing. */
-	function answerFromTelegram(target: number | undefined): void {
-		const ctx = sessionCtx;
-		if (ctx === null) return;
+	function answerFromTelegram(ctx: ExtensionContext, target: number | undefined): void {
 		const open = [standingQuestion?.messageId, replyQuestionMessageId, pinnedMessageId];
 		if (target !== undefined && !open.includes(target)) return;
 		retireQuestions(ctx, "Answered on Telegram.");
