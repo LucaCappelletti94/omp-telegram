@@ -1755,14 +1755,10 @@ function throttleNote(): string {
 /** The first failure of the current Telegram outage, shared by every omp process and removed by Telegram's next answer. */
 const OUTAGE_FILE = join(STATE_DIR, "outage.json");
 
-/** Records a server failure, or a lost connection as status 0, keeping the first so the outage's age stays true. */
-function noteOutage(status: number, description: string): void {
+/** Records how Telegram fails, keeping the first failure so the outage's age stays true. */
+function noteOutage(how: string): void {
 	if (readJsonFile(OUTAGE_FILE) !== null) return;
-	writeFileAtomic(
-		OUTAGE_FILE,
-		JSON.stringify({ since: Date.now(), status, description: clip(description, 100) }),
-		0o600,
-	);
+	writeFileAtomic(OUTAGE_FILE, JSON.stringify({ since: Date.now(), how: clip(how, 120) }), 0o600);
 }
 
 /** Ends the outage, since Telegram answered. */
@@ -1772,14 +1768,10 @@ function endOutage(): void {
 
 /** How long Telegram has been down, for a tool result. Empty while it answers. */
 function outageNote(): string {
-	const raw = readJsonFile(OUTAGE_FILE) as { since?: unknown; status?: unknown; description?: unknown } | null;
-	if (typeof raw?.since !== "number") return "";
+	const raw = readJsonFile(OUTAGE_FILE) as { since?: unknown; how?: unknown } | null;
+	if (typeof raw?.since !== "number" || typeof raw.how !== "string") return "";
 	const minutes = Math.max(1, Math.round((Date.now() - raw.since) / 60_000));
-	const how =
-		typeof raw.status === "number" && raw.status > 0
-			? `answers ${raw.status} ${typeof raw.description === "string" ? raw.description : ""}`.trimEnd()
-			: "cannot be reached";
-	return ` Telegram has been down for ${minutes} ${minutes === 1 ? "minute" : "minutes"} and ${how}, so nothing reaches the chat until it answers again.`;
+	return ` Telegram has been down for ${minutes} ${minutes === 1 ? "minute" : "minutes"} and ${raw.how}, so nothing reaches the chat until it answers again.`;
 }
 
 /**
@@ -1851,13 +1843,14 @@ async function sendWithRetry(
 			response = await send();
 		} catch (error) {
 			// A shutdown aborts its own calls, which says nothing about Telegram.
-			if (lifetime?.aborted !== true) noteOutage(0, "");
+			if (lifetime?.aborted !== true) noteOutage("cannot be reached");
 			throw error;
 		}
 		const payload: unknown = await response.json().catch(() => null);
 		const envelope = payload !== null && typeof payload === "object" ? (payload as TelegramEnvelope) : null;
 		if (response.status >= 500) {
-			noteOutage(response.status, typeof envelope?.description === "string" ? envelope.description : "");
+			const description = typeof envelope?.description === "string" ? ` ${envelope.description}` : "";
+			noteOutage(`answers ${response.status}${description}`);
 		} else if (response.status !== 429) {
 			endOutage();
 		}
