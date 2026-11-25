@@ -1557,7 +1557,7 @@ async function renderMermaid(text: string): Promise<{ ok: true; png: Uint8Array 
 			args.push("-p", puppeteer);
 		}
 		try {
-			await execFileAsync("mmdc", args, { timeout: MMDC_TIMEOUT_MS });
+			await execFileAsync("mmdc", args, { cwd: homedir(), timeout: MMDC_TIMEOUT_MS });
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			return {
@@ -1942,9 +1942,11 @@ function settledKeyboard(labels: string[], chosen: Set<string>): InlineButton[][
 
 const execFileAsync = promisify(execFile);
 
+/** Runs `command` from the home directory, because the omp process may sit in a worktree deleted since it started. */
 async function run(command: string, args: string[], timeout = 300_000): Promise<RunResult> {
 	try {
 		const { stdout } = await execFileAsync(command, args, {
+			cwd: homedir(),
 			encoding: "utf8",
 			timeout,
 			maxBuffer: 64 * 1024 * 1024,
@@ -3179,7 +3181,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const child = spawn(
 				setpriv ? "/usr/bin/setpriv" : "systemd-inhibit",
 				setpriv ? ["--pdeathsig", "TERM", "systemd-inhibit", ...args] : args,
-				{ stdio: ["ignore", "pipe", "ignore"] },
+				{ cwd: homedir(), stdio: ["ignore", "pipe", "ignore"] },
 			);
 			inhibitor = child;
 			// The lock lives exactly as long as this process, which exits on its own schedule and kills the child then.
@@ -3967,7 +3969,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 			const out = execFileSync(
 				"tmux",
 				["display-message", "-p", "-t", pane, "#{session_name}\t#{window_index}\t#{pane_index}"],
-				{ timeout: 2000 },
+				{ cwd: homedir(), timeout: 2000 },
 			)
 				.toString()
 				.trim();
@@ -4017,7 +4019,10 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		const pane = process.env.TMUX_PANE;
 		if (process.env.TMUX === undefined || pane === undefined) return;
 		try {
-			execFileSync("tmux", ["select-window", "-t", pane, ";", "select-pane", "-t", pane], { timeout: 2000 });
+			execFileSync("tmux", ["select-window", "-t", pane, ";", "select-pane", "-t", pane], {
+				cwd: homedir(),
+				timeout: 2000,
+			});
 		} catch {}
 	}
 
@@ -4037,6 +4042,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 		if (!/^%\d+$/u.test(pane)) return;
 		try {
 			spawn("sh", ["-c", `sleep 2; exec tmux kill-pane -t '${pane}'`], {
+				cwd: homedir(),
 				detached: true,
 				stdio: "ignore",
 			}).unref();
@@ -4195,7 +4201,7 @@ export default function notifyTelegram(pi: ExtensionAPI): void {
 					"-F",
 					"#{session_name}\t#{window_index}\t#{window_bell_flag}\t#{@omp_priority}\t#{pane_id}\t#{pane_title}",
 				],
-				{ timeout: 2000 },
+				{ cwd: homedir(), timeout: 2000 },
 			).toString();
 		} catch {
 			return null;
