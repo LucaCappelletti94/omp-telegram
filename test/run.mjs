@@ -11809,7 +11809,8 @@ case "$args" in
   *"show-ref"*) [ "$GIT_BRANCH_EXISTS" = "1" ] ;;
   *"remote add"*) if [ "$GIT_ADDFAIL" = "1" ]; then echo "add failed" 1>&2; exit 1; fi ;;
   *clone*)
-    if [ "$GIT_CLONEFAIL" = "1" ]; then echo "clone failed" 1>&2; exit 1
+    if [ ! -d "$(pwd -P 2>/dev/null)" ]; then echo "fatal: Unable to read current working directory" 1>&2; exit 128
+    elif [ "$GIT_CLONEFAIL" = "1" ]; then echo "clone failed" 1>&2; exit 1
     elif [ -n "$GIT_CLONE_FLAKY" ]; then
       if [ -f "$GIT_CLONE_FLAKY" ]; then exit 0; else : > "$GIT_CLONE_FLAKY"; echo "not ready" 1>&2; exit 1; fi
     else exit 0; fi ;;
@@ -12312,6 +12313,21 @@ esac
 		requestOf(flaky.details?.id).state,
 	);
 	check("the flaky clone ran twice", (gitText().match(/clone /g) ?? []).length >= 2);
+
+	const goneCwd = join(root, "deleted-cwd");
+	mkdirSync(goneCwd, { recursive: true });
+	const priorCwd = process.cwd();
+	const orphaned = await launchTool("j2", { repo: "someorg/orphaned", document: "req.md", problem: "P." });
+	process.chdir(goneCwd);
+	rmSync(goneCwd, { recursive: true });
+	await tap(orphaned.details?.id, "l");
+	await settle(800);
+	process.chdir(priorCwd);
+	check(
+		"a launch from a process whose working directory was deleted still clones",
+		requestOf(orphaned.details?.id).state === "launched",
+		JSON.stringify(requestOf(orphaned.details?.id)),
+	);
 
 	// k. A launch that cannot open its tmux window rolls the worktree back and reports it.
 	mkdirSync(join(root, "github", "rollback", ".git", "info"), { recursive: true });
@@ -13688,7 +13704,7 @@ heading("dependency graph across sessions");
 		{ mode: 0o755 },
 	);
 	const onePixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-	const mmdcScript = `#!/bin/sh\necho "$*" >> ${mmdcLog}\nout=""; in=""; prev=""\nfor a in "$@"; do [ "$prev" = "-o" ] && out="$a"; [ "$prev" = "-i" ] && in="$a"; prev="$a"; done\ncat "$in" >> ${mmdcLog}\nprintf '%s' '${onePixel}' | base64 -d > "$out"\n`;
+	const mmdcScript = `#!/bin/sh\n[ -d "$(pwd -P 2>/dev/null)" ] || { echo "process.cwd failed, uv_cwd" 1>&2; exit 1; }\necho "$*" >> ${mmdcLog}\nout=""; in=""; prev=""\nfor a in "$@"; do [ "$prev" = "-o" ] && out="$a"; [ "$prev" = "-i" ] && in="$a"; prev="$a"; done\ncat "$in" >> ${mmdcLog}\nprintf '%s' '${onePixel}' | base64 -d > "$out"\n`;
 	writeFileSync(join(gBin, "mmdc"), mmdcScript, { mode: 0o755 });
 	process.env.PATH = `${gBin}:${savedPath}`;
 	process.env.TMUX = "/tmp/fake-tmux,1,0";
@@ -14434,6 +14450,20 @@ heading("dependency graph across sessions");
 		"a /deps filter keeps only the matching component",
 		readFileSync(mmdcLog, "utf8").includes("Gizmo leaks") &&
 			!readFileSync(mmdcLog, "utf8").includes("Widget mis-encodes Y"),
+	);
+
+	const goneRenderCwd = join(root, "deleted-render-cwd");
+	mkdirSync(goneRenderCwd, { recursive: true });
+	const renderCwd = process.cwd();
+	process.chdir(goneRenderCwd);
+	rmSync(goneRenderCwd, { recursive: true });
+	const photosBeforeGoneCwd = called("sendPhoto").length;
+	api.queued = [{ update_id: 9111, message: { message_id: 907, date: 1, chat: { id: CHAT }, text: "/deps gizmo" } }];
+	await waiter.pump(600);
+	process.chdir(renderCwd);
+	check(
+		"/deps renders its diagram from a process whose working directory was deleted",
+		called("sendPhoto").length === photosBeforeGoneCwd + 1,
 	);
 
 	// A PATH with no mmdc anywhere, so an installed one on this machine cannot answer.
